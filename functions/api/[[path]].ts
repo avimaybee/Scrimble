@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
 import { handle } from 'hono/cloudflare-pages';
-import { verifyFirebaseToken } from './middleware/auth';
-import { decrypt } from './utils/crypto';
-import { diffSchema } from './types/diff';
+import { verifyFirebaseToken } from '../middleware/auth';
+import { decrypt } from '../utils/crypto';
+import { diffSchema } from '../types/diff';
 
 type Bindings = {
   DB: any;
