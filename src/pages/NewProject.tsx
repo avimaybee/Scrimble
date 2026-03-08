@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ArrowRight, Sparkles } from 'lucide-react';
+import { ArrowRight, Sparkles, Key } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
-import { generatePlan } from '../lib/ai';
-import { ProjectType, RiskLevel } from '../types';
 import { cn } from '../lib/utils';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -64,102 +63,26 @@ export default function NewProject() {
     }
 
     setLoading(true);
+    setLoadingSteps([]);
     setError('');
 
     try {
-      setLoadingSteps(prev => [...prev, 'Reading your description...']);
-      const planData = await generatePlan(trimmedPrompt);
-
-      setLoadingSteps(prev => [...prev.slice(-2), 'Figuring out the stages...']);
-      const projectId = await dbService.createProject({
-        user_id: user.uid,
-        name: planData.project_name,
-        description: `${trimmedPrompt.substring(0, 100)}...`,
-        project_type: planData.project_type as ProjectType,
-        stack: typeof planData.stack === 'string' ? planData.stack : JSON.stringify(planData.stack),
-        status: 'active',
+      setLoadingSteps(prev => [...prev, 'Saving your brief...']);
+      const project = await dbService.createProject({
+        description: trimmedPrompt,
       });
 
-      await dbService.createPlan({
-        project_id: projectId,
-        version: 1,
-        canvas_state: JSON.stringify({ x: 0, y: 0, zoom: 1 }),
-      });
-
-      let globalStepOrder = 0;
-      let prevStepId: string | null = null;
-
-      setLoadingSteps(prev => [...prev.slice(-2), 'Building the canvas...']);
-
-      for (const stage of planData.stages || []) {
-        const stageId = await dbService.createStage({
-          project_id: projectId,
-          title: stage.title,
-          type: stage.type,
-          order_index: stage.order_index,
-          status: stage.order_index === 0 ? 'active' : 'locked',
-        });
-
-        for (let i = 0; i < (stage.steps || []).length; i += 1) {
-          const step = stage.steps[i];
-
-          const stepId = await dbService.createStep({
-            project_id: projectId,
-            stage_id: stageId,
-            title: step.title,
-            type: step.type || 'task',
-            category: step.category || stage.type,
-            position_x: i * 250,
-            position_y: stage.order_index * 400 + 100,
-            status: stage.order_index === 0 && i === 0 ? 'active' : 'locked',
-            is_gate: step.is_gate || false,
-            risk_level: (step.risk_level as RiskLevel) || 'low',
-            objective: step.objective || '',
-            why_it_matters: step.why_it_matters || '',
-            suggested_tools: JSON.stringify(step.suggested_tools || []),
-            done_when: step.done_when || '',
-            is_ai_enriched: false,
-            order_index: globalStepOrder,
-          });
-
-          globalStepOrder += 1;
-
-          for (let j = 0; j < (step.checklist || []).length; j += 1) {
-            const item = step.checklist[j];
-            await dbService.createChecklistItem({
-              step_id: stepId,
-              label: item.label,
-              is_required: item.is_required || false,
-              is_completed: false,
-              order_index: j,
-            });
-          }
-
-          prevStepId = stepId;
-        }
-      }
-
-      // 3. Create edges from planData.edges
-      for (const edge of planData.edges || []) {
-        await dbService.createEdge({
-          project_id: projectId,
-          source_step_id: edge.source_step_id,
-          target_step_id: edge.target_step_id,
-          edge_type: (edge.edge_type as any) || 'default',
-        });
-      }
-
-      setLoadingSteps(prev => [...prev.slice(-2), 'Polishing the sequence...']);
+      setLoadingSteps(prev => [...prev.slice(-2), 'Queueing the generation run...']);
       window.setTimeout(() => {
-        navigate(`/project/${projectId}`);
-      }, 800);
+        navigate(`/project/${project.id}/generating`);
+      }, 250);
     } catch (err: unknown) {
       console.error('Error generating plan:', err);
       setLoading(false);
       setError(
         err instanceof Error
           ? err.message
-          : 'Failed to generate your plan. Please check your AI key and try again.',
+          : 'Failed to start your project generation. Please check your AI key and try again.',
       );
     }
   };
@@ -173,7 +96,7 @@ export default function NewProject() {
             rotate: [0, 90, 180, 270, 360],
           }}
           transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
-          className="mb-12 flex h-20 w-20 items-center justify-center rounded-2xl bg-accent-primary-muted/20 border border-accent-primary/20 shadow-[0_0_40px_rgba(235,94,40,0.1)]"
+          className="mb-12 flex h-20 w-20 items-center justify-center rounded-[16px] bg-accent-primary-muted/20 border border-accent-primary/20 shadow-[0_0_40px_rgba(235,94,40,0.1)]"
         >
           <Sparkles className="h-10 w-10 text-accent-primary" />
         </motion.div>
@@ -194,7 +117,7 @@ export default function NewProject() {
                   idx === loadingSteps.length - 1 ? "bg-accent-primary animate-pulse" : "bg-status-secure"
                 )} />
                 <span className={cn(
-                  "text-[15px] font-medium tracking-tight transition-colors duration-300",
+                  "text-[15px] font-medium tracking-[-0.03em] transition-colors duration-300",
                   idx === loadingSteps.length - 1 ? "text-text-primary" : "text-text-tertiary"
                 )}>
                   {step}
@@ -245,7 +168,7 @@ export default function NewProject() {
 
           <motion.div variants={itemVariants} className="group relative">
             <div className="absolute -inset-1 rounded-[16px] bg-gradient-to-r from-accent-primary to-accent-primary-muted blur opacity-20 transition duration-1000 group-hover:opacity-40 group-hover:duration-200" />
-            <div className="relative rounded-[16px] border border-border-default bg-bg-surface p-2 shadow-panel">
+            <div className="relative rounded-[16px] border border-border-default focus-within:border-border-strong focus-within:ring-1 focus-within:ring-border-strong transition-colors duration-200 bg-bg-surface p-2 shadow-panel">
               <textarea
                 ref={textareaRef}
                 value={prompt}
@@ -255,9 +178,18 @@ export default function NewProject() {
                 autoFocus
               />
               <div className="flex flex-col gap-4 px-4 pb-3 sm:flex-row sm:items-end sm:justify-between">
-                <div className="space-y-1">
-                  <div className="text-xs text-text-tertiary">Powered by your AI key</div>
-                  <div className="text-[11px] text-text-tertiary">The more detail, the better.</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-[13px] text-text-tertiary">The more detail, the better.</div>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Key className="h-3.5 w-3.5 text-text-tertiary opacity-70 hover:opacity-100 transition-opacity" />
+                      </TooltipTrigger>
+                      <TooltipContent className="bg-bg-elevated border-border-default text-text-primary text-xs">
+                        <p>Runs through your saved AI provider</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 </div>
 
                 <div className="flex items-center gap-3 self-end">

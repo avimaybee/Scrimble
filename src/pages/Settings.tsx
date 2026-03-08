@@ -238,7 +238,7 @@ export default function Settings() {
             </div>
 
             <div>
-              <h2 className="text-xl font-medium tracking-[-0.02em] text-text-primary">
+              <h2 className="text-xl font-medium tracking-[-0.03em] text-text-primary">
                 {user?.displayName || 'User'}
               </h2>
               <p className="text-text-secondary">{user?.email}</p>
@@ -287,7 +287,7 @@ export default function Settings() {
                 <div className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
                   <div>
                     <div className="mb-2 flex flex-wrap items-center gap-2">
-                      <h3 className="text-[17px] font-medium tracking-[-0.02em] text-text-primary">
+                      <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
                         {providerLabels[provider.provider]}
                       </h3>
                       {provider.is_default ? (
@@ -341,17 +341,17 @@ export default function Settings() {
 
           <form onSubmit={handleSaveProvider} className="space-y-5">
             <div>
-              <div className="grid gap-2 sm:grid-cols-4">
+              <div className="grid gap-1 sm:grid-cols-4 rounded-[10px] border border-border-default bg-bg-elevated p-1">
                 {providerOptions.map((option) => (
                   <button
                     key={option.value}
                     type="button"
                     onClick={() => setForm((current) => ({ ...current, provider: option.value }))}
                     className={cn(
-                      'h-11 rounded-[8px] border px-3 text-sm font-medium transition-colors',
+                      'h-9 rounded-[6px] px-3 text-sm font-medium transition-all duration-200',
                       form.provider === option.value
-                        ? 'border-accent-border bg-accent-primary-muted text-accent-primary'
-                        : 'border-border-default bg-bg-surface text-text-secondary hover:border-border-strong hover:text-text-primary',
+                        ? 'bg-bg-surface text-accent-primary shadow-[0_0_0_1px_var(--color-accent-border)]'
+                        : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface/50'
                     )}
                   >
                     {option.label}
@@ -363,7 +363,7 @@ export default function Settings() {
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className={cn(form.provider === 'custom' && 'sm:col-span-2')}>
-                <label className="mb-2 block text-[13px] font-medium text-[#c5bcad]">
+                <label className="mb-2 block text-[13px] font-medium text-text-secondary">
                   Your API key
                 </label>
                 <input
@@ -379,7 +379,7 @@ export default function Settings() {
               </div>
 
               <div>
-                <label className="mb-2 block text-[13px] font-medium text-[#c5bcad]">
+                <label className="mb-2 block text-[13px] font-medium text-text-secondary">
                   Model to use (optional)
                 </label>
                 <input
@@ -395,7 +395,7 @@ export default function Settings() {
 
               {form.provider === 'custom' ? (
                 <div className="sm:col-span-2">
-                  <label className="mb-2 block text-[13px] font-medium text-[#c5bcad]">
+                  <label className="mb-2 block text-[13px] font-medium text-text-secondary">
                     API URL
                   </label>
                   <input
@@ -424,10 +424,10 @@ export default function Settings() {
           </form>
         </div>
 
-        <div className="mt-6 rounded-[14px] border border-accent-border bg-accent-primary-muted/35 p-4">
+        <div className="mt-6 rounded-[10px] border border-accent-border bg-accent-primary-muted p-4">
           <div className="flex items-start gap-3">
             <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-accent-primary" />
-            <p className="text-sm leading-relaxed text-[#f0e7db]">
+            <p className="text-sm leading-relaxed text-text-primary">
               Your privacy is priority. API keys are encrypted with <strong>AES-256</strong> before being stored in our isolated Cloudflare D1 database. Scrimble never stores them in plain text and only uses them to securely proxy your requests.
             </p>
           </div>

@@ -11,6 +11,7 @@ import LandingPage from './pages/LandingPage';
 import AuthPage from './pages/AuthPage';
 import Dashboard from './pages/Dashboard';
 import NewProject from './pages/NewProject';
+import ProjectGeneration from './pages/ProjectGeneration';
 import ProjectCanvas from './pages/ProjectCanvas';
 import Settings from './pages/Settings';
 import AppLayout from './components/AppLayout';
@@ -58,6 +59,20 @@ function ProtectedRoute() {
   );
 }
 
+function ProtectedFullscreenRoute() {
+  const { user, isAuthReady } = useAuthStore();
+
+  if (!isAuthReady) {
+    return <div className="min-h-screen flex items-center justify-center bg-bg-base text-text-primary uppercase tracking-widest text-[10px]">Loading...</div>;
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return <RouteTransition className="min-h-screen flex flex-col bg-bg-base" />;
+}
+
 function AnimatedRoutes() {
   const location = useLocation();
 
@@ -89,6 +104,10 @@ function AnimatedRoutes() {
           }
         />
         
+        <Route element={<ProtectedFullscreenRoute />}>
+          <Route path="/project/:id/generating" element={<ErrorBoundary name="Generation"><ProjectGeneration /></ErrorBoundary>} />
+        </Route>
+
         <Route element={<ProtectedRoute />}>
           <Route path="/dashboard" element={<ErrorBoundary name="Dashboard"><Dashboard /></ErrorBoundary>} />
           <Route path="/new" element={<ErrorBoundary name="New Project"><NewProject /></ErrorBoundary>} />

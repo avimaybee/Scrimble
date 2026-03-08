@@ -11,7 +11,7 @@ export function Dialog({ open, onOpenChange, children }: { open?: boolean, onOpe
             initial={{ opacity: 0 }} 
             animate={{ opacity: 1 }} 
             exit={{ opacity: 0 }} 
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm"
+            className="fixed inset-0 bg-[#0f0e0e]/60 backdrop-blur-sm"
             onClick={() => onOpenChange?.(false)}
           />
           <motion.div
@@ -30,7 +30,7 @@ export function Dialog({ open, onOpenChange, children }: { open?: boolean, onOpe
 
 export function DialogContent({ children, className }: { children: React.ReactNode, className?: string }) {
   return (
-    <div className={cn("bg-bg-surface border border-border-default rounded-2xl shadow-modal overflow-hidden", className)}>
+    <div className={cn("bg-bg-surface border border-border-default rounded-[16px] shadow-modal overflow-hidden", className)}>
       {children}
     </div>
   );

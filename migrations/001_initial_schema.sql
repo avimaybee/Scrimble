@@ -1,4 +1,15 @@
--- Scrimble D1 Schema — Migration 001 — Apply with: wrangler d1 execute scrimble-db --file=migrations/001_initial_schema.sql
+-- Scrimble D1 Schema — Migration 001
+-- Reordered drops to satisfy foreign key constraints
+DROP TABLE IF EXISTS edges;
+DROP TABLE IF EXISTS checklist_items;
+DROP TABLE IF EXISTS agent_runs;
+DROP TABLE IF EXISTS steps;
+DROP TABLE IF EXISTS stages;
+DROP TABLE IF EXISTS workflows;
+DROP TABLE IF EXISTS plans;
+DROP TABLE IF EXISTS projects;
+DROP TABLE IF EXISTS ai_providers;
+DROP TABLE IF EXISTS profiles;
 
 -- ────────────────────────────────────────────
 -- USER PROFILES

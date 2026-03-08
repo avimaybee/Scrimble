@@ -55,6 +55,8 @@
   --radius-btn: 8px;
   --radius-card: 14px;
   --radius-panel: 16px;
+  --radius-badge: 6px;
+  --radius-step: 10px;
 
   --shadow-step: 0 0 0 1px var(--color-border-default), 0 4px 24px rgba(0,0,0,0.2);
   --shadow-step-active: 0 0 0 1px var(--color-accent-border), 0 4px 20px rgba(235,94,40,0.10);
@@ -222,9 +224,9 @@ body {
   color: var(--color-text-secondary);
   border: 1px solid var(--color-border-default);
   border-radius: 8px;
-  padding: 10px 22px;
-  font-size: 14px;
-  font-weight: 400;
+  padding: 6px 14px;
+  font-size: 12px;
+  gap: 6px;font-weight: 400;
   transition: border-color 120ms ease, color 120ms ease;
 }
 .btn-ghost:hover {
@@ -458,8 +460,8 @@ body {
 .step-card {
   background: var(--color-bg-surface);
   border: 1px solid var(--color-border-default);
-  border-radius: 12px;
-  width: 220px;
+  border-radius: var(--radius-step);
+  width: 176px;
   box-shadow: var(--shadow-step);
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   overflow: hidden;
@@ -556,12 +558,8 @@ body {
 }
 
 .step-card--needs-review {
+  border-color: rgba(251, 191, 36, 0.4) !important;
   animation: waiting-pulse 2s ease-in-out infinite;
-}
-
-@keyframes waiting-pulse {
-  0%, 100% { border-color: rgba(251, 191, 36, 0.3); box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.1); }
-  50%       { border-color: rgba(251, 191, 36, 0.7); box-shadow: 0 0 12px rgba(251, 191, 36, 0.2); }
 }
 
 .review-badge {
@@ -572,7 +570,7 @@ body {
   background: #f59e0b;
   color: #0f0e0e;
   padding: 4px 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-badge);
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
   font-weight: 700;
@@ -609,11 +607,11 @@ body {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 6px;
+  padding: 4px;
 
   background: rgba(36,33,30,0.92);
   border: 1px solid var(--color-border-default);
-  border-radius: 16px;
+  border-radius: 999px;
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
@@ -623,8 +621,8 @@ body {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 8px 16px;
-  border-radius: 10px;
+  padding: 8px 18px;
+  border-radius: 999px;
   font-family: 'DM Sans', sans-serif;
   font-size: 13px;
   font-weight: 500;
@@ -767,7 +765,7 @@ body {
   height: 100%;
   background: rgba(204, 197, 185, 0.015);
   border: 1px dashed var(--color-border-strong);
-  border-radius: 24px;
+  border-radius: var(--radius-panel);
   position: relative;
   transition: all 0.3s ease;
   overflow: visible;
@@ -779,7 +777,7 @@ body {
   top: 0; left: 0; bottom: 0;
   width: 48px;
   background: linear-gradient(to right, rgba(204, 197, 185, 0.03), transparent);
-  border-radius: 24px 0 0 24px;
+  border-radius: var(--radius-panel) 0 0 var(--radius-panel);
   pointer-events: none;
 }
 
@@ -927,7 +925,7 @@ body {
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-bg-base text-text-primary;
   }
   html {
     @apply font-sans;
@@ -1002,7 +1000,7 @@ body {
   background: linear-gradient(90deg, var(--color-bg-elevated) 25%, var(--color-border-subtle) 50%, var(--color-bg-elevated) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite linear;
-  border-radius: 12px;
+  border-radius: var(--radius-card);
 }
 
 @keyframes shimmer {
@@ -1010,33 +1008,10 @@ body {
   100% { background-position: -200% 0; }
 }
 
-/* Step Card Needs Review */
-.step-card--needs-review {
-  border-color: rgba(234, 179, 8, 0.4) !important;
-  background: rgba(234, 179, 8, 0.05) !important;
-  box-shadow: 0 0 15px rgba(234, 179, 8, 0.1) !important;
-}
-
-.review-badge {
-  position: absolute;
-  top: -10px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: #f59e0b;
-  color: #000;
-  padding: 2px 10px;
-  border-radius: 100px;
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  z-index: 10;
-  white-space: nowrap;
-}
-
 /* Checklist UI */
 .checklist-item-container {
   will-change: transform, border-color, background-color;
+  border-radius: var(--radius-card);
 }
 
 .checklist-item-container:active {

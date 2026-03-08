@@ -8,7 +8,7 @@ These must be set using `wrangler pages secret put <NAME>` or in the Cloudflare 
 | Variable | Description | Command to Generate/Source |
 |----------|-------------|----------------------------|
 | `ENCRYPTION_KEY` | 32-byte hex for AES-256 | `openssl rand -hex 32` |
-| `FIREBASE_PROJECT_ID` | Project ID for JWT verification | Firebase Console (Project Settings) |
+| `ENCRYPTION_KEY` | 32-byte hex for AES-256 | `openssl rand -hex 32` |
 
 ## 2. Backend Variables (wrangler.toml)
 Non-sensitive configuration. Safe to commit if no PII/Secrets are included.
@@ -16,6 +16,7 @@ Non-sensitive configuration. Safe to commit if no PII/Secrets are included.
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `ENVIRONMENT` | `production` | Deployment environment |
+| `FIREBASE_PROJECT_ID` | `scrimble-auth` | Required for JWT issuer verification |
 
 ## 3. Frontend Variables (.env.local)
 Required for local development and build. Values sourced from `src/lib/firebase.ts`.
@@ -45,3 +46,12 @@ The following settings must be configured manually in the respective consoles fo
 - **Authorized redirect URIs**:
     - `https://scrimble-auth.firebaseapp.com/__/auth/handler`
     - `https://scrimble.pages.dev/__/auth/handler` (or your custom domain equivalent)
+## 6. Custom AI Provider URLs
+For OpenAI-compatible providers (Ollama, Together, etc.), use one of these formats in Settings:
+
+| Format | Example | Note |
+|--------|---------|------|
+| **Host only** | `https://api.example.com` | Scrimble appends `/v1/chat/completions` |
+| **V1 base** | `https://api.example.com/v1` | Scrimble appends `/chat/completions` |
+| **Full endpoint** | `https://api.example.com/v1/chat/completions` | Accepted as is |
+| **Local (Ollama)** | `http://localhost:11434/v1` | Most common for local work |

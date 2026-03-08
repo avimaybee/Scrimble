@@ -9,15 +9,13 @@ export default function PillNav() {
 
   const isNewProject = location.pathname === '/new';
   const isSettings = location.pathname === '/settings';
-  const isProject = location.pathname.startsWith('/project/');
   const isDashboard = location.pathname === '/dashboard';
-  
+
   const activeTab = useMemo(() => {
-    if (isDashboard) return 'dashboard';
-    if (isProject) return 'plan';
+    if (isDashboard || isNewProject) return 'dashboard';
     if (isSettings) return 'settings';
     return null;
-  }, [isDashboard, isProject, isSettings]);
+  }, [isDashboard, isNewProject, isSettings]);
 
   return (
     <AnimatePresence>
@@ -27,26 +25,26 @@ export default function PillNav() {
         transition={{ type: 'spring', bounce: 0.4, duration: 0.8 }}
         className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2"
       >
-        <div className="relative rounded-[16px] border border-border-default bg-bg-surface/90 p-2 shadow-lg backdrop-blur-xl">
+        <div className="relative rounded-full border border-border-default bg-bg-surface/90 p-1 shadow-lg backdrop-blur-xl">
           <div className="flex items-center justify-center gap-1">
             <div className="flex items-center gap-1">
               <NavItem
                 to="/dashboard"
                 isActive={activeTab === 'dashboard'}
-                icon={<LayoutGrid className="h-5 w-5" />}
-                label="Explore"
+                icon={<LayoutGrid className="h-4.5 w-4.5" />}
+                label="Dashboard"
               />
               <NavItem
                 to="/new"
-                isActive={activeTab === 'plan'}
-                icon={<PlusSquare className="h-5 w-5" />}
-                label="Plan"
+                isActive={false}
+                icon={<PlusSquare className="h-4.5 w-4.5" />}
+                label="New"
               />
               <NavItem
                 to="/settings"
                 isActive={activeTab === 'settings'}
-                icon={<Settings className="h-5 w-5" />}
-                label="Adjust"
+                icon={<Settings className="h-4.5 w-4.5" />}
+                label="Settings"
               />
             </div>
           </div>
@@ -61,25 +59,29 @@ function NavItem({
   isActive,
   icon,
   label,
+  disabled
 }: {
   to: string;
   isActive: boolean;
   icon: React.ReactNode;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <Link
-      to={to}
+      to={disabled ? '#' : to}
+      onClick={(e) => disabled && e.preventDefault()}
       className={cn(
-        'group relative flex flex-col items-center justify-center py-1 transition-all duration-200',
-        isActive ? 'text-accent-primary' : 'text-text-tertiary hover:text-text-secondary'
+        'group relative flex flex-col items-center justify-center px-3 py-1 transition-all duration-200',
+        isActive ? 'text-accent-primary' : 'text-text-tertiary hover:text-text-secondary',
+        disabled && !isActive ? 'opacity-50 cursor-not-allowed hover:text-text-tertiary' : ''
       )}
     >
       <div className="relative mb-0.5 flex items-center justify-center">
         {isActive && (
           <motion.div
             layoutId="nav-bg"
-            className="absolute -inset-x-3 -inset-y-1.5 rounded-[8px] bg-accent-primary-muted/20"
+            className="absolute -inset-x-2.5 -inset-y-1 rounded-full bg-accent-primary-muted/20"
             transition={{ type: 'spring', bounce: 0.2, duration: 0.6 }}
           />
         )}

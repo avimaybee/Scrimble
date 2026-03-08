@@ -208,24 +208,15 @@ export const auth = getAuth(app)
 5. Decoded Firebase UID is used to query D1: WHERE user_id = '{uid}'
 ```
 
-### Firebase JWT Verification in Workers
+### Firebase JWT Verification in Pages Functions
 ```typescript
-// workers/middleware/auth.ts
-async function verifyFirebaseToken(token: string, env: Env): Promise<string> {
-  // Fetch Firebase public keys — cached in Cloudflare Cache API (1hr TTL)
-  const KEYS_URL = 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com'
-  
-  const cache = caches.default
-  let keysResponse = await cache.match(KEYS_URL)
-  if (!keysResponse) {
-    keysResponse = await fetch(KEYS_URL)
-    await cache.put(KEYS_URL, keysResponse.clone())
-  }
-  const keys = await keysResponse.json()
-  
-  // Verify JWT: signature, expiry, iss, aud = env.FIREBASE_PROJECT_ID
-  const uid = await verifyJWT(token, keys, env.FIREBASE_PROJECT_ID)
-  return uid // Firebase UID → used as user_id in D1
+// functions/middleware/auth.ts
+export async function verifyFirebaseToken(token: string, firebaseProjectId: string): Promise<string> {
+  const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
+    issuer: `https://securetoken.google.com/${firebaseProjectId}`,
+    audience: firebaseProjectId,
+  });
+  return payload.sub; // Firebase UID
 }
 ```
 
@@ -330,18 +321,13 @@ Metadata:     10–11px                 JetBrains 500          +0.06em  uppercas
 ```
 
 ### Section Labels
-Every section uses a mono uppercase label with a paprika dash before it:
-```css
-.section-label {
-  display: flex; align-items: center; gap: 10px;
-  font-family: 'JetBrains Mono'; font-size: 11px;
-  letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--accent-soft);
-}
-.section-label::before {
-  content: ''; width: 16px; height: 1.5px;
-  background: var(--accent); border-radius: 2px; flex-shrink: 0;
-}
+Every section uses a mono uppercase label with a paprika dash:
+```tsx
+// Implement with a span for precise alignment
+<div className="flex items-center gap-2.5 font-mono text-[11px] uppercase tracking-[0.08em]">
+  <span className="h-[1.5px] w-4 shrink-0 rounded-sm bg-accent-primary" />
+  {children}
+</div>
 ```
 
 ### Never Use
@@ -844,14 +830,38 @@ Consumer Worker:
 Retry: 3 attempts, exponential backoff
 ```
 
+### Sequential Generation Pipeline
+
+Project creation (`POST /api/projects`) now enqueues a dedicated 6-batch agent job that runs entirely inside the queue consumer worker. Each batch executes in order—`batch_1_research_stack`, `batch_2_fetch_and_read`, `batch_3_architect`, `batch_4_plan_build`, `batch_5_enrich_steps`, `batch_6_generate_files`—with each step reading the previous batch output from D1, making exactly one AI call through the BYOK proxy, validating the JSON response with Zod, persisting the result to `agent_runs` (run_type matches the batch name), updating `projects.generation_status` to the newly running batch, and writing a structured SSE event into `project_generation_events`. Validation failures are retried once with the invalid response appended to the prompt; a second failure marks the project `failed`, records the error, and emits a terminal SSE event.
+
+Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved. The review payload (including any user feedback and preferred IDE) is stored alongside the `batch_3_architect` run and is forwarded to batches 4‑6 so every subsequent step honors the builder’s choices (e.g., swapping databases, enforcing a different email provider, targeting a specific MCP format).
+
+The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and wires live listeners so the queue consumer’s `persistGenerationStreamEvent` helper can push activity directly into the stream. Event payloads use the new union (`batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, `pipeline_failed`), which the frontend decodes to drive the live status feed, review panel, and progress dots. Events are durable—clients reconnecting with `Last-Event-ID` receive a replay before subscribing to the live channel.
+
 ### API Key Security
 ```
 Storage: AES-256 encrypted in D1 (ai_providers.api_key_enc)
-Encryption key: Stored in Cloudflare Worker secret (env.ENCRYPTION_KEY)
-In transit: Key is decrypted only inside Worker memory, never sent to client
-Displayed: Masked on client (e.g. "sk-...abc123" — first 3 + last 6 chars)
+Encryption key: Stored in Cloudflare secret (env.ENCRYPTION_KEY)
+In transit: Key is decrypted only inside memory, never logged or sent to client
+Displayed: Masked on client (e.g. "sk-...abc123")
 Deleted: Removed from D1 on user request — no recovery
 ```
+
+### Security Headers
+Every API response includes critical security headers via middleware in `[[path]].ts`:
+- **Content-Security-Policy**: Restricts script/connect sources to authorized domains only.
+- **Referrer-Policy**: `strict-origin-when-cross-origin`.
+- **X-Content-Type-Options**: `nosniff`.
+- **X-Frame-Options**: `DENY`.
+- **X-XSS-Protection**: `1; mode=block`.
+
+### AI Robustness & Proxying
+The AI proxy includes built-in resilience:
+- **Retry Logic**: 3 attempts max with exponential backoff (1s, 3s, 7s).
+- **Error Mapping**:
+  - `429` (Rate Limited) → Returns `{ error: 'rate_limited' }`
+  - `401` (Invalid Key) → Returns `{ error: 'invalid_key' }`
+  - Final failure → Returns `{ error: 'provider_unavailable' }`
 
 ---
 
@@ -879,6 +889,21 @@ interface AIProvider {
 // Factory: getProvider(providerRecord) → OpenAIProvider | AnthropicProvider | GeminiProvider | CustomProvider
 ```
 
+### Agentic Generation Pipeline
+
+Scrimble’s “start a project” flow now enqueues a Cloudflare Queue job that runs six sequential batches inside the queue consumer worker. Each batch:
+
+1. Reads input from the previous batch’s `agent_runs` output (stored as JSON).
+2. Makes exactly one AI call through the BYOK proxy.
+3. Validates the JSON response with Zod and, on failure, retries once with the invalid output appended to the prompt.
+4. Persists the output to `agent_runs` with `run_type` set to the batch name.
+5. Updates `projects.generation_status` to the batch currently running.
+6. Writes a structured SSE event into `project_generation_events` so the frontend can replay and stream it immediately.
+
+Batch 2 (`fetch_and_read`) uses the new `fetchAndParse(url)` helper for both docs and GitHub URLs—scraping clean prose from HTML, or calling the GitHub REST API for repo metadata, README, releases, and recent bug/breaking-change issues with a 10-second timeout and SSE logging for every attempt. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
+
+The backend emits `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, activity log, progress dots, ETA counter, and review gate. Every event goes through the durable `project_generation_events` table so reconnections using `Last-Event-ID` replay history before subscribing to the live `TransformStream`.
+
 ### Human-in-the-Loop Workflow
 
 Certain steps are **gates** (`is_gate = 1`). At a gate:
@@ -891,6 +916,8 @@ Certain steps are **gates** (`is_gate = 1`). At a gate:
 6. A review prompt appears: *"Before I continue — does this look right to you?"*
 7. User can: **Approve** (agent continues) / **Edit** (modify AI output, then approve) / **Reject** (agent retries with feedback)
 8. On approval: step status → `complete`, downstream steps unlock, agent continues
+
+After `batch_3_architect` finishes, the pipeline halts automatically. The project’s `generation_status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The queue consumer re-enqueues the job for `batch_4_plan_build` only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
 
 **Gate review API:**
 ```typescript
@@ -1079,10 +1106,25 @@ All section labels use the paprika dash treatment.
 Single large textarea. No character limit. "Build my plan →" button becomes active once they type anything.
 
 **On submit → Generating screen:**
-- Full screen, pulsing Scrimble logo mark
-- Sequential streaming status: "Reading your description..." → "Figuring out the stages..." → "Writing your steps..." → "Almost done..."
-- Each line fades in and out with Framer Motion
-- Background: subtle warm radial pulse emanating from logo
+- Full-screen, vertically centered layout with the pulsing Scrimble mark (animated opacity pulse, 2s loop) and `bg-base`.
+- The main heading swaps between the six batch labels (`Identifying your stack`, `Reading the docs`, `Designing your architecture`, `Building your plan`, `Writing step details`, `Preparing your files`) using AnimatePresence as each `batch_start` SSE event arrives.
+- A scrollable activity log (max-height 280px) streams live events (`activity`, `batch_complete`, `checkpoint`, `pipeline_failed`) with icons (🔍, 📦, ⚠️, 🏗️, ✅, 📝), timestamps (HH:MM:SS JetBrains Mono), and auto-scroll behavior. Each event is persisted so reconnecting clients replay history via `Last-Event-ID`.
+- A six-dot progress indicator (connected line) mirrors the batch order. Completed dots glow emerald, the current batch glows paprika with a halo, and pending dots stay muted. Labels beneath each dot match the batch short names.
+- Estimated time remaining counts down from 12 minutes and recalculates dynamically as each `batch_complete` event reports `duration_ms`.
+- The entire feed runs without cancel/back controls—Scrimble silently works until a terminal event arrives.
+
+**Review checkpoint**
+- When `batch_3_architect` emits a `checkpoint` SSE event, AnimatePresence crossfades the activity feed into the review panel (y: 24 → 0, opacity: 0 → 1). The panel shows:
+  - "Your stack" grid of stack cards (name + package@version + reason + optional gotcha tooltip).
+  - "How it's structured" data-model summary (table name + column list).
+  - Feedback textarea (DM Sans 14px) for adjustments and preference buttons for `cursor`, `windsurf`, `vscode`, `claude_desktop`.
+  - "Let me adjust" (ghost) and "Looks right, build my plan →" (paprika) buttons. Approval re-enqueues batch 4 with feedback; the panel stays until approved.
+- If the SSE stream reports `pipeline_failed`, the review screen surfaces the error message and a "Try again" button that reconnects the stream.
+- On success (terminal `pipeline_complete`), a Sonner toast appears ("Your project plan is ready."), waits 1.5s, then navigates to `/project/:id`.
+
+**Background notes**
+- The SSE connection attaches the Firebase auth token via `fetch` headers, reconnects automatically after disconnects, and pings the server every 20s (`: ping`) to keep proxies alive.
+- Activity icons match the pipeline semantics: 🔍 fetching docs, 📦 hitting GitHub, ⚠️ gotcha/warning, 🏗️ architecture, ✅ completed batch, 📝 writing steps.
 
 ---
 
@@ -1137,6 +1179,9 @@ Good morning.                                    [+ New project]
                         ↑ Step detail panel (420px)
                           slides from right on step click
 
+Sidebar extras:
+- "Download AI files" button (download icon) sits above the exports section. It calls `GET /api/projects/:id/skill-files`, shows the tooltip "Files will be ready when your plan is complete." while the pipeline is running, and enables with paprika fill + hint text: "Paste these into your IDE so your AI coding tool knows exactly what you're building."
+
 [BOTTOM PILL NAV]  ◇ Plan   ⊞ Projects   ⚙ Settings
 ```
 
@@ -1178,10 +1223,10 @@ Width 176px. Status-driven appearance:
 **Body sections:**
 1. **Goal** — what this step achieves
 2. **Why this matters** — what goes wrong if skipped
-3. **What the AI prepared** — shimmer skeleton while loading → rendered markdown artifact
-4. **Prompts to use** — copy-pasteable prompt cards with Copy button
+3. **What the AI prepared** — individual shimmer skeletons for each section while loading
+4. **Prompts to use** — copy-pasteable prompt cards with optimistic copy state
 5. **Suggested tools** — horizontal chip scroll
-6. **Things to check** — interactive checklist, required items marked
+6. **Things to check** — interactive checklist with optimistic local toggle
 7. **Done when...** — exit criteria in emerald border container
 
 **Human-in-the-loop review panel** (when `is_gate = 1` and `status = needs_review`):
@@ -1272,53 +1317,37 @@ them only to do work on your projects.
 ### ✅ Complete
 - Firebase Auth (Google OAuth) + protected routes (Zustand authStore)
 - Natural language project intake → AI plan generation
-- Cloudflare D1 schema + Firebase JWT verification in Workers
-- React Flow canvas with custom StepCard components
-- Graph progression (complete step → unlock downstream)
-- Left sidebar with stage list and completion %
-- Step detail panel with checklist interaction
-- Gated completion (disabled until required items checked)
-- Skip logic with risk warning modal
-- Dashboard with project cards, loading/empty states
-
-### 🚧 Remaining
-
-**Critical — Core AI loop:**
-- [ ] AI step enrichment (shimmer skeleton → Gemini/OpenAI call → D1 write → render)
-- [ ] AI plan update (natural language → diff → D1 mutation → canvas re-render)
-- [ ] Human-in-the-loop review panel in StepPanel
-
-**Critical — BYOK:**
-- [ ] AI Keys settings page (add, list, remove providers)
-- [ ] Encrypted key storage in D1
-- [ ] AI provider abstraction layer + proxy Worker route
-- [ ] User's key used for all agent calls (not hardcoded key)
-
-**Polish:**
-- [ ] Stage cluster groups on canvas (React Flow `parentNode`)
-- [ ] Accurate dashboard progress bar (real D1 calculation)
-- [ ] Unlock toast animation
-- [ ] Export to Markdown
-- [ ] Agent working state on step cards (sweep animation)
-- [ ] Needs-review state on step cards (amber pulse)
-- [ ] Welcome guide for first-time users
+- Cloudflare D1 schema (controlled by `001_initial_schema.sql`)
+- Firebase JWT verification in Pages Functions (fixed "iss" claim logic)
+- Security Headers (CSP, X-Frame-Options, etc.) on all API routes
+- React Flow canvas with custom StepCard components and status-driven visuals
+- AI Robustness: Outbound retry logic and structured error mapping
+- Optimistic UI: Checklist toggles, step completion, and panel transitions
+- Step detail panel with section-level loading shimmers
+- Dashboard with project cards, progress calculation, and empty states
+- AI key management with custom provider URL hints
+- AI step enrichment ( Gemini/OpenAI integration + D1 persistence)
+- AI plan update (natural language diffing + D1 mutation)
+- Sequential 6-batch generation pipeline (research stack → fetch/read → architect → plan build → enrich → file generation) with single-AI-call batches, Zod validation, `agent_runs` auditing, and SSE event persistence so the frontend always knows what the agent is doing.
+- Batch 2 relies on `fetchAndParse(url)` to scrape docs or query GitHub (README, metadata, releases, recent bugs), while batch 6 returns six required skill/context files that are stored in D1 and zipped through `/api/projects/:id/skill-files` for download.
+- Live generation screen now streams `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` events: animated batch headings, icon-coded log entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
+- Canvas sidebar exposes a "Download AI files" button with download icon, hint text ("Paste these into your IDE…"), and tooltip-disabled state until the files are ready.
+- Human-in-the-loop review panel (Approve/Reject gates)
+- Tiered Export system (Markdown + JSON)
+- Stage cluster groups on canvas (React Flow `parentNode`)
+- Agent working states (sweep animations) and needs-review states (amber pulse)
+- First-time user guide (contextual tooltips)
+- Project renaming and archiving
 
 ---
 
-## 18. Remaining Work — Priority Order
+### 18. Documentation & Handoff Checklist
 
-```
-1.  AI Keys settings page          — unblocks everything else
-2.  AI provider abstraction layer  — required for enrichment + update
-3.  Fix dashboard progress bar     — 15 min, high visible impact
-4.  Unlock toast                   — 20 min, satisfying UX moment
-5.  Step enrichment                — core product value
-6.  Human-in-the-loop review       — core product value
-7.  Plan update (natural language) — core product value
-8.  Agent working animations       — makes AI activity visible
-9.  Export to Markdown             — useful, low risk
-10. Stage clusters on canvas       — React Flow refactor, do last
-```
+- [x] All environment variables documented in `ENV_MANIFEST.md`
+- [x] Database schema source of truth established in `migrations/001_initial_schema.sql`
+- [x] Security audit complete — no sensitive logging, CSP active
+- [x] AI proxy robustness verified (Retries + Rate Limit handling)
+- [x] UI/UX audit complete across all major pages
 
 ---
 

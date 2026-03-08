@@ -48,12 +48,12 @@ export class ErrorBoundary extends Component<Props, State> {
           <motion.div
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl border border-status-error/20 bg-status-error/5 text-status-error"
+            className="mb-6 flex h-16 w-16 items-center justify-center rounded-[16px] border border-status-error/20 bg-status-error/5 text-status-error"
           >
             <Hexagon className="h-8 w-8" />
           </motion.div>
 
-          <h2 className="mb-2 font-serif text-2xl tracking-[-0.02em] text-text-primary">
+          <h2 className="mb-2 font-serif text-2xl tracking-[-0.03em] text-text-primary">
             Something went wrong
           </h2>
           <p className="mb-8 max-w-md text-text-secondary">

@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
-import { useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
   ReactFlow,
   Background,
@@ -18,6 +18,7 @@ import { Project, Plan, Stage, Step, Edge as AppEdge, ChecklistItem, StepStatus 
 import StepCard from '../components/StepCard';
 import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Hexagon, Download, Sparkles, Pencil, Check, X, ArrowLeft, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
 import { updatePlan as aiUpdatePlan } from '../lib/ai';
@@ -50,6 +51,7 @@ const nodeTypes = {
 
 export default function ProjectCanvas() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
   const [stages, setStages] = useState<Stage[]>([]);
   const [appSteps, setAppSteps] = useState<Step[]>([]);
@@ -62,6 +64,7 @@ export default function ProjectCanvas() {
   const [loading, setLoading] = useState(true);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
+  const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
   const [updateStatus, setUpdateStatus] = useState('');
   const [updateMessage, setUpdateMessage] = useState('');
   const [showUnlockToast, setShowUnlockToast] = useState(false);
@@ -75,7 +78,17 @@ export default function ProjectCanvas() {
     if (!id) return;
     try {
       const proj = await dbService.getProject(id);
-      if (proj) setProject(proj);
+      if (!proj) {
+        setProject(null);
+        return;
+      }
+
+      if (proj.generation_status !== 'complete') {
+        navigate(`/project/${id}/generating`, { replace: true });
+        return;
+      }
+
+      setProject(proj);
 
       const fetchedStages = await dbService.getStagesByProjectId(id);
       setStages(fetchedStages);
@@ -93,7 +106,7 @@ export default function ProjectCanvas() {
     } finally {
       setLoading(false);
     }
-  }, [id]);
+  }, [id, navigate]);
 
   useEffect(() => {
     fetchProjectData();
@@ -356,6 +369,24 @@ export default function ProjectCanvas() {
     URL.revokeObjectURL(url);
   };
 
+  const handleDownloadAiFiles = useCallback(async () => {
+    if (!project || isDownloadingAiFiles) {
+      return;
+    }
+
+    setIsDownloadingAiFiles(true);
+
+    try {
+      await dbService.downloadSkillFiles(project.id);
+      toast.success('AI files download started');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to download AI files.';
+      toast.error(message);
+    } finally {
+      setIsDownloadingAiFiles(false);
+    }
+  }, [isDownloadingAiFiles, project]);
+
   if (loading) {
     return (
       <div className="min-h-screen bg-bg-base flex flex-col items-center justify-center">
@@ -374,7 +405,7 @@ export default function ProjectCanvas() {
           <Hexagon className="w-12 h-12 text-accent-primary" />
         </motion.div>
         <div className="flex flex-col items-center gap-2">
-          <h2 className="font-serif text-xl text-text-primary tracking-tight">Accessing your plan...</h2>
+          <h2 className="font-serif text-xl text-text-primary tracking-[-0.03em]">Accessing your plan...</h2>
           <div className="flex gap-1.5 h-1 items-center">
             {[0, 1, 2].map((i) => (
               <motion.div
@@ -389,6 +420,8 @@ export default function ProjectCanvas() {
       </div>
     );
   }
+
+  const aiFilesReady = Boolean(project && project.generation_status === 'complete');
 
   return (
     <div className="flex-1 flex flex-col bg-bg-base font-sans overflow-hidden">
@@ -488,6 +521,31 @@ export default function ProjectCanvas() {
           </div>
           
           <div className="p-4 border-t border-border-subtle space-y-3">
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="block">
+                    <button
+                      type="button"
+                      onClick={() => void handleDownloadAiFiles()}
+                      disabled={!aiFilesReady || isDownloadingAiFiles}
+                      className="btn-primary w-full flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <Download className="w-4 h-4" />
+                      {isDownloadingAiFiles ? 'Preparing AI files...' : 'Download AI files'}
+                    </button>
+                  </span>
+                </TooltipTrigger>
+                {!aiFilesReady ? (
+                  <TooltipContent className="max-w-[240px] whitespace-normal bg-text-primary px-3 py-2 text-[12px] leading-5 text-bg-base">
+                    Files will be ready when your plan is complete.
+                  </TooltipContent>
+                ) : null}
+              </Tooltip>
+            </TooltipProvider>
+            <p className="px-1 font-sans text-[12px] leading-5 text-text-tertiary">
+              Paste these into your IDE so your AI coding tool knows exactly what you&apos;re building.
+            </p>
             <button 
               onClick={() => setShowUpdateModal(true)}
               className="btn-ghost w-full flex items-center justify-center gap-2"
@@ -497,7 +555,7 @@ export default function ProjectCanvas() {
             </button>
             <DropdownMenu>
               <DropdownMenuTrigger className="w-full">
-                <button className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-xl text-sm font-medium transition-colors">
+                <button className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-[8px] text-sm font-medium transition-colors">
                   <Download className="w-4 h-4" />
                   Export
                 </button>
@@ -520,7 +578,7 @@ export default function ProjectCanvas() {
           <ErrorBoundary
             fallback={
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-bg-base p-8 text-center">
-                <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-accent-primary-muted/20">
+                <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-[16px] bg-accent-primary-muted/20">
                   <Hexagon className="h-10 w-10 text-accent-primary" />
                 </div>
                 <h3 className="text-2xl font-serif mb-3 text-text-primary">Something went wrong with your plan view.</h3>
@@ -578,8 +636,8 @@ export default function ProjectCanvas() {
           {/* Empty State Overlay */}
           {!loading && appSteps.length === 0 && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-              <div className="max-w-md p-8 bg-bg-surface border border-dashed border-border-strong rounded-2xl shadow-panel text-center pointer-events-auto">
-                <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent-primary-muted/20">
+              <div className="max-w-md p-8 bg-bg-surface border border-dashed border-border-strong rounded-[14px] shadow-panel text-center pointer-events-auto">
+                <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[8px] bg-accent-primary-muted/20">
                   <Sparkles className="h-8 w-8 text-accent-primary" />
                 </div>
                 <h3 className="text-2xl font-serif mb-2">Ready to build?</h3>
@@ -603,7 +661,7 @@ export default function ProjectCanvas() {
                 initial={{ opacity: 0, scale: 0.9, y: 10 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: 10 }}
-                className="absolute left-64 top-[50%] z-[60] ml-8 w-64 p-5 bg-accent-primary text-white rounded-2xl shadow-2xl"
+                className="absolute left-64 top-[50%] z-[60] ml-8 w-64 p-5 bg-accent-primary text-white rounded-[16px] shadow-2xl"
               >
                 <div className="flex gap-1 mb-2">
                   <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
@@ -619,7 +677,7 @@ export default function ProjectCanvas() {
                 </p>
                 <div className="flex justify-between items-center">
                   <button onClick={dismissGuide} className="text-xs font-medium hover:underline text-white/70">Skip</button>
-                  <button onClick={() => setGuideStep(2)} className="px-3 py-1.5 bg-white text-accent-primary rounded-lg text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
+                  <button onClick={() => setGuideStep(2)} className="px-3 py-1.5 bg-white text-accent-primary rounded-[8px] text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
                 </div>
                 <div className="absolute left-[-8px] top-[50%] translate-y-[-50%] w-0 h-0 border-y-8 border-y-transparent border-r-8 border-r-accent-primary" />
               </motion.div>
@@ -630,7 +688,7 @@ export default function ProjectCanvas() {
                 initial={{ opacity: 0, scale: 0.9, x: 10 }}
                 animate={{ opacity: 1, scale: 1, x: 0 }}
                 exit={{ opacity: 0, scale: 0.9, x: 10 }}
-                className="absolute left-[50%] top-[40%] translate-x-[-50%] z-[60] w-64 p-5 bg-accent-primary text-white rounded-2xl shadow-2xl"
+                className="absolute left-[50%] top-[40%] translate-x-[-50%] z-[60] w-64 p-5 bg-accent-primary text-white rounded-[16px] shadow-2xl"
               >
                 <div className="flex gap-1 mb-2">
                   <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
@@ -646,7 +704,7 @@ export default function ProjectCanvas() {
                 </p>
                 <div className="flex justify-between items-center">
                   <button onClick={dismissGuide} className="text-xs font-medium hover:underline text-white/70">Skip</button>
-                  <button onClick={() => setGuideStep(3)} className="px-3 py-1.5 bg-white text-accent-primary rounded-lg text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
+                  <button onClick={() => setGuideStep(3)} className="px-3 py-1.5 bg-white text-accent-primary rounded-[8px] text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
                 </div>
               </motion.div>
             )}
@@ -656,7 +714,7 @@ export default function ProjectCanvas() {
                 initial={{ opacity: 0, scale: 0.9, y: -10 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: -10 }}
-                className="absolute right-8 bottom-32 z-[60] w-64 p-5 bg-accent-primary text-white rounded-2xl shadow-2xl"
+                className="absolute right-8 bottom-32 z-[60] w-64 p-5 bg-accent-primary text-white rounded-[16px] shadow-2xl"
               >
                 <div className="flex gap-1 mb-2">
                   <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
@@ -671,7 +729,7 @@ export default function ProjectCanvas() {
                   Once your plan is ready, export it as Markdown or JSON to start building!
                 </p>
                 <div className="flex justify-end items-center">
-                  <button onClick={dismissGuide} className="px-4 py-1.5 bg-white text-accent-primary rounded-lg text-xs font-bold hover:bg-white/90 transition-colors">Got it!</button>
+                  <button onClick={dismissGuide} className="px-4 py-1.5 bg-white text-accent-primary rounded-[8px] text-xs font-bold hover:bg-white/90 transition-colors">Got it!</button>
                 </div>
                 <div className="absolute right-24 bottom-[-8px] w-0 h-0 border-x-8 border-x-transparent border-t-8 border-t-accent-primary" />
               </motion.div>

@@ -1,6 +1,21 @@
 export type ProjectType = 'saas_mvp' | 'client_site' | 'internal_tool' | 'other';
 export type StepStatus = 'locked' | 'active' | 'waiting' | 'complete' | 'skipped' | 'needs_review' | 'agent_working';
 export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
+export type GenerationBatchName =
+  | 'batch_1_research_stack'
+  | 'batch_2_fetch_and_read'
+  | 'batch_3_architect'
+  | 'batch_4_plan_build'
+  | 'batch_5_enrich_steps'
+  | 'batch_6_generate_files';
+export type PreferredIde = 'cursor' | 'windsurf' | 'vscode' | 'claude_desktop';
+export type GenerationStatus =
+  | GenerationBatchName
+  | 'queued'
+  | 'awaiting_review'
+  | 'approved'
+  | 'complete'
+  | 'failed';
 
 export interface Profile {
   id: string;
@@ -18,6 +33,10 @@ export interface Project {
   project_type: ProjectType;
   stack: string;
   status: 'active' | 'completed' | 'archived';
+  generation_status: GenerationStatus;
+  generation_error?: string;
+  generation_started_at?: string;
+  generation_completed_at?: string;
   progress: number;
   created_at: string;
   updated_at: string;
@@ -58,7 +77,7 @@ export interface Step {
   why_it_matters?: string;
   suggested_tools?: string;
   prompts?: string;
-  done_when?: string; // Formerly exit_criteria
+  done_when?: string;
   ai_output?: string;
   is_ai_enriched: boolean;
   order_index: number;
@@ -83,4 +102,121 @@ export interface ChecklistItem {
   is_completed: boolean;
   completed_at?: string;
   order_index: number;
+}
+
+export interface ArchitectureDecisionRecord {
+  project_name: string;
+  project_type: string;
+  recommended_stack: {
+    frontend: string;
+    backend: string;
+    auth: string;
+    database: string;
+    payments: string;
+    email: string;
+    deploy: string;
+  };
+  data_model: Array<{
+    table: string;
+    columns: Array<{
+      name: string;
+      type: string;
+      nullable?: boolean;
+      notes?: string;
+    }>;
+    relationships: string[];
+  }>;
+  integrations: Array<{
+    service: string;
+    purpose: string;
+    package_name: string;
+    version: string;
+  }>;
+  security_surface: Array<{
+    concern: string;
+    approach: string;
+  }>;
+  gotchas: Array<{
+    technology: string;
+    issue: string;
+    mitigation: string;
+  }>;
+}
+
+export interface ProjectGenerationBatchStartEvent {
+  batch: GenerationBatchName;
+  label: string;
+}
+
+export interface ProjectGenerationEvent {
+  batch: GenerationBatchName;
+  completed_at?: string;
+  message: string;
+  duration_ms?: number;
+}
+
+export interface ProjectGenerationActivity {
+  icon: string;
+  message: string;
+  timestamp: string;
+}
+
+export interface ProjectGenerationCheckpointEvent {
+  adr: ArchitectureDecisionRecord;
+}
+
+export interface ProjectGenerationStatusResponse {
+  project_id: string;
+  generation_status: GenerationStatus;
+  generation_error: string | null;
+  completed_batches: ProjectGenerationEvent[];
+  completed_batch_count: number;
+  total_batches: number;
+  progress_percent: number;
+  is_complete: boolean;
+  is_failed: boolean;
+  is_review_required: boolean;
+  is_approved: boolean;
+}
+
+export interface GeneratedProjectFile {
+  id: string;
+  filename: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ArchitectureReviewCard {
+  technology: string;
+  package_name: string;
+  version: string;
+  reason: string;
+  gotcha_issue?: string;
+  gotcha_mitigation?: string;
+}
+
+export interface ArchitectureReviewDataModelTable {
+  table: string;
+  columns: string[];
+}
+
+export interface ArchitectureReviewResponse {
+  project_id: string;
+  project_name: string;
+  project_type: string;
+  recommended_stack: {
+    frontend: string;
+    backend: string;
+    auth: string;
+    database: string;
+    payments: string;
+    email: string;
+    deploy: string;
+  };
+  stack_cards: ArchitectureReviewCard[];
+  data_model: ArchitectureReviewDataModelTable[];
+  preferred_ide: PreferredIde;
+  review_feedback: string;
+  review_feedback_provided: boolean;
 }

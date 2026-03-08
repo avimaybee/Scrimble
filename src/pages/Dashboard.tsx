@@ -120,7 +120,6 @@ export default function Dashboard() {
           <h1 className="mb-2 text-4xl font-serif tracking-[-0.03em] text-text-primary">
             {greeting}
           </h1>
-          <p className="text-lg text-text-secondary">Keep your project moving, one step at a time.</p>
         </motion.div>
 
         <motion.div variants={itemVariants} className="flex items-center gap-3">

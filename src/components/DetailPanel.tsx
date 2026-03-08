@@ -233,7 +233,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
           exit={{ x: '100%', opacity: 0 }}
           transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
           className={cn(
-            "fixed top-[76px] right-4 bottom-4 w-[420px] bg-bg-surface/95 backdrop-blur-xl border-border-default shadow-panel z-40 flex flex-col font-sans rounded-2xl overflow-hidden",
+            "fixed top-[76px] right-4 bottom-4 w-[420px] bg-bg-surface/95 backdrop-blur-xl border-border-default shadow-panel z-40 flex flex-col font-sans rounded-[16px] overflow-hidden",
             step?.status === 'needs_review' ? "border-2 border-status-warning/40 shadow-[0_0_20px_rgba(234,179,8,0.2)]" : "border"
           )}
         >
@@ -244,7 +244,10 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
             <>
               {/* Header */}
               <div className="relative p-6 border-b border-border-subtle shrink-0">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-accent-primary" />
+                <div className={cn(
+                  "absolute top-0 left-0 right-0 h-1",
+                  `bg-stage-${step.category.toLowerCase()}`
+                )} />
                 <button 
                   onClick={onClose}
                   className="absolute top-4 right-4 p-2 text-text-tertiary hover:text-text-primary transition-colors rounded-[8px] hover:bg-bg-elevated"
@@ -255,7 +258,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                 <div className="text-label mb-2">
                   {step.category} &gt; {step.type}
                 </div>
-                <h2 className="text-panel-title mb-3 pr-8">
+                <h2 className="font-serif text-[20px] font-semibold text-text-primary leading-tight mb-3 pr-8">
                   {step.title}
                 </h2>
                 
@@ -307,7 +310,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                 {/* Why It Matters */}
                 <section>
                   <h3 className="text-sm font-medium text-text-primary mb-2">Why It Matters</h3>
-                  <div className="bg-bg-elevated border border-border-default rounded-lg p-4">
+                  <div className="bg-bg-elevated border border-border-default rounded-[10px] p-4">
                     <p className="text-sm text-text-secondary leading-relaxed">
                       {step.why_it_matters || "No context provided."}
                     </p>
@@ -319,7 +322,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                   <h3 className="text-sm font-medium text-text-primary mb-2">Details from AI</h3>
                   
                   {executionError && (
-                    <div className="mb-4 p-3 bg-status-error/10 border border-status-error/20 rounded-lg text-xs text-status-error flex items-center gap-2">
+                    <div className="mb-4 p-3 bg-status-error/10 border border-status-error/20 rounded-[8px] text-xs text-status-error flex items-center gap-2">
                       <AlertTriangle className="w-4 h-4" />
                       <span>{executionError}</span>
                       <button 
@@ -332,7 +335,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                   )}
 
                   {(step?.is_ai_enriched || isExecuting) && !loading ? (
-                    <div className="bg-bg-elevated border border-border-default rounded-lg p-4 relative group">
+                    <div className="bg-bg-elevated border border-border-default rounded-[10px] p-4 relative group">
                       {isEditing ? (
                         <textarea
                           value={editedOutput}
@@ -388,7 +391,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       )}
                     </div>
                   ) : (
-                    <div className="bg-bg-elevated border border-border-default rounded-lg p-5 space-y-3">
+                    <div className="bg-bg-elevated border border-border-default rounded-[10px] p-5 space-y-3">
                       <div className="skeleton-block h-3 w-full" />
                       <div className="skeleton-block h-3 w-[90%]" />
                       <div className="skeleton-block h-3 w-[85%]" />
@@ -474,7 +477,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       <label 
                         key={item.id} 
                         className={cn(
-                          "checklist-item-container flex items-start gap-4 p-4 rounded-xl border cursor-pointer transition-all duration-300",
+                          "checklist-item-container flex items-start gap-4 p-4 rounded-[14px] border cursor-pointer transition-all duration-300",
                           item.is_completed 
                             ? "bg-accent-primary-muted/10 border-accent-primary/20 shadow-sm" 
                             : "bg-bg-elevated/50 border-border-default hover:border-border-strong hover:bg-bg-elevated"
@@ -518,7 +521,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
 
                 {/* Done When */}
                 <section>
-                  <div className="bg-status-secure/10 border border-status-secure/30 rounded-lg p-4">
+                  <div className="bg-status-secure/10 border border-status-secure/30 rounded-[10px] p-4">
                     <h3 className="text-xs font-semibold text-status-secure uppercase tracking-wider mb-2">Done when...</h3>
                     <p className="text-sm text-text-primary leading-relaxed">
                       {step.done_when || "Complete all items above."}
@@ -536,7 +539,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                           onClick={() => setIsEditing(!isEditing)}
                           disabled={reviewAction !== null}
                           className={cn(
-                            "flex-1 py-2.5 rounded-lg text-sm font-medium border transition-all disabled:cursor-not-allowed disabled:opacity-60",
+                            "flex-1 py-2.5 rounded-[8px] text-sm font-medium border transition-all disabled:cursor-not-allowed disabled:opacity-60",
                             isEditing 
                               ? "bg-accent-primary text-white border-accent-primary" 
                               : "bg-bg-elevated text-text-primary border-border-default hover:border-border-strong"
@@ -547,7 +550,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                         <button 
                           onClick={() => setIsRejectDialogOpen(true)}
                           disabled={reviewAction !== null}
-                          className="flex-1 py-2.5 rounded-lg text-sm font-medium border border-status-warning/30 bg-status-warning/10 text-status-warning hover:bg-status-warning/20 transition-all disabled:cursor-not-allowed disabled:opacity-60"
+                          className="flex-1 py-2.5 rounded-[8px] text-sm font-medium border border-status-warning/30 bg-status-warning/10 text-status-warning hover:bg-status-warning/20 transition-all disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           Reject, try again
                         </button>
@@ -561,7 +564,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       </button>
                     </div>
                 ) : showSkipWarning ? (
-                  <div className="bg-bg-elevated border border-status-warning rounded-xl p-4 mb-4">
+                  <div className="bg-bg-elevated border border-status-warning rounded-[14px] p-4 mb-4">
                     <div className="flex items-start gap-3 mb-3">
                       <AlertTriangle className="w-5 h-5 text-status-warning shrink-0" />
                       <div>
@@ -574,13 +577,13 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                     <div className="flex gap-3">
                       <button 
                         onClick={() => setShowSkipWarning(false)}
-                        className="flex-1 bg-bg-surface border border-border-default hover:bg-border-default text-sm font-medium py-2 rounded-lg transition-colors"
+                        className="flex-1 bg-bg-surface border border-border-default hover:bg-border-default text-sm font-medium py-2 rounded-[8px] transition-colors"
                       >
                         Cancel
                       </button>
                       <button 
                         onClick={handleSkip}
-                        className="flex-1 bg-status-warning/20 text-status-warning hover:bg-status-warning/30 text-sm font-medium py-2 rounded-lg transition-colors"
+                        className="flex-1 bg-status-warning/20 text-status-warning hover:bg-status-warning/30 text-sm font-medium py-2 rounded-[8px] transition-colors"
                       >
                         Skip anyway
                       </button>
@@ -615,9 +618,9 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
 
       {/* Rejection Feedback Dialog */}
       <Dialog open={isRejectDialogOpen} onOpenChange={setIsRejectDialogOpen}>
-        <DialogContent className="sm:max-w-[480px] bg-bg-surface border-border-default shadow-modal">
+        <DialogContent className="sm:max-w-[480px] bg-bg-surface border-border-default shadow-modal rounded-[16px]">
           <DialogHeader>
-            <DialogTitle className="text-heading text-2xl">What should I change?</DialogTitle>
+            <DialogTitle className="font-serif text-2xl tracking-[-0.03em] text-text-primary">What should I change?</DialogTitle>
             <DialogDescription className="text-body mt-2">
               Tell me what's wrong or what's missing. I'll re-architect this step based on your feedback.
             </DialogDescription>
@@ -628,7 +631,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
               placeholder="e.g. This schema is too complex, just use a simple JSON column for now.&#10;Add a security check for the upload endpoint."
-              className="w-full h-32 bg-bg-elevated border border-border-default focus:border-accent-border focus:ring-1 focus:ring-accent-border rounded-xl p-4 text-text-primary placeholder:text-text-tertiary transition-all duration-200 outline-none resize-none font-sans text-[15px]"
+              className="w-full h-32 bg-bg-elevated border border-border-default focus:border-accent-border focus:ring-1 focus:ring-accent-border rounded-[14px] p-4 text-text-primary placeholder:text-text-tertiary transition-all duration-200 outline-none resize-none font-sans text-[15px]"
               autoFocus
             />
           </div>
