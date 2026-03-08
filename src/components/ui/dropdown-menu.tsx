@@ -27,10 +27,26 @@ export function DropdownMenu({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function DropdownMenuTrigger({ children, className }: { children: React.ReactNode, className?: string }) {
+export function DropdownMenuTrigger({ children, className, onClick, asChild }: { children: React.ReactNode, className?: string, onClick?: (e: React.MouseEvent) => void, asChild?: boolean }) {
   const { open, setOpen } = React.useContext(DropdownMenuContext);
+  
+  const handleClick = (e: React.MouseEvent) => {
+    onClick?.(e);
+    setOpen(!open);
+  };
+
+  if (asChild && React.isValidElement(children)) {
+    return React.cloneElement(children as React.ReactElement<any>, {
+      className: cn(className, (children as React.ReactElement<any>).props.className),
+      onClick: (e: React.MouseEvent) => {
+        (children as React.ReactElement<any>).props.onClick?.(e);
+        handleClick(e);
+      }
+    });
+  }
+
   return (
-    <div className={className} onClick={() => setOpen(!open)} role="button" tabIndex={0}>
+    <div className={className} onClick={handleClick} role="button" tabIndex={0}>
       {children}
     </div>
   );

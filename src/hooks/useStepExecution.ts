@@ -7,13 +7,54 @@ interface UseStepExecutionProps {
   onError?: (error: string) => void;
 }
 
+interface ExecuteStepOptions {
+  providerId?: string;
+  feedback?: string;
+  editedOutput?: string;
+}
+
+function extractStreamText(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') {
+    return '';
+  }
+
+  const value = parsed as {
+    choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
+    content?: Array<{ text?: string }>;
+    delta?: { text?: string };
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+
+  if (value.choices?.[0]?.delta?.content) {
+    return value.choices[0].delta.content;
+  }
+
+  if (value.choices?.[0]?.message?.content) {
+    return value.choices[0].message.content;
+  }
+
+  if (value.content?.[0]?.text) {
+    return value.content[0].text;
+  }
+
+  if (value.delta?.text) {
+    return value.delta.text;
+  }
+
+  if (value.candidates?.[0]?.content?.parts?.[0]?.text) {
+    return value.candidates[0].content.parts[0].text;
+  }
+
+  return '';
+}
+
 export function useStepExecution({ onSuccess, onError }: UseStepExecutionProps = {}) {
   const [isExecuting, setIsAgentWorking] = useState(false);
   const [streamingOutput, setStreamingOutput] = useState('');
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const executeStep = useCallback(async (stepId: string, projectId: string, providerId: string) => {
+  const executeStep = useCallback(async (stepId: string, projectId: string, options: ExecuteStepOptions = {}) => {
     setIsAgentWorking(true);
     setStreamingOutput('');
     setError(null);
@@ -35,7 +76,12 @@ export function useStepExecution({ onSuccess, onError }: UseStepExecutionProps =
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ projectId, providerId }),
+        body: JSON.stringify({
+          projectId,
+          providerId: options.providerId,
+          feedback: options.feedback,
+          editedOutput: options.editedOutput,
+        }),
         signal: abortControllerRef.current.signal
       });
 
@@ -58,26 +104,29 @@ export function useStepExecution({ onSuccess, onError }: UseStepExecutionProps =
         const lines = chunk.split('\n');
         
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') break;
-            
-            try {
-              const parsed = JSON.parse(data);
-              let delta = '';
-              
-              if (parsed.choices?.[0]?.delta?.content) {
-                delta = parsed.choices[0].delta.content;
-              } else if (parsed.content?.[0]?.text) {
-                delta = parsed.content[0].text;
-              } else if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
-                delta = parsed.candidates[0].content.parts[0].text;
-              }
+          const trimmedLine = line.trim();
+          if (!trimmedLine || trimmedLine.startsWith(':')) {
+            continue;
+          }
 
-              fullContent += delta;
+          const data = trimmedLine.startsWith('data: ') ? trimmedLine.slice(6) : trimmedLine;
+          if (!data || data === '[DONE]') {
+            continue;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = extractStreamText(parsed);
+            if (!delta) {
+              continue;
+            }
+
+            fullContent += delta;
+            setStreamingOutput(fullContent);
+          } catch {
+            if (!trimmedLine.startsWith('data: ')) {
+              fullContent += data;
               setStreamingOutput(fullContent);
-            } catch (e) {
-              // Ignore partial JSON or comments
             }
           }
         }

@@ -1,48 +1,76 @@
+import { auth } from './firebase';
 import { Project, Plan, Stage, Step, Edge as AppEdge, ChecklistItem } from '../types';
 
 const API_BASE = '/api'; // Cloudflare Worker endpoint
 
-async function fetchAPI(endpoint: string, options: RequestInit = {}) {
+interface ReviewResponse {
+  success: boolean;
+  decision: 'approve' | 'reject';
+  unlockedStepIds?: string[];
+  regenerate?: boolean;
+}
+
+async function fetchAPI<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('User not authenticated');
+  }
+
+  const token = await user.getIdToken();
   const response = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
       ...options.headers,
     },
   });
+
   if (!response.ok) {
-    throw new Error(`API error: ${response.statusText}`);
+    const errorBody = await response.json().catch(() => null) as { error?: string } | null;
+    throw new Error(errorBody?.error || `API error: ${response.statusText}`);
   }
-  if (response.status === 204) return null;
-  return response.json();
+
+  if (response.status === 204) {
+    return null as T;
+  }
+
+  return response.json() as Promise<T>;
 }
 
 export const dbService = {
   // Projects
   async getProject(id: string): Promise<Project | null> {
-    return fetchAPI(`/projects/${id}`);
+    return fetchAPI<Project | null>(`/projects/${id}`);
   },
   
-  async getProjectsByUserId(userId: string): Promise<Project[]> {
-    return fetchAPI(`/projects?userId=${userId}`);
+  async getProjectsByUserId(_userId: string): Promise<Project[]> {
+    return fetchAPI<Project[]>('/projects');
   },
   
   async createProject(project: Omit<Project, 'id' | 'created_at' | 'updated_at' | 'progress'>): Promise<string> {
-    const data = await fetchAPI('/projects', {
+    const data = await fetchAPI<{ id: string }>('/projects', {
       method: 'POST',
       body: JSON.stringify(project)
     });
     return data.id;
   },
 
+  async updateProject(id: string, updates: Partial<Project>): Promise<void> {
+    await fetchAPI(`/projects/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(updates)
+    });
+  },
+
   // Build Plans
   async getPlanByProjectId(projectId: string): Promise<Plan | null> {
-    const plans = await fetchAPI(`/plans?projectId=${projectId}`);
+    const plans = await fetchAPI<Plan[]>(`/plans?projectId=${projectId}`);
     return plans.length > 0 ? plans[0] : null;
   },
   
   async createPlan(plan: Omit<Plan, 'id' | 'created_at' | 'updated_at'>): Promise<string> {
-    const data = await fetchAPI('/plans', {
+    const data = await fetchAPI<{ id: string }>('/plans', {
       method: 'POST',
       body: JSON.stringify(plan)
     });
@@ -51,11 +79,11 @@ export const dbService = {
 
   // Stages
   async getStagesByProjectId(projectId: string): Promise<Stage[]> {
-    return fetchAPI(`/stages?projectId=${projectId}`);
+    return fetchAPI<Stage[]>(`/stages?projectId=${projectId}`);
   },
   
   async createStage(stage: Omit<Stage, 'id' | 'created_at'>): Promise<string> {
-    const data = await fetchAPI('/stages', {
+    const data = await fetchAPI<{ id: string }>('/stages', {
       method: 'POST',
       body: JSON.stringify(stage)
     });
@@ -64,15 +92,15 @@ export const dbService = {
 
   // Steps
   async getStep(id: string): Promise<Step | null> {
-    return fetchAPI(`/steps/${id}`);
+    return fetchAPI<Step | null>(`/steps/${id}`);
   },
 
   async getStepsByProjectId(projectId: string): Promise<Step[]> {
-    return fetchAPI(`/steps?projectId=${projectId}`);
+    return fetchAPI<Step[]>(`/steps?projectId=${projectId}`);
   },
   
   async createStep(step: Omit<Step, 'id' | 'created_at' | 'updated_at'>): Promise<string> {
-    const data = await fetchAPI('/steps', {
+    const data = await fetchAPI<{ id: string }>('/steps', {
       method: 'POST',
       body: JSON.stringify(step)
     });
@@ -96,8 +124,8 @@ export const dbService = {
     decision: 'approve' | 'reject', 
     feedback?: string, 
     edited_output?: string 
-  }): Promise<void> {
-    await fetchAPI(`/steps/${stepId}/review`, {
+  }): Promise<ReviewResponse> {
+    return fetchAPI<ReviewResponse>(`/steps/${stepId}/review`, {
       method: 'POST',
       body: JSON.stringify(review)
     });
@@ -105,11 +133,11 @@ export const dbService = {
 
   // Connections (Edges)
   async getEdgesByProjectId(projectId: string): Promise<AppEdge[]> {
-    return fetchAPI(`/edges?projectId=${projectId}`);
+    return fetchAPI<AppEdge[]>(`/edges?projectId=${projectId}`);
   },
   
   async createEdge(edge: Omit<AppEdge, 'id'>): Promise<string> {
-    const data = await fetchAPI('/edges', {
+    const data = await fetchAPI<{ id: string }>('/edges', {
       method: 'POST',
       body: JSON.stringify(edge)
     });
@@ -118,11 +146,11 @@ export const dbService = {
 
   // Checklist Items
   async getChecklistItemsByStepId(stepId: string): Promise<ChecklistItem[]> {
-    return fetchAPI(`/checklist-items?stepId=${stepId}`);
+    return fetchAPI<ChecklistItem[]>(`/checklist-items?stepId=${stepId}`);
   },
   
   async createChecklistItem(item: Omit<ChecklistItem, 'id'>): Promise<string> {
-    const data = await fetchAPI('/checklist-items', {
+    const data = await fetchAPI<{ id: string }>('/checklist-items', {
       method: 'POST',
       body: JSON.stringify(item)
     });

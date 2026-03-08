@@ -1,7 +1,9 @@
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import { handle } from 'hono/cloudflare-pages';
+import { z } from 'zod';
 import { verifyFirebaseToken } from '../middleware/auth';
-import { decrypt } from '../utils/crypto';
+import { decrypt, encrypt } from '../utils/crypto';
 import { diffSchema } from '../types/diff';
 
 type Bindings = {
@@ -10,72 +12,1280 @@ type Bindings = {
   ENCRYPTION_KEY: string;
 };
 
-const app = new Hono<{ Bindings: Bindings }>().basePath('/api');
+type Variables = {
+  uid: string;
+};
 
-app.post('/projects/:id/plan-diff', async (c) => {
-  const projectId = c.req.param('id');
-  const authHeader = c.req.header('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ error: 'Missing or invalid Authorization header' }, 401);
+type AppEnv = {
+  Bindings: Bindings;
+  Variables: Variables;
+};
+
+type AppContext = Context<AppEnv>;
+type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom';
+
+const app = new Hono<AppEnv>().basePath('/api');
+
+app.use('*', async (c, next) => {
+  await next();
+  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://identitytoolkit.googleapis.com https://firebaseinstallations.googleapis.com https://securetoken.googleapis.com; img-src 'self' data: https://lh3.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+  c.header('X-XSS-Protection', '1; mode=block');
+});
+
+const providerSchema = z.object({
+  name: z.string().trim().min(1),
+  provider: z.enum(['anthropic', 'gemini', 'openai', 'custom']),
+  apiKey: z.string().trim().min(1),
+  baseUrl: z.string().trim().optional(),
+  model: z.string().trim().optional(),
+  isDefault: z.boolean().optional(),
+});
+
+const enrichSchema = z.object({
+  projectId: z.string().trim().min(1),
+  providerId: z.string().trim().optional(),
+  feedback: z.string().trim().optional(),
+  editedOutput: z.string().trim().optional(),
+});
+
+const proxySchema = z.object({
+  providerId: z.string().trim().optional(),
+  system: z.string().optional(),
+  prompt: z.string().trim().min(1),
+  projectId: z.string().trim().optional(),
+  stepId: z.string().trim().optional(),
+});
+ 
+const StepDetailSchema = z.object({
+  ai_output: z.string(),
+  prompts: z.array(z.object({
+    label: z.string(),
+    content: z.string()
+  }))
+});
+
+const reviewSchema = z
+  .object({
+    decision: z.enum(['approve', 'reject']),
+    feedback: z.string().trim().optional(),
+    edited_output: z.string().trim().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.decision === 'reject' && !value.feedback) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['feedback'],
+        message: 'Feedback is required when rejecting a step.',
+      });
+    }
+  });
+
+function jsonError(message: string, status: number, details?: unknown) {
+  return Response.json(details ? { error: message, details } : { error: message }, { status });
+}
+
+function toBoolean(value: unknown): boolean {
+  return value === true || value === 1 || value === '1';
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
   }
 
-  const token = authHeader.split(' ')[1];
-  let uid: string;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return fallback;
+}
+
+function asText(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function optionalText(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function serializeJson(value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+function defaultModelForProvider(provider: ProviderType): string {
+  switch (provider) {
+    case 'anthropic':
+      return 'claude-3-5-sonnet-latest';
+    case 'gemini':
+      return 'gemini-2.0-flash';
+    case 'custom':
+      return 'gpt-4o-mini';
+    case 'openai':
+    default:
+      return 'gpt-4o-mini';
+  }
+}
+
+function inferGateFlag(source: {
+  title?: string | null;
+  objective?: string | null;
+  why_it_matters?: string | null;
+  category?: string | null;
+  done_when?: string | null;
+}): boolean {
+  const haystack = [source.title, source.objective, source.why_it_matters, source.category, source.done_when]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return [
+    'security',
+    'auth',
+    'authentication',
+    'deploy',
+    'deployment',
+    'production',
+    'billing',
+    'payment',
+    'secret',
+    'permission',
+    'database change',
+    'database migration',
+    'environment variable',
+  ].some((keyword) => haystack.includes(keyword));
+}
+
+function extractTextFromProviderChunk(parsed: any): string {
+  if (parsed.choices?.[0]?.delta?.content) {
+    return parsed.choices[0].delta.content as string;
+  }
+
+  if (parsed.choices?.[0]?.message?.content) {
+    return parsed.choices[0].message.content as string;
+  }
+
+  if (parsed.content?.[0]?.text) {
+    return parsed.content[0].text as string;
+  }
+
+  if (parsed.delta?.text) {
+    return parsed.delta.text as string;
+  }
+
+  if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
+    return parsed.candidates[0].content.parts[0].text as string;
+  }
+
+  return '';
+}
+
+function mapProviderRow(row: any) {
+  return {
+    id: row.id,
+    name: row.name,
+    provider: row.provider,
+    base_url: row.base_url || undefined,
+    model: row.model || undefined,
+    is_default: toBoolean(row.is_default),
+  };
+}
+
+function mapProjectRow(row: any) {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    name: row.name,
+    description: row.description || '',
+    project_type: row.project_type || 'other',
+    stack: row.stack || '{}',
+    status: row.status || 'active',
+    progress: asNumber(row.progress, 0),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function mapPlanRow(row: any) {
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    version: asNumber(row.version, 1),
+    canvas_state: row.canvas_state || '{}',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function mapStageRow(row: any) {
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    title: row.title,
+    type: row.type,
+    order_index: asNumber(row.order_index, 0),
+    status: row.status || 'locked',
+    created_at: row.created_at,
+  };
+}
+
+function mapStepRow(row: any) {
+  return {
+    id: row.id,
+    stage_id: row.stage_id,
+    project_id: row.project_id,
+    title: row.title,
+    type: row.type,
+    category: row.category || '',
+    position_x: asNumber(row.position_x, 0),
+    position_y: asNumber(row.position_y, 0),
+    status: row.status || 'locked',
+    is_gate: toBoolean(row.is_gate),
+    risk_level: row.risk_level || 'low',
+    objective: row.objective || '',
+    why_it_matters: row.why_it_matters || '',
+    suggested_tools: row.suggested_tools || undefined,
+    prompts: row.prompts || undefined,
+    done_when: row.done_when || '',
+    ai_output: row.ai_output || undefined,
+    is_ai_enriched: toBoolean(row.is_ai_enriched),
+    order_index: asNumber(row.order_index, 0),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function mapEdgeRow(row: any) {
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    source_step_id: row.source_step_id,
+    target_step_id: row.target_step_id,
+    edge_type: row.edge_type || 'default',
+    condition: row.condition || undefined,
+  };
+}
+
+function mapChecklistItemRow(row: any) {
+  return {
+    id: row.id,
+    step_id: row.step_id,
+    label: row.label,
+    is_required: toBoolean(row.is_required),
+    is_completed: toBoolean(row.is_completed),
+    completed_at: row.completed_at || undefined,
+    order_index: asNumber(row.order_index, 0),
+  };
+}
+
+async function ensureProfile(c: AppContext, uid: string) {
+  await c.env.DB.prepare('INSERT OR IGNORE INTO profiles (id) VALUES (?)').bind(uid).run();
+}
+
+async function touchProject(c: AppContext, projectId: string) {
+  await c.env.DB.prepare('UPDATE projects SET updated_at = datetime("now") WHERE id = ?').bind(projectId).run();
+}
+
+async function getOwnedProject(c: AppContext, projectId: string) {
+  return c.env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, c.get('uid')).first();
+}
+
+async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
+  return c.env.DB.prepare(`
+    SELECT
+      p.*,
+      CASE
+        WHEN COUNT(s.id) = 0 THEN 0
+        ELSE CAST(ROUND(100.0 * SUM(CASE WHEN s.status = 'complete' THEN 1 ELSE 0 END) / COUNT(s.id)) AS INTEGER)
+      END AS progress
+    FROM projects p
+    LEFT JOIN steps s ON s.project_id = p.id
+    WHERE p.id = ? AND p.user_id = ?
+    GROUP BY p.id
+  `)
+    .bind(projectId, c.get('uid'))
+    .first();
+}
+
+async function getOwnedStep(c: AppContext, stepId: string) {
+  return c.env.DB.prepare(`
+    SELECT steps.*
+    FROM steps
+    INNER JOIN projects ON projects.id = steps.project_id
+    WHERE steps.id = ? AND projects.user_id = ?
+  `)
+    .bind(stepId, c.get('uid'))
+    .first();
+}
+
+async function getOwnedChecklistItem(c: AppContext, checklistItemId: string) {
+  return c.env.DB.prepare(`
+    SELECT checklist_items.*, steps.project_id
+    FROM checklist_items
+    INNER JOIN steps ON steps.id = checklist_items.step_id
+    INNER JOIN projects ON projects.id = steps.project_id
+    WHERE checklist_items.id = ? AND projects.user_id = ?
+  `)
+    .bind(checklistItemId, c.get('uid'))
+    .first();
+}
+
+async function resolveProvider(c: AppContext, providerId?: string) {
+  const uid = c.get('uid');
+
+  if (providerId) {
+    return c.env.DB.prepare('SELECT * FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, uid).first();
+  }
+
+  return c.env.DB.prepare(
+    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC LIMIT 1'
+  )
+    .bind(uid)
+    .first();
+}
+
+async function insertAgentRun(
+  c: AppContext,
+  payload: {
+    projectId: string;
+    stepId?: string | null;
+    runType: string;
+    status: string;
+    provider?: string | null;
+    model?: string | null;
+    input?: string | null;
+    output?: string | null;
+  },
+) {
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(`
+    INSERT INTO agent_runs (id, project_id, step_id, run_type, status, provider, model, input, output)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      id,
+      payload.projectId,
+      payload.stepId || null,
+      payload.runType,
+      payload.status,
+      payload.provider || null,
+      payload.model || null,
+      payload.input || null,
+      payload.output || null,
+    )
+    .run();
+
+  return id;
+}
+
+async function streamToText(stream: ReadableStream<Uint8Array>) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let fullContent = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    const chunk = decoder.decode(value);
+    const lines = chunk.split('\n');
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':')) {
+        continue;
+      }
+
+      const candidate = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
+      if (!candidate || candidate === '[DONE]') {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(candidate);
+        fullContent += extractTextFromProviderChunk(parsed);
+      } catch {
+        if (!trimmed.startsWith('data: ')) {
+          fullContent += candidate;
+        }
+      }
+    }
+  }
+
+  return fullContent;
+}
+
+async function callProvider(payload: {
+  providerType: ProviderType;
+  apiKey: string;
+  model: string;
+  baseUrl?: string | null;
+  system?: string | null;
+  prompt: string;
+}) {
+  if (payload.providerType === 'anthropic') {
+    return fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': payload.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: payload.model,
+        system: payload.system || undefined,
+        messages: [{ role: 'user', content: payload.prompt }],
+        stream: true,
+      }),
+    });
+  }
+
+  if (payload.providerType === 'gemini') {
+    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:streamGenerateContent?key=${payload.apiKey}`;
+    return fetch(googleUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: payload.system ? `${payload.system}\n\n${payload.prompt}` : payload.prompt }],
+          },
+        ],
+      }),
+    });
+  }
+
+  let url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
+  
+  if (payload.providerType === 'custom' && payload.baseUrl) {
+    // If user provided a base URL like ".../v1", append the endpoint
+    if (url.endsWith('/v1')) {
+      url = `${url}/chat/completions`;
+    } else if (!url.includes('/chat/completions') && !url.includes('/v1/')) {
+      // If it looks like a host only, append the typical path
+      url = url.endsWith('/') ? `${url}v1/chat/completions` : `${url}/v1/chat/completions`;
+    }
+  }
+
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${payload.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: payload.model,
+      messages: [
+        ...(payload.system ? [{ role: 'system', content: payload.system }] : []),
+        { role: 'user', content: payload.prompt },
+      ],
+      stream: true,
+    }),
+  });
+}
+
+async function callAIWithRetry(payload: {
+  providerType: ProviderType;
+  apiKey: string;
+  model: string;
+  baseUrl?: string | null;
+  system?: string | null;
+  prompt: string;
+}): Promise<Response> {
+  const MAX_RETRIES = 3;
+  const BACKOFFS = [1000, 3000, 7000];
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await callProvider(payload);
+
+      if (response.ok) return response;
+
+      if (response.status === 429) {
+        return Response.json({
+          error: 'rate_limited',
+          message: 'Your AI provider is rate limited. Wait a moment and try again.'
+        }, { status: 429 });
+      }
+
+      if (response.status === 401) {
+        return Response.json({
+          error: 'invalid_key',
+          message: 'Your AI key was rejected. Check it in Settings.'
+        }, { status: 401 });
+      }
+
+      if (attempt < MAX_RETRIES && (response.status >= 500 || response.status === 0)) {
+        await new Promise(resolve => setTimeout(resolve, BACKOFFS[attempt]));
+        continue;
+      }
+
+      return Response.json({
+        error: 'provider_unavailable',
+        message: "Your AI provider isn't responding. Try again shortly."
+      }, { status: 503 });
+
+    } catch (error) {
+      if (attempt < MAX_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, BACKOFFS[attempt]));
+        continue;
+      }
+      return Response.json({
+        error: 'provider_unavailable',
+        message: "Your AI provider isn't responding. Try again shortly."
+      }, { status: 503 });
+    }
+  }
+
+  return Response.json({
+    error: 'provider_unavailable',
+    message: "Your AI provider isn't responding. Try again shortly."
+  }, { status: 503 });
+}
+
+app.use('*', async (c, next) => {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return jsonError('Missing or invalid Authorization header', 401);
+  }
+
   try {
-    uid = await verifyFirebaseToken(token, c.env.FIREBASE_PROJECT_ID);
-  } catch (err: any) {
-    return c.json({ error: `Auth failed: ${err.message}` }, 401);
+    const uid = await verifyFirebaseToken(authHeader.slice(7), c.env.FIREBASE_PROJECT_ID);
+    c.set('uid', uid);
+    await ensureProfile(c, uid);
+    await next();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Authentication failed';
+    return jsonError(`Auth failed: ${message}`, 401);
+  }
+});
+
+app.get('/ai/providers', async (c) => {
+  const providers = await c.env.DB.prepare(
+    'SELECT id, name, provider, base_url, model, is_default FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC'
+  )
+    .bind(c.get('uid'))
+    .all();
+
+  return c.json(providers.results.map(mapProviderRow));
+});
+
+app.post('/ai/providers', async (c) => {
+  const parsed = providerSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid provider payload', details: parsed.error.format() }, 400);
+  }
+
+  const { name, provider, apiKey } = parsed.data;
+  const baseUrl = parsed.data.baseUrl?.trim() || null;
+  const model = parsed.data.model?.trim() || defaultModelForProvider(provider);
+  const isDefault = parsed.data.isDefault ?? false;
+
+  if (provider === 'custom' && !baseUrl) {
+    return c.json({ error: 'A base URL is required for custom providers.' }, 400);
+  }
+
+  // SECURITY: key material never logged
+  const encryptedKey = await encrypt(apiKey, c.env.ENCRYPTION_KEY);
+  const id = crypto.randomUUID();
+
+  if (isDefault) {
+    await c.env.DB.prepare('UPDATE ai_providers SET is_default = 0 WHERE user_id = ?').bind(c.get('uid')).run();
+  }
+
+  await c.env.DB.prepare(`
+    INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model, is_default)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model, isDefault ? 1 : 0)
+    .run();
+
+  return c.json({ success: true, id });
+});
+
+app.delete('/ai/providers/:id', async (c) => {
+  const providerId = c.req.param('id');
+  const existingProvider = await c.env.DB.prepare('SELECT id FROM ai_providers WHERE id = ? AND user_id = ?')
+    .bind(providerId, c.get('uid'))
+    .first();
+
+  if (!existingProvider) {
+    return c.json({ error: 'Provider not found' }, 404);
+  }
+
+  await c.env.DB.prepare('DELETE FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, c.get('uid')).run();
+  return c.json({ success: true });
+});
+
+app.get('/projects', async (c) => {
+  const projects = await c.env.DB.prepare(`
+    SELECT
+      p.*,
+      CASE
+        WHEN COUNT(s.id) = 0 THEN 0
+        ELSE CAST(ROUND(100.0 * SUM(CASE WHEN s.status = 'complete' THEN 1 ELSE 0 END) / COUNT(s.id)) AS INTEGER)
+      END AS progress
+    FROM projects p
+    LEFT JOIN steps s ON s.project_id = p.id
+    WHERE p.user_id = ?
+    GROUP BY p.id
+    ORDER BY p.updated_at DESC
+  `)
+    .bind(c.get('uid'))
+    .all();
+
+  return c.json(projects.results.map(mapProjectRow));
+});
+
+app.post('/projects', async (c) => {
+  const body = await c.req.json();
+  const name = asText(body.name).trim();
+
+  if (!name) {
+    return c.json({ error: 'Project name is required.' }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(`
+    INSERT INTO projects (id, user_id, name, description, project_type, stack, status, risk_score)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      id,
+      c.get('uid'),
+      name,
+      asText(body.description),
+      optionalText(body.project_type),
+      serializeJson(body.stack) || '{}',
+      optionalText(body.status) || 'active',
+      asNumber(body.risk_score, 0),
+    )
+    .run();
+
+  return c.json({ success: true, id });
+});
+
+app.get('/projects/:id', async (c) => {
+  const project = await getOwnedProjectWithProgress(c, c.req.param('id'));
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  return c.json(mapProjectRow(project));
+});
+
+app.patch('/projects/:id', async (c) => {
+  const projectId = c.req.param('id');
+  const existingProject = await getOwnedProject(c, projectId);
+  if (!existingProject) {
+    return c.json({ error: 'Project not found' }, 404);
   }
 
   const body = await c.req.json();
-  const result = diffSchema.safeParse(body);
-  if (!result.success) {
-    return c.json({ error: 'Malformed diff', details: result.error.format() }, 400);
+  await c.env.DB.prepare(`
+    UPDATE projects
+    SET name = ?, description = ?, project_type = ?, stack = ?, status = ?, risk_score = ?, updated_at = datetime("now")
+    WHERE id = ?
+  `)
+    .bind(
+      optionalText(body.name) || existingProject.name,
+      typeof body.description === 'string' ? body.description : existingProject.description,
+      typeof body.project_type === 'string' ? body.project_type : existingProject.project_type,
+      body.stack !== undefined ? serializeJson(body.stack) || '{}' : existingProject.stack,
+      optionalText(body.status) || existingProject.status,
+      body.risk_score !== undefined ? asNumber(body.risk_score, 0) : asNumber(existingProject.risk_score, 0),
+      projectId,
+    )
+    .run();
+
+  const updatedProject = await getOwnedProjectWithProgress(c, projectId);
+  return c.json(updatedProject ? mapProjectRow(updatedProject) : { success: true });
+});
+
+app.get('/plans', async (c) => {
+  const projectId = c.req.query('projectId');
+  if (!projectId) {
+    return c.json({ error: 'projectId is required' }, 400);
   }
 
-  const diff = result.data;
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const plans = await c.env.DB.prepare('SELECT * FROM plans WHERE project_id = ? ORDER BY version DESC, created_at DESC')
+    .bind(projectId)
+    .all();
+
+  return c.json(plans.results.map(mapPlanRow));
+});
+
+app.post('/plans', async (c) => {
+  const body = await c.req.json();
+  const projectId = asText(body.project_id).trim();
+  if (!projectId) {
+    return c.json({ error: 'project_id is required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare('INSERT INTO plans (id, project_id, version, canvas_state) VALUES (?, ?, ?, ?)')
+    .bind(id, projectId, asNumber(body.version, 1), serializeJson(body.canvas_state) || '{}')
+    .run();
+
+  await touchProject(c, projectId);
+  return c.json({ success: true, id });
+});
+
+app.get('/stages', async (c) => {
+  const projectId = c.req.query('projectId');
+  if (!projectId) {
+    return c.json({ error: 'projectId is required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const stages = await c.env.DB.prepare('SELECT * FROM stages WHERE project_id = ? ORDER BY order_index ASC, created_at ASC')
+    .bind(projectId)
+    .all();
+
+  return c.json(stages.results.map(mapStageRow));
+});
+
+app.post('/stages', async (c) => {
+  const body = await c.req.json();
+  const projectId = asText(body.project_id).trim();
+  const title = asText(body.title).trim();
+  const type = asText(body.type).trim();
+
+  if (!projectId || !title || !type) {
+    return c.json({ error: 'project_id, title, and type are required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare('INSERT INTO stages (id, project_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(id, projectId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
+    .run();
+
+  await touchProject(c, projectId);
+  return c.json({ success: true, id });
+});
+
+app.get('/steps', async (c) => {
+  const projectId = c.req.query('projectId');
+  if (!projectId) {
+    return c.json({ error: 'projectId is required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const steps = await c.env.DB.prepare('SELECT * FROM steps WHERE project_id = ? ORDER BY order_index ASC, created_at ASC')
+    .bind(projectId)
+    .all();
+
+  return c.json(steps.results.map(mapStepRow));
+});
+
+app.get('/steps/:id', async (c) => {
+  const step = await getOwnedStep(c, c.req.param('id'));
+  if (!step) {
+    return c.json({ error: 'Step not found' }, 404);
+  }
+
+  return c.json(mapStepRow(step));
+});
+
+app.post('/steps', async (c) => {
+  const body = await c.req.json();
+  const projectId = asText(body.project_id).trim();
+  const title = asText(body.title).trim();
+
+  if (!projectId || !title) {
+    return c.json({ error: 'project_id and title are required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const inferredGate = inferGateFlag({
+    title,
+    objective: optionalText(body.objective),
+    why_it_matters: optionalText(body.why_it_matters),
+    category: optionalText(body.category),
+    done_when: optionalText(body.done_when),
+  });
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(`
+    INSERT INTO steps (
+      id, project_id, stage_id, title, type, category, position_x, position_y, status,
+      is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools,
+      done_when, ai_output, prompts, is_ai_enriched
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      id,
+      projectId,
+      optionalText(body.stage_id),
+      title,
+      optionalText(body.type) || 'task',
+      asText(body.category),
+      asNumber(body.position_x, 0),
+      asNumber(body.position_y, 0),
+      optionalText(body.status) || 'locked',
+      typeof body.is_gate === 'boolean' ? (body.is_gate ? 1 : 0) : inferredGate ? 1 : 0,
+      optionalText(body.risk_level) || 'low',
+      asNumber(body.order_index, 0),
+      asText(body.objective),
+      asText(body.why_it_matters),
+      serializeJson(body.suggested_tools),
+      asText(body.done_when),
+      optionalText(body.ai_output),
+      serializeJson(body.prompts),
+      typeof body.is_ai_enriched === 'boolean' && body.is_ai_enriched ? 1 : 0,
+    )
+    .run();
+
+  await touchProject(c, projectId);
+  return c.json({ success: true, id });
+});
+
+app.patch('/steps/:id', async (c) => {
+  const stepId = c.req.param('id');
+  const existingStep = await getOwnedStep(c, stepId);
+  if (!existingStep) {
+    return c.json({ error: 'Step not found' }, 404);
+  }
+
+  const body = await c.req.json();
+  const inferredGate = inferGateFlag({
+    title: typeof body.title === 'string' ? body.title : existingStep.title,
+    objective: typeof body.objective === 'string' ? body.objective : existingStep.objective,
+    why_it_matters: typeof body.why_it_matters === 'string' ? body.why_it_matters : existingStep.why_it_matters,
+    category: typeof body.category === 'string' ? body.category : existingStep.category,
+    done_when: typeof body.done_when === 'string' ? body.done_when : existingStep.done_when,
+  });
+
+  await c.env.DB.prepare(`
+    UPDATE steps
+    SET stage_id = ?, title = ?, type = ?, category = ?, position_x = ?, position_y = ?, status = ?,
+        is_gate = ?, risk_level = ?, order_index = ?, objective = ?, why_it_matters = ?,
+        suggested_tools = ?, done_when = ?, ai_output = ?, prompts = ?, is_ai_enriched = ?, updated_at = datetime("now")
+    WHERE id = ?
+  `)
+    .bind(
+      body.stage_id !== undefined ? optionalText(body.stage_id) : existingStep.stage_id,
+      optionalText(body.title) || existingStep.title,
+      optionalText(body.type) || existingStep.type,
+      typeof body.category === 'string' ? body.category : existingStep.category,
+      body.position_x !== undefined ? asNumber(body.position_x, 0) : asNumber(existingStep.position_x, 0),
+      body.position_y !== undefined ? asNumber(body.position_y, 0) : asNumber(existingStep.position_y, 0),
+      optionalText(body.status) || existingStep.status,
+      typeof body.is_gate === 'boolean' ? (body.is_gate ? 1 : 0) : inferredGate ? 1 : 0,
+      optionalText(body.risk_level) || existingStep.risk_level,
+      body.order_index !== undefined ? asNumber(body.order_index, 0) : asNumber(existingStep.order_index, 0),
+      typeof body.objective === 'string' ? body.objective : existingStep.objective,
+      typeof body.why_it_matters === 'string' ? body.why_it_matters : existingStep.why_it_matters,
+      body.suggested_tools !== undefined ? serializeJson(body.suggested_tools) : existingStep.suggested_tools,
+      typeof body.done_when === 'string' ? body.done_when : existingStep.done_when,
+      body.ai_output !== undefined ? optionalText(body.ai_output) : existingStep.ai_output,
+      body.prompts !== undefined ? serializeJson(body.prompts) : existingStep.prompts,
+      typeof body.is_ai_enriched === 'boolean' ? (body.is_ai_enriched ? 1 : 0) : toBoolean(existingStep.is_ai_enriched) ? 1 : 0,
+      stepId,
+    )
+    .run();
+
+  await touchProject(c, existingStep.project_id as string);
+  const updatedStep = await getOwnedStep(c, stepId);
+  return c.json(updatedStep ? mapStepRow(updatedStep) : { success: true });
+});
+
+app.delete('/steps/:id', async (c) => {
+  const stepId = c.req.param('id');
+  const existingStep = await getOwnedStep(c, stepId);
+  if (!existingStep) {
+    return c.json({ error: 'Step not found' }, 404);
+  }
+
+  await c.env.DB.prepare('DELETE FROM steps WHERE id = ?').bind(stepId).run();
+  await touchProject(c, existingStep.project_id as string);
+  return c.body(null, 204);
+});
+
+app.post('/steps/:id/review', async (c) => {
+  const stepId = c.req.param('id');
+  const stepRecord = await getOwnedStep(c, stepId);
+  if (!stepRecord) {
+    return c.json({ error: 'Step not found' }, 404);
+  }
+
+  const parsed = reviewSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid review payload', details: parsed.error.format() }, 400);
+  }
+
+  const review = parsed.data;
+  const nextOutput = review.edited_output?.trim() || stepRecord.ai_output || null;
+  const runId = await insertAgentRun(c, {
+    projectId: stepRecord.project_id as string,
+    stepId,
+    runType: 'review_gate',
+    status: 'complete',
+    input: JSON.stringify(review),
+    output: review.feedback || nextOutput,
+  });
+
+  if (review.decision === 'approve') {
+    const unlockedStepIds = (
+      await c.env.DB.prepare('SELECT target_step_id FROM edges WHERE project_id = ? AND source_step_id = ?')
+        .bind(stepRecord.project_id, stepId)
+        .all()
+    ).results
+      .map((row: any) => row.target_step_id as string)
+      .filter(Boolean);
+
+    const statements = [
+      c.env.DB.prepare(`
+        UPDATE steps
+        SET ai_output = ?, is_ai_enriched = 1, status = 'complete', updated_at = datetime("now")
+        WHERE id = ?
+      `).bind(nextOutput, stepId),
+      c.env.DB.prepare('UPDATE agent_runs SET completed_at = datetime("now") WHERE id = ?').bind(runId),
+    ];
+
+    if (unlockedStepIds.length > 0) {
+      const placeholders = unlockedStepIds.map(() => '?').join(', ');
+      statements.push(
+        c.env.DB.prepare(`
+          UPDATE steps
+          SET status = 'active', updated_at = datetime("now")
+          WHERE project_id = ? AND status = 'locked' AND id IN (${placeholders})
+        `).bind(stepRecord.project_id, ...unlockedStepIds),
+      );
+    }
+
+    await c.env.DB.batch(statements);
+    await touchProject(c, stepRecord.project_id as string);
+    return c.json({ success: true, decision: 'approve', unlockedStepIds });
+  }
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(`
+      UPDATE steps
+      SET ai_output = ?, is_ai_enriched = 0, status = 'active', updated_at = datetime("now")
+      WHERE id = ?
+    `).bind(nextOutput, stepId),
+    c.env.DB.prepare('UPDATE agent_runs SET completed_at = datetime("now") WHERE id = ?').bind(runId),
+  ]);
+
+  await touchProject(c, stepRecord.project_id as string);
+  return c.json({ success: true, decision: 'reject', regenerate: true });
+});
+
+app.get('/edges', async (c) => {
+  const projectId = c.req.query('projectId');
+  if (!projectId) {
+    return c.json({ error: 'projectId is required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const edges = await c.env.DB.prepare('SELECT * FROM edges WHERE project_id = ?').bind(projectId).all();
+  return c.json(edges.results.map(mapEdgeRow));
+});
+
+app.post('/edges', async (c) => {
+  const body = await c.req.json();
+  const projectId = asText(body.project_id).trim();
+  const sourceStepId = asText(body.source_step_id).trim();
+  const targetStepId = asText(body.target_step_id).trim();
+
+  if (!projectId || !sourceStepId || !targetStepId) {
+    return c.json({ error: 'project_id, source_step_id, and target_step_id are required' }, 400);
+  }
+
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const stepCount = await c.env.DB.prepare('SELECT COUNT(*) AS count FROM steps WHERE project_id = ? AND id IN (?, ?)')
+    .bind(projectId, sourceStepId, targetStepId)
+    .first();
+
+  if (asNumber(stepCount?.count, 0) !== 2) {
+    return c.json({ error: 'Both steps must belong to the project.' }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(`
+    INSERT INTO edges (id, project_id, source_step_id, target_step_id, edge_type, condition)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `)
+    .bind(id, projectId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
+    .run();
+
+  await touchProject(c, projectId);
+  return c.json({ success: true, id });
+});
+
+app.get('/checklist-items', async (c) => {
+  const stepId = c.req.query('stepId');
+  if (!stepId) {
+    return c.json({ error: 'stepId is required' }, 400);
+  }
+
+  const step = await getOwnedStep(c, stepId);
+  if (!step) {
+    return c.json({ error: 'Step not found' }, 404);
+  }
+
+  const checklistItems = await c.env.DB.prepare(
+    'SELECT * FROM checklist_items WHERE step_id = ? ORDER BY order_index ASC, id ASC'
+  )
+    .bind(stepId)
+    .all();
+
+  return c.json(checklistItems.results.map(mapChecklistItemRow));
+});
+
+app.post('/checklist-items', async (c) => {
+  const body = await c.req.json();
+  const stepId = asText(body.step_id).trim();
+  const label = asText(body.label).trim();
+
+  if (!stepId || !label) {
+    return c.json({ error: 'step_id and label are required' }, 400);
+  }
+
+  const step = await getOwnedStep(c, stepId);
+  if (!step) {
+    return c.json({ error: 'Step not found' }, 404);
+  }
+
+  const id = crypto.randomUUID();
+  const isCompleted = typeof body.is_completed === 'boolean' ? body.is_completed : false;
+
+  await c.env.DB.prepare(`
+    INSERT INTO checklist_items (id, step_id, label, is_required, is_completed, completed_at, order_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      id,
+      stepId,
+      label,
+      typeof body.is_required === 'boolean' && body.is_required ? 1 : 0,
+      isCompleted ? 1 : 0,
+      isCompleted ? optionalText(body.completed_at) || new Date().toISOString() : null,
+      asNumber(body.order_index, 0),
+    )
+    .run();
+
+  await touchProject(c, step.project_id as string);
+  return c.json({ success: true, id });
+});
+
+app.patch('/checklist-items/:id', async (c) => {
+  const checklistItemId = c.req.param('id');
+  const existingItem = await getOwnedChecklistItem(c, checklistItemId);
+  if (!existingItem) {
+    return c.json({ error: 'Checklist item not found' }, 404);
+  }
+
+  const body = await c.req.json();
+  const isCompleted = typeof body.is_completed === 'boolean' ? body.is_completed : toBoolean(existingItem.is_completed);
+
+  await c.env.DB.prepare(`
+    UPDATE checklist_items
+    SET label = ?, is_required = ?, is_completed = ?, completed_at = ?, order_index = ?
+    WHERE id = ?
+  `)
+    .bind(
+      optionalText(body.label) || existingItem.label,
+      typeof body.is_required === 'boolean' ? (body.is_required ? 1 : 0) : toBoolean(existingItem.is_required) ? 1 : 0,
+      isCompleted ? 1 : 0,
+      isCompleted ? optionalText(body.completed_at) || new Date().toISOString() : null,
+      body.order_index !== undefined ? asNumber(body.order_index, 0) : asNumber(existingItem.order_index, 0),
+      checklistItemId,
+    )
+    .run();
+
+  await touchProject(c, existingItem.project_id as string);
+  return c.json({ success: true });
+});
+
+app.post('/projects/:id/plan-diff', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found or access denied' }, 403);
+  }
+
+  const parsed = diffSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: 'Malformed diff', details: parsed.error.format() }, 400);
+  }
+
   const statements: any[] = [];
 
-  for (const change of diff.changes) {
+  for (const change of parsed.data.changes) {
     if (change.action === 'update_step') {
-      const { step_id, updates } = change;
+      const existingStep = await c.env.DB.prepare('SELECT * FROM steps WHERE id = ? AND project_id = ?')
+        .bind(change.step_id, projectId)
+        .first();
+
+      if (!existingStep) {
+        continue;
+      }
+
+      const nextTitle = change.updates.title || existingStep.title;
+      const nextObjective = change.updates.objective || existingStep.objective;
+      const nextWhyItMatters = change.updates.why_it_matters || existingStep.why_it_matters;
+      const nextDoneWhen = change.updates.done_when || existingStep.done_when;
+      const nextSuggestedTools = change.updates.suggested_tools
+        ? JSON.stringify(change.updates.suggested_tools)
+        : existingStep.suggested_tools;
+      const nextIsGate = inferGateFlag({
+        title: nextTitle,
+        objective: nextObjective,
+        why_it_matters: nextWhyItMatters,
+        category: existingStep.category,
+        done_when: nextDoneWhen,
+      });
+
       statements.push(
-        c.env.DB.prepare(
-          'UPDATE steps SET title = COALESCE(?, title), objective = COALESCE(?, objective), why_it_matters = COALESCE(?, why_it_matters), suggested_tools = COALESCE(?, suggested_tools), done_when = COALESCE(?, done_when), is_ai_enriched = 0, updated_at = datetime("now") WHERE id = ? AND project_id = ?'
-        ).bind(
-          updates.title || null,
-          updates.objective || null,
-          updates.why_it_matters || null,
-          updates.suggested_tools ? JSON.stringify(updates.suggested_tools) : null,
-          updates.done_when || null,
-          step_id,
-          projectId
-        )
+        c.env.DB.prepare(`
+          UPDATE steps
+          SET title = ?, objective = ?, why_it_matters = ?, suggested_tools = ?, done_when = ?, is_gate = ?, is_ai_enriched = 0, updated_at = datetime("now")
+          WHERE id = ? AND project_id = ?
+        `).bind(
+          nextTitle,
+          nextObjective,
+          nextWhyItMatters,
+          nextSuggestedTools,
+          nextDoneWhen,
+          nextIsGate ? 1 : 0,
+          change.step_id,
+          projectId,
+        ),
       );
-    } else if (change.action === 'add_step') {
-      const { stage_id, step } = change;
+      continue;
+    }
+
+    if (change.action === 'add_step') {
+      const stageRecord = await c.env.DB.prepare('SELECT * FROM stages WHERE id = ? AND project_id = ?')
+        .bind(change.stage_id, projectId)
+        .first();
+
+      if (!stageRecord) {
+        continue;
+      }
+
+      const placement = await c.env.DB.prepare(`
+        SELECT
+          COALESCE(MAX(order_index), -1) AS max_order_index,
+          COALESCE(MAX(position_x), 0) AS max_position_x,
+          COALESCE(MAX(position_y), ?) AS max_position_y
+        FROM steps
+        WHERE project_id = ? AND stage_id = ?
+      `)
+        .bind(asNumber(stageRecord.order_index, 0) * 400 + 100, projectId, change.stage_id)
+        .first();
+
       const stepId = crypto.randomUUID();
+      const nextOrderIndex = asNumber(placement?.max_order_index, -1) + 1;
+      const nextPositionX = asNumber(placement?.max_position_x, 0) + 250;
+      const nextPositionY = asNumber(placement?.max_position_y, asNumber(stageRecord.order_index, 0) * 400 + 100);
+      const nextIsGate = inferGateFlag({
+        title: change.step.title,
+        objective: change.step.objective,
+        why_it_matters: change.step.why_it_matters,
+        category: stageRecord.type as string,
+        done_when: change.step.done_when,
+      });
+
       statements.push(
-        c.env.DB.prepare(
-          'INSERT INTO steps (id, project_id, stage_id, title, type, risk_level, objective, why_it_matters, done_when, is_ai_enriched) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)'
-        ).bind(
+        c.env.DB.prepare(`
+          INSERT INTO steps (
+            id, project_id, stage_id, title, type, category, position_x, position_y, status,
+            is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when, is_ai_enriched
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        `).bind(
           stepId,
           projectId,
-          stage_id,
-          step.title,
-          step.type,
-          step.risk_level,
-          step.objective || '',
-          step.why_it_matters || '',
-          step.done_when || ''
-        )
+          change.stage_id,
+          change.step.title,
+          change.step.type,
+          stageRecord.type,
+          nextPositionX,
+          nextPositionY,
+          'locked',
+          nextIsGate ? 1 : 0,
+          change.step.risk_level,
+          nextOrderIndex,
+          change.step.objective || '',
+          change.step.why_it_matters || '',
+          change.step.suggested_tools ? JSON.stringify(change.step.suggested_tools) : null,
+          change.step.done_when || '',
+        ),
       );
-    } else if (change.action === 'remove_step') {
-      const { step_id } = change;
+
+      if (change.step.checklist?.length) {
+        change.step.checklist.forEach((item, index) => {
+          statements.push(
+            c.env.DB.prepare(`
+              INSERT INTO checklist_items (id, step_id, label, is_required, is_completed, order_index)
+              VALUES (?, ?, ?, ?, 0, ?)
+            `).bind(crypto.randomUUID(), stepId, item.label, item.is_required ? 1 : 0, index),
+          );
+        });
+      }
+
+      continue;
+    }
+
+    if (change.action === 'remove_step') {
       statements.push(
         c.env.DB.prepare(
-          'DELETE FROM steps WHERE id = ? AND project_id = ? AND status NOT IN ("complete", "needs_review")'
-        ).bind(step_id, projectId)
+          'DELETE FROM steps WHERE id = ? AND project_id = ? AND status NOT IN ("complete", "needs_review")',
+        ).bind(change.step_id, projectId),
       );
     }
   }
@@ -83,37 +1293,25 @@ app.post('/projects/:id/plan-diff', async (c) => {
   try {
     if (statements.length > 0) {
       await c.env.DB.batch(statements);
+      await touchProject(c, projectId);
     }
-    return c.json({ success: true, summary: diff.summary });
-  } catch (err: any) {
-    return c.json({ error: `Failed to apply diff: ${err.message}` }, 500);
+
+    return c.json({ success: true, summary: parsed.data.summary });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown diff failure';
+    return c.json({ error: `Failed to apply diff: ${message}` }, 500);
   }
 });
 
 app.post('/steps/:id/enrich', async (c) => {
   const stepId = c.req.param('id');
-  const authHeader = c.req.header('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ error: 'Missing or invalid Authorization header' }, 401);
+  const parsed = enrichSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid enrichment payload', details: parsed.error.format() }, 400);
   }
 
-  const token = authHeader.split(' ')[1];
-  let uid: string;
-  try {
-    uid = await verifyFirebaseToken(token, c.env.FIREBASE_PROJECT_ID);
-  } catch (err: any) {
-    return c.json({ error: `Auth failed: ${err.message}` }, 401);
-  }
-
-  const { providerId, projectId } = await c.req.json();
-  if (!providerId || !projectId) {
-    return c.json({ error: 'providerId and projectId are required' }, 400);
-  }
-
-  // 1. Get Step details
-  const stepRecord = await c.env.DB.prepare(
-    'SELECT * FROM steps WHERE id = ? AND project_id = ?'
-  )
+  const { providerId, projectId, feedback, editedOutput } = parsed.data;
+  const stepRecord = await c.env.DB.prepare('SELECT * FROM steps WHERE id = ? AND project_id = ?')
     .bind(stepId, projectId)
     .first();
 
@@ -121,295 +1319,261 @@ app.post('/steps/:id/enrich', async (c) => {
     return c.json({ error: 'Step not found' }, 404);
   }
 
-  // 2. Get Project details (for context)
-  const projectRecord = await c.env.DB.prepare(
-    'SELECT * FROM projects WHERE id = ? AND user_id = ?'
-  )
-    .bind(projectId, uid)
-    .first();
-
+  const projectRecord = await getOwnedProject(c, projectId);
   if (!projectRecord) {
     return c.json({ error: 'Project not found or access denied' }, 403);
   }
 
-  // 3. Update status to agent_working
-  await c.env.DB.prepare('UPDATE steps SET status = "agent_working" WHERE id = ?')
-    .bind(stepId)
-    .run();
-
-  // 4. Get Provider Key
-  const providerRecord = await c.env.DB.prepare(
-    'SELECT * FROM ai_providers WHERE id = ? AND user_id = ?'
-  )
-    .bind(providerId, uid)
-    .first();
-
+  const providerRecord = await resolveProvider(c, providerId);
   if (!providerRecord) {
-    return c.json({ error: 'Provider not found or access denied' }, 403);
+    return c.json({ error: 'No AI provider is configured yet. Add one in Settings first.' }, 400);
   }
 
   let apiKey: string;
   try {
+    // SECURITY: key material never logged
     apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
-  } catch (err) {
+  } catch {
     return c.json({ error: 'Failed to decrypt API key' }, 500);
   }
 
-  const providerType = providerRecord.provider as string;
-  const model = providerRecord.model as string;
-  const baseUrl = providerRecord.base_url as string;
+  const providerType = providerRecord.provider as ProviderType;
+  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
+  const baseUrl = providerRecord.base_url as string | null;
+  const systemPrompt = `You are Scrimble's step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.`;
+  const promptSections = [
+    `Step title: ${stepRecord.title}`,
+    `Project name: ${projectRecord.name}`,
+    `Project brief: ${projectRecord.description || 'No project description provided.'}`,
+    `Project stack: ${projectRecord.stack || '{}'}`,
+    `Step objective: ${stepRecord.objective || 'Not specified yet.'}`,
+    `Why it matters: ${stepRecord.why_it_matters || 'Not specified yet.'}`,
+    `Done when: ${stepRecord.done_when || 'Not specified yet.'}`,
+  ];
 
-  const systemPrompt = `You are Scrimble's step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder — plain language, no jargon. Respond ONLY with valid JSON.`;
-  const userPrompt = `Step: "${stepRecord.title}"\nProject: "${projectRecord.description}"\nStack: ${projectRecord.stack}`;
+  if (editedOutput) {
+    promptSections.push(`Current draft to improve:\n${editedOutput}`);
+  }
 
-  const runId = crypto.randomUUID();
-  await c.env.DB.prepare(
-    'INSERT INTO agent_runs (id, project_id, step_id, run_type, status, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  )
-    .bind(runId, projectId, stepId, 'enrich_step', 'running', providerType, model)
+  if (feedback) {
+    promptSections.push(`Human feedback to address:\n${feedback}`);
+    promptSections.push('Revise the guidance so it directly addresses the human feedback before continuing.');
+  }
+
+  await c.env.DB.prepare('UPDATE steps SET status = "agent_working", updated_at = datetime("now") WHERE id = ?')
+    .bind(stepId)
     .run();
 
-  try {
-    let aiResponse: Response;
+  const runId = await insertAgentRun(c, {
+    projectId,
+    stepId,
+    runType: 'enrich_step',
+    status: 'running',
+    provider: providerType,
+    model,
+    input: JSON.stringify({ feedback: feedback || null, editedOutput: editedOutput || null }),
+  });
 
-    // Call AI (reuse logic from proxy but with specific prompts)
-    if (providerType === 'anthropic') {
-      aiResponse = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: model,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userPrompt }],
-          stream: true,
-        }),
-      });
-    } else if (providerType === 'gemini') {
-      const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}`;
-      aiResponse = await fetch(googleUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [
-            { role: 'user', parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }] }
-          ],
-        }),
-      });
-    } else {
-      const url = baseUrl || 'https://api.openai.com/v1/chat/completions';
-      aiResponse = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          stream: true,
-        }),
-      });
-    }
+  try {
+    const aiResponse = await callAIWithRetry({
+      providerType,
+      apiKey,
+      model,
+      baseUrl,
+      system: systemPrompt,
+      prompt: promptSections.join('\n\n'),
+    });
 
     if (!aiResponse.ok) {
-      throw new Error(`AI Provider error: ${aiResponse.status}`);
+      const errorData = await aiResponse.clone().json().catch(() => ({ message: 'AI Enrichment Error' }));
+      const message = errorData.message || 'AI Enrichment Error';
+      
+      await c.env.DB.batch([
+        c.env.DB.prepare('UPDATE steps SET status = "active", updated_at = datetime("now") WHERE id = ?').bind(stepId),
+        c.env.DB.prepare(`
+          UPDATE agent_runs
+          SET status = 'failed', output = ?, completed_at = datetime("now")
+          WHERE id = ?
+        `).bind(message, runId),
+      ]);
+
+      return aiResponse;
+    }
+
+    if (!aiResponse.body) {
+      throw new Error('AI Provider did not return a streaming body.');
     }
 
     const { readable, writable } = new TransformStream();
     const [stream1, stream2] = readable.tee();
 
-    // Finalize in background
-    c.executionCtx.waitUntil((async () => {
-      const reader = stream2.getReader();
-      const decoder = new TextDecoder();
-      let fullContent = '';
-      
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') break;
-            try {
-              const parsed = JSON.parse(data);
-              if (parsed.choices?.[0]?.delta?.content) {
-                fullContent += parsed.choices[0].delta.content;
-              } else if (parsed.content?.[0]?.text) {
-                fullContent += parsed.content[0].text;
-              } else if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
-                fullContent += parsed.candidates[0].content.parts[0].text;
-              }
-            } catch (e) {}
+    c.executionCtx.waitUntil(
+      (async () => {
+        const fullContent = await streamToText(stream2);
+
+        try {
+          const parsedContent = JSON.parse(fullContent);
+          const validated = StepDetailSchema.safeParse(parsedContent);
+          if (!validated.success) {
+            throw new Error(`AI enrichment validation failed: ${validated.error.message}`);
           }
+
+          const data = validated.data;
+          const nextStatus = toBoolean(stepRecord.is_gate) ? 'needs_review' : 'complete';
+ 
+          await c.env.DB.batch([
+            c.env.DB.prepare(`
+              UPDATE steps
+              SET ai_output = ?, prompts = ?, is_ai_enriched = 1, status = ?, updated_at = datetime("now")
+              WHERE id = ?
+            `).bind(
+              data.ai_output || null,
+              JSON.stringify(data.prompts || []),
+              nextStatus,
+              stepId,
+            ),
+            c.env.DB.prepare(`
+              UPDATE agent_runs
+              SET status = 'complete', output = ?, completed_at = datetime("now")
+              WHERE id = ?
+            `).bind(fullContent, runId),
+          ]);
+ 
+          await touchProject(c, projectId);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Malformed AI payload';
+          await c.env.DB.batch([
+            c.env.DB.prepare('UPDATE steps SET status = "active", updated_at = datetime("now") WHERE id = ?').bind(stepId),
+            c.env.DB.prepare(`
+              UPDATE agent_runs
+              SET status = 'failed', output = ?, completed_at = datetime("now")
+              WHERE id = ?
+            `).bind(`JSON Parse Error: ${message}\nRaw: ${fullContent}`, runId),
+          ]);
         }
-      }
+      })(),
+    );
 
-      try {
-        const parsed = JSON.parse(fullContent);
-        const nextStatus = stepRecord.is_gate ? 'needs_review' : 'complete';
-        
-        await c.env.DB.batch([
-          c.env.DB.prepare('UPDATE steps SET ai_output = ?, prompts = ?, is_ai_enriched = 1, status = ?, updated_at = datetime("now") WHERE id = ?')
-            .bind(parsed.ai_output || null, JSON.stringify(parsed.prompts || []), nextStatus, stepId),
-          c.env.DB.prepare('UPDATE agent_runs SET status = "complete", output = ?, completed_at = datetime("now") WHERE id = ?')
-            .bind(fullContent, runId)
-        ]);
-      } catch (err: any) {
-        await c.env.DB.prepare('UPDATE agent_runs SET status = "failed", output = ? WHERE id = ?')
-          .bind(`JSON Parse Error: ${err.message}\nRaw: ${fullContent}`, runId)
-          .run();
-      }
-    })());
-
-    aiResponse.body?.pipeTo(writable);
+    aiResponse.body.pipeTo(writable);
 
     return new Response(stream1, {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
+        Connection: 'keep-alive',
       },
     });
-
-  } catch (err: any) {
-    await c.env.DB.prepare('UPDATE steps SET status = "active" WHERE id = ?').bind(stepId).run();
-    return c.json({ error: err.message }, 500);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown enrichment failure';
+    await c.env.DB.batch([
+      c.env.DB.prepare('UPDATE steps SET status = "active", updated_at = datetime("now") WHERE id = ?').bind(stepId),
+      c.env.DB.prepare(`
+        UPDATE agent_runs
+        SET status = 'failed', output = ?, completed_at = datetime("now")
+        WHERE id = ?
+      `).bind(message, runId),
+    ]);
+    return c.json({ error: message }, 500);
   }
 });
 
 app.post('/ai/proxy', async (c) => {
-  const authHeader = c.req.header('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ error: 'Missing or invalid Authorization header' }, 401);
+  const parsed = proxySchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid proxy payload', details: parsed.error.format() }, 400);
   }
 
-  const token = authHeader.split(' ')[1];
-  let uid: string;
-  try {
-    uid = await verifyFirebaseToken(token, c.env.FIREBASE_PROJECT_ID);
-  } catch (err: any) {
-    return c.json({ error: `Auth failed: ${err.message}` }, 401);
-  }
-
-  const { providerId, system, prompt, projectId, stepId } = await c.req.json();
-  if (!providerId || !prompt) {
-    return c.json({ error: 'providerId and prompt are required' }, 400);
-  }
-
-  const providerRecord = await c.env.DB.prepare(
-    'SELECT * FROM ai_providers WHERE id = ? AND user_id = ?'
-  )
-    .bind(providerId, uid)
-    .first();
-
+  const providerRecord = await resolveProvider(c, parsed.data.providerId);
   if (!providerRecord) {
-    return c.json({ error: 'Provider not found or access denied' }, 403);
+    return c.json({ error: 'No AI provider is configured yet. Add one in Settings first.' }, 400);
   }
 
   let apiKey: string;
   try {
+    // SECURITY: key material never logged
     apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
-  } catch (err) {
+  } catch {
     return c.json({ error: 'Failed to decrypt API key' }, 500);
   }
 
-  const providerType = providerRecord.provider as string;
-  const model = providerRecord.model as string;
-  const baseUrl = providerRecord.base_url as string;
-
-  const runId = crypto.randomUUID();
-  await c.env.DB.prepare(
-    'INSERT INTO agent_runs (id, project_id, step_id, run_type, status, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  )
-    .bind(runId, projectId || 'default', stepId || null, 'proxy_call', 'running', providerType, model)
-    .run();
+  const providerType = providerRecord.provider as ProviderType;
+  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
+  const baseUrl = providerRecord.base_url as string | null;
+  const runId = parsed.data.projectId
+    ? await insertAgentRun(c, {
+        projectId: parsed.data.projectId,
+        stepId: parsed.data.stepId || null,
+        runType: 'proxy_call',
+        status: 'running',
+        provider: providerType,
+        model,
+      })
+    : null;
 
   try {
-    let response: Response;
-
-    if (providerType === 'anthropic') {
-      response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: model,
-          system: system,
-          messages: [{ role: 'user', content: prompt }],
-          stream: true,
-        }),
-      });
-    } else if (providerType === 'gemini') {
-      const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}`;
-      response = await fetch(googleUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [
-            { role: 'user', parts: [{ text: system ? `${system}\n\n${prompt}` : prompt }] }
-          ],
-        }),
-      });
-    } else {
-      const url = baseUrl || 'https://api.openai.com/v1/chat/completions';
-      response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: model,
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: prompt },
-          ],
-          stream: true,
-        }),
-      });
-    }
+    const response = await callAIWithRetry({
+      providerType,
+      apiKey,
+      model,
+      baseUrl,
+      system: parsed.data.system || null,
+      prompt: parsed.data.prompt,
+    });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`AI Provider returned ${response.status}: ${errorText}`);
+      const errorData = await response.clone().json().catch(() => ({ message: 'AI Proxy Error' }));
+      const message = errorData.message || 'AI Proxy Error';
+
+      if (runId) {
+        await c.env.DB.prepare(`
+          UPDATE agent_runs
+          SET status = 'failed', output = ?, completed_at = datetime("now")
+          WHERE id = ?
+        `)
+          .bind(message, runId)
+          .run();
+      }
+      return response;
+    }
+
+    if (!response.body) {
+      throw new Error('AI Provider did not return a streaming body.');
     }
 
     const { readable, writable } = new TransformStream();
-    response.body?.pipeTo(writable);
+    response.body.pipeTo(writable);
 
-    c.executionCtx.waitUntil(
-      c.env.DB.prepare('UPDATE agent_runs SET status = ?, completed_at = ? WHERE id = ?')
-        .bind('complete', new Date().toISOString(), runId)
-        .run()
-    );
+    if (runId) {
+      c.executionCtx.waitUntil(
+        c.env.DB.prepare(`
+          UPDATE agent_runs
+          SET status = 'complete', completed_at = datetime("now")
+          WHERE id = ?
+        `).bind(runId).run(),
+      );
+    }
 
     return new Response(readable, {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
+        Connection: 'keep-alive',
       },
     });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown proxy failure';
 
-  } catch (err: any) {
-    await c.env.DB.prepare('UPDATE agent_runs SET status = ?, output = ? WHERE id = ?')
-      .bind('failed', err.message, runId)
-      .run();
-    return c.json({ error: err.message }, 500);
+    if (runId) {
+      await c.env.DB.prepare(`
+        UPDATE agent_runs
+        SET status = 'failed', output = ?, completed_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(message, runId)
+        .run();
+    }
+
+    return c.json({ error: message }, 500);
   }
 });
 

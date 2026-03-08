@@ -8,3 +8,4 @@ coverage/
 !.env.example
 conductor
 .agents
+wrangler.toml

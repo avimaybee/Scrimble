@@ -10,8 +10,11 @@ export const diffSchema = z.object({
         title: z.string().optional(),
         objective: z.string().optional(),
         why_it_matters: z.string().optional(),
-        suggested_tools: z.array(z.any()).optional(),
-        checklist: z.array(z.any()).optional(),
+        suggested_tools: z.array(z.string()).optional(),
+        checklist: z.array(z.object({
+          label: z.string(),
+          is_required: z.boolean().optional().default(false)
+        })).optional(),
         done_when: z.string().optional()
       })
     }),
@@ -24,7 +27,11 @@ export const diffSchema = z.object({
         risk_level: z.string().default('low'),
         objective: z.string().optional(),
         why_it_matters: z.string().optional(),
-        checklist: z.array(z.any()).optional(),
+        suggested_tools: z.array(z.string()).optional(),
+        checklist: z.array(z.object({
+          label: z.string(),
+          is_required: z.boolean().optional().default(false)
+        })).optional(),
         done_when: z.string().optional()
       })
     }),

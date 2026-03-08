@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, CheckCircle2, AlertTriangle, ExternalLink, RefreshCw, Copy } from 'lucide-react';
+import { X, AlertTriangle, ExternalLink, RefreshCw, Copy, Sparkles } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import AnimatedCheckmark from './ui/AnimatedCheckmark';
 import { Step, ChecklistItem, Project } from '../types';
 import { cn } from '../lib/utils';
-import { getStepDetails } from '../lib/ai';
 import { dbService } from '../lib/db';
 import { useStepExecution } from '../hooks/useStepExecution';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
@@ -24,6 +25,29 @@ interface DetailPanelProps {
   onStepComplete: (stepId: string) => void;
 }
 
+interface PromptCard {
+  label: string;
+  content: string;
+}
+
+interface SuggestedTool {
+  name: string;
+  url: string;
+}
+
+function parseJsonArray<T>(value: string | undefined): T[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function DetailPanel({ stepId, project, onClose, onStepComplete }: DetailPanelProps) {
   const [step, setStep] = useState<Step | null>(null);
   const [checklist, setChecklist] = useState<ChecklistItem[]>([]);
@@ -42,6 +66,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
   const [editedOutput, setEditedOutput] = useState('');
   const [isRejectDialogOpen, setIsRejectDialogOpen] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const [reviewAction, setReviewAction] = useState<'approve' | 'reject' | null>(null);
 
   useEffect(() => {
     if (!stepId) return;
@@ -70,18 +95,15 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
     }
   }
 
-  const enrichStep = async (stepData: Step, projectData: Project) => {
-    const providerId = localStorage.getItem('scrimble_default_provider_id');
-    if (!providerId) {
-      toast.error("Please configure an AI provider in Settings first.");
-      return;
-    }
-    executeStep(stepData.id, projectData.id, providerId);
+  const enrichStep = async (stepData: Step, projectData: Project, options?: { feedback?: string; editedOutput?: string }) => {
+    await executeStep(stepData.id, projectData.id, options);
   };
 
   const handleRegenerate = () => {
     if (step && project) {
-      enrichStep(step, project);
+      void enrichStep(step, project, {
+        editedOutput: editedOutput.trim() || undefined,
+      });
     }
   };
 
@@ -93,6 +115,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
       await dbService.toggleChecklistItem(itemId, newStatus);
     } catch (error) {
       console.error("Error updating checklist item:", error);
+      toast.error("Couldn't save that change. Try again.");
       // Revert on error
       setChecklist(prev => prev.map(item => item.id === itemId ? { ...item, is_completed: currentStatus } : item));
     }
@@ -101,14 +124,17 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
   const handleComplete = async () => {
     if (!step) return;
     
+    // Optimistic UI: Close and trigger complete in parent immediately
+    onStepComplete(step.id);
+    onClose();
+
     try {
       await dbService.updateStep(step.id, {
         status: 'complete'
       });
-      onStepComplete(step.id);
-      onClose();
     } catch (error) {
       console.error("Error completing step:", error);
+      toast.error("Couldn't save step completion. Try again.");
     }
   };
 
@@ -127,7 +153,76 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
   };
 
   const allRequiredChecked = checklist.filter(i => i.is_required).every(i => i.is_completed);
-  const suggestedTools = step?.suggested_tools ? JSON.parse(step.suggested_tools) : [];
+  const suggestedTools = useMemo(() => parseJsonArray<SuggestedTool>(step?.suggested_tools), [step?.suggested_tools]);
+  const promptCards = useMemo(() => parseJsonArray<PromptCard>(step?.prompts), [step?.prompts]);
+  const enrichmentLoading = isExecuting || (!!step && !step.is_ai_enriched && !executionError);
+
+  const handleApprove = async () => {
+    if (!step) {
+      return;
+    }
+
+    setReviewAction('approve');
+
+    try {
+      await dbService.submitReview(step.id, {
+        decision: 'approve',
+        edited_output: editedOutput.trim() || undefined,
+      });
+      toast.success('Step approved.');
+      onStepComplete(step.id);
+      onClose();
+    } catch (error) {
+      console.error('Error approving step:', error);
+      toast.error(error instanceof Error ? error.message : 'Failed to approve this step.');
+    } finally {
+      setReviewAction(null);
+    }
+  };
+
+  const handleReject = async () => {
+    if (!step || !project) {
+      return;
+    }
+
+    const trimmedFeedback = feedback.trim();
+    if (!trimmedFeedback) {
+      return;
+    }
+
+    setReviewAction('reject');
+
+    try {
+      await dbService.submitReview(step.id, {
+        decision: 'reject',
+        feedback: trimmedFeedback,
+        edited_output: editedOutput.trim() || undefined,
+      });
+
+      setIsRejectDialogOpen(false);
+      setFeedback('');
+      setStep((current) => (
+        current
+          ? {
+              ...current,
+              status: 'agent_working',
+              is_ai_enriched: false,
+              ai_output: editedOutput.trim() || current.ai_output,
+            }
+          : current
+      ));
+
+      await enrichStep(step, project, {
+        feedback: trimmedFeedback,
+        editedOutput: editedOutput.trim() || undefined,
+      });
+    } catch (error) {
+      console.error('Error rejecting step:', error);
+      toast.error(error instanceof Error ? error.message : 'Failed to rework this step.');
+    } finally {
+      setReviewAction(null);
+    }
+  };
 
   return (
     <AnimatePresence>
@@ -137,13 +232,15 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
           animate={{ x: 0, opacity: 1 }}
           exit={{ x: '100%', opacity: 0 }}
           transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-          className="fixed top-[76px] right-4 bottom-4 w-[420px] bg-bg-surface/95 backdrop-blur-xl border border-border-default shadow-panel z-40 flex flex-col font-sans rounded-2xl overflow-hidden"
+          className={cn(
+            "fixed top-[76px] right-4 bottom-4 w-[420px] bg-bg-surface/95 backdrop-blur-xl border-border-default shadow-panel z-40 flex flex-col font-sans rounded-2xl overflow-hidden",
+            step?.status === 'needs_review' ? "border-2 border-status-warning/40 shadow-[0_0_20px_rgba(234,179,8,0.2)]" : "border"
+          )}
         >
-          {loading ? (
-            <div className="p-8 flex items-center justify-center h-full">
-              <RefreshCw className="w-6 h-6 text-accent-primary animate-spin" />
-            </div>
-          ) : step ? (
+          {step?.status === 'needs_review' && (
+            <div className="absolute inset-0 bg-status-warning/5 animate-pulse pointer-events-none z-[-1]" />
+          )}
+          {step ? (
             <>
               {/* Header */}
               <div className="relative p-6 border-b border-border-subtle shrink-0">
@@ -234,7 +331,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                     </div>
                   )}
 
-                  {(step?.is_ai_enriched || isExecuting) ? (
+                  {(step?.is_ai_enriched || isExecuting) && !loading ? (
                     <div className="bg-bg-elevated border border-border-default rounded-lg p-4 relative group">
                       {isEditing ? (
                         <textarea
@@ -247,11 +344,29 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                         <div className="text-sm text-text-secondary leading-relaxed whitespace-pre-wrap font-sans">
                           {isExecuting ? (
                             <>
-                              {streamingOutput}
+                              <div className="markdown-content">
+                                <ReactMarkdown 
+                                  components={{
+                                    p: ({ children }) => <p className="mb-4 last:mb-0">{children}</p>,
+                                    code: ({ children }) => <code>{children}</code>
+                                  }}
+                                >
+                                  {streamingOutput}
+                                </ReactMarkdown>
+                              </div>
                               <span className="inline-block w-1.5 h-4 bg-accent-primary ml-1 animate-pulse" />
                             </>
                           ) : (
-                            editedOutput || step?.ai_output || "No details generated."
+                            <div className="markdown-content">
+                              <ReactMarkdown 
+                                components={{
+                                  p: ({ children }) => <p className="mb-4 last:mb-0">{children}</p>,
+                                  code: ({ children }) => <code>{children}</code>
+                                }}
+                                >
+                                {editedOutput || step?.ai_output || "No details generated."}
+                              </ReactMarkdown>
+                            </div>
                           )}
                         </div>
                       )}
@@ -273,11 +388,13 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       )}
                     </div>
                   ) : (
-                    <div className="bg-bg-elevated border border-border-default rounded-lg p-4">
-                      <div className="skeleton-line w-full" />
-                      <div className="skeleton-line w-4/5" />
-                      <div className="skeleton-line w-3/5" />
-                      <span className="generating-label text-xs text-text-tertiary">Waiting for agent...</span>
+                    <div className="bg-bg-elevated border border-border-default rounded-lg p-5 space-y-3">
+                      <div className="skeleton-block h-3 w-full" />
+                      <div className="skeleton-block h-3 w-[90%]" />
+                      <div className="skeleton-block h-3 w-[85%]" />
+                      <div className="pt-2">
+                        <span className="text-[10px] font-mono uppercase tracking-widest text-text-tertiary animate-pulse">Analysing step context...</span>
+                      </div>
                     </div>
                   )}
                 </section>
@@ -286,9 +403,9 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                 <section>
                   <h3 className="text-sm font-medium text-text-primary mb-2">Helper Prompts</h3>
                   
-                  {step.is_ai_enriched && !enrichmentLoading ? (
+                  {step.is_ai_enriched && !enrichmentLoading && !loading ? (
                     <div className="space-y-3">
-                      {step.prompts ? JSON.parse(step.prompts).map((prompt: any, i: number) => (
+                      {promptCards.length > 0 ? promptCards.map((prompt, i) => (
                         <div key={i} className="prompt-item">
                           <div className="prompt-header">
                             <span className="prompt-label">{prompt.label}</span>
@@ -317,8 +434,8 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                     </div>
                   ) : (
                     <div className="space-y-3">
-                      <div className="skeleton-block h-16 w-full" />
-                      <div className="skeleton-block h-16 w-full" />
+                      <div className="skeleton-block h-20 w-full" />
+                      <div className="skeleton-block h-20 w-full" />
                     </div>
                   )}
                 </section>
@@ -328,7 +445,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                   <section>
                     <h3 className="text-sm font-medium text-text-primary mb-3">Tools to use</h3>
                     <div className="flex flex-wrap gap-2">
-                      {suggestedTools.map((tool: any, idx: number) => (
+                      {suggestedTools.map((tool, idx: number) => (
                         <a 
                           key={idx}
                           href={tool.url}
@@ -353,14 +470,14 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                     </span>
                   </h3>
                   <div className="space-y-3">
-                    {checklist.map(item => (
+                    {!loading ? checklist.map(item => (
                       <label 
                         key={item.id} 
                         className={cn(
-                          "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-all duration-200",
+                          "checklist-item-container flex items-start gap-4 p-4 rounded-xl border cursor-pointer transition-all duration-300",
                           item.is_completed 
-                            ? "bg-accent-primary-muted/30 border-accent-primary/30" 
-                            : "bg-bg-elevated border-border-default hover:border-border-strong"
+                            ? "bg-accent-primary-muted/10 border-accent-primary/20 shadow-sm" 
+                            : "bg-bg-elevated/50 border-border-default hover:border-border-strong hover:bg-bg-elevated"
                         )}
                       >
                         <div className="mt-0.5 relative flex items-center justify-center w-5 h-5 shrink-0">
@@ -368,21 +485,34 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                             type="checkbox"
                             checked={item.is_completed}
                             onChange={() => handleCheckToggle(item.id, item.is_completed)}
-                            className="peer appearance-none w-5 h-5 border-2 border-border-strong rounded focus:ring-2 focus:ring-accent-primary-muted focus:outline-none checked:bg-accent-primary checked:border-accent-primary transition-colors cursor-pointer"
+                            className="checklist-checkbox peer"
                           />
-                          <CheckCircle2 className="absolute w-3.5 h-3.5 text-white opacity-0 peer-checked:opacity-100 pointer-events-none transition-opacity" />
+                          <div className={cn(
+                            "absolute inset-0 border-2 rounded transition-all duration-300 pointer-events-none",
+                            item.is_completed ? "border-accent-primary bg-accent-primary" : "border-border-strong"
+                          )} />
+                          <AnimatedCheckmark 
+                            isChecked={item.is_completed} 
+                            className="absolute w-3.5 h-3.5 text-white z-10" 
+                          />
                         </div>
                         <div className="flex-1 min-w-0">
                           <span className={cn(
-                            "text-sm block leading-snug",
-                            item.is_completed ? "text-text-secondary line-through" : "text-text-primary"
+                            "checklist-label text-[15px] block leading-relaxed transition-all duration-300",
+                            item.is_completed ? "item-completed" : "text-text-primary"
                           )}>
                             {item.label}
-                            {item.is_required && <span className="text-status-secure ml-1">*</span>}
+                            {item.is_required && <span className="text-status-secure ml-1.5 font-bold">*</span>}
                           </span>
                         </div>
                       </label>
-                    ))}
+                    )) : (
+                      <>
+                        <div className="skeleton-block h-14 w-full" />
+                        <div className="skeleton-block h-14 w-full" />
+                        <div className="skeleton-block h-14 w-full" />
+                      </>
+                    )}
                   </div>
                 </section>
 
@@ -402,31 +532,34 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                 {step.is_gate && step.status === 'needs_review' ? (
                   <div className="flex flex-col gap-3">
                     <div className="flex gap-3">
-                      <button 
-                        onClick={() => setIsEditing(!isEditing)}
-                        className={cn(
-                          "flex-1 py-2.5 rounded-lg text-sm font-medium border transition-all",
-                          isEditing 
-                            ? "bg-accent-primary text-white border-accent-primary" 
-                            : "bg-bg-elevated text-text-primary border-border-default hover:border-border-strong"
+                        <button 
+                          onClick={() => setIsEditing(!isEditing)}
+                          disabled={reviewAction !== null}
+                          className={cn(
+                            "flex-1 py-2.5 rounded-lg text-sm font-medium border transition-all disabled:cursor-not-allowed disabled:opacity-60",
+                            isEditing 
+                              ? "bg-accent-primary text-white border-accent-primary" 
+                              : "bg-bg-elevated text-text-primary border-border-default hover:border-border-strong"
                         )}
                       >
                         {isEditing ? 'Save edits' : 'Edit'}
                       </button>
+                        <button 
+                          onClick={() => setIsRejectDialogOpen(true)}
+                          disabled={reviewAction !== null}
+                          className="flex-1 py-2.5 rounded-lg text-sm font-medium border border-status-warning/30 bg-status-warning/10 text-status-warning hover:bg-status-warning/20 transition-all disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          Reject, try again
+                        </button>
+                      </div>
                       <button 
-                        onClick={() => setIsRejectDialogOpen(true)}
-                        className="flex-1 py-2.5 rounded-lg text-sm font-medium border border-status-warning/30 bg-status-warning/10 text-status-warning hover:bg-status-warning/20 transition-all"
+                        onClick={handleApprove}
+                        disabled={reviewAction !== null}
+                        className="w-full btn-primary py-3 flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        Reject, try again
+                        {reviewAction === 'approve' ? 'Saving your approval...' : 'Looks good →'}
                       </button>
                     </div>
-                    <button 
-                      onClick={handleApprove}
-                      className="w-full btn-primary py-3 flex items-center justify-center gap-2"
-                    >
-                      Looks good →
-                    </button>
-                  </div>
                 ) : showSkipWarning ? (
                   <div className="bg-bg-elevated border border-status-warning rounded-xl p-4 mb-4">
                     <div className="flex items-start gap-3 mb-3">
@@ -509,10 +642,10 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
             </button>
             <button 
               onClick={handleReject}
-              disabled={!feedback.trim()}
+              disabled={!feedback.trim() || reviewAction !== null}
               className="btn-primary"
             >
-              Send feedback
+              {reviewAction === 'reject' ? 'Reworking...' : 'Send feedback'}
             </button>
           </DialogFooter>
         </DialogContent>

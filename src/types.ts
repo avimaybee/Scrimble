@@ -1,4 +1,4 @@
-export type ProjectType = 'saas_mvp' | 'client_site' | 'internal_tool';
+export type ProjectType = 'saas_mvp' | 'client_site' | 'internal_tool' | 'other';
 export type StepStatus = 'locked' | 'active' | 'waiting' | 'complete' | 'skipped' | 'needs_review' | 'agent_working';
 export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 

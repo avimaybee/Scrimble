@@ -1,4 +1,4 @@
-import { diffSchema, PlanDiff } from '../workers/types/diff';
+import { diffSchema, PlanDiff } from '../functions/types/diff';
 
 // Mock AI Responses for Scenarios
 const SCENARIOS = [

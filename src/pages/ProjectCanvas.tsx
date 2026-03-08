@@ -14,14 +14,22 @@ import {
   Panel
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Project, Plan, Stage, Step, Edge as AppEdge, ChecklistItem } from '../types';
+import { Project, Plan, Stage, Step, Edge as AppEdge, ChecklistItem, StepStatus } from '../types';
 import StepCard from '../components/StepCard';
 import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Hexagon, Download, Sparkles } from 'lucide-react';
+import { Hexagon, Download, Sparkles, Pencil, Check, X, ArrowLeft, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
 import { updatePlan as aiUpdatePlan } from '../lib/ai';
 import { dbService } from '../lib/db';
+import { cn } from '../lib/utils';
+import ErrorBoundary from '../components/ErrorBoundary';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 import StageGroup from '../components/StageGroup';
 
@@ -58,6 +66,10 @@ export default function ProjectCanvas() {
   const [updateMessage, setUpdateMessage] = useState('');
   const [showUnlockToast, setShowUnlockToast] = useState(false);
   const [unlockedCount, setUnlockedCount] = useState(0);
+  
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [guideStep, setGuideStep] = useState<number | null>(null);
 
   const fetchProjectData = useCallback(async () => {
     if (!id) return;
@@ -69,7 +81,10 @@ export default function ProjectCanvas() {
       setStages(fetchedStages);
 
       const fetchedSteps = await dbService.getStepsByProjectId(id);
-      setAppSteps(fetchedSteps);
+      setAppSteps((fetchedSteps.map(s => ({
+        ...s,
+        status: s.status as StepStatus
+      }))) as Step[]);
 
       const fetchedEdges = await dbService.getEdgesByProjectId(id);
       setAppEdges(fetchedEdges);
@@ -83,6 +98,39 @@ export default function ProjectCanvas() {
   useEffect(() => {
     fetchProjectData();
   }, [fetchProjectData]);
+
+  useEffect(() => {
+    if (!loading && project) {
+      const hasSeenGuide = localStorage.getItem(`scrimble-guide-${project.id}`);
+      if (!hasSeenGuide && appSteps.length > 0) {
+        setGuideStep(1);
+      }
+    }
+  }, [loading, project, appSteps.length]);
+
+  const handleRename = async () => {
+    if (!project || !newName.trim() || newName === project.name) {
+      setIsEditingName(false);
+      return;
+    }
+
+    try {
+      await dbService.updateProject(project.id, { name: newName });
+      setProject({ ...project, name: newName });
+      toast.success('Project renamed');
+    } catch (error) {
+      toast.error('Failed to rename project');
+    } finally {
+      setIsEditingName(false);
+    }
+  };
+
+  const dismissGuide = () => {
+    if (project) {
+      localStorage.setItem(`scrimble-guide-${project.id}`, 'true');
+      setGuideStep(null);
+    }
+  };
 
   const handlePlanUpdate = async () => {
     if (!project || !updateMessage.trim()) return;
@@ -113,10 +161,11 @@ export default function ProjectCanvas() {
         setShowUpdateModal(false);
         setUpdateMessage('');
       }, 500);
-    } catch (err: any) {
+    } catch (err) {
       console.error(err);
+      const errorMessage = err instanceof Error ? err.message : "Failed to update your plan";
       setUpdateStatus('Something went wrong. Let me try again.');
-      toast.error(err.message || "Failed to update your plan");
+      toast.error(errorMessage);
     } finally {
       setIsUpdating(false);
     }
@@ -211,30 +260,42 @@ export default function ProjectCanvas() {
   }, []);
 
   const handleStepComplete = async (stepId: string) => {
-    // Update local state for immediate feedback
-    setAppSteps(prev => prev.map(s => s.id === stepId ? { ...s, status: 'complete' } : s));
+    // Capture state for rollback
+    const previousSteps = [...appSteps];
+    
+    // Optimistically update main step
+    setAppSteps(prev => prev.map(s => s.id === stepId ? { ...s, status: 'complete' as StepStatus } : s));
     
     // Find downstream steps to unlock
     const downstreamEdges = appEdges.filter(e => e.source_step_id === stepId);
     const downstreamStepIds = downstreamEdges.map(e => e.target_step_id);
     
     if (downstreamStepIds.length > 0) {
-      let count = 0;
-      const updatedSteps = appSteps.map(s => {
-        if (downstreamStepIds.includes(s.id) && s.status === 'locked') {
-          // Update in DB
-          dbService.updateStep(s.id, { status: 'active' }).catch(console.error);
-          count++;
-          return { ...s, status: 'active' };
-        }
-        return s;
-      });
-      
-      if (count > 0) {
-        setAppSteps(updatedSteps);
-        setUnlockedCount(count);
+      const lockableStepIds = appSteps
+        .filter(s => downstreamStepIds.includes(s.id) && s.status === 'locked')
+        .map(s => s.id);
+
+      if (lockableStepIds.length > 0) {
+        // Optimistically update downstream steps
+        setAppSteps(prev => prev.map(s => 
+          lockableStepIds.includes(s.id) ? { ...s, status: 'active' as StepStatus } : s
+        ));
+        
+        setUnlockedCount(lockableStepIds.length);
         setShowUnlockToast(true);
         setTimeout(() => setShowUnlockToast(false), 4000);
+
+        // Perform background updates
+        try {
+          await Promise.all(lockableStepIds.map(id => 
+            dbService.updateStep(id, { status: 'active' })
+          ));
+        } catch (error) {
+          console.error("Error unlocking steps:", error);
+          toast.error("Couldn't unlock downstream steps. Try reloading.");
+          // Rollback
+          setAppSteps(previousSteps);
+        }
       }
     }
   };
@@ -278,21 +339,100 @@ export default function ProjectCanvas() {
     URL.revokeObjectURL(url);
   };
 
+  const exportAsJSON = () => {
+    if (!project) return;
+    const data = {
+      project,
+      stages,
+      steps: appSteps,
+      edges: appEdges
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${project.name.replace(/\s+/g, '-').toLowerCase()}-workflow.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   if (loading) {
     return (
-      <div className="min-h-screen bg-bg-base flex items-center justify-center">
-        <Hexagon className="w-8 h-8 text-accent-primary animate-spin" />
+      <div className="min-h-screen bg-bg-base flex flex-col items-center justify-center">
+        <motion.div
+          animate={{ 
+            scale: [0.95, 1.05, 0.95],
+            opacity: [0.5, 1, 0.5] 
+          }}
+          transition={{ 
+            duration: 2, 
+            repeat: Infinity, 
+            ease: "easeInOut" 
+          }}
+          className="mb-8 flex h-24 w-24 items-center justify-center rounded-[32px] bg-accent-primary-muted/20 border border-accent-primary/20 shadow-[0_0_40px_rgba(235,94,40,0.1)]"
+        >
+          <Hexagon className="w-12 h-12 text-accent-primary" />
+        </motion.div>
+        <div className="flex flex-col items-center gap-2">
+          <h2 className="font-serif text-xl text-text-primary tracking-tight">Accessing your plan...</h2>
+          <div className="flex gap-1.5 h-1 items-center">
+            {[0, 1, 2].map((i) => (
+              <motion.div
+                key={i}
+                animate={{ opacity: [0.3, 1, 0.3] }}
+                transition={{ duration: 1, repeat: Infinity, delay: i * 0.2 }}
+                className="w-1 h-1 rounded-full bg-accent-primary"
+              />
+            ))}
+          </div>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="flex-1 flex flex-col bg-bg-base font-sans overflow-hidden">
-      <div className="flex-1 flex relative h-full">
+      <div className={cn(
+        "flex-1 flex relative h-full transition-all duration-500 ease-[0.16, 1, 0.3, 1]",
+        selectedStepId ? "pr-[440px]" : "pr-0"
+      )}>
         {/* Sidebar */}
         <div className="w-[280px] bg-bg-surface border-r border-border-subtle flex flex-col shrink-0 z-10 h-full">
           <div className="p-6 border-b border-border-subtle">
-            <h2 className="text-panel-title truncate mb-1">{project?.name}</h2>
+            <div className="flex items-start justify-between mb-1">
+              {isEditingName ? (
+                <div className="flex items-center gap-1 w-full">
+                  <input
+                    autoFocus
+                    value={newName}
+                    onChange={(e) => setNewName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleRename();
+                      if (e.key === 'Escape') setIsEditingName(false);
+                    }}
+                    className="flex-1 bg-bg-elevated border border-accent-primary/30 rounded px-2 py-1 text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent-primary"
+                  />
+                  <button onClick={handleRename} className="p-1 text-status-secure hover:bg-bg-elevated rounded">
+                    <Check className="w-4 h-4" />
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <h2 className="text-panel-title truncate pr-6 group relative">
+                    {project?.name}
+                    <button 
+                      onClick={() => {
+                        setNewName(project?.name || '');
+                        setIsEditingName(true);
+                      }}
+                      className="ml-2 p-1 text-text-tertiary hover:text-text-primary transition-colors inline-block"
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                  </h2>
+                </>
+              )}
+            </div>
             <div className="inline-block px-2 py-0.5 bg-bg-elevated border border-border-default rounded text-xs text-text-secondary font-mono capitalize">
               {project?.project_type.replace('_', ' ')}
             </div>
@@ -355,46 +495,188 @@ export default function ProjectCanvas() {
               <Sparkles className="w-4 h-4 text-accent-primary" />
               Update plan
             </button>
-            <button 
-              onClick={exportAsMarkdown}
-              className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-xl text-sm font-medium transition-colors"
-            >
-              <Download className="w-4 h-4" />
-              Export
-            </button>
+            <DropdownMenu>
+              <DropdownMenuTrigger className="w-full">
+                <button className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-xl text-sm font-medium transition-colors">
+                  <Download className="w-4 h-4" />
+                  Export
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-[248px]">
+                <DropdownMenuItem onClick={exportAsMarkdown} className="flex gap-2">
+                  <FileText className="w-4 h-4" />
+                  <span>Download Markdown (.md)</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={exportAsJSON} className="flex gap-2">
+                  <FileJson className="w-4 h-4" />
+                  <span>Download Workflow (.json)</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 
-        {/* Canvas */}
-        <div className="flex-1 relative bg-[radial-gradient(circle,rgba(204,197,185,0.05)_1px,transparent_1px)] bg-[size:28px_28px]">
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onNodeClick={handleNodeClick}
-            nodeTypes={nodeTypes}
-            fitView
-            className="bg-transparent"
-            minZoom={0.1}
-            maxZoom={1.5}
-            defaultEdgeOptions={{
-              style: { stroke: 'var(--color-border-strong)', strokeWidth: 1.5, opacity: 0.6 },
-              type: 'bezier',
-            }}
+        <div className="flex-1 relative">
+          <ErrorBoundary
+            fallback={
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-bg-base p-8 text-center">
+                <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-accent-primary-muted/20">
+                  <Hexagon className="h-10 w-10 text-accent-primary" />
+                </div>
+                <h3 className="text-2xl font-serif mb-3 text-text-primary">Something went wrong with your plan view.</h3>
+                <button 
+                  onClick={() => window.location.reload()}
+                  className="btn-primary flex items-center gap-2"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  Reload
+                </button>
+              </div>
+            }
           >
-            <Controls className="bg-bg-surface border-border-default fill-text-primary" showInteractive={false} />
-            <MiniMap 
-              nodeColor={(n) => {
-                if (n.data?.status === 'complete') return 'var(--color-status-secure)';
-                if (n.data?.status === 'active') return 'var(--color-accent-primary)';
-                return 'var(--color-border-strong)';
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              onNodeClick={handleNodeClick}
+              nodeTypes={nodeTypes}
+              fitView
+              className="bg-bg-base"
+              minZoom={0.1}
+              maxZoom={1.5}
+              defaultEdgeOptions={{
+                style: { stroke: 'var(--color-border-strong)', strokeWidth: 1.5, opacity: 0.6 },
+                type: 'bezier',
               }}
-              maskColor="var(--color-bg-base)"
-              className="bg-bg-surface border border-border-default rounded-lg overflow-hidden"
-            />
-          </ReactFlow>
+            >
+              <Background 
+                color="rgba(204,197,185,0.08)" 
+                gap={28} 
+                size={1} 
+                className="bg-bg-base"
+              />
+              <Controls 
+                className="bg-bg-surface border-border-default fill-text-primary rounded-lg shadow-panel overflow-hidden" 
+                showInteractive={false} 
+              />
+              <MiniMap 
+                nodeColor={(n) => {
+                  if (n.data?.status === 'complete') return 'var(--color-status-secure)';
+                  if (n.data?.status === 'active') return 'var(--color-accent-primary)';
+                  if (n.data?.status === 'needs_review') return 'var(--color-status-warning)';
+                  return 'var(--color-border-strong)';
+                }}
+                maskColor="rgba(15, 14, 14, 0.7)"
+                className="!bg-bg-surface/80 !backdrop-blur-md border border-border-default rounded-xl overflow-hidden shadow-lg !m-4"
+                aria-label="Minimap"
+              />
+            </ReactFlow>
+          </ErrorBoundary>
+          
+          {/* Empty State Overlay */}
+          {!loading && appSteps.length === 0 && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
+              <div className="max-w-md p-8 bg-bg-surface border border-dashed border-border-strong rounded-2xl shadow-panel text-center pointer-events-auto">
+                <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent-primary-muted/20">
+                  <Sparkles className="h-8 w-8 text-accent-primary" />
+                </div>
+                <h3 className="text-2xl font-serif mb-2">Ready to build?</h3>
+                <p className="text-text-secondary mb-6 leading-relaxed">
+                  Start by adding your first step or describe what you want to build using the Update button.
+                </p>
+                <button 
+                  onClick={() => setShowUpdateModal(true)}
+                  className="btn-primary"
+                >
+                  Describe your project
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* User Guide Tooltips */}
+          <AnimatePresence>
+            {guideStep === 1 && (
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.9, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.9, y: 10 }}
+                className="absolute left-64 top-[50%] z-[60] ml-8 w-64 p-5 bg-accent-primary text-white rounded-2xl shadow-2xl"
+              >
+                <div className="flex gap-1 mb-2">
+                  <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
+                    <div className="h-full bg-white w-1/3" />
+                  </div>
+                </div>
+                <h4 className="font-bold mb-1 flex items-center gap-2">
+                  <Info className="w-4 h-4" />
+                  1. The Build Plan
+                </h4>
+                <p className="text-sm text-white/90 leading-relaxed mb-4">
+                  This sidebar shows your project stages. You can update the entire plan anytime.
+                </p>
+                <div className="flex justify-between items-center">
+                  <button onClick={dismissGuide} className="text-xs font-medium hover:underline text-white/70">Skip</button>
+                  <button onClick={() => setGuideStep(2)} className="px-3 py-1.5 bg-white text-accent-primary rounded-lg text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
+                </div>
+                <div className="absolute left-[-8px] top-[50%] translate-y-[-50%] w-0 h-0 border-y-8 border-y-transparent border-r-8 border-r-accent-primary" />
+              </motion.div>
+            )}
+
+            {guideStep === 2 && (
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.9, x: 10 }}
+                animate={{ opacity: 1, scale: 1, x: 0 }}
+                exit={{ opacity: 0, scale: 0.9, x: 10 }}
+                className="absolute left-[50%] top-[40%] translate-x-[-50%] z-[60] w-64 p-5 bg-accent-primary text-white rounded-2xl shadow-2xl"
+              >
+                <div className="flex gap-1 mb-2">
+                  <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
+                    <div className="h-full bg-white w-2/3" />
+                  </div>
+                </div>
+                <h4 className="font-bold mb-1 flex items-center gap-2">
+                  <Sparkles className="w-4 h-4" />
+                  2. Visual Workflow
+                </h4>
+                <p className="text-sm text-white/90 leading-relaxed mb-4">
+                  Everything is mapped visually here. Click any card to see detailed instructions.
+                </p>
+                <div className="flex justify-between items-center">
+                  <button onClick={dismissGuide} className="text-xs font-medium hover:underline text-white/70">Skip</button>
+                  <button onClick={() => setGuideStep(3)} className="px-3 py-1.5 bg-white text-accent-primary rounded-lg text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
+                </div>
+              </motion.div>
+            )}
+
+            {guideStep === 3 && (
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.9, y: -10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.9, y: -10 }}
+                className="absolute right-8 bottom-32 z-[60] w-64 p-5 bg-accent-primary text-white rounded-2xl shadow-2xl"
+              >
+                <div className="flex gap-1 mb-2">
+                  <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
+                    <div className="h-full bg-white w-full" />
+                  </div>
+                </div>
+                <h4 className="font-bold mb-1 flex items-center gap-2">
+                  <Check className="w-4 h-4" />
+                  3. Finish & Export
+                </h4>
+                <p className="text-sm text-white/90 leading-relaxed mb-4">
+                  Once your plan is ready, export it as Markdown or JSON to start building!
+                </p>
+                <div className="flex justify-end items-center">
+                  <button onClick={dismissGuide} className="px-4 py-1.5 bg-white text-accent-primary rounded-lg text-xs font-bold hover:bg-white/90 transition-colors">Got it!</button>
+                </div>
+                <div className="absolute right-24 bottom-[-8px] w-0 h-0 border-x-8 border-x-transparent border-t-8 border-t-accent-primary" />
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
 
         {/* Detail Panel Overlay */}
