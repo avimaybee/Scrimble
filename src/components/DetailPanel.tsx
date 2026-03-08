@@ -1,0 +1,522 @@
+import { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { X, CheckCircle2, AlertTriangle, ExternalLink, RefreshCw, Copy } from 'lucide-react';
+import { Step, ChecklistItem, Project } from '../types';
+import { cn } from '../lib/utils';
+import { getStepDetails } from '../lib/ai';
+import { dbService } from '../lib/db';
+import { useStepExecution } from '../hooks/useStepExecution';
+import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { toast } from 'sonner';
+
+interface DetailPanelProps {
+  stepId: string | null;
+  project: Project | null;
+  onClose: () => void;
+  onStepComplete: (stepId: string) => void;
+}
+
+export default function DetailPanel({ stepId, project, onClose, onStepComplete }: DetailPanelProps) {
+  const [step, setStep] = useState<Step | null>(null);
+  const [checklist, setChecklist] = useState<ChecklistItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [showSkipWarning, setShowSkipWarning] = useState(false);
+
+  // Step Execution Hook
+  const { executeStep, isExecuting, streamingOutput, error: executionError } = useStepExecution({
+    onSuccess: () => {
+      if (stepId) fetchStepData(stepId);
+    }
+  });
+
+  // Review states
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedOutput, setEditedOutput] = useState('');
+  const [isRejectDialogOpen, setIsRejectDialogOpen] = useState(false);
+  const [feedback, setFeedback] = useState('');
+
+  useEffect(() => {
+    if (!stepId) return;
+    fetchStepData(stepId);
+  }, [stepId, project]);
+
+  async function fetchStepData(id: string) {
+    setLoading(true);
+    try {
+      const stepData = await dbService.getStep(id);
+      if (stepData) {
+        setStep(stepData);
+        setEditedOutput(stepData.ai_output || '');
+        
+        if (stepData.is_ai_enriched === false && project && !isExecuting) {
+          enrichStep(stepData, project);
+        }
+      }
+      
+      const items = await dbService.getChecklistItemsByStepId(id);
+      setChecklist(items);
+    } catch (error) {
+      console.error("Error fetching step details:", error);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const enrichStep = async (stepData: Step, projectData: Project) => {
+    const providerId = localStorage.getItem('scrimble_default_provider_id');
+    if (!providerId) {
+      toast.error("Please configure an AI provider in Settings first.");
+      return;
+    }
+    executeStep(stepData.id, projectData.id, providerId);
+  };
+
+  const handleRegenerate = () => {
+    if (step && project) {
+      enrichStep(step, project);
+    }
+  };
+
+  const handleCheckToggle = async (itemId: string, currentStatus: boolean) => {
+    const newStatus = !currentStatus;
+    setChecklist(prev => prev.map(item => item.id === itemId ? { ...item, is_completed: newStatus } : item));
+    
+    try {
+      await dbService.toggleChecklistItem(itemId, newStatus);
+    } catch (error) {
+      console.error("Error updating checklist item:", error);
+      // Revert on error
+      setChecklist(prev => prev.map(item => item.id === itemId ? { ...item, is_completed: currentStatus } : item));
+    }
+  };
+
+  const handleComplete = async () => {
+    if (!step) return;
+    
+    try {
+      await dbService.updateStep(step.id, {
+        status: 'complete'
+      });
+      onStepComplete(step.id);
+      onClose();
+    } catch (error) {
+      console.error("Error completing step:", error);
+    }
+  };
+
+  const handleSkip = async () => {
+    if (!step) return;
+    
+    try {
+      await dbService.updateStep(step.id, {
+        status: 'skipped'
+      });
+      onStepComplete(step.id);
+      onClose();
+    } catch (error) {
+      console.error("Error skipping step:", error);
+    }
+  };
+
+  const allRequiredChecked = checklist.filter(i => i.is_required).every(i => i.is_completed);
+  const suggestedTools = step?.suggested_tools ? JSON.parse(step.suggested_tools) : [];
+
+  return (
+    <AnimatePresence>
+      {stepId && (
+        <motion.div
+          initial={{ x: '100%', opacity: 0 }}
+          animate={{ x: 0, opacity: 1 }}
+          exit={{ x: '100%', opacity: 0 }}
+          transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+          className="fixed top-[76px] right-4 bottom-4 w-[420px] bg-bg-surface/95 backdrop-blur-xl border border-border-default shadow-panel z-40 flex flex-col font-sans rounded-2xl overflow-hidden"
+        >
+          {loading ? (
+            <div className="p-8 flex items-center justify-center h-full">
+              <RefreshCw className="w-6 h-6 text-accent-primary animate-spin" />
+            </div>
+          ) : step ? (
+            <>
+              {/* Header */}
+              <div className="relative p-6 border-b border-border-subtle shrink-0">
+                <div className="absolute top-0 left-0 right-0 h-1 bg-accent-primary" />
+                <button 
+                  onClick={onClose}
+                  className="absolute top-4 right-4 p-2 text-text-tertiary hover:text-text-primary transition-colors rounded-[8px] hover:bg-bg-elevated"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+                
+                <div className="text-label mb-2">
+                  {step.category} &gt; {step.type}
+                </div>
+                <h2 className="text-panel-title mb-3 pr-8">
+                  {step.title}
+                </h2>
+                
+                <div className="flex items-center gap-3">
+                  <span className={cn(
+                    "px-2.5 py-1 rounded-[6px] text-xs font-medium uppercase tracking-wide",
+                    step.status === 'locked' && "bg-status-locked text-text-secondary",
+                    step.status === 'active' && "bg-accent-primary-muted text-accent-primary",
+                    step.status === 'complete' && "bg-status-secure/20 text-status-secure",
+                    step.status === 'skipped' && "bg-status-skip text-text-secondary",
+                    step.status === 'waiting' && "bg-status-waiting text-status-warning",
+                    step.status === 'needs_review' && "bg-status-warning/20 text-status-warning animate-pulse",
+                  )}>
+                    {step.status === 'needs_review' ? 'Needs Review' : step.status}
+                  </span>
+                  
+                  <span className={cn(
+                    "px-2.5 py-1 rounded-[6px] text-xs font-medium flex items-center gap-1",
+                    step.risk_level === 'low' && "bg-bg-elevated text-text-secondary",
+                    step.risk_level === 'medium' && "bg-status-warning/20 text-status-warning",
+                    step.risk_level === 'high' && "bg-status-secure/20 text-status-secure",
+                    step.risk_level === 'critical' && "bg-status-secure text-white",
+                  )}>
+                    <AlertTriangle className="w-3 h-3" />
+                    How important: {step.risk_level}
+                  </span>
+                </div>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-8">
+                {step.is_gate && step.status === 'needs_review' && (
+                  <section className="review-prompt-container">
+                    <h3 className="review-prompt-heading">Before I continue — does this look right?</h3>
+                    <p className="text-sm text-text-secondary">
+                      I've architected this step. Review my details below, edit if needed, and approve to move forward.
+                    </p>
+                  </section>
+                )}
+
+                {/* Objective */}
+                <section>
+                  <h3 className="text-sm font-medium text-text-primary mb-2">Objective</h3>
+                  <p className="text-sm text-text-secondary leading-relaxed">
+                    {step.objective || "No objective defined."}
+                  </p>
+                </section>
+
+                {/* Why It Matters */}
+                <section>
+                  <h3 className="text-sm font-medium text-text-primary mb-2">Why It Matters</h3>
+                  <div className="bg-bg-elevated border border-border-default rounded-lg p-4">
+                    <p className="text-sm text-text-secondary leading-relaxed">
+                      {step.why_it_matters || "No context provided."}
+                    </p>
+                  </div>
+                </section>
+
+                {/* AI OUTPUT SECTION */}
+                <section>
+                  <h3 className="text-sm font-medium text-text-primary mb-2">Details from AI</h3>
+                  
+                  {executionError && (
+                    <div className="mb-4 p-3 bg-status-error/10 border border-status-error/20 rounded-lg text-xs text-status-error flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4" />
+                      <span>{executionError}</span>
+                      <button 
+                        onClick={handleRegenerate}
+                        className="ml-auto underline font-medium"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+
+                  {(step?.is_ai_enriched || isExecuting) ? (
+                    <div className="bg-bg-elevated border border-border-default rounded-lg p-4 relative group">
+                      {isEditing ? (
+                        <textarea
+                          value={editedOutput}
+                          onChange={(e) => setEditedOutput(e.target.value)}
+                          className="w-full min-h-[160px] bg-transparent text-sm text-text-primary outline-none resize-y font-sans leading-relaxed"
+                          autoFocus
+                        />
+                      ) : (
+                        <div className="text-sm text-text-secondary leading-relaxed whitespace-pre-wrap font-sans">
+                          {isExecuting ? (
+                            <>
+                              {streamingOutput}
+                              <span className="inline-block w-1.5 h-4 bg-accent-primary ml-1 animate-pulse" />
+                            </>
+                          ) : (
+                            editedOutput || step?.ai_output || "No details generated."
+                          )}
+                        </div>
+                      )}
+                      
+                      {!isExecuting && !isEditing && step?.is_ai_enriched && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button 
+                              className="absolute top-2 right-2 p-1.5 text-text-tertiary hover:text-text-primary bg-bg-surface border border-border-default rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 text-xs"
+                              onClick={handleRegenerate}
+                            >
+                              <RefreshCw className="w-3 h-3" />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Get fresh details</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="bg-bg-elevated border border-border-default rounded-lg p-4">
+                      <div className="skeleton-line w-full" />
+                      <div className="skeleton-line w-4/5" />
+                      <div className="skeleton-line w-3/5" />
+                      <span className="generating-label text-xs text-text-tertiary">Waiting for agent...</span>
+                    </div>
+                  )}
+                </section>
+
+                {/* PROMPTS SECTION */}
+                <section>
+                  <h3 className="text-sm font-medium text-text-primary mb-2">Helper Prompts</h3>
+                  
+                  {step.is_ai_enriched && !enrichmentLoading ? (
+                    <div className="space-y-3">
+                      {step.prompts ? JSON.parse(step.prompts).map((prompt: any, i: number) => (
+                        <div key={i} className="prompt-item">
+                          <div className="prompt-header">
+                            <span className="prompt-label">{prompt.label}</span>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <button 
+                                  className="btn-copy"
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(prompt.content);
+                                    toast.success('Copied to clipboard');
+                                  }}
+                                >
+                                  <Copy className="w-3 h-3" />
+                                </button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p>Copy Prompt</p>
+                              </TooltipContent>
+                            </Tooltip>
+                          </div>
+                          <div className="prompt-content">{prompt.content}</div>
+                        </div>
+                      )) : (
+                        <div className="text-sm text-text-tertiary">No prompts available.</div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="skeleton-block h-16 w-full" />
+                      <div className="skeleton-block h-16 w-full" />
+                    </div>
+                  )}
+                </section>
+
+                {/* Suggested Tools */}
+                {suggestedTools.length > 0 && (
+                  <section>
+                    <h3 className="text-sm font-medium text-text-primary mb-3">Tools to use</h3>
+                    <div className="flex flex-wrap gap-2">
+                      {suggestedTools.map((tool: any, idx: number) => (
+                        <a 
+                          key={idx}
+                          href={tool.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-2 bg-bg-elevated hover:bg-border-default border border-border-default px-3 py-1.5 rounded-[8px] text-sm text-text-primary transition-colors group"
+                        >
+                          {tool.name}
+                          <ExternalLink className="w-3 h-3 text-text-tertiary group-hover:text-text-primary" />
+                        </a>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                {/* Checklist */}
+                <section>
+                  <h3 className="text-sm font-medium text-text-primary mb-4 flex items-center justify-between">
+                    Checklist
+                    <span className="text-xs font-mono text-text-tertiary">
+                      {checklist.filter(i => i.is_completed).length}/{checklist.length}
+                    </span>
+                  </h3>
+                  <div className="space-y-3">
+                    {checklist.map(item => (
+                      <label 
+                        key={item.id} 
+                        className={cn(
+                          "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-all duration-200",
+                          item.is_completed 
+                            ? "bg-accent-primary-muted/30 border-accent-primary/30" 
+                            : "bg-bg-elevated border-border-default hover:border-border-strong"
+                        )}
+                      >
+                        <div className="mt-0.5 relative flex items-center justify-center w-5 h-5 shrink-0">
+                          <input 
+                            type="checkbox"
+                            checked={item.is_completed}
+                            onChange={() => handleCheckToggle(item.id, item.is_completed)}
+                            className="peer appearance-none w-5 h-5 border-2 border-border-strong rounded focus:ring-2 focus:ring-accent-primary-muted focus:outline-none checked:bg-accent-primary checked:border-accent-primary transition-colors cursor-pointer"
+                          />
+                          <CheckCircle2 className="absolute w-3.5 h-3.5 text-white opacity-0 peer-checked:opacity-100 pointer-events-none transition-opacity" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <span className={cn(
+                            "text-sm block leading-snug",
+                            item.is_completed ? "text-text-secondary line-through" : "text-text-primary"
+                          )}>
+                            {item.label}
+                            {item.is_required && <span className="text-status-secure ml-1">*</span>}
+                          </span>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                </section>
+
+                {/* Done When */}
+                <section>
+                  <div className="bg-status-secure/10 border border-status-secure/30 rounded-lg p-4">
+                    <h3 className="text-xs font-semibold text-status-secure uppercase tracking-wider mb-2">Done when...</h3>
+                    <p className="text-sm text-text-primary leading-relaxed">
+                      {step.done_when || "Complete all items above."}
+                    </p>
+                  </div>
+                </section>
+              </div>
+
+              {/* Footer */}
+              <div className="p-6 border-t border-border-subtle bg-bg-surface shrink-0">
+                {step.is_gate && step.status === 'needs_review' ? (
+                  <div className="flex flex-col gap-3">
+                    <div className="flex gap-3">
+                      <button 
+                        onClick={() => setIsEditing(!isEditing)}
+                        className={cn(
+                          "flex-1 py-2.5 rounded-lg text-sm font-medium border transition-all",
+                          isEditing 
+                            ? "bg-accent-primary text-white border-accent-primary" 
+                            : "bg-bg-elevated text-text-primary border-border-default hover:border-border-strong"
+                        )}
+                      >
+                        {isEditing ? 'Save edits' : 'Edit'}
+                      </button>
+                      <button 
+                        onClick={() => setIsRejectDialogOpen(true)}
+                        className="flex-1 py-2.5 rounded-lg text-sm font-medium border border-status-warning/30 bg-status-warning/10 text-status-warning hover:bg-status-warning/20 transition-all"
+                      >
+                        Reject, try again
+                      </button>
+                    </div>
+                    <button 
+                      onClick={handleApprove}
+                      className="w-full btn-primary py-3 flex items-center justify-center gap-2"
+                    >
+                      Looks good →
+                    </button>
+                  </div>
+                ) : showSkipWarning ? (
+                  <div className="bg-bg-elevated border border-status-warning rounded-xl p-4 mb-4">
+                    <div className="flex items-start gap-3 mb-3">
+                      <AlertTriangle className="w-5 h-5 text-status-warning shrink-0" />
+                      <div>
+                        <h4 className="text-sm font-semibold text-text-primary">Skipping is risky</h4>
+                        <p className="text-xs text-text-secondary mt-1">
+                          This step helps keep things stable. Skipping it might cause issues later.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex gap-3">
+                      <button 
+                        onClick={() => setShowSkipWarning(false)}
+                        className="flex-1 bg-bg-surface border border-border-default hover:bg-border-default text-sm font-medium py-2 rounded-lg transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <button 
+                        onClick={handleSkip}
+                        className="flex-1 bg-status-warning/20 text-status-warning hover:bg-status-warning/30 text-sm font-medium py-2 rounded-lg transition-colors"
+                      >
+                        Skip anyway
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-4">
+                    <button 
+                      onClick={() => setShowSkipWarning(true)}
+                      className="text-sm font-medium text-text-tertiary hover:text-text-primary transition-colors px-2"
+                    >
+                      Skip
+                    </button>
+                    <button 
+                      onClick={handleComplete}
+                      disabled={!allRequiredChecked}
+                      className="flex-1 btn-primary py-3"
+                    >
+                      Mark as Done
+                    </button>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="p-8 flex items-center justify-center h-full text-text-secondary">
+              Step not found
+            </div>
+          )}
+        </motion.div>
+      )}
+
+      {/* Rejection Feedback Dialog */}
+      <Dialog open={isRejectDialogOpen} onOpenChange={setIsRejectDialogOpen}>
+        <DialogContent className="sm:max-w-[480px] bg-bg-surface border-border-default shadow-modal">
+          <DialogHeader>
+            <DialogTitle className="text-heading text-2xl">What should I change?</DialogTitle>
+            <DialogDescription className="text-body mt-2">
+              Tell me what's wrong or what's missing. I'll re-architect this step based on your feedback.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="py-4">
+            <textarea 
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
+              placeholder="e.g. This schema is too complex, just use a simple JSON column for now.&#10;Add a security check for the upload endpoint."
+              className="w-full h-32 bg-bg-elevated border border-border-default focus:border-accent-border focus:ring-1 focus:ring-accent-border rounded-xl p-4 text-text-primary placeholder:text-text-tertiary transition-all duration-200 outline-none resize-none font-sans text-[15px]"
+              autoFocus
+            />
+          </div>
+          
+          <DialogFooter className="gap-2 sm:gap-0">
+            <button 
+              onClick={() => setIsRejectDialogOpen(false)}
+              className="btn-ghost"
+            >
+              Cancel
+            </button>
+            <button 
+              onClick={handleReject}
+              disabled={!feedback.trim()}
+              className="btn-primary"
+            >
+              Send feedback
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </AnimatePresence>
+  );
+}
