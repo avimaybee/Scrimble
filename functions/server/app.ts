@@ -12,6 +12,7 @@ import { createGenerationSseStream, persistGenerationStreamEvent } from './gener
 import {
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
+  processProjectGeneration,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 
@@ -20,9 +21,6 @@ type Bindings = {
   FIREBASE_PROJECT_ID: string;
   ENCRYPTION_KEY: string;
   GITHUB_TOKEN?: string;
-  AGENT_QUEUE?: {
-    send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
-  };
 };
 
 type Variables = {
@@ -798,27 +796,22 @@ app.post('/projects', async (c) => {
     )
     .run();
 
-  try {
-    await c.env.AGENT_QUEUE.send(
-      {
-        type: 'generate_project',
-        projectId: id,
-        userId: c.get('uid'),
-        providerId: parsed.data.providerId,
-      },
-      { contentType: 'json' },
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
-    await c.env.DB.prepare(`
-      UPDATE projects
-      SET generation_status = 'failed', generation_error = ?, updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(message, id)
-      .run();
-    return c.json({ error: message }, 500);
-  }
+  c.executionCtx.waitUntil(
+    processProjectGeneration(c.env, {
+      projectId: id,
+      userId: c.get('uid'),
+      providerId: parsed.data.providerId,
+    }).catch(async (error) => {
+      const message = error instanceof Error ? error.message : 'Failed project generation background task.';
+      await c.env.DB.prepare(`
+        UPDATE projects
+        SET generation_status = 'failed', generation_error = ?, updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(message, id)
+        .run();
+    })
+  );
 
   return c.json({ success: true, id, generation_status: 'queued' }, 202);
 });
@@ -917,27 +910,22 @@ app.post('/projects/:id/architecture-review', async (c) => {
     return c.json({ error: message }, 409);
   }
 
-  try {
-    await c.env.AGENT_QUEUE.send(
-      {
-        type: 'generate_project',
-        projectId,
-        userId: c.get('uid'),
-        providerId,
-      },
-      { contentType: 'json' },
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to resume project generation.';
-    await c.env.DB.prepare(`
-      UPDATE projects
-      SET generation_status = 'awaiting_review', generation_error = ?, updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(message, projectId)
-      .run();
-    return c.json({ error: message }, 500);
-  }
+  c.executionCtx.waitUntil(
+    processProjectGeneration(c.env, {
+      projectId,
+      userId: c.get('uid'),
+      providerId,
+    }).catch(async (error) => {
+      const message = error instanceof Error ? error.message : 'Failed project generation background task.';
+      await c.env.DB.prepare(`
+        UPDATE projects
+        SET generation_status = 'failed', generation_error = ?, updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(message, projectId)
+        .run();
+    })
+  );
 
   await persistGenerationStreamEvent(c.env, {
     projectId,
