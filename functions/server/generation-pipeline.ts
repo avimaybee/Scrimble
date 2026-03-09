@@ -273,6 +273,89 @@ function toBoolean(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
 }
 
+function normalizeToNpmPackage(techName: string): string {
+  const name = techName.toLowerCase().trim();
+
+  // If it already looks like a scoped package or simple package and has no spaces, return it
+  // This allows the AI to suggest standard packages not in our map
+  if (/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/.test(name) && !name.includes(' ')) {
+    return name;
+  }
+
+  const map: Record<string, string> = {
+    // Firebase variants
+    'firebase': 'firebase',
+    'firebase auth': 'firebase',
+    'firebase authentication': 'firebase',
+    'firebase firestore': 'firebase',
+    'firebase storage': 'firebase',
+    'firebase hosting': 'firebase',
+    'firebase-js-sdk': 'firebase',
+
+    // Cloudflare variants
+    'cloudflare workers': 'wrangler',
+    'cloudflare pages': 'wrangler',
+    'cloudflare d1': 'wrangler',
+    'cloudflare kv': 'wrangler',
+    'cloudflare queues': 'wrangler',
+    'cloudflare r2': 'wrangler',
+
+    // React ecosystem
+    'next.js': 'next',
+    'nextjs': 'next',
+    'react flow': '@xyflow/react',
+    'reactflow': '@xyflow/react',
+    'tailwind': 'tailwindcss',
+    'tailwind css': 'tailwindcss',
+    'framer motion': 'framer-motion',
+
+    // Auth
+    'clerk': '@clerk/nextjs',
+    'next auth': 'next-auth',
+    'nextauth': 'next-auth',
+    'auth.js': 'next-auth',
+    'supabase auth': '@supabase/supabase-js',
+    'lucia': 'lucia',
+    'better auth': 'better-auth',
+
+    // Database
+    'supabase': '@supabase/supabase-js',
+    'prisma': '@prisma/client',
+    'drizzle': 'drizzle-orm',
+    'drizzle orm': 'drizzle-orm',
+    'planetscale': '@planetscale/database',
+    'neon': '@neondatabase/serverless',
+    'turso': '@libsql/client',
+
+    // Payments
+    'stripe': 'stripe',
+    'lemon squeezy': '@lemonsqueezy/lemonsqueezy.js',
+    'lemonsqueezy': '@lemonsqueezy/lemonsqueezy.js',
+
+    // State/UI
+    'zustand': 'zustand',
+    'tanstack query': '@tanstack/react-query',
+    'react query': '@tanstack/react-query',
+    'shadcn': 'shadcn-ui',
+    'shadcn/ui': 'shadcn-ui',
+    'radix ui': '@radix-ui/react-primitive',
+  };
+
+  // Direct match
+  if (map[name]) return map[name];
+
+  // Partial match — find first key that contains the tech name or vice versa
+  for (const [key, pkg] of Object.entries(map)) {
+    if (name.includes(key) || key.includes(name)) return pkg;
+  }
+
+  // Fallback — clean the name and try to make it npm compatible
+  // 1. Remove anything in parentheses (e.g. "React (Library)")
+  // 2. Replace spaces with hyphens
+  // 3. Remove non-alphabetical/non-versioning characters
+  return name.replace(/\(.*\)/g, '').trim().replace(/\s+/g, '-').replace(/[^a-z0-9@/-]/g, '');
+}
+
 function emptyGithubRepoAnalysis(owner = '', repo = ''): GithubRepoAnalysis {
   return {
     owner,
@@ -530,7 +613,9 @@ function fallbackStackCardsFromRecommendedStack(adr: Batch3Architect): Architect
   return Object.entries(adr.recommended_stack).map(([category, selection]) => {
     const versionMatch = selection.match(/\bv?\d+(?:\.\d+)+(?:[-\w.]*)?/i);
     const version = versionMatch?.[0] || 'See ADR';
-    const packageName = selection.replace(versionMatch?.[0] || '', '').replace(/[()]/g, '').trim() || selection;
+    const packageName = normalizeToNpmPackage(
+      selection.replace(versionMatch?.[0] || '', '').replace(/[()]/g, '').trim() || selection,
+    );
 
     return {
       technology: category.replace(/^\w/, (character) => character.toUpperCase()),
@@ -558,7 +643,7 @@ function buildArchitectureReviewPayload(
     const gotcha = findMatchingGotcha(adr, integration);
     cards.push({
       technology: integration.service,
-      package_name: integration.package_name,
+      package_name: normalizeToNpmPackage(integration.package_name || integration.service),
       version: integration.version,
       reason: integration.purpose,
       gotcha_issue: gotcha?.issue,
@@ -2557,6 +2642,15 @@ async function finalizeProjectGeneration(env: Bindings, projectId: string) {
   });
 }
 
+async function getCompletedBatches(projectId: string, env: Bindings): Promise<string[]> {
+  const rows = await env.DB.prepare(
+    `SELECT run_type FROM agent_runs 
+     WHERE project_id = ? AND status = 'complete' 
+     ORDER BY created_at ASC`,
+  ).bind(projectId).all();
+  return rows.results.map((r: any) => r.run_type as string);
+}
+
 export async function processProjectGeneration(env: Bindings, message: QueueMessageBody) {
   const project = await getProjectById(env, message.projectId);
   if (!project) {
@@ -2568,6 +2662,8 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
     return;
   }
 
+  const completed = await getCompletedBatches(message.projectId, env);
+
   const provider = await resolveProviderConfiguration(env, message.userId, message.providerId);
   const builderProfile = await loadBuilderProfileContext(message.userId, env);
   const projectBrief = await loadProjectBriefContext(env, message.projectId, message.userId, {
@@ -2577,7 +2673,7 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
   });
 
   try {
-    if (currentStatus === 'queued') {
+    if (currentStatus === 'queued' && !completed.includes('batch_1_research_stack')) {
       await updateProjectGenerationStatus(env, project.id, 'queued', {
         generationError: null,
         markStarted: true,
@@ -2590,29 +2686,72 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
       });
     }
 
-    switch (currentStatus) {
+    // Map which statuses fall through based on what is already completed
+    let statusToRun = currentStatus;
+
+    // If we're resumed, currentStatus might be something like 'batch_2_fetch_and_read'
+    // but the DB says batch_2 is 'complete'. We should skip forward.
+    const pipelineOrder: ProjectGenerationStatus[] = [
+      'queued',
+      'batch_1_research_stack',
+      'batch_2_fetch_and_read',
+      'batch_3_architect',
+      'approved',
+      'batch_4_plan_build',
+      'batch_5_enrich_steps',
+      'batch_6_generate_files',
+    ];
+
+    const currentIndex = pipelineOrder.indexOf(currentStatus as any);
+    if (currentIndex !== -1) {
+      for (let i = currentIndex; i < pipelineOrder.length; i++) {
+        const batchName = pipelineOrder[i];
+        if (completed.includes(batchName)) {
+          // Find next status
+          if (i + 1 < pipelineOrder.length) {
+            statusToRun = pipelineOrder[i + 1] as any;
+          }
+        } else {
+          break;
+        }
+      }
+    }
+
+    switch (statusToRun) {
       case 'intake':
         return;
       case 'queued':
-        await executeBatch1(env, project, provider, builderProfile, projectBrief);
+        if (!completed.includes('batch_1_research_stack')) {
+          await executeBatch1(env, project, provider, builderProfile, projectBrief);
+        }
       // fall through
       case 'batch_1_research_stack':
-        await executeBatch2(env, project, provider, builderProfile, projectBrief);
+        if (!completed.includes('batch_2_fetch_and_read')) {
+          await executeBatch2(env, project, provider, builderProfile, projectBrief);
+        }
       // fall through
       case 'batch_2_fetch_and_read':
-        await executeBatch3(env, project.id, provider, project, builderProfile, projectBrief);
+        if (!completed.includes('batch_3_architect')) {
+          await executeBatch3(env, project.id, provider, project, builderProfile, projectBrief);
+        }
       // fall through
       case 'batch_3_architect':
         await pauseForArchitectureReview(env, project.id);
         return;
       case 'approved':
-        await executeBatch4(env, project.id, provider, builderProfile, projectBrief);
+        if (!completed.includes('batch_4_plan_build')) {
+          await executeBatch4(env, project.id, provider, builderProfile, projectBrief);
+        }
       // fall through
       case 'batch_4_plan_build':
-        await executeBatch5(env, project.id, provider, builderProfile, projectBrief);
+        if (!completed.includes('batch_5_enrich_steps')) {
+          await executeBatch5(env, project.id, provider, builderProfile, projectBrief);
+        }
       // fall through
       case 'batch_5_enrich_steps':
-        await executeBatch6(env, project.id, provider, builderProfile, projectBrief);
+        if (!completed.includes('batch_6_generate_files')) {
+          await executeBatch6(env, project.id, provider, builderProfile, projectBrief);
+        }
       // fall through
       case 'batch_6_generate_files':
         await finalizeProjectGeneration(env, project.id);

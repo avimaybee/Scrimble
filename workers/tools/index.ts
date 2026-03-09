@@ -1,6 +1,6 @@
 import { fetchAndParse, type GitHubResearchResult } from '../../functions/utils/fetch-url';
 import { persistGenerationStreamEvent } from '../../functions/server/generation-events';
-import { getActiveMCPServer } from '../../functions/server/mcp-servers';
+import { decrypt } from '../../functions/utils/crypto';
 import type { Bindings, GenerationBatchName } from '../../functions/server/types';
 
 const TOOL_TIMEOUT_MS = 10_000;
@@ -136,6 +136,31 @@ function buildGitHubHeaders(token?: string | null): HeadersInit {
   return headers;
 }
 
+async function getUserMCPConfig(
+  userId: string,
+  serverType: 'brave-search' | 'github' | 'context7',
+  env: Bindings,
+): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT config_enc FROM mcp_servers
+     WHERE user_id = ? AND server_type = ? AND is_active = 1
+     LIMIT 1`,
+  )
+    .bind(userId, serverType)
+    .first();
+
+  if (!row) {
+    return null;
+  }
+
+  const config = JSON.parse(await decrypt(row.config_enc as string, env.ENCRYPTION_KEY)) as {
+    apiKey?: string;
+    token?: string;
+  };
+
+  return config.apiKey || config.token || null;
+}
+
 async function emitToolEvent(env: Env | undefined, icon: string, message: string) {
   const context = env?.TOOL_CONTEXT;
   if (!context) {
@@ -256,8 +281,9 @@ export async function searchWeb(
   await emitToolEvent(env, '🔍', `Searching for ${query}...`);
 
   try {
-    const braveServer = await getActiveMCPServer(env, userId, 'brave-search');
-    if (!braveServer) {
+    const token = await getUserMCPConfig(userId, 'brave-search', env);
+    if (!token) {
+      await emitToolEvent(env, '🔍', 'Brave Search not connected — continuing without web results.');
       return [];
     }
 
@@ -268,7 +294,7 @@ export async function searchWeb(
     const payload = await fetchJson(endpoint.toString(), {
       headers: {
         Accept: 'application/json',
-        'X-Subscription-Token': braveServer.config.apiKey,
+        'X-Subscription-Token': token,
       },
     }) as {
       web?: {
@@ -342,9 +368,13 @@ export async function analyzeGithubRepo(
   await emitToolEvent(env, '📦', `Checking ${owner}/${repo} on GitHub...`);
 
   try {
-    const githubServer = await getActiveMCPServer(env, userId, 'github');
+    const token = await getUserMCPConfig(userId, 'github', env);
+    if (!token) {
+      await emitToolEvent(env, '📦', 'GitHub not connected — using public API (rate limited).');
+    }
+
     const result = await fetchAndParse(`https://github.com/${owner}/${repo}`, {
-      githubToken: githubServer?.config.token || null,
+      githubToken: token,
     });
 
     if (result.kind !== 'github_repo') {
@@ -393,14 +423,14 @@ export async function getLibraryDocs(
   await emitToolEvent(env, '🔍', `Looking up live docs for ${library}...`);
 
   try {
-    const context7Server = await getActiveMCPServer(env, userId, 'context7');
-    if (context7Server) {
+    const token = await getUserMCPConfig(userId, 'context7', env);
+    if (token) {
       const payload = await fetchJson('https://api.context7.com/v1/search', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${context7Server.config.apiKey}`,
-          'X-API-Key': context7Server.config.apiKey,
+          Authorization: `Bearer ${token}`,
+          'X-API-Key': token,
         },
         body: JSON.stringify({
           library,
@@ -415,6 +445,8 @@ export async function getLibraryDocs(
       }
 
       await emitWarning(env, `Context7 had no fresh docs for ${library} — falling back to the docs homepage.`);
+    } else {
+      await emitToolEvent(env, '🔍', 'Context7 not connected — using the docs homepage fallback.');
     }
   } catch (error) {
     await emitWarning(env, `Context7 lookup failed for ${library} — falling back to the docs homepage.`);
@@ -442,7 +474,11 @@ export async function getLibraryIssues(
   await emitToolEvent(env, '📦', `Searching ${owner}/${repo} issues...`);
 
   try {
-    const githubServer = await getActiveMCPServer(env, userId, 'github');
+    const token = await getUserMCPConfig(userId, 'github', env);
+    if (!token) {
+      await emitToolEvent(env, '📦', 'GitHub not connected — using public API (rate limited).');
+    }
+
     const since = new Date(Date.now() - daysSince * 24 * 60 * 60 * 1000).toISOString();
     const endpoint = new URL(`https://api.github.com/repos/${owner}/${repo}/issues`);
     endpoint.searchParams.set('state', 'open');
@@ -454,7 +490,7 @@ export async function getLibraryIssues(
     }
 
     const payload = await fetchJson(endpoint.toString(), {
-      headers: buildGitHubHeaders(githubServer?.config.token || null),
+      headers: buildGitHubHeaders(token),
     }) as Array<Record<string, unknown>>;
 
     return payload

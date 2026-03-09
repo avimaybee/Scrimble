@@ -147,6 +147,8 @@ export default function ProjectGeneration() {
   const [reviewFeedback, setReviewFeedback] = useState('');
   const [preferredIde, setPreferredIde] = useState<PreferredIde>('cursor');
   const [error, setError] = useState('');
+  const [isResuming, setIsResuming] = useState(false);
+  const [showResumeBadge, setShowResumeBadge] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
@@ -269,6 +271,21 @@ export default function ProjectGeneration() {
 
     setProject(projectData);
     setStatus(statusData);
+
+    const isGenerating =
+      statusData.generation_status !== 'queued' &&
+      statusData.generation_status !== 'awaiting_review' &&
+      statusData.generation_status !== 'complete' &&
+      statusData.generation_status !== 'failed' &&
+      statusData.generation_status !== 'approved';
+
+    if (isGenerating && !statusData.is_failed) {
+      // Check if we haven't had a stream update in a while
+      // The stream is managed by useEffect, but we can nudge a resume check here
+      setShowResumeBadge(true);
+    } else {
+      setShowResumeBadge(false);
+    }
 
     if (isGenerationBatchName(statusData.generation_status)) {
       setActiveBatch(statusData.generation_status);
@@ -606,6 +623,25 @@ export default function ProjectGeneration() {
       setIsSubmittingReview(false);
     }
   }, [id, preferredIde, reviewFeedback, syncProjectState]);
+
+  const handleResume = useCallback(async () => {
+    if (!id || isResuming) {
+      return;
+    }
+
+    setIsResuming(true);
+    setError('');
+
+    try {
+      await dbService.resumeProjectGeneration(id);
+      toast.success('Resuming generation pipeline...');
+      setStreamConnectionKey((prev) => prev + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resume project generation.');
+    } finally {
+      setIsResuming(false);
+    }
+  }, [id, isResuming]);
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg-base px-6 py-12">
@@ -1082,11 +1118,31 @@ export default function ProjectGeneration() {
                   </div>
 
 
-                  {error ? (
+                  {error && !showResumeBadge ? (
                     <div className="mt-4 flex items-center gap-2 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-status-warning">
                       <TriangleAlert className="h-4 w-4" />
                       <span>{error}</span>
                     </div>
+                  ) : null}
+
+                  {showResumeBadge ? (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="mt-6 flex flex-col items-center gap-3 rounded-[16px] border border-border-default/80 bg-bg-surface/60 p-4"
+                    >
+                      <div className="flex items-center gap-2 font-sans text-[13px] text-text-secondary">
+                        <TriangleAlert className="h-4 w-4 text-accent-primary" />
+                        <span>Build stream seems interrupted.</span>
+                      </div>
+                      <button
+                        onClick={handleResume}
+                        disabled={isResuming}
+                        className="rounded-[10px] bg-accent-primary px-4 py-2 font-sans text-[13px] font-medium text-white transition-all hover:bg-accent-secondary hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isResuming ? 'Resuming...' : 'Resume Build'}
+                      </button>
+                    </motion.div>
                   ) : null}
                 </>
               )}

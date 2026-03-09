@@ -30,7 +30,6 @@ export type Bindings = {
   DB: any;
   FIREBASE_PROJECT_ID: string;
   ENCRYPTION_KEY: string;
-  GITHUB_TOKEN?: string;
   AGENT_QUEUE?: {
     send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
   };

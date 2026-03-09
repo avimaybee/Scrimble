@@ -14,4 +14,4 @@ FIREBASE_PROJECT_ID = "scrimble-auth"
 [[queues.consumers]]
 queue = "scrimble"
 max_batch_size = 1
-max_batch_timeout = 3600
+max_batch_timeout = 60

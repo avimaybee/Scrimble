@@ -151,6 +151,12 @@ export const dbService = {
     return fetchAPI<Project | null>(`/projects/${id}`);
   },
 
+  async resumeProjectGeneration(id: string): Promise<{ success: boolean; generation_status: string }> {
+    return fetchAPI(`/projects/${id}/resume`, {
+      method: 'POST',
+    });
+  },
+
   async getProjectsByUserId(_userId: string): Promise<Project[]> {
     return fetchAPI<Project[]>('/projects');
   },

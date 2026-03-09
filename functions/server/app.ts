@@ -1177,6 +1177,41 @@ app.post('/projects/:id/architecture-review', async (c) => {
   });
 });
 
+app.post('/projects/:id/resume', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  if (!c.env.AGENT_QUEUE) {
+    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+  }
+
+  const status = project.generation_status || 'queued';
+  if (status === 'complete' || status === 'failed') {
+    return c.json({ error: 'Cannot resume a project that is already complete or failed.' }, 409);
+  }
+
+  // Find the last providerId used for this project to re-enqueue
+  const lastRun = await c.env.DB.prepare(
+    'SELECT provider_id FROM agent_runs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(projectId).first<{ provider_id: string | null }>();
+
+  await c.env.AGENT_QUEUE.send({
+    type: 'generate_project',
+    projectId,
+    userId: c.get('uid'),
+    providerId: lastRun?.provider_id || undefined,
+  });
+
+  return c.json({
+    success: true,
+    generation_status: status,
+    resumedAt: new Date().toISOString()
+  });
+});
+
 app.get('/projects/:id/generation-stream', async (c) => {
   const projectId = c.req.param('id');
   const project = await getOwnedProject(c, projectId);
@@ -1280,34 +1315,17 @@ app.delete('/projects/:id', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  // Delete all related records in the correct order to avoid foreign key / dependency issues
-  // Note: D1 doesn't always strictly enforce FKs depending on config, but good practice applies.
+  // Delete everything related to this project.
+  // Using CASCADE would be ideal, but we'll do explicit deletes for safety.
   await c.env.DB.batch([
-    // Delete checklist items (via steps)
-    c.env.DB.prepare(`
-      DELETE FROM checklist_items 
-      WHERE step_id IN (SELECT id FROM steps WHERE project_id = ?)
-    `).bind(projectId),
-    
-    // Delete agent runs
-    c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
-    
-    // Delete generation events
+    c.env.DB.prepare('DELETE FROM project_generation_events WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM generation_stream_events WHERE project_id = ?').bind(projectId),
-    
-    // Delete edges
+    c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM edges WHERE project_id = ?').bind(projectId),
-    
-    // Delete steps
-    c.env.DB.prepare('DELETE FROM steps WHERE project_id = ?').bind(projectId),
-    
-    // Delete stages
+    c.env.DB.prepare('DELETE FROM checklist_items WHERE step_id IN (SELECT id FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?))').bind(projectId),
+    c.env.DB.prepare('DELETE FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?1) OR id IN (SELECT id FROM steps WHERE project_id = ?1)').bind(projectId),
     c.env.DB.prepare('DELETE FROM stages WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),
-    
-    // Delete workflows
     c.env.DB.prepare('DELETE FROM workflows WHERE project_id = ?').bind(projectId),
-    
-    // Finally delete the project
     c.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(projectId),
   ]);
 

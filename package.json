@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "deploy": "vite build && wrangler pages deploy dist",
+    "deploy:consumer": "wrangler deploy --config wrangler.consumer.toml",
+    "deploy:all": "npm run deploy && npm run deploy:consumer",
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
