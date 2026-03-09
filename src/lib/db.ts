@@ -12,6 +12,7 @@ import {
   ProjectGenerationBatchStartEvent,
   ProjectGenerationCheckpointEvent,
   ProjectGenerationEvent,
+  ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
   Stage,
   Step,
@@ -41,6 +42,7 @@ interface StreamProjectGenerationOptions {
   signal?: AbortSignal;
   onBatchStart?: (event: ProjectGenerationBatchStartEvent) => void;
   onActivity?: (event: ProjectGenerationActivity) => void;
+  onThinking?: (event: ProjectGenerationThinking) => void;
   onBatchCompleted?: (event: ProjectGenerationEvent) => void;
   onCheckpoint?: (event: ProjectGenerationCheckpointEvent) => void;
   onComplete?: () => void;
@@ -235,6 +237,13 @@ export const dbService = {
                 icon: typeof parsed.icon === 'string' ? parsed.icon : '✦',
                 message: parsed.message,
                 timestamp: parsed.timestamp,
+              });
+            }
+
+            if (currentEvent === 'thinking' && typeof parsed.content === 'string') {
+              options.onThinking?.({
+                content: parsed.content,
+                timestamp: new Date().toISOString(),
               });
             }
 

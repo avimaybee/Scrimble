@@ -27,8 +27,12 @@ import {
   type QueueMessageBatch,
   type QueueMessageBody,
 } from './types';
-import { getBatchStartLabel, persistGenerationStreamEvent } from './generation-events';
-import { callAIText, defaultModelForProvider } from './ai';
+import {
+  emitTransientGenerationStreamEvent,
+  getBatchStartLabel,
+  persistGenerationStreamEvent,
+} from './generation-events';
+import { callAIText, defaultModelForProvider, extractJSON } from './ai';
 import { decrypt } from '../utils/crypto';
 import { extractGitHubRepository } from '../utils/fetch-url';
 import {
@@ -770,6 +774,22 @@ async function logActivity(
   });
 }
 
+function emitThinking(env: Bindings, projectId: string, batchName: GenerationBatchName, content: string) {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  emitTransientGenerationStreamEvent({
+    projectId,
+    batchName,
+    event: {
+      type: 'thinking',
+      content,
+    },
+  });
+}
+
 async function loadBatchRunRecord(env: Bindings, projectId: string, runType: GenerationBatchName) {
   const record = await env.DB.prepare(`
     SELECT id, input, output
@@ -929,6 +949,8 @@ ${schemaDescription}`;
 async function callValidatedBatch<T>(
   provider: ProviderConfig,
   options: {
+    env: Bindings;
+    projectId: string;
     runType: GenerationBatchName;
     systemPrompt: string;
     prompt: string;
@@ -947,11 +969,12 @@ async function callValidatedBatch<T>(
       baseUrl: provider.baseUrl,
       system: options.systemPrompt,
       prompt,
+      onReasoningDelta: (delta) => emitThinking(options.env, options.projectId, options.runType, delta),
     });
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(text);
+      parsed = JSON.parse(extractJSON(text));
     } catch {
       lastError = `The AI response for ${options.runType} was not valid JSON.`;
       if (attempt === 1) {
@@ -1311,6 +1334,8 @@ Only include technologies that matter to implementation.`;
 
   try {
     const result = await callValidatedBatch(provider, {
+      env,
+      projectId: project.id,
       runType: 'batch_1_research_stack',
       systemPrompt,
       prompt,
@@ -1718,6 +1743,8 @@ Preserve specific version and compatibility details.`;
 
   try {
     const result = await callValidatedBatch(provider, {
+      env,
+      projectId,
       runType: 'batch_2_fetch_and_read',
       systemPrompt,
       prompt,
@@ -1822,6 +1849,8 @@ Base every recommendation on the provided research corpus.`;
 
   try {
     const result = await callValidatedBatch(provider, {
+      env,
+      projectId,
       runType: 'batch_3_architect',
       systemPrompt,
       prompt,
@@ -1906,6 +1935,8 @@ Rules:
 
   try {
     const result = await callValidatedBatch(provider, {
+      env,
+      projectId,
       runType: 'batch_4_plan_build',
       systemPrompt,
       prompt,
@@ -2038,6 +2069,8 @@ For each step, obey any requirements array included in the live step research co
 
   try {
     const result = await callValidatedBatch(provider, {
+      env,
+      projectId,
       runType: 'batch_5_enrich_steps',
       systemPrompt,
       prompt,
@@ -2179,6 +2212,8 @@ Rules:
 
   try {
     const result = await callValidatedBatch(provider, {
+      env,
+      projectId,
       runType: 'batch_6_generate_files',
       systemPrompt,
       prompt,

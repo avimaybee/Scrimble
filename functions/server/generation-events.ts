@@ -4,20 +4,25 @@ import type { Bindings, GenerationBatchName } from './types';
 export type GenerationStreamEvent =
   | { type: 'batch_start'; batch: GenerationBatchName; label: string }
   | { type: 'activity'; icon: string; message: string; timestamp: string }
+  | { type: 'thinking'; content: string }
   | { type: 'batch_complete'; batch: GenerationBatchName; duration_ms: number }
   | { type: 'checkpoint'; adr: Batch3Architect }
   | { type: 'pipeline_complete'; project_id: string }
   | { type: 'pipeline_failed'; error: string };
 
-type PersistedGenerationEvent = {
-  id: number;
+type LiveGenerationEventEnvelope = {
+  id: number | null;
   projectId: string;
   batchName: GenerationBatchName | null;
   createdAt: string;
   event: GenerationStreamEvent;
 };
 
-type LiveGenerationListener = (event: PersistedGenerationEvent) => void;
+type PersistedGenerationEvent = LiveGenerationEventEnvelope & {
+  id: number;
+};
+
+type LiveGenerationListener = (event: LiveGenerationEventEnvelope) => void;
 
 const encoder = new TextEncoder();
 const TERMINAL_EVENT_TYPES = new Set<GenerationStreamEvent['type']>(['pipeline_complete', 'pipeline_failed']);
@@ -188,7 +193,7 @@ function subscribeToLiveGenerationEvents(projectId: string, listener: LiveGenera
   };
 }
 
-function publishLiveGenerationEvent(projectId: string, event: PersistedGenerationEvent) {
+function publishLiveGenerationEvent(projectId: string, event: LiveGenerationEventEnvelope) {
   const listeners = liveGenerationListeners.get(projectId);
   if (!listeners || listeners.size === 0) {
     return;
@@ -197,8 +202,9 @@ function publishLiveGenerationEvent(projectId: string, event: PersistedGeneratio
   listeners.forEach((listener) => listener(event));
 }
 
-function formatSseEvent(event: PersistedGenerationEvent) {
-  return `id: ${event.id}\nevent: ${event.event.type}\ndata: ${JSON.stringify(event.event)}\n\n`;
+function formatSseEvent(event: LiveGenerationEventEnvelope) {
+  const idLine = event.id === null ? '' : `id: ${event.id}\n`;
+  return `${idLine}event: ${event.event.type}\ndata: ${JSON.stringify(event.event)}\n\n`;
 }
 
 export function isTerminalGenerationEvent(event: GenerationStreamEvent) {
@@ -214,7 +220,7 @@ export async function persistGenerationStreamEvent(
   payload: {
     projectId: string;
     batchName?: GenerationBatchName;
-    event: GenerationStreamEvent;
+    event: Exclude<GenerationStreamEvent, { type: 'thinking' }>;
   },
 ) {
   const result = await env.DB.prepare(`
@@ -239,6 +245,23 @@ export async function persistGenerationStreamEvent(
 
   publishLiveGenerationEvent(payload.projectId, persistedEvent);
   return persistedEvent;
+}
+
+export function emitTransientGenerationStreamEvent(payload: {
+  projectId: string;
+  batchName?: GenerationBatchName;
+  event: Extract<GenerationStreamEvent, { type: 'thinking' }>;
+}) {
+  const transientEvent: LiveGenerationEventEnvelope = {
+    id: null,
+    projectId: payload.projectId,
+    batchName: payload.batchName || null,
+    createdAt: new Date().toISOString(),
+    event: payload.event,
+  };
+
+  publishLiveGenerationEvent(payload.projectId, transientEvent);
+  return transientEvent;
 }
 
 export async function listPersistedGenerationEventsSince(env: Bindings, projectId: string, lastEventId: number) {
@@ -270,7 +293,7 @@ export function createGenerationSseStream(
   let replayComplete = false;
   let latestEventId = payload.lastEventId;
   let pingInterval: ReturnType<typeof setInterval> | null = null;
-  const bufferedEvents: PersistedGenerationEvent[] = [];
+  const bufferedEvents: LiveGenerationEventEnvelope[] = [];
   let writeChain = Promise.resolve();
 
   const cleanup = () => {
@@ -305,8 +328,8 @@ export function createGenerationSseStream(
       });
   };
 
-  const dispatchEvent = (event: PersistedGenerationEvent) => {
-    if (event.id <= latestEventId) {
+  const dispatchEvent = (event: LiveGenerationEventEnvelope) => {
+    if (event.id !== null && event.id <= latestEventId) {
       return;
     }
 
@@ -315,7 +338,9 @@ export function createGenerationSseStream(
       return;
     }
 
-    latestEventId = event.id;
+    if (event.id !== null) {
+      latestEventId = event.id;
+    }
     enqueueChunk(formatSseEvent(event));
 
     if (isTerminalGenerationEvent(event.event)) {
@@ -343,20 +368,20 @@ export function createGenerationSseStream(
 
       replayComplete = true;
 
-      bufferedEvents
-        .sort((left, right) => left.id - right.id)
-        .forEach((event) => {
-          if (event.id <= latestEventId) {
-            return;
-          }
+      bufferedEvents.forEach((event) => {
+        if (event.id !== null && event.id <= latestEventId) {
+          return;
+        }
 
+        if (event.id !== null) {
           latestEventId = event.id;
-          enqueueChunk(formatSseEvent(event));
+        }
+        enqueueChunk(formatSseEvent(event));
 
-          if (isTerminalGenerationEvent(event.event)) {
-            cleanup();
-          }
-        });
+        if (isTerminalGenerationEvent(event.event)) {
+          cleanup();
+        }
+      });
 
       if (isClosed) {
         return;

@@ -12,8 +12,8 @@ import type {
   GenerationBatchName,
   PreferredIde,
   Project,
-  ProjectGenerationActivity,
   ProjectGenerationEvent,
+  ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
 } from '../types';
 
@@ -40,9 +40,25 @@ const reviewIdeOptions: Array<{ id: PreferredIde; label: string; hint: string }>
   { id: 'claude_desktop', label: 'Claude Desktop', hint: 'Use when you want Claude Desktop MCP wiring.' },
 ];
 
-type ActivityFeedItem = ProjectGenerationActivity & {
+type ActivityFeedItem = {
   key: string;
+  kind: 'activity' | 'thinking';
+  icon: string;
+  message: string;
+  timestamp: string;
 };
+
+function normalizeFeedMessage(message: string) {
+  return message.replace(/\s+/g, ' ').trim();
+}
+
+function formatFeedMessage(entry: ActivityFeedItem, options?: { prefixThinking?: boolean }) {
+  if (entry.kind === 'thinking') {
+    return `${options?.prefixThinking === false ? '' : 'Thinking: '}${entry.message}`;
+  }
+
+  return entry.message;
+}
 
 function mergeCompletedEvents(
   status: ProjectGenerationStatusResponse | null,
@@ -133,6 +149,7 @@ export default function ProjectGeneration() {
   const [activeBatch, setActiveBatch] = useState<GenerationBatchName | null>(null);
   const [streamEvents, setStreamEvents] = useState<ProjectGenerationEvent[]>([]);
   const [activityFeed, setActivityFeed] = useState<ActivityFeedItem[]>([]);
+  const [currentActivity, setCurrentActivity] = useState<ActivityFeedItem | null>(null);
   const [reviewData, setReviewData] = useState<ArchitectureReviewResponse | null>(null);
   const [reviewFeedback, setReviewFeedback] = useState('');
   const [preferredIde, setPreferredIde] = useState<PreferredIde>('cursor');
@@ -148,6 +165,7 @@ export default function ProjectGeneration() {
   const [now, setNow] = useState(() => Date.now());
   const hasNavigatedRef = useRef(false);
   const activityKeysRef = useRef(new Set<string>());
+  const currentActivityRef = useRef<ActivityFeedItem | null>(null);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
   const feedbackRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -160,6 +178,63 @@ export default function ProjectGeneration() {
     toast.success('Your project plan is ready.');
     window.setTimeout(() => navigate(`/project/${id}`, { replace: true }), 1500);
   }, [id, navigate]);
+
+  const pushActivityToHistory = useCallback((entry: ActivityFeedItem | null) => {
+    if (!entry) {
+      return;
+    }
+
+    const normalizedMessage = normalizeFeedMessage(entry.message);
+    if (!normalizedMessage) {
+      return;
+    }
+
+    setActivityFeed((previous) => [...previous, { ...entry, message: normalizedMessage }].slice(-120));
+  }, []);
+
+  const replaceCurrentActivity = useCallback((nextEntry: ActivityFeedItem | null) => {
+    const previousEntry = currentActivityRef.current;
+    if (previousEntry && previousEntry.key !== nextEntry?.key) {
+      pushActivityToHistory(previousEntry);
+    }
+
+    currentActivityRef.current = nextEntry;
+    setCurrentActivity(nextEntry);
+  }, [pushActivityToHistory]);
+
+  const appendThinkingActivity = useCallback((delta: string, timestamp: string) => {
+    const normalizedDelta = normalizeFeedMessage(delta);
+    if (!normalizedDelta) {
+      return;
+    }
+
+    const previousEntry = currentActivityRef.current;
+    if (previousEntry?.kind === 'thinking') {
+      const updatedEntry = {
+        ...previousEntry,
+        message: normalizeFeedMessage(`${previousEntry.message}${delta}`),
+        timestamp,
+      };
+      currentActivityRef.current = updatedEntry;
+      setCurrentActivity(updatedEntry);
+      return;
+    }
+
+    if (previousEntry) {
+      pushActivityToHistory(previousEntry);
+    }
+
+    const nextEntry: ActivityFeedItem = {
+      key: `thinking-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'thinking',
+      icon: '✦',
+      message: normalizedDelta,
+      timestamp,
+    };
+
+    currentActivityRef.current = nextEntry;
+    setCurrentActivity(nextEntry);
+  }, [pushActivityToHistory]);
 
   const loadReviewData = useCallback(async () => {
     if (!id) {
@@ -298,6 +373,7 @@ export default function ProjectGeneration() {
       .streamProjectGeneration(id, {
         signal: controller.signal,
         onBatchStart: (event) => {
+          replaceCurrentActivity(null);
           setActiveBatch(event.batch);
           setError('');
           setStatus((previous) =>
@@ -318,7 +394,15 @@ export default function ProjectGeneration() {
           }
 
           activityKeysRef.current.add(key);
-          setActivityFeed((previous) => [...previous, { ...event, key }].slice(-120));
+          replaceCurrentActivity({
+            ...event,
+            key,
+            kind: 'activity' as const,
+            message: normalizeFeedMessage(event.message),
+          });
+        },
+        onThinking: (event: ProjectGenerationThinking) => {
+          appendThinkingActivity(event.content, event.timestamp);
         },
         onBatchCompleted: (event) => {
           setStreamEvents((previous) => {
@@ -328,6 +412,7 @@ export default function ProjectGeneration() {
           });
         },
         onCheckpoint: () => {
+          replaceCurrentActivity(null);
           setStatus((previous) =>
             previous
               ? {
@@ -341,6 +426,7 @@ export default function ProjectGeneration() {
           void loadReviewData();
         },
         onComplete: () => {
+          replaceCurrentActivity(null);
           setStatus((previous) =>
             previous
               ? {
@@ -355,6 +441,7 @@ export default function ProjectGeneration() {
           void syncProjectState().finally(() => scheduleProjectNavigation());
         },
         onFailed: (message) => {
+          replaceCurrentActivity(null);
           setError(message);
           setStatus((previous) =>
             previous
@@ -378,7 +465,16 @@ export default function ProjectGeneration() {
       });
 
     return () => controller.abort();
-  }, [hasPreparationCompleted, id, loadReviewData, scheduleProjectNavigation, streamConnectionKey, syncProjectState]);
+  }, [
+    appendThinkingActivity,
+    hasPreparationCompleted,
+    id,
+    loadReviewData,
+    replaceCurrentActivity,
+    scheduleProjectNavigation,
+    streamConnectionKey,
+    syncProjectState,
+  ]);
 
   useEffect(() => {
     const container = logContainerRef.current;
@@ -435,16 +531,13 @@ export default function ProjectGeneration() {
     ? Math.max(Math.round(remainingBatchCount * averageBatchDurationSeconds), 0)
     : Math.max(INITIAL_ESTIMATE_SECONDS - elapsedSeconds, 0);
 
-  const visibleFeed = activityFeed.length > 0
-    ? activityFeed
-    : [
-        {
-          key: 'placeholder',
-          icon: '•',
-          message: getPlaceholderMessage(status, currentBatch.id),
-          timestamp: new Date().toISOString(),
-        },
-      ];
+  const liveActivity = currentActivity ?? {
+    key: `live-placeholder-${status?.generation_status ?? currentBatch.id}`,
+    kind: 'activity' as const,
+    icon: '•',
+    message: getPlaceholderMessage(status, currentBatch.id),
+    timestamp: project?.generation_started_at ?? new Date(0).toISOString(),
+  };
 
   const showReviewPanel = Boolean(status?.is_review_required && !status?.is_complete && !status?.is_failed);
   const showPreparationScreen = Boolean(generationPreparation && !hasPreparationCompleted);
@@ -925,29 +1018,74 @@ export default function ProjectGeneration() {
               ) : (
                 <>
                   <div className="w-full rounded-[16px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
-                    <div ref={logContainerRef} className="max-h-[280px] overflow-y-auto pr-2">
-                      <AnimatePresence initial={false}>
-                        {visibleFeed.map((entry) => (
-                          <motion.div
-                            key={entry.key}
-                            initial={{ opacity: 0, y: 8 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -4 }}
-                            transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
-                            className="flex items-start gap-3 py-2"
+                    <div className="border-b border-border-subtle pb-4">
+                      <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                        Currently working
+                      </div>
+                      <AnimatePresence mode="wait" initial={false}>
+                        <motion.div
+                          key={liveActivity.key}
+                          initial={{ opacity: 0, y: 8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -8 }}
+                          transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
+                          className="flex items-start gap-3"
+                        >
+                          <motion.span
+                            aria-hidden="true"
+                            className="mt-[10px] h-[3px] w-[3px] shrink-0 rounded-full bg-accent-primary"
+                            animate={{ opacity: [0.45, 1, 0.45], scale: [1, 1.8, 1] }}
+                            transition={{ duration: 1.4, ease: 'easeInOut', repeat: Infinity }}
+                          />
+                          <span
+                            title={formatFeedMessage(liveActivity, { prefixThinking: false })}
+                            className={cn(
+                              'block min-w-0 flex-1 truncate text-[14px] leading-6 text-text-primary',
+                              liveActivity.kind === 'thinking' ? 'font-mono' : 'font-sans font-medium tracking-[-0.01em]',
+                            )}
                           >
-                            <span className={cn('mt-[1px] text-base leading-none', getActivityToneClass(entry.icon))} aria-hidden="true">
-                              {entry.icon}
-                            </span>
-                            <span className="w-[68px] shrink-0 pt-[1px] font-mono text-[11px] text-text-muted">
-                              {formatTimestamp(entry.timestamp)}
-                            </span>
-                            <span className="min-w-0 flex-1 font-sans text-[13px] leading-6 text-text-secondary">
-                              {entry.message}
-                            </span>
-                          </motion.div>
-                        ))}
+                            {formatFeedMessage(liveActivity, { prefixThinking: false })}
+                          </span>
+                        </motion.div>
                       </AnimatePresence>
+                    </div>
+
+                    <div ref={logContainerRef} className="mt-4 max-h-[280px] overflow-y-auto pr-2">
+                      {activityFeed.length === 0 ? (
+                        <div className="rounded-[12px] border border-border-subtle bg-bg-base/38 px-3 py-3 font-sans text-[13px] text-text-muted">
+                          Recent updates will collect here as the plan builder works.
+                        </div>
+                      ) : (
+                        <AnimatePresence initial={false}>
+                          {activityFeed.map((entry) => (
+                            <motion.div
+                              key={entry.key}
+                              initial={{ opacity: 0, y: -10 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              exit={{ opacity: 0, y: -4 }}
+                              transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
+                              className="flex items-start gap-3 py-2"
+                            >
+                              <span className={cn('mt-[1px] text-base leading-none', getActivityToneClass(entry.icon))} aria-hidden="true">
+                                {entry.icon}
+                              </span>
+                              <span className="w-[68px] shrink-0 pt-[1px] font-mono text-[11px] text-text-muted">
+                                {formatTimestamp(entry.timestamp)}
+                              </span>
+                              <span
+                                className={cn(
+                                  'min-w-0 flex-1 text-[13px] leading-6',
+                                  entry.kind === 'thinking'
+                                    ? 'font-mono text-text-primary/88'
+                                    : 'font-sans text-text-secondary',
+                                )}
+                              >
+                                {formatFeedMessage(entry)}
+                              </span>
+                            </motion.div>
+                          ))}
+                        </AnimatePresence>
+                      )}
                     </div>
                   </div>
 
@@ -993,7 +1131,7 @@ export default function ProjectGeneration() {
                       </div>
                     </div>
                     <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Working now</div>
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Current batch</div>
                       <div className="mt-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary">
                         {currentBatch.shortLabel}
                       </div>

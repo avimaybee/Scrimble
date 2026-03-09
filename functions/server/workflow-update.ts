@@ -7,7 +7,7 @@ import {
   type GithubRepoAnalysis,
   type SearchResult,
 } from '../../workers/tools';
-import { callAIText } from './ai';
+import { callAIText, extractJSON } from './ai';
 import {
   Batch2FetchAndReadSchema,
   Batch3ArchitectSchema,
@@ -218,11 +218,7 @@ function parseGitHubRepoUrl(url: string) {
 }
 
 function parseJsonResponse<T>(rawText: string, schema: z.ZodType<T>, errorMessage: string) {
-  const cleaned = rawText
-    .trim()
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/\s*```$/i, '');
+  const cleaned = extractJSON(rawText);
 
   let parsed: unknown;
   try {

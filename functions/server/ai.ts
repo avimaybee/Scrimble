@@ -1,13 +1,35 @@
 import type { ProviderType } from './types';
 
+type StreamCallbacks = {
+  onReasoningDelta?: (delta: string) => Promise<void> | void;
+};
+
+function extractString(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractString(item))
+      .filter(Boolean)
+      .join('');
+  }
+
+  return '';
+}
+
 function extractTextFromProviderChunk(parsed: unknown): string {
   if (!parsed || typeof parsed !== 'object') {
     return '';
   }
 
   const value = parsed as {
-    choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
-    content?: Array<{ text?: string }>;
+    choices?: Array<{
+      delta?: { content?: string };
+      message?: { content?: string };
+    }>;
+    content?: Array<{ text?: string; type?: string; thinking?: string }>;
     delta?: { text?: string };
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
   };
@@ -35,6 +57,52 @@ function extractTextFromProviderChunk(parsed: unknown): string {
   return '';
 }
 
+function extractReasoningFromProviderChunk(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') {
+    return '';
+  }
+
+  const value = parsed as {
+    choices?: Array<{
+      delta?: {
+        reasoning_content?: string | string[];
+        reasoning?: string | string[];
+      };
+    }>;
+    content?: Array<{ type?: string; thinking?: string; text?: string }>;
+    delta?: { thinking?: string; text?: string };
+  };
+
+  const openAiReasoning =
+    extractString(value.choices?.[0]?.delta?.reasoning_content) ||
+    extractString(value.choices?.[0]?.delta?.reasoning);
+
+  if (openAiReasoning) {
+    return openAiReasoning;
+  }
+
+  const anthropicThinking =
+    value.content
+      ?.filter((block) => block.type === 'thinking')
+      .map((block) => extractString(block.thinking || block.text))
+      .join('') || '';
+
+  if (anthropicThinking) {
+    return anthropicThinking;
+  }
+
+  return extractString(value.delta?.thinking);
+}
+
+export function extractJSON(raw: string): string {
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch) {
+    return fenceMatch[1].trim();
+  }
+
+  return raw.trim();
+}
+
 export function defaultModelForProvider(provider: ProviderType): string {
   switch (provider) {
     case 'anthropic':
@@ -49,43 +117,81 @@ export function defaultModelForProvider(provider: ProviderType): string {
   }
 }
 
-export async function streamToText(stream: ReadableStream<Uint8Array>) {
+async function processStreamLine(
+  line: string,
+  fullContent: { value: string },
+  callbacks?: StreamCallbacks,
+) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith(':') || trimmed.startsWith('event:')) {
+    return false;
+  }
+
+  const candidate = trimmed.startsWith('data:') ? trimmed.slice(5).trimStart() : trimmed;
+  if (!candidate) {
+    return false;
+  }
+
+  if (candidate === '[DONE]') {
+    return true;
+  }
+
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    const reasoningDelta = extractReasoningFromProviderChunk(parsed);
+    if (reasoningDelta) {
+      await callbacks?.onReasoningDelta?.(reasoningDelta);
+    }
+
+    const contentDelta = extractTextFromProviderChunk(parsed);
+    if (contentDelta) {
+      fullContent.value += contentDelta;
+    }
+
+    const finishReason = (parsed as { choices?: Array<{ finish_reason?: string | null }> }).choices?.[0]?.finish_reason;
+    return finishReason === 'stop';
+  } catch {
+    if (!trimmed.startsWith('data:')) {
+      fullContent.value += candidate;
+    }
+
+    return false;
+  }
+}
+
+export async function streamToText(stream: ReadableStream<Uint8Array>, callbacks?: StreamCallbacks) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
-  let fullContent = '';
+  const fullContent = { value: '' };
+  let buffer = '';
+  let shouldStop = false;
 
-  while (true) {
+  while (!shouldStop) {
     const { done, value } = await reader.read();
     if (done) {
       break;
     }
 
-    const chunk = decoder.decode(value);
-    const lines = chunk.split('\n');
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
 
     for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(':')) {
-        continue;
-      }
-
-      const candidate = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
-      if (!candidate || candidate === '[DONE]') {
-        continue;
-      }
-
-      try {
-        const parsed = JSON.parse(candidate) as unknown;
-        fullContent += extractTextFromProviderChunk(parsed);
-      } catch {
-        if (!trimmed.startsWith('data: ')) {
-          fullContent += candidate;
-        }
+      shouldStop = await processStreamLine(line, fullContent, callbacks);
+      if (shouldStop) {
+        break;
       }
     }
   }
 
-  return fullContent;
+  if (!shouldStop) {
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      await processStreamLine(buffer, fullContent, callbacks);
+    }
+  }
+
+  return fullContent.value;
 }
 
 const AI_TIMEOUT_MS = 600_000; // 10 minutes
@@ -253,6 +359,7 @@ export async function callAIText(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
+  onReasoningDelta?: (delta: string) => Promise<void> | void;
 }) {
   const response = await callAIWithRetry(payload);
   if (!response.ok) {
@@ -264,6 +371,8 @@ export async function callAIText(payload: {
     throw new Error('AI provider did not return a response body.');
   }
 
-  const text = await streamToText(response.body);
+  const text = await streamToText(response.body, {
+    onReasoningDelta: payload.onReasoningDelta,
+  });
   return { response, text };
 }

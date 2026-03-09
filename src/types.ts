@@ -161,6 +161,11 @@ export interface ProjectGenerationActivity {
   timestamp: string;
 }
 
+export interface ProjectGenerationThinking {
+  content: string;
+  timestamp: string;
+}
+
 export interface ProjectGenerationCheckpointEvent {
   adr: ArchitectureDecisionRecord;
 }

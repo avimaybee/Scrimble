@@ -41,6 +41,7 @@ export type Bindings = {
 export type GenerationEventType =
   | 'batch_start'
   | 'activity'
+  | 'thinking'
   | 'batch_complete'
   | 'checkpoint'
   | 'pipeline_complete'
