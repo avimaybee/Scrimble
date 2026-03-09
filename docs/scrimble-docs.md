@@ -136,12 +136,12 @@ The most important moment in Scrimble is when you open it after being away. It i
 ### Backend
 | Concern | Choice | Notes |
 |---|---|---|
-| Runtime | Cloudflare Pages Functions | Edge serverless — all API routes live in `/functions` |
-| Database | Cloudflare D1 (SQLite) | Relational, edge-native, bound to Pages |
+| Runtime | Cloudflare Pages Functions | Edge serverless — Produces queue messages |
+| Background Jobs | Cloudflare Workers (Standalone) | Consumes "scrimble" queue — Handles AI pipeline |
+| Database | Cloudflare D1 (SQLite) | Relational, edge-native, shared between environments |
 | Auth | Firebase Auth (auth only) | Google OAuth + email/password — JWT verification in Functions |
-| AI Routing | Function-side proxy | All AI calls proxied through Functions — user keys never leave server |
-| Background Jobs | Cloudflare Queues | Async AI agent tasks (triggered from Functions) |
-| Hosting | Cloudflare Pages | Unified frontend and backend deployment |
+| AI Routing | Function-side proxy | All AI calls proxied through Functions or Background Worker |
+| Hosting | Cloudflare Pages | Unified frontend and API deployment |
 
 ### shadcn Usage Policy
 **Use shadcn for invisible infrastructure only:**
@@ -574,6 +574,12 @@ transition: { duration: 0.25, ease: [0.16, 1, 0.3, 1] }
 /settings             → User preferences, AI key management
 ```
 
+### Navigation Patterns
+
+- Landing, authentication, `/new`, and the live generation journeys intentionally render without the pill nav so those entry points stay focused. Only the dashboard, the canvas (`/project/:id`), and the settings shell inherit the nav chrome from `AppLayout`.
+- The bottom Pill Nav labels its tabs **Plan / Projects / Settings**. “Plan” links to the current project (and is disabled until a plan is open), “Projects” always returns to `/dashboard`, and “Settings” anchors to `/settings`. The active pill uses the layoutId “pill-nav-active” so the paprika indicator animates smoothly between tabs, and the layout also adds 104px of bottom padding whenever the nav is present so content never collides with it.
+- All other routes (landing, `/login`, `/signup`, `/new`, `/project/:id/step/[stepId]`, the generation screen, and any modal-heavy state) deliberately hide the nav, keeping the interface free of distracting chrome while the user is signing in, starting a plan, or reviewing a step.
+
 ### Build Stages
 Every project is guided through these stages (AI selects relevant ones based on the description):
 
@@ -638,6 +644,20 @@ CREATE TABLE IF NOT EXISTS ai_providers (
   base_url        TEXT,                 -- for custom providers (OpenAI-compatible)
   model           TEXT,                 -- preferred model for this provider
   is_default      INTEGER DEFAULT 0,    -- one default per user
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- MCP SERVER CONNECTIONS
+-- Research tool credentials — encrypted at rest
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id              TEXT PRIMARY KEY,
+  user_id         TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  server_type     TEXT NOT NULL,        -- 'brave-search' | 'github' | 'context7' | 'custom'
+  name            TEXT NOT NULL,
+  config_enc      TEXT NOT NULL,        -- AES-256 encrypted JSON config
+  is_active       INTEGER DEFAULT 1,
   created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -769,6 +789,7 @@ CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_ai_providers_user  ON ai_providers(user_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_user   ON mcp_servers(user_id);
 ```
 
 ---
@@ -789,7 +810,7 @@ PATCH  /api/projects/:id           → Update project metadata
 
 GET    /api/workflows/:id          → Get workflow with stages and steps
 PATCH  /api/workflows/:id          → Update canvas viewport state
-POST   /api/workflows/:id/update   → Natural language plan update → AI diff → D1
+POST   /api/workflows/:id/update   → Natural language plan update → live MCP research → AI diff → D1 + re-enrichment
 
 GET    /api/steps/:id              → Get full step content
 PATCH  /api/steps/:id              → Update step status or content
@@ -800,9 +821,14 @@ POST   /api/steps/:id/review       → Submit human review (approve/reject at ga
 
 PATCH  /api/checklist/:itemId      → Toggle checklist item
 
-GET    /api/settings/ai-providers  → List user's AI providers (keys masked)
-POST   /api/settings/ai-providers  → Add new AI provider key
-DELETE /api/settings/ai-providers/:id → Remove AI provider
+GET    /api/ai/providers           → List user's AI providers
+POST   /api/ai/providers           → Add new AI provider key
+DELETE /api/ai/providers/:id       → Remove AI provider
+
+GET    /api/settings/mcp-servers   → List user's research tools (configs masked)
+POST   /api/settings/mcp-servers   → Add or replace a research tool connection
+PATCH  /api/settings/mcp-servers/:id → Toggle research tool active/inactive
+DELETE /api/settings/mcp-servers/:id → Remove research tool connection
 
 POST   /api/ai/proxy               → Proxied AI call (uses user's stored key)
 ```
@@ -832,18 +858,37 @@ Retry: 3 attempts, exponential backoff
 
 ### Sequential Generation Pipeline
 
-Project creation (`POST /api/projects`) now enqueues a dedicated 6-batch agent job that runs entirely inside the queue consumer worker. Each batch executes in order—`batch_1_research_stack`, `batch_2_fetch_and_read`, `batch_3_architect`, `batch_4_plan_build`, `batch_5_enrich_steps`, `batch_6_generate_files`—with each step reading the previous batch output from D1, making exactly one AI call through the BYOK proxy, validating the JSON response with Zod, persisting the result to `agent_runs` (run_type matches the batch name), updating `projects.generation_status` to the newly running batch, and writing a structured SSE event into `project_generation_events`. Validation failures are retried once with the invalid response appended to the prompt; a second failure marks the project `failed`, records the error, and emits a terminal SSE event.
+Project creation enqueues a dedicated 6-batch agent job. Scrimble uses a professional hybrid architecture to handle these long-running tasks:
+1. **Pages (The Boss)**: Handles the UI and enqueues tasks via `AGENT_QUEUE.send()`.
+2. **Cloudflare Queue (Magic Mailbox)**: A queue named `scrimble` that ensures task reliability.
+3. **Worker (The Helper)**: A standalone Cloudflare Worker (`worker-consumer.ts`) dedicated to consuming messages and running the AI pipeline.
 
-Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved. The review payload (including any user feedback and preferred IDE) is stored alongside the `batch_3_architect` run and is forwarded to batches 4‑6 so every subsequent step honors the builder’s choices (e.g., swapping databases, enforcing a different email provider, targeting a specific MCP format).
+Each batch executes in order with **Smart Caps** to ensure extreme thoroughness without reckless resource usage:
+- **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
+- **AI Patience**: 10-minute timeout per AI provider call (managed via AbortController).
+- **Research Liberty**: 2-minute timeout for documentation fetches; up to 100,000 tokens processed per document.
+- **Output Freedom**: Up to 16,384 tokens per AI response (provider-dependent).
+- **Input Freedom**: Zero character limits on natural language project intake.
 
-The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and wires live listeners so the queue consumer’s `persistGenerationStreamEvent` helper can push activity directly into the stream. Event payloads use the new union (`batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, `pipeline_failed`), which the frontend decodes to drive the live status feed, review panel, and progress dots. Events are durable—clients reconnecting with `Last-Event-ID` receive a replay before subscribing to the live channel.
+Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved. The review payload (including feedback and preferred IDE) is stored and forwarded to batches 4‑6 so every subsequent step honors the builder’s choices.
+
+### Professional Icon System
+Scrimble strictly uses technical, engineering-focused icons (Lucide React) to maintain a professional aesthetic:
+- **AI/Compute**: `Cpu`
+- **Process/Structure**: `Workflow`
+- **Execution/Monitoring**: `Activity`
+- **Action/Trigger**: `Zap`
+- *Prohibited: Any whimsical, magic, sparkle, or glitter-themed icons.*
+
+The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`.
+ That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and wires live listeners so the queue consumer’s `persistGenerationStreamEvent` helper can push activity directly into the stream. Event payloads use the new union (`batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, `pipeline_failed`), which the frontend decodes to drive the live status feed, review panel, and progress dots. Events are durable—clients reconnecting with `Last-Event-ID` receive a replay before subscribing to the live channel.
 
 ### API Key Security
 ```
-Storage: AES-256 encrypted in D1 (ai_providers.api_key_enc)
+Storage: AES-256 encrypted in D1 (`ai_providers.api_key_enc`, `mcp_servers.config_enc`)
 Encryption key: Stored in Cloudflare secret (env.ENCRYPTION_KEY)
-In transit: Key is decrypted only inside memory, never logged or sent to client
-Displayed: Masked on client (e.g. "sk-...abc123")
+In transit: Secrets are decrypted only inside memory, never logged or sent to client
+Displayed: Masked on client (e.g. "sk-...abc123", "Read-only token ••••abcd")
 Deleted: Removed from D1 on user request — no recovery
 ```
 
@@ -900,7 +945,8 @@ Scrimble’s “start a project” flow now enqueues a Cloudflare Queue job that
 5. Updates `projects.generation_status` to the batch currently running.
 6. Writes a structured SSE event into `project_generation_events` so the frontend can replay and stream it immediately.
 
-Batch 2 (`fetch_and_read`) uses the new `fetchAndParse(url)` helper for both docs and GitHub URLs—scraping clean prose from HTML, or calling the GitHub REST API for repo metadata, README, releases, and recent bug/breaking-change issues with a 10-second timeout and SSE logging for every attempt. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
+Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. Every tool call emits an `activity` SSE event, and failures degrade gracefully into partial research instead of crashing the batch. Step enrichment is now deeper too: auth steps fetch security/session docs plus recent vulnerability chatter, database steps pull schema+migration references, deployment steps read platform docs/issues/checklists, and payment steps pull live Stripe checkout + webhook guidance before the AI writes the final step artifact. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
+Batch 2 also records a `research_sources` ledger (tool, source URL, one-line summary) and a `data_quality` object (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`) so the architecture checkpoint can explain which tools were consulted, how deep the research went, and which sources the agent actually read.
 
 The backend emits `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, activity log, progress dots, ETA counter, and review gate. Every event goes through the durable `project_generation_events` table so reconnections using `Last-Event-ID` replay history before subscribing to the live `TransformStream`.
 
@@ -934,6 +980,9 @@ Body: {
 - "Go live" / deployment steps
 - Any step that makes external API calls or database changes
 - Architecture decisions that affect all downstream work
+
+### Plan updates with live research
+Natural-language plan updates now post to `/api/workflows/:id/update`, which streams a mini activity feed straight back into the update modal. The server analyzes what changed, performs MCP-powered mini research for any newly mentioned technologies (Context7 docs, GitHub analysis + releases/issues, Brave Search chatter when connected), generates the JSON diff, applies it, and immediately re-enriches every affected step before signaling completion. Every phase emits a chronological event (`🔍 Reading Railway documentation...`, `✅ Research complete`, `🔄 Updating your plan...`, `✅ 4 steps updated`) so the builder can follow the work, and the final bundle includes the refreshed research metadata and `research_sources` ledger that feeds the architecture review badges and step footers.
 
 ### Agent Prompts
 
@@ -1019,6 +1068,7 @@ Rules:
 - Every prompt must reference their actual tools by name
 - ai_output: a real, useful artifact — not generic advice
 - Write as if explaining to a smart non-engineer
+- Use the live research bundle for the step (Context7/docs, GitHub issues, search results) and obey any step-specific requirements such as security checklists, starter schemas, deployment checklists, or Stripe webhook guidance.
 ```
 
 #### Prompt 3 — Plan Update
@@ -1052,6 +1102,7 @@ Rules:
 - Never remove steps that are already done (status === 'complete')
 - Updated steps: set is_ai_enriched = 0 to trigger re-enrichment
 - summary: specific — "Updated 3 launch steps for Railway instead of Vercel"
+- If the builder introduces a new technology, run a mini research pass first (docs + GitHub + web search) and use that research to make the diff specific instead of generic
 ```
 
 ---
@@ -1105,7 +1156,10 @@ All section labels use the paprika dash treatment.
 
 Single large textarea. No character limit. "Build my plan →" button becomes active once they type anything.
 
+If no AI provider is configured, `/new` blocks submission and shows a direct "You need to add an AI key first." call-to-action that links to Settings. The backend also rejects `POST /api/projects` when no provider can be resolved, so generation never starts in a silent-failure state.
+
 **On submit → Generating screen:**
+- Before the activity feed begins, a short "Getting ready to research" transition screen appears when the user arrives from `/new`. It lists the active research depth for this run (`Web search`, `GitHub — authenticated/public only`, `Live docs via Context7`) using the same green/muted badge styling as the architecture review panel. If any optional tools are missing, the screen lingers for ~2.5s and links to `/settings#mcp-servers`; if everything is connected it crossfades out immediately.
 - Full-screen, vertically centered layout with the pulsing Scrimble mark (animated opacity pulse, 2s loop) and `bg-base`.
 - The main heading swaps between the six batch labels (`Identifying your stack`, `Reading the docs`, `Designing your architecture`, `Building your plan`, `Writing step details`, `Preparing your files`) using AnimatePresence as each `batch_start` SSE event arrives.
 - A scrollable activity log (max-height 280px) streams live events (`activity`, `batch_complete`, `checkpoint`, `pipeline_failed`) with icons (🔍, 📦, ⚠️, 🏗️, ✅, 📝), timestamps (HH:MM:SS JetBrains Mono), and auto-scroll behavior. Each event is persisted so reconnecting clients replay history via `Last-Event-ID`.
@@ -1119,12 +1173,22 @@ Single large textarea. No character limit. "Build my plan →" button becomes ac
   - "How it's structured" data-model summary (table name + column list).
   - Feedback textarea (DM Sans 14px) for adjustments and preference buttons for `cursor`, `windsurf`, `vscode`, `claude_desktop`.
   - "Let me adjust" (ghost) and "Looks right, build my plan →" (paprika) buttons. Approval re-enqueues batch 4 with feedback; the panel stays until approved.
+  - A Research depth row lives above the stack grid, displaying badges such as `[✓ Web search]`, `[✓ GitHub — authenticated]`, or `[✗ Brave Search — not connected]`. Connected badges follow the mint style (`bg-[rgba(52,211,153,0.1)]`, `border-[rgba(52,211,153,0.2)]`, `text-[#34d399]`, checkmark icon), while offline tools use a muted grey treatment (`bg-[rgba(204,197,185,0.05)]`, `border-[rgba(204,197,185,0.1)]`, `text-[var(--text-muted)]`, X icon, "not connected" suffix). Below the badges, a JetBrains Mono 11px line reads "Researched {n} technologies across {m} sources." If fewer than two tools were connected, a quiet amber nudge appears beneath: "Connect more research tools in Settings for deeper analysis next time." (Links to `/settings#mcp-servers`.)
+  - A collapsible "What I read" disclosure expands to show every source the agent consulted: each entry lists the URL or GitHub repo, the MCP tool that fetched it (Brave, GitHub, Context7, or fallback fetch), and a one-line summary of the insight it contributed, proving the agent actually read the Supabase changelog or docs page it cites.
 - If the SSE stream reports `pipeline_failed`, the review screen surfaces the error message and a "Try again" button that reconnects the stream.
 - On success (terminal `pipeline_complete`), a Sonner toast appears ("Your project plan is ready."), waits 1.5s, then navigates to `/project/:id`.
 
 **Background notes**
 - The SSE connection attaches the Firebase auth token via `fetch` headers, reconnects automatically after disconnects, and pings the server every 20s (`: ping`) to keep proxies alive.
+- Natural-language plan updates now stream their own mini activity feed inside the update modal. The server performs change analysis, mini MCP research for newly introduced technologies, diff generation, diff application, and automatic re-enrichment of affected steps before returning the final success event.
 - Activity icons match the pipeline semantics: 🔍 fetching docs, 📦 hitting GitHub, ⚠️ gotcha/warning, 🏗️ architecture, ✅ completed batch, 📝 writing steps.
+
+### 15.2.1 Auth (`/login` & `/signup`)
+
+- Auth lives on a single, centered card inside the warm radial gradients of the entry page. The hero area stacks the hexagon badge, the mono “Getting started” label, and a heading that switches between “Pick up where you left off.” (login) and “Start your first plan.” (signup) so the surface feels more confident than a generic login form.
+- The card is divided into two sections. The upper half showcases Google sign-in: a small title (“Continue with Google”), a supporting sentence about tying your plan to one account, a soft warning banner for errors (`bg-status-skipped` + `text-status-error`), and the primary button with Google’s colored icon, the label “Continue with Google,” and the paprika arrow icon.
+- The lower half signals that email sign-in is coming soon. Two disabled inputs (email, password) sit under the helper text “Email sign-in is on the way,” followed by a disabled ghost button. This keeps the copy calm and honest while still hinting that more options are on the roadmap.
+- Beneath the card, micro-copy toggles between “Don’t have an account yet?” and “Already have an account?” depending on the route, linking to the respective signup or login page with the same accent color used in the rest of the UI.
 
 ---
 
@@ -1186,7 +1250,6 @@ Sidebar extras:
 ```
 
 **App Bottom Pill Nav** (canvas, dashboard, settings only):
-```css
 position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
 background: rgba(36,33,30,0.92); backdrop-filter: blur(20px);
 border: 1px solid var(--border-default); border-radius: 16px;
@@ -1228,6 +1291,8 @@ Width 176px. Status-driven appearance:
 5. **Suggested tools** — horizontal chip scroll
 6. **Things to check** — interactive checklist with optimistic local toggle
 7. **Done when...** — exit criteria in emerald border container
+
+Every enriched step now ends with a JetBrains Mono 11px footer that reads `Researched {date} using {tools used}` (Context7, GitHub, Brave, or fallback fetch). The footer explicitly calls out any missing tools and invites the builder to connect them in Settings so future enrichments can go deeper. It anchors the Research depth story from the architecture review, proving the agent actually read the Supabase changelog, Stripe webhook guide, or deployment docs before writing the guidance.
 
 **Human-in-the-loop review panel** (when `is_gate = 1` and `status = needs_review`):
 ```
@@ -1277,6 +1342,39 @@ to do the work at each step of your plan.
 
 Your keys are encrypted and never shared. Scrimble uses
 them only to do work on your projects.
+```
+
+### 15.8 Settings — Research Tools (`/settings`)
+
+```
+Research Tools
+
+Connect tools that let Scrimble do deeper research when
+building your plan. The more you connect, the better your
+plan will be.
+
+┌──────────────────────────────────────────────────────────┐
+│  Brave Search                          [Recommended]     │
+│  API key: [________________________]     [Connect]       │
+├──────────────────────────────────────────────────────────┤
+│  GitHub                                              │
+│  Personal Access Token (public_repo): [___________]   │
+├──────────────────────────────────────────────────────────┤
+│  Context7                              [Recommended]    │
+│  API key: [________________________]     [Connect]      │
+├──────────────────────────────────────────────────────────┤
+│  Custom MCP                                             │
+│  Server name: [____________]  Base URL: [___________]   │
+└──────────────────────────────────────────────────────────┘
+
+If no tools are connected, a subtle paprika nudge appears
+between AI Keys and this section:
+"Connect research tools to make your plans significantly
+more accurate."
+
+Research tools are only used during plan building. Tokens
+are encrypted, masked in the UI, and can be paused or
+disconnected per connection.
 ```
 
 ---
@@ -1329,7 +1427,9 @@ them only to do work on your projects.
 - AI step enrichment ( Gemini/OpenAI integration + D1 persistence)
 - AI plan update (natural language diffing + D1 mutation)
 - Sequential 6-batch generation pipeline (research stack → fetch/read → architect → plan build → enrich → file generation) with single-AI-call batches, Zod validation, `agent_runs` auditing, and SSE event persistence so the frontend always knows what the agent is doing.
-- Batch 2 relies on `fetchAndParse(url)` to scrape docs or query GitHub (README, metadata, releases, recent bugs), while batch 6 returns six required skill/context files that are stored in D1 and zipped through `/api/projects/:id/skill-files` for download.
+- Batch 2 now relies on the Worker-side tools layer (`fetchUrl`, `analyzeGithubRepo`, `getLibraryDocs`, `getLibraryIssues`, `searchWeb`), collecting docs, releases, issues, and Brave Search chatter, while also writing the `research_sources` ledger plus `data_quality` stats (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`). These metadata power the Research depth badges, "What I read" list, and per-step footers. Batch 6 still returns the six required skill/context files that are stored in D1 and zipped through `/api/projects/:id/skill-files` for download.
+- Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
+- Research depth badges and the "Researched {date} using {tools}" footer inject transparency into the detail panel and architecture review, highlighting when Context7, Brave Search, or GitHub were used and nudging builders to connect any missing tools for deeper next-time results.
 - Live generation screen now streams `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` events: animated batch headings, icon-coded log entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
 - Canvas sidebar exposes a "Download AI files" button with download icon, hint text ("Paste these into your IDE…"), and tooltip-disabled state until the files are ready.
 - Human-in-the-loop review panel (Approve/Reject gates)

@@ -45,7 +45,7 @@ function ProtectedRoute() {
   const { user, isAuthReady } = useAuthStore();
   
   if (!isAuthReady) {
-    return <div className="min-h-screen flex items-center justify-center bg-bg-base text-text-primary uppercase tracking-widest text-[10px]">Loading...</div>;
+    return <div className="min-h-screen flex items-center justify-center bg-bg-base font-mono text-[11px] uppercase tracking-[0.14em] text-text-tertiary">Getting things ready</div>;
   }
   
   if (!user) {
@@ -63,7 +63,7 @@ function ProtectedFullscreenRoute() {
   const { user, isAuthReady } = useAuthStore();
 
   if (!isAuthReady) {
-    return <div className="min-h-screen flex items-center justify-center bg-bg-base text-text-primary uppercase tracking-widest text-[10px]">Loading...</div>;
+    return <div className="min-h-screen flex items-center justify-center bg-bg-base font-mono text-[11px] uppercase tracking-[0.14em] text-text-tertiary">Getting things ready</div>;
   }
 
   if (!user) {
@@ -128,7 +128,20 @@ export default function App() {
       <BrowserRouter>
         <AnimatedRoutes />
       </BrowserRouter>
-      <Toaster theme="dark" position="bottom-right" richColors />
+      <Toaster
+        theme="dark"
+        position="bottom-right"
+        expand={false}
+        toastOptions={{
+          classNames: {
+            toast: '!rounded-[14px] !border !border-border-default !bg-bg-surface !text-text-primary !shadow-panel',
+            title: '!font-sans !text-[14px] !font-medium !text-text-primary',
+            description: '!font-sans !text-[13px] !text-text-secondary',
+            actionButton: '!bg-accent-primary !text-text-primary',
+            cancelButton: '!bg-bg-elevated !text-text-secondary',
+          },
+        }}
+      />
     </TooltipProvider>
   );
 }

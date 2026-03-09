@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Hexagon, TriangleAlert } from 'lucide-react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { ExternalLink, Hexagon, TriangleAlert } from 'lucide-react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { dbService } from '../lib/db';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
+  GenerationPreparationState,
   GenerationBatchName,
   PreferredIde,
   Project,
@@ -26,7 +27,7 @@ const generationBatches: Array<{
 }> = [
   { id: 'batch_1_research_stack', heading: 'Identifying your stack', shortLabel: 'Stack' },
   { id: 'batch_2_fetch_and_read', heading: 'Reading the docs', shortLabel: 'Docs' },
-  { id: 'batch_3_architect', heading: 'Designing your architecture', shortLabel: 'Arch' },
+  { id: 'batch_3_architect', heading: "Planning how it's built", shortLabel: 'Build' },
   { id: 'batch_4_plan_build', heading: 'Building your plan', shortLabel: 'Plan' },
   { id: 'batch_5_enrich_steps', heading: 'Writing step details', shortLabel: 'Steps' },
   { id: 'batch_6_generate_files', heading: 'Preparing your files', shortLabel: 'Files' },
@@ -109,7 +110,7 @@ function getPlaceholderMessage(status: ProjectGenerationStatusResponse | null, c
     case 'queued':
       return 'Waiting for the agent to pick up your brief...';
     case 'approved':
-      return 'Architecture approved — queuing the next planning batch...';
+      return 'Review approved — queuing the next planning batch...';
     case 'batch_4_plan_build':
     case 'batch_5_enrich_steps':
     case 'batch_6_generate_files':
@@ -121,7 +122,12 @@ function getPlaceholderMessage(status: ProjectGenerationStatusResponse | null, c
 
 export default function ProjectGeneration() {
   const { id } = useParams<{ id: string }>();
+  const location = useLocation();
   const navigate = useNavigate();
+  const initialPreparationState =
+    ((location.state as { preparation?: GenerationPreparationState } | null)?.preparation as
+      | GenerationPreparationState
+      | undefined) || null;
   const [project, setProject] = useState<Project | null>(null);
   const [status, setStatus] = useState<ProjectGenerationStatusResponse | null>(null);
   const [activeBatch, setActiveBatch] = useState<GenerationBatchName | null>(null);
@@ -136,6 +142,8 @@ export default function ProjectGeneration() {
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
   const [hasEditedReview, setHasEditedReview] = useState(false);
   const [hasEditedPreferredIde, setHasEditedPreferredIde] = useState(false);
+  const [hasPreparationCompleted, setHasPreparationCompleted] = useState(!initialPreparationState);
+  const [generationPreparation] = useState<GenerationPreparationState | null>(initialPreparationState);
   const [streamConnectionKey, setStreamConnectionKey] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   const hasNavigatedRef = useRef(false);
@@ -167,7 +175,7 @@ export default function ProjectGeneration() {
       setReviewFeedback((previous) => (hasEditedReview ? previous : review.review_feedback));
       setPreferredIde((previous) => (hasEditedPreferredIde ? previous : review.preferred_ide));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load the architecture review.');
+      setError(err instanceof Error ? err.message : 'Failed to load your review.');
     } finally {
       setIsReviewLoading(false);
     }
@@ -217,6 +225,28 @@ export default function ProjectGeneration() {
     return () => window.clearInterval(intervalId);
   }, []);
 
+  const needsPreparationNudge = Boolean(
+    generationPreparation &&
+      (!generationPreparation.has_brave_search ||
+        !generationPreparation.has_github_token ||
+        !generationPreparation.has_context7),
+  );
+
+  useEffect(() => {
+    if (!generationPreparation) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(
+      () => {
+        setHasPreparationCompleted(true);
+      },
+      needsPreparationNudge ? 2500 : 0,
+    );
+
+    return () => window.clearTimeout(timeoutId);
+  }, [generationPreparation, needsPreparationNudge]);
+
   useEffect(() => {
     if (!id) {
       navigate('/new', { replace: true });
@@ -258,7 +288,7 @@ export default function ProjectGeneration() {
   }, [id, navigate, syncProjectState]);
 
   useEffect(() => {
-    if (!id) {
+    if (!id || !hasPreparationCompleted) {
       return;
     }
 
@@ -348,7 +378,7 @@ export default function ProjectGeneration() {
       });
 
     return () => controller.abort();
-  }, [id, loadReviewData, scheduleProjectNavigation, streamConnectionKey, syncProjectState]);
+  }, [hasPreparationCompleted, id, loadReviewData, scheduleProjectNavigation, streamConnectionKey, syncProjectState]);
 
   useEffect(() => {
     const container = logContainerRef.current;
@@ -390,56 +420,106 @@ export default function ProjectGeneration() {
     return Math.max(Math.floor((now - startedAt) / 1000), 0);
   }, [now, project?.generation_started_at]);
 
-  const estimatedRemainingSeconds = useMemo(() => {
-    if (status?.is_complete) {
-      return 0;
-    }
-
-    if (completedBatchCount === 0) {
-      return Math.max(INITIAL_ESTIMATE_SECONDS - elapsedSeconds, 0);
-    }
-
-    const reportedDurationSeconds = completedEvents.reduce((total, event) => total + ((event.duration_ms ?? 0) / 1000), 0);
-    if (reportedDurationSeconds > 0) {
-      const averageBatchSeconds = reportedDurationSeconds / completedBatchCount;
-      const estimatedTotalSeconds = Math.max(Math.round(averageBatchSeconds * generationBatches.length), elapsedSeconds);
-      return Math.max(estimatedTotalSeconds - elapsedSeconds, 0);
-    }
-
-    const completedAtValues = completedEvents
-      .map((event) => event.completed_at)
-      .filter((value): value is string => Boolean(value))
-      .map((value) => Date.parse(value))
-      .filter((value) => !Number.isNaN(value));
-
-    const startedAt = project?.generation_started_at ? Date.parse(project.generation_started_at) : Number.NaN;
-
-    if (completedAtValues.length === 0 || Number.isNaN(startedAt)) {
-      return Math.max(INITIAL_ESTIMATE_SECONDS - elapsedSeconds, 0);
-    }
-
-    const totalCompletedDurationSeconds = Math.max(
-      Math.floor((completedAtValues[completedAtValues.length - 1] - startedAt) / 1000),
-      1,
-    );
-    const averageBatchSeconds = totalCompletedDurationSeconds / completedBatchCount;
-    const estimatedTotalSeconds = Math.max(Math.round(averageBatchSeconds * generationBatches.length), elapsedSeconds);
-
-    return Math.max(estimatedTotalSeconds - elapsedSeconds, 0);
-  }, [completedBatchCount, completedEvents, elapsedSeconds, project?.generation_started_at, status?.is_complete]);
+  const progressPercent = Math.min(Math.round((completedBatchCount / generationBatches.length) * 100), 99);
+  const totalCompletedDurationSeconds = completedEvents.reduce(
+    (sum, event) => sum + ((event.duration_ms ?? 0) / 1000),
+    0,
+  );
+  const averageBatchDurationSeconds = completedBatchCount > 0
+    ? totalCompletedDurationSeconds / completedBatchCount
+    : INITIAL_ESTIMATE_SECONDS / generationBatches.length;
+  const remainingBatchCount = status?.is_complete
+    ? 0
+    : Math.max(generationBatches.length - completedBatchCount, 0);
+  const estimatedRemainingSeconds = completedBatchCount > 0
+    ? Math.max(Math.round(remainingBatchCount * averageBatchDurationSeconds), 0)
+    : Math.max(INITIAL_ESTIMATE_SECONDS - elapsedSeconds, 0);
 
   const visibleFeed = activityFeed.length > 0
     ? activityFeed
     : [
         {
           key: 'placeholder',
-          icon: '✦',
+          icon: '•',
           message: getPlaceholderMessage(status, currentBatch.id),
           timestamp: new Date().toISOString(),
         },
       ];
 
   const showReviewPanel = Boolean(status?.is_review_required && !status?.is_complete && !status?.is_failed);
+  const showPreparationScreen = Boolean(generationPreparation && !hasPreparationCompleted);
+  const preparationBadges = useMemo(() => {
+    if (!generationPreparation) {
+      return [];
+    }
+
+    return [
+      {
+        key: 'web-search',
+        label: generationPreparation.has_brave_search ? 'Web search' : 'Web search — not connected',
+        active: generationPreparation.has_brave_search,
+      },
+      {
+        key: 'github',
+        label: generationPreparation.has_github_token ? 'GitHub — authenticated' : 'GitHub — public only',
+        active: true,
+      },
+      {
+        key: 'live-docs',
+        label: generationPreparation.has_context7
+          ? 'Live docs via Context7'
+          : 'Live docs — not connected',
+        active: generationPreparation.has_context7,
+      },
+    ];
+  }, [generationPreparation]);
+  const researchBadges = useMemo(() => {
+    if (!reviewData) {
+      return [];
+    }
+
+    const communityUsed = reviewData.research_sources.some((source) =>
+      ['Brave Search', 'Web search'].includes(source.tool),
+    );
+    const githubUsed = reviewData.research_sources.some((source) => source.tool === 'GitHub');
+    const liveDocsUsed = reviewData.research_sources.some((source) =>
+      ['Context7', 'Live docs', 'Docs', 'Web fetch'].includes(source.tool),
+    );
+
+    return [
+      {
+        key: 'web-search',
+        label: 'Web search',
+        active: communityUsed,
+      },
+      {
+        key: 'github',
+        label: reviewData.data_quality.has_github_token || githubUsed ? 'GitHub' : 'GitHub — not connected',
+        active: reviewData.data_quality.has_github_token || githubUsed,
+      },
+      {
+        key: 'live-docs',
+        label: reviewData.data_quality.has_context7 || liveDocsUsed ? 'Live docs' : 'Live docs — not connected',
+        active: reviewData.data_quality.has_context7 || liveDocsUsed,
+      },
+      {
+        key: 'brave-search',
+        label: reviewData.data_quality.has_brave_search ? 'Brave Search' : 'Brave Search — not connected',
+        active: reviewData.data_quality.has_brave_search,
+      },
+    ];
+  }, [reviewData]);
+  const connectedResearchToolCount = useMemo(() => {
+    if (!reviewData) {
+      return 0;
+    }
+
+    return [
+      reviewData.data_quality.has_brave_search,
+      reviewData.data_quality.has_github_token,
+      reviewData.data_quality.has_context7,
+    ].filter(Boolean).length;
+  }, [reviewData]);
 
   const handleApproveReview = useCallback(async () => {
     if (!id) {
@@ -464,7 +544,7 @@ export default function ProjectGeneration() {
       setActiveBatch('batch_4_plan_build');
       void syncProjectState();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to approve the architecture review.');
+      setError(err instanceof Error ? err.message : 'Failed to approve your review.');
     } finally {
       setIsSubmittingReview(false);
     }
@@ -486,13 +566,57 @@ export default function ProjectGeneration() {
         <motion.div
           animate={{ opacity: [0.4, 1, 0.4] }}
           transition={{ duration: 2, ease: 'easeInOut', repeat: Infinity }}
-          className="mb-8 flex h-20 w-20 items-center justify-center rounded-[22px] border border-accent-primary/20 bg-accent-primary/8 shadow-[0_0_80px_rgba(235,94,40,0.18)]"
+          className="mb-8 text-accent-primary"
         >
-          <Hexagon className="h-10 w-10 text-accent-primary" />
+          <Hexagon className="h-10 w-10" />
         </motion.div>
 
         <AnimatePresence mode="wait">
-          {showReviewPanel ? (
+          {showPreparationScreen ? (
+            <motion.div
+              key="preparation-panel"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
+              className="w-full max-w-[720px]"
+            >
+              <div className="mx-auto max-w-[620px] rounded-[18px] border border-border-default/80 bg-bg-surface/78 px-6 py-7 text-left shadow-panel backdrop-blur-sm">
+                <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">
+                  Getting ready to research
+                </div>
+                <div className="mt-5 flex flex-wrap gap-2">
+                  {preparationBadges.map((badge) => (
+                    <span
+                      key={badge.key}
+                      className={cn(
+                        'inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1 font-sans text-[12px]',
+                        badge.active
+                          ? 'border border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure'
+                          : 'border border-[rgba(204,197,185,0.1)] bg-[rgba(204,197,185,0.05)] text-text-muted',
+                      )}
+                    >
+                      <span aria-hidden="true">{badge.active ? '✓' : '✗'}</span>
+                      <span>{badge.label}</span>
+                    </span>
+                  ))}
+                </div>
+                {needsPreparationNudge ? (
+                  <a
+                    href="/settings#mcp-servers"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-5 inline-flex items-center gap-2 font-sans text-[13px] text-text-secondary transition-colors hover:text-text-primary"
+                  >
+                    <span>
+                      Your plan will still be great. Connect more tools in Settings to go deeper next time.
+                    </span>
+                    <ExternalLink className="h-4 w-4 text-accent-primary" />
+                  </a>
+                ) : null}
+              </div>
+            </motion.div>
+          ) : showReviewPanel ? (
             <motion.div
               key="review-panel"
               initial={{ y: 24, opacity: 0 }}
@@ -502,11 +626,12 @@ export default function ProjectGeneration() {
               className="w-full max-w-[720px] text-left"
             >
               <div className="mb-8">
-                <h1 className="font-serif text-[32px] leading-[1.02] tracking-[-0.03em] text-text-primary">
-                  Here&apos;s what I found
+                <div className="section-label">Your review</div>
+                <h1 className="mt-4 font-serif text-[32px] leading-[1.02] tracking-[-0.03em] text-text-primary">
+                  Before I build the rest, does this look right?
                 </h1>
                 <p className="mt-3 max-w-[560px] font-sans text-[15px] leading-7 text-text-secondary">
-                  Before I build your plan, make sure this looks right. You can adjust anything.
+                  I&apos;ve drafted the setup. Change anything you want before the full plan is written out.
                 </p>
               </div>
 
@@ -518,7 +643,87 @@ export default function ProjectGeneration() {
               ) : null}
 
               <div className="space-y-5">
-                <section className="rounded-[24px] border border-border-default/80 bg-bg-surface/78 p-5 shadow-panel backdrop-blur-sm">
+                <section className="surface-panel rounded-[16px] p-5">
+                  <div className="mb-4">
+                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">Research depth</h2>
+                    <p className="mt-1 font-sans text-[13px] text-text-tertiary">
+                      A quick look at how much live research informed this planning pass.
+                    </p>
+                  </div>
+
+                  {reviewData ? (
+                    <div className="space-y-4">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-sans text-[13px] text-text-secondary">Research used:</span>
+                        {researchBadges.map((badge) => (
+                          <span
+                            key={badge.key}
+                              className={cn(
+                                'inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1 font-sans text-[12px]',
+                                badge.active
+                                ? 'border border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure'
+                                : 'border border-[rgba(204,197,185,0.1)] bg-[rgba(204,197,185,0.05)] text-text-muted',
+                              )}
+                          >
+                            <span aria-hidden="true">{badge.active ? '✓' : '✗'}</span>
+                            <span>{badge.label}</span>
+                          </span>
+                        ))}
+                      </div>
+
+                      <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                        Researched {reviewData.data_quality.technologies_researched} technologies across {reviewData.data_quality.urls_fetched} sources
+                      </div>
+
+                      {connectedResearchToolCount < 2 ? (
+                        <div className="rounded-[14px] border border-status-warning/20 bg-status-warning/8 px-4 py-3 font-sans text-[13px] text-status-warning">
+                          Connect more research tools in{' '}
+                          <a href="/settings#mcp-servers" className="underline underline-offset-4">
+                            Settings
+                          </a>{' '}
+                          for deeper analysis next time.
+                        </div>
+                      ) : null}
+
+                      <details className="rounded-[14px] border border-border-default/70 bg-bg-base/76 px-4 py-3">
+                        <summary className="cursor-pointer list-none font-sans text-[14px] font-medium text-text-primary">
+                          What I read
+                        </summary>
+                        <div className="mt-4 space-y-3">
+                          {reviewData.research_sources.map((source) => (
+                            <div key={`${source.tool}-${source.url}`} className="rounded-[14px] border border-border-default/60 bg-bg-surface/72 px-3 py-3">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                                  {source.tool}
+                                </span>
+                                {source.technology ? (
+                                  <span className="font-sans text-[12px] text-text-tertiary">{source.technology}</span>
+                                ) : null}
+                              </div>
+                              <a
+                                href={source.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mt-2 block font-sans text-[13px] font-medium text-text-primary underline-offset-4 hover:underline"
+                              >
+                                {source.title || source.url}
+                              </a>
+                              {source.summary ? (
+                                <p className="mt-2 font-sans text-[13px] leading-6 text-text-secondary">{source.summary}</p>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    </div>
+                  ) : (
+                    <div className="rounded-[14px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
+                      Loading the research depth summary...
+                    </div>
+                  )}
+                </section>
+
+                <section className="surface-panel rounded-[16px] p-5">
                   <div className="mb-4">
                     <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">Your stack</h2>
                     <p className="mt-1 font-sans text-[13px] text-text-tertiary">
@@ -527,8 +732,8 @@ export default function ProjectGeneration() {
                   </div>
 
                   {isReviewLoading && !reviewData ? (
-                    <div className="rounded-[18px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
-                      Loading the architecture review...
+                    <div className="rounded-[14px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
+                      Loading your review...
                     </div>
                   ) : (
                     reviewData && reviewData.stack_cards.length > 0 ? (
@@ -536,7 +741,7 @@ export default function ProjectGeneration() {
                         {reviewData.stack_cards.map((card) => (
                           <div
                             key={`${card.technology}-${card.package_name}-${card.version}`}
-                            className="rounded-[18px] border border-border-default/70 bg-bg-base/76 p-4"
+                            className="rounded-[14px] border border-border-default/70 bg-bg-base/76 p-4"
                           >
                             <div className="font-sans text-[15px] font-semibold text-text-primary">{card.technology}</div>
                             <div className="mt-1 font-mono text-[12px] text-text-muted">
@@ -548,31 +753,31 @@ export default function ProjectGeneration() {
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
-                                    <div className="mt-3 flex cursor-help items-center gap-2 rounded-[12px] border border-status-warning/20 bg-status-warning/8 px-3 py-2 text-[12px] text-status-warning">
+                                    <div className="mt-3 flex cursor-help items-center gap-2 rounded-[10px] border border-status-warning/20 bg-status-warning/8 px-3 py-2 text-[12px] text-status-warning">
                                       <span aria-hidden="true">⚠️</span>
                                       <span className="min-w-0 truncate">{card.gotcha_issue}</span>
                                     </div>
                                   </TooltipTrigger>
-                                  <TooltipContent className="max-w-[260px] whitespace-normal bg-text-primary px-3 py-2 text-[12px] leading-5 text-bg-base">
-                                    {card.gotcha_mitigation}
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TooltipProvider>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="rounded-[18px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
-                        The architecture is ready, but the stack summary hasn&apos;t been materialized yet.
+                                   <TooltipContent className="max-w-[260px] whitespace-normal px-3 py-2 text-[12px] leading-5">
+                                     {card.gotcha_mitigation}
+                                   </TooltipContent>
+                                 </Tooltip>
+                               </TooltipProvider>
+                             ) : null}
+                           </div>
+                         ))}
+                       </div>
+                     ) : (
+                      <div className="rounded-[14px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
+                        The setup is ready, but the stack summary isn&apos;t loaded yet.
                       </div>
                     )
                   )}
                 </section>
 
-                <section className="rounded-[24px] border border-border-default/80 bg-bg-surface/78 p-5 shadow-panel backdrop-blur-sm">
+                <section className="surface-panel rounded-[16px] p-5">
                   <div className="mb-4">
-                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">How it&apos;s structured</h2>
+                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">How it&apos;s built</h2>
                     <p className="mt-1 font-sans text-[13px] text-text-tertiary">
                       A quick sanity check of the core data model before the plan is expanded.
                     </p>
@@ -583,7 +788,7 @@ export default function ProjectGeneration() {
                       {reviewData.data_model.map((table) => (
                         <div
                           key={table.table}
-                          className="rounded-[16px] border border-border-default/70 bg-bg-base/76 px-4 py-3"
+                          className="rounded-[14px] border border-border-default/70 bg-bg-base/76 px-4 py-3"
                         >
                           <div className="font-mono text-[12px] uppercase tracking-[0.14em] text-text-muted">
                             {table.table}
@@ -601,7 +806,7 @@ export default function ProjectGeneration() {
                   )}
                 </section>
 
-                <section className="rounded-[24px] border border-border-default/80 bg-bg-surface/78 p-5 shadow-panel backdrop-blur-sm">
+                <section className="surface-panel rounded-[16px] p-5">
                   <div className="mb-4">
                     <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">Anything to change?</h2>
                     <p className="mt-1 font-sans text-[13px] text-text-tertiary">
@@ -649,7 +854,7 @@ export default function ProjectGeneration() {
                       setReviewFeedback(event.target.value);
                     }}
                     placeholder="e.g. use Drizzle instead of Prisma, add Resend for email, keep it simpler..."
-                    className="min-h-[124px] w-full resize-y rounded-[16px] border border-border-default bg-bg-base/82 px-4 py-3 font-sans text-[14px] leading-6 text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
+                    className="min-h-[124px] w-full resize-y rounded-[14px] border border-border-default bg-bg-base/82 px-4 py-3 font-sans text-[14px] leading-6 text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
                   />
                 </section>
               </div>
@@ -658,7 +863,7 @@ export default function ProjectGeneration() {
                 <button
                   type="button"
                   onClick={() => feedbackRef.current?.focus()}
-                  className="inline-flex items-center justify-center rounded-[var(--radius-btn)] border border-border-default bg-transparent px-4 py-3 font-sans text-[14px] font-medium text-text-secondary transition-colors hover:border-accent-primary/40 hover:text-text-primary"
+                  className="btn-ghost"
                 >
                   Let me adjust
                 </button>
@@ -666,7 +871,7 @@ export default function ProjectGeneration() {
                   type="button"
                   onClick={() => void handleApproveReview()}
                   disabled={isSubmittingReview || isReviewLoading || !reviewData}
-                  className="inline-flex items-center justify-center rounded-[var(--radius-btn)] bg-accent-primary px-5 py-3 font-sans text-[14px] font-medium text-bg-base transition-all hover:translate-y-[-1px] hover:bg-accent-primary-hover disabled:cursor-not-allowed disabled:opacity-60"
+                  className="btn-primary px-5"
                 >
                   {isSubmittingReview ? 'Building your plan...' : 'Looks right, build my plan →'}
                 </button>
@@ -695,11 +900,11 @@ export default function ProjectGeneration() {
               </AnimatePresence>
 
               {status?.is_failed ? (
-                <div className="w-full rounded-[22px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
+                <div className="w-full rounded-[16px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
                   <div className="flex items-start gap-3">
                     <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The agent hit a snag</div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The plan builder hit a snag</div>
                       <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
                         {error || status.generation_error || 'Project generation failed.'}
                       </p>
@@ -712,14 +917,14 @@ export default function ProjectGeneration() {
                       setStreamConnectionKey((previous) => previous + 1);
                       void syncProjectState();
                     }}
-                    className="mt-5 inline-flex items-center justify-center rounded-[var(--radius-btn)] bg-accent-primary px-4 py-3 font-sans text-[14px] font-medium text-bg-base transition-all hover:translate-y-[-1px] hover:bg-accent-primary-hover"
+                    className="btn-primary mt-5"
                   >
                     Try again
                   </button>
                 </div>
               ) : (
                 <>
-                  <div className="w-full rounded-[22px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
+                  <div className="w-full rounded-[16px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
                     <div ref={logContainerRef} className="max-h-[280px] overflow-y-auto pr-2">
                       <AnimatePresence initial={false}>
                         {visibleFeed.map((entry) => (
@@ -774,23 +979,39 @@ export default function ProjectGeneration() {
                     </div>
                   </div>
 
-                  <div className="mt-8 flex flex-col items-center gap-2">
-                    <div className="font-mono text-[11px] uppercase tracking-[0.18em] text-text-muted">
-                      Estimated time remaining
-                    </div>
-                    <div className="font-serif text-[30px] tracking-[-0.03em] text-text-primary">
-                      {formatRemainingTime(estimatedRemainingSeconds)}
-                    </div>
-                    {isLoading ? (
-                      <div className="text-[12px] font-sans text-text-tertiary">Loading the current generation state...</div>
-                    ) : null}
-                    {error ? (
-                      <div className="mt-2 flex items-center gap-2 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-status-warning">
-                        <TriangleAlert className="h-4 w-4" />
-                        <span>{error}</span>
+                  <div className="mt-8 grid w-full gap-3 sm:grid-cols-3">
+                    <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Time left</div>
+                      <div className="mt-2 font-serif text-[28px] tracking-[-0.03em] text-text-primary">
+                        {status?.is_complete ? '00:00' : formatRemainingTime(estimatedRemainingSeconds)}
                       </div>
-                    ) : null}
+                    </div>
+                    <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Progress</div>
+                      <div className="mt-2 font-serif text-[28px] tracking-[-0.03em] text-text-primary">
+                        {status?.is_complete ? '100%' : `${progressPercent}%`}
+                      </div>
+                    </div>
+                    <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Working now</div>
+                      <div className="mt-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary">
+                        {currentBatch.shortLabel}
+                      </div>
+                      <div className="mt-1 font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">
+                        {completedBatchCount} of {generationBatches.length} batches done
+                      </div>
+                    </div>
                   </div>
+
+                  {isLoading ? (
+                    <div className="mt-4 text-[12px] font-sans text-text-tertiary">Loading the current generation state...</div>
+                  ) : null}
+                  {error ? (
+                    <div className="mt-4 flex items-center gap-2 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-status-warning">
+                      <TriangleAlert className="h-4 w-4" />
+                      <span>{error}</span>
+                    </div>
+                  ) : null}
                 </>
               )}
             </motion.div>

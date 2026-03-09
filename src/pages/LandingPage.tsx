@@ -117,7 +117,7 @@ const canvasPreviewSteps: PreviewStep[] = [
   {
     id: 'build',
     stage: 'Build',
-    title: 'Ship auth and onboarding',
+    title: 'Ship sign-in and getting started',
     tone: 'active',
     top: '46%',
     left: '42%',
@@ -404,8 +404,7 @@ export default function LandingPage() {
               className="mb-10 max-w-[440px] text-body text-[17px] leading-relaxed" 
               style={{ textWrap: 'pretty' }}
             >
-              Scrimble keeps vibe coders on track — one step at a time,{' '}
-              <span className="whitespace-nowrap">powered by AI.</span>
+              Scrimble keeps solo builders on track — one step at a time, with AI doing the heavy lifting.
             </motion.p>
 
             <motion.div

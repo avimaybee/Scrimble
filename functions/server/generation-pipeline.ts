@@ -30,7 +30,25 @@ import {
 import { getBatchStartLabel, persistGenerationStreamEvent } from './generation-events';
 import { callAIText, defaultModelForProvider } from './ai';
 import { decrypt } from '../utils/crypto';
-import { fetchAndParse, type GitHubResearchResult, type ResearchResult } from '../utils/fetch-url';
+import { extractGitHubRepository } from '../utils/fetch-url';
+import {
+  analyzeGithubRepo,
+  fetchUrl,
+  getLibraryDocs,
+  getLibraryIssues,
+  searchWeb,
+  type Env as ToolEnv,
+  type SearchResult,
+  type GithubIssue,
+  type GithubRepoAnalysis,
+} from '../../workers/tools';
+import { getConnectedResearchTools } from './mcp-servers';
+import {
+  appendResearchFooter,
+  collectStepResearchContext,
+  formatStepResearchPrompt,
+  type StepResearchContext,
+} from './step-research';
 
 type ProviderConfig = {
   providerId: string;
@@ -72,6 +90,9 @@ export type ArchitectureReviewDataModelTable = {
   columns: string[];
 };
 
+export type ArchitectureReviewResearchSource = Batch2FetchAndRead['sources'][number];
+export type ArchitectureReviewDataQuality = Batch2FetchAndRead['data_quality'];
+
 export type ArchitectureReviewPayload = {
   project_id: string;
   project_name: string;
@@ -79,6 +100,8 @@ export type ArchitectureReviewPayload = {
   recommended_stack: Batch3Architect['recommended_stack'];
   stack_cards: ArchitectureReviewStackCard[];
   data_model: ArchitectureReviewDataModelTable[];
+  research_sources: ArchitectureReviewResearchSource[];
+  data_quality: ArchitectureReviewDataQuality;
   preferred_ide: PreferredIde;
   review_feedback: string;
   review_feedback_provided: boolean;
@@ -107,6 +130,31 @@ type EnrichedPlanStage = Omit<Batch4PlanBuild['stages'][number], 'steps'> & {
 
 type EnrichedPlan = Omit<Batch4PlanBuild, 'stages'> & {
   stages: EnrichedPlanStage[];
+};
+
+type FetchedCommunitySource = {
+  title: string;
+  url: string;
+  description: string;
+  content: string;
+};
+
+type FetchedTechnologyResearch = {
+  technology: string;
+  docs_url: string;
+  github_url: string;
+  changelog_url: string;
+  docs_content: string;
+  github_readme: string;
+  latest_version: string;
+  last_commit_date: string;
+  open_issues_count: number;
+  recent_breaking_changes: string;
+  repo_health_summary: string;
+  community_sentiment: string;
+  bug_report_digest: string;
+  source_ledger: Batch2FetchAndRead['sources'];
+  community_pages: FetchedCommunitySource[];
 };
 
 type ActiveStepSummary = {
@@ -190,43 +238,92 @@ function toBoolean(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
 }
 
-function formatResearchFailure(result: ResearchResult) {
-  if (result.kind !== 'error') {
+function emptyGithubRepoAnalysis(owner = '', repo = ''): GithubRepoAnalysis {
+  return {
+    owner,
+    repo,
+    stars: 0,
+    forks: 0,
+    openIssues: 0,
+    lastPush: 'Unknown',
+    latestRelease: 'Unknown',
+    readme: '',
+    summary: '',
+    releases: [],
+    recentIssues: [],
+  };
+}
+
+function formatGithubIssues(issues: GithubIssue[]) {
+  return issues
+    .map((issue) => `Open issue (${issue.createdAt}) ${issue.title}: ${issue.body}`)
+    .join('\n\n');
+}
+
+function formatSearchResults(results: SearchResult[]) {
+  return results
+    .map((result) => `${result.title}: ${result.description} (${result.url})`)
+    .join('\n');
+}
+
+function summarizeSnippet(value: string, maxLength = 180) {
+  const collapsed = value.replace(/\s+/g, ' ').trim();
+  if (!collapsed) {
     return '';
   }
 
-  const statusSuffix = result.status !== undefined ? ` (${result.status})` : '';
-  return `Failed to fetch ${result.url}${statusSuffix}${result.message ? `: ${result.message}` : '.'}`;
+  return collapsed.length <= maxLength ? collapsed : `${collapsed.slice(0, maxLength)}...`;
 }
 
-function formatGitHubBreakingChanges(result: GitHubResearchResult) {
-  const sections: string[] = [];
+function dedupeSearchResults(results: SearchResult[]) {
+  const seen = new Set<string>();
 
-  if (result.releases.length > 0) {
-    sections.push(
-      result.releases
-        .map((release) => `Release ${release.tag_name} (${release.published_at}): ${release.body}`)
-        .join('\n\n'),
-    );
-  }
+  return results.filter((result) => {
+    const key = result.url.trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      return false;
+    }
 
-  if (result.recent_issues.length > 0) {
-    sections.push(
-      result.recent_issues
-        .map((issue) => `Open issue (${issue.created_at}) ${issue.title}: ${issue.body}`)
-        .join('\n\n'),
-    );
-  }
+    seen.add(key);
+    return true;
+  });
+}
 
-  if (result.partial_errors.length > 0) {
-    sections.push(
-      result.partial_errors
-        .map((error) => `GitHub fetch failed for ${error.url}${error.status ? ` (${error.status})` : ''}.`)
-        .join('\n'),
-    );
-  }
+function dedupeResearchSources(sources: Batch2FetchAndRead['sources']) {
+  const seen = new Set<string>();
 
-  return sections.join('\n\n');
+  return sources.filter((source) => {
+    const key = `${source.tool}::${source.url}`.toLowerCase();
+    if (!source.url || seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function createResearchSource(
+  technology: string,
+  tool: string,
+  url: string,
+  title: string,
+  summary: string,
+): Batch2FetchAndRead['sources'][number] {
+  return {
+    technology,
+    tool,
+    url,
+    title,
+    summary: summarizeSnippet(summary),
+  };
+}
+
+function formatReleaseDigest(releases: GithubRepoAnalysis['releases']) {
+  return releases
+    .slice(0, 3)
+    .map((release) => `${release.tagName} (${release.publishedAt}): ${release.body}`)
+    .join('\n\n');
 }
 
 function formatCompactNumber(value: number) {
@@ -328,6 +425,7 @@ function buildArchitectureReviewPayload(
   projectId: string,
   adr: Batch3Architect,
   input: Record<string, unknown>,
+  research: Batch2FetchAndRead,
 ): ArchitectureReviewPayload {
   const seen = new Set<string>();
   const stackCards = adr.integrations.reduce<ArchitectureReviewStackCard[]>((cards, integration) => {
@@ -364,6 +462,8 @@ function buildArchitectureReviewPayload(
       table: table.table,
       columns: table.columns.map((column) => `${column.name} (${column.type})`),
     })),
+    research_sources: research.sources,
+    data_quality: research.data_quality,
     preferred_ide: preferredIde,
     review_feedback: reviewFeedback,
     review_feedback_provided: reviewFeedbackProvided,
@@ -684,7 +784,7 @@ async function loadBatchRunRecord(env: Bindings, projectId: string, runType: Gen
   return record as AgentRunRecord | null;
 }
 
-async function loadBatchOutput<T>(
+export async function loadBatchOutput<T>(
   env: Bindings,
   projectId: string,
   runType: GenerationBatchName,
@@ -746,7 +846,8 @@ async function loadArchitectureReviewContext(env: Bindings, projectId: string): 
 
 export async function getArchitectureReviewPayload(env: Bindings, projectId: string) {
   const context = await loadArchitectureReviewContext(env, projectId);
-  return buildArchitectureReviewPayload(projectId, context.adr, context.input);
+  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2);
 }
 
 export async function saveArchitectureReviewApproval(
@@ -964,22 +1065,29 @@ async function completeBatch<T>(
 }
 
 async function materializePlanStructure(env: Bindings, projectId: string, plan: Batch4PlanBuild) {
+  const workflowResult = await env.DB.prepare('SELECT id FROM workflows WHERE project_id = ? LIMIT 1').bind(projectId).first();
+  let workflowId = workflowResult?.id as string | undefined;
+
+  if (!workflowId) {
+    workflowId = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO workflows (id, project_id, version, canvas_state) VALUES (?, ?, ?, ?)')
+      .bind(workflowId, projectId, 1, JSON.stringify({ x: 0, y: 0, zoom: 1 }));
+  }
+
   const statements: Array<any> = [
-    env.DB.prepare('DELETE FROM checklist_items WHERE step_id IN (SELECT id FROM steps WHERE project_id = ?)').bind(projectId),
-    env.DB.prepare('DELETE FROM edges WHERE project_id = ?').bind(projectId),
-    env.DB.prepare('DELETE FROM steps WHERE project_id = ?').bind(projectId),
-    env.DB.prepare('DELETE FROM stages WHERE project_id = ?').bind(projectId),
-    env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(projectId),
-    env.DB.prepare('INSERT INTO plans (id, project_id, version, canvas_state) VALUES (?, ?, ?, ?)')
-      .bind(crypto.randomUUID(), projectId, 1, JSON.stringify({ x: 0, y: 0, zoom: 1 })),
+    env.DB.prepare('DELETE FROM checklist_items WHERE step_id IN (SELECT id FROM steps WHERE workflow_id = ?)').bind(workflowId),
+    env.DB.prepare('DELETE FROM edges WHERE workflow_id = ?').bind(workflowId),
+    env.DB.prepare('DELETE FROM steps WHERE workflow_id = ?').bind(workflowId),
+    env.DB.prepare('DELETE FROM stages WHERE workflow_id = ?').bind(workflowId),
+    env.DB.prepare('UPDATE workflows SET version = version + 1, updated_at = datetime("now") WHERE id = ?').bind(workflowId),
   ];
 
   let globalOrderIndex = 0;
 
   for (const stage of plan.stages) {
     statements.push(
-      env.DB.prepare('INSERT INTO stages (id, project_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
-        .bind(stage.id, projectId, stage.title, stage.type, stage.order_index, stage.order_index === 0 ? 'active' : 'locked'),
+      env.DB.prepare('INSERT INTO stages (id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(stage.id, workflowId, stage.title, stage.type, stage.order_index, stage.order_index === 0 ? 'active' : 'locked'),
     );
 
     stage.steps.forEach((step, stepIndex) => {
@@ -994,13 +1102,13 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
       statements.push(
         env.DB.prepare(`
           INSERT INTO steps (
-            id, project_id, stage_id, title, type, category, position_x, position_y, status,
+            id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
             is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when,
             ai_output, prompts, is_ai_enriched
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           step.id,
-          projectId,
+          workflowId,
           stage.id,
           step.title,
           step.type || 'task',
@@ -1037,9 +1145,9 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
   for (const edge of plan.edges || []) {
     statements.push(
       env.DB.prepare(`
-        INSERT INTO edges (id, project_id, source_step_id, target_step_id, edge_type)
+        INSERT INTO edges (id, workflow_id, source_step_id, target_step_id, edge_type)
         VALUES (?, ?, ?, ?, ?)
-      `).bind(edge.id, projectId, edge.source_step_id, edge.target_step_id, edge.edge_type || 'default'),
+      `).bind(edge.id, workflowId, edge.source_step_id, edge.target_step_id, edge.edge_type || 'default'),
     );
   }
 
@@ -1058,12 +1166,12 @@ async function applyStepEnrichments(env: Bindings, projectId: string, enrichment
             ELSE status
           END,
           updated_at = datetime("now")
-      WHERE project_id = ? AND id = ?
+      WHERE id = ? AND workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)
     `).bind(
       enrichment.ai_output,
       JSON.stringify(enrichment.prompts),
-      projectId,
       enrichment.step_id,
+      projectId,
     ),
   );
 
@@ -1092,16 +1200,17 @@ async function persistGeneratedFiles(env: Bindings, projectId: string, files: Ba
 async function loadCurrentActiveStep(env: Bindings, projectId: string): Promise<ActiveStepSummary | null> {
   const activeStep = await env.DB.prepare(`
     SELECT
-      steps.id,
-      steps.title,
-      steps.objective,
-      steps.done_when,
-      steps.order_index,
-      stages.title AS stage_title
-    FROM steps
-    INNER JOIN stages ON stages.id = steps.stage_id
-    WHERE steps.project_id = ? AND steps.status = 'active'
-    ORDER BY steps.order_index ASC
+      s.id,
+      s.title,
+      s.objective,
+      s.done_when,
+      s.order_index,
+      st.title AS stage_title
+    FROM steps s
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    INNER JOIN stages st ON st.id = s.stage_id
+    WHERE w.project_id = ? AND s.status = 'active'
+    ORDER BY s.order_index ASC
     LIMIT 1
   `)
     .bind(projectId)
@@ -1120,16 +1229,17 @@ async function loadCurrentActiveStep(env: Bindings, projectId: string): Promise<
 
   const fallbackStep = await env.DB.prepare(`
     SELECT
-      steps.id,
-      steps.title,
-      steps.objective,
-      steps.done_when,
-      steps.order_index,
-      stages.title AS stage_title
-    FROM steps
-    INNER JOIN stages ON stages.id = steps.stage_id
-    WHERE steps.project_id = ?
-    ORDER BY steps.order_index ASC
+      s.id,
+      s.title,
+      s.objective,
+      s.done_when,
+      s.order_index,
+      st.title AS stage_title
+    FROM steps s
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    INNER JOIN stages st ON st.id = s.stage_id
+    WHERE w.project_id = ?
+    ORDER BY s.order_index ASC
     LIMIT 1
   `)
     .bind(projectId)
@@ -1169,6 +1279,14 @@ async function executeBatch1(env: Bindings, project: ProjectRecord, provider: Pr
   const input = {
     description: project.description || '',
   };
+  const currentYear = new Date().getFullYear();
+  const toolEnv: ToolEnv = {
+    ...env,
+    TOOL_CONTEXT: {
+      projectId: project.id,
+      batchName: 'batch_1_research_stack',
+    },
+  };
 
   await emitBatchStart(env, project.id, 'batch_1_research_stack');
   await logActivity(env, {
@@ -1200,22 +1318,78 @@ Only include technologies that matter to implementation.`;
       schemaDescription: schemaDescriptions.batch_1_research_stack,
     });
 
+    const technologiesWithSearches = [];
+
+    for (const technology of result.data.technologies) {
+      await logActivity(env, {
+        projectId: project.id,
+        batchName: 'batch_1_research_stack',
+        kind: 'fetch',
+        message: `Searching for ${technology.name} community feedback...`,
+      });
+      const communitySearchResults = dedupeSearchResults(
+        await searchWeb(`${technology.name} vs alternatives ${currentYear}`, project.user_id, toolEnv),
+      );
+
+      await logActivity(env, {
+        projectId: project.id,
+        batchName: 'batch_1_research_stack',
+        kind: 'fetch',
+        message: `Searching for ${technology.name} breaking changes...`,
+      });
+      const breakingChangeSearchResults = dedupeSearchResults(
+        await searchWeb(
+          `${technology.name} breaking changes deprecations ${currentYear}`,
+          project.user_id,
+          toolEnv,
+        ),
+      );
+
+      if (communitySearchResults.length > 0) {
+        await logActivity(env, {
+          projectId: project.id,
+          batchName: 'batch_1_research_stack',
+          kind: 'fetch',
+          message: `${technology.name} community feedback surfaced ${communitySearchResults.length} comparison source${communitySearchResults.length === 1 ? '' : 's'}.`,
+        });
+      }
+
+      if (breakingChangeSearchResults.length > 0) {
+        await logActivity(env, {
+          projectId: project.id,
+          batchName: 'batch_1_research_stack',
+          kind: 'warning',
+          message: `${technology.name} surfaced ${breakingChangeSearchResults.length} breaking-change or deprecation source${breakingChangeSearchResults.length === 1 ? '' : 's'}.`,
+        });
+      }
+
+      technologiesWithSearches.push({
+        ...technology,
+        community_search_results: communitySearchResults,
+        breaking_change_search_results: breakingChangeSearchResults,
+      });
+    }
+
+    const enrichedBatch1 = {
+      technologies: technologiesWithSearches,
+    };
+
     await completeBatch(
       env,
       project.id,
       provider,
       'batch_1_research_stack',
       input,
-      result.data,
+      enrichedBatch1,
       result.attemptCount,
-      result.data,
+      enrichedBatch1,
       Date.now() - startedAt,
     );
     await logActivity(env, {
       projectId: project.id,
       batchName: 'batch_1_research_stack',
       kind: 'complete',
-      message: `Stack candidates identified — ${result.data.technologies.length} technologies queued for research.`,
+      message: `Stack candidates identified — ${enrichedBatch1.technologies.length} technologies queued for research.`,
     });
   } catch (error) {
     await failBatch(
@@ -1230,10 +1404,20 @@ Only include technologies that matter to implementation.`;
   }
 }
 
-async function executeBatch2(env: Bindings, projectId: string, provider: ProviderConfig) {
+async function executeBatch2(env: Bindings, project: ProjectRecord, provider: ProviderConfig) {
   const startedAt = Date.now();
+  const projectId = project.id;
   const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
-  const fetchedSources = [];
+  const fetchedSources: FetchedTechnologyResearch[] = [];
+  const connectedTools = await getConnectedResearchTools(env, project.user_id);
+  let issuesFound = 0;
+  const toolEnv: ToolEnv = {
+    ...env,
+    TOOL_CONTEXT: {
+      projectId,
+      batchName: 'batch_2_fetch_and_read',
+    },
+  };
 
   await emitBatchStart(env, projectId, 'batch_2_fetch_and_read');
   await logActivity(env, {
@@ -1244,35 +1428,58 @@ async function executeBatch2(env: Bindings, projectId: string, provider: Provide
   });
 
   for (const technology of batch1.technologies) {
-    const logFetchAttempt = (attempt: {
-      url: string;
-      source: string;
-      status: string | number;
-      duration_ms: number;
-    }) =>
-      insertGenerationEvent(env, {
-        projectId,
-        eventType: 'fetch_attempt',
-        batchName: 'batch_2_fetch_and_read',
-        body: {
-          ...attempt,
-          batch: 'batch_2_fetch_and_read',
-          technology: technology.name,
-        },
-      });
-
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
       kind: 'fetch',
-      message: `Reading ${technology.name} documentation...`,
+      message: `Researching ${technology.name} with every source you've connected...`,
     });
 
-    const docsResult = await fetchAndParse(technology.docs_url, {
-      githubToken: env.GITHUB_TOKEN || null,
-      onLog: logFetchAttempt,
-    });
-    if (docsResult.kind === 'error') {
+    const githubRepository = extractGitHubRepository(technology.github_url);
+    const searchResults = dedupeSearchResults([
+      ...technology.community_search_results,
+      ...technology.breaking_change_search_results,
+    ]);
+    const [docsResult, changelogResult, liveDocsResult, githubAnalysis, githubIssues] = await Promise.all([
+      fetchUrl(technology.docs_url, toolEnv),
+      fetchUrl(technology.changelog_url, toolEnv),
+      getLibraryDocs(
+        technology.name,
+        'installation, migration, compatibility, breaking changes, best practices',
+        project.user_id,
+        toolEnv,
+      ),
+      githubRepository
+        ? analyzeGithubRepo(githubRepository.owner, githubRepository.repo, project.user_id, toolEnv)
+        : Promise.resolve(emptyGithubRepoAnalysis()),
+      githubRepository
+        ? getLibraryIssues(
+            githubRepository.owner,
+            githubRepository.repo,
+            ['bug', 'breaking-change'],
+            90,
+            project.user_id,
+            toolEnv,
+          )
+        : Promise.resolve([]),
+    ]);
+    const communityPages = (
+      await Promise.all(
+        searchResults.map(async (result) => {
+          const page = await fetchUrl(result.url, toolEnv);
+
+          return {
+            title: result.title,
+            url: result.url,
+            description: result.description,
+            content: page.content,
+          };
+        }),
+      )
+    ).filter((page): page is FetchedCommunitySource => Boolean(page.content || page.description));
+    issuesFound += githubIssues.length;
+
+    if (!docsResult.content && !liveDocsResult.content) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
@@ -1281,11 +1488,7 @@ async function executeBatch2(env: Bindings, projectId: string, provider: Provide
       });
     }
 
-    const changelogResult = await fetchAndParse(technology.changelog_url, {
-      githubToken: env.GITHUB_TOKEN || null,
-      onLog: logFetchAttempt,
-    });
-    if (changelogResult.kind === 'error') {
+    if (!changelogResult.content) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
@@ -1294,37 +1497,36 @@ async function executeBatch2(env: Bindings, projectId: string, provider: Provide
       });
     }
 
-    const githubResult = await fetchAndParse(technology.github_url, {
-      githubToken: env.GITHUB_TOKEN || null,
-      onLog: logFetchAttempt,
-    });
-
-    if (githubResult.kind === 'github_repo') {
+    if (githubRepository && githubAnalysis.summary) {
+      const relativeUpdate =
+        githubAnalysis.lastPush !== 'Unknown'
+          ? `, updated ${formatRelativeAge(githubAnalysis.lastPush)}`
+          : '';
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'github',
-        message: `Checking ${githubResult.repo.owner}/${githubResult.repo.repo} on GitHub — ${formatCompactNumber(githubResult.metadata.stars)} stars, updated ${formatRelativeAge(githubResult.metadata.last_push_date)}`,
+        message: `Checking ${githubAnalysis.owner}/${githubAnalysis.repo} on GitHub — ${formatCompactNumber(githubAnalysis.stars)} stars${relativeUpdate}`,
       });
 
-      if (githubResult.latest_version !== 'Unknown') {
+      if (githubAnalysis.latestRelease !== 'Unknown') {
         await logActivity(env, {
           projectId,
           batchName: 'batch_2_fetch_and_read',
           kind: 'github',
-          message: `Checking ${githubResult.repo.owner}/${githubResult.repo.repo} — latest release ${githubResult.latest_version}`,
+          message: `Checking ${githubAnalysis.owner}/${githubAnalysis.repo} — latest release ${githubAnalysis.latestRelease}`,
         });
       }
 
-      if (githubResult.recent_issues.length > 0) {
+      if (githubIssues.length > 0) {
         await logActivity(env, {
           projectId,
           batchName: 'batch_2_fetch_and_read',
           kind: 'warning',
-          message: `${githubResult.recent_issues.length} recent bug or breaking-change issue${githubResult.recent_issues.length === 1 ? '' : 's'} surfaced for ${githubResult.repo.owner}/${githubResult.repo.repo}.`,
+          message: `${githubIssues.length} recent bug or breaking-change issue${githubIssues.length === 1 ? '' : 's'} surfaced for ${githubAnalysis.owner}/${githubAnalysis.repo}.`,
         });
       }
-    } else {
+    } else if (githubRepository) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
@@ -1333,38 +1535,171 @@ async function executeBatch2(env: Bindings, projectId: string, provider: Provide
       });
     }
 
-    const docsContent = docsResult.kind === 'document' ? docsResult.text : formatResearchFailure(docsResult);
-    const changelogContent =
-      changelogResult.kind === 'document' ? changelogResult.text : formatResearchFailure(changelogResult);
+    if (!githubRepository) {
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'warning',
+        message: `${technology.name} did not include a valid GitHub repository URL — skipping GitHub analysis.`,
+      });
+    }
+
+    if (searchResults.length > 0) {
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'fetch',
+        message: `Read ${communityPages.length} community source${communityPages.length === 1 ? '' : 's'} for ${technology.name}.`,
+      });
+    }
+
+    if (liveDocsResult.content && liveDocsResult.source === 'Context7') {
+      const versionSuffix =
+        liveDocsResult.version !== 'unknown' ? ` (${liveDocsResult.version})` : '';
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'fetch',
+        message: `Pulled live ${technology.name} docs from Context7${versionSuffix}.`,
+      });
+    }
+
+    if (githubRepository && githubAnalysis.summary) {
+      const recentBreakingSignals = githubIssues.length + technology.breaking_change_search_results.length;
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'github',
+        message: `📦 ${githubAnalysis.owner}/${githubAnalysis.repo} — ${formatCompactNumber(githubAnalysis.stars)} stars, last commit ${formatRelativeAge(githubAnalysis.lastPush)}, ${recentBreakingSignals} recent breaking-change signal${recentBreakingSignals === 1 ? '' : 's'} found.`,
+      });
+    }
+
+    const docsContentSections = [docsResult.content];
+    if (liveDocsResult.content) {
+      const sourceLabel =
+        liveDocsResult.source === 'Context7' && liveDocsResult.version !== 'unknown'
+          ? `${liveDocsResult.source} ${liveDocsResult.version}`
+          : liveDocsResult.source;
+      docsContentSections.push(`${sourceLabel}\n${liveDocsResult.content}`);
+    }
+
+    const changelogContent = changelogResult.content || 'Release notes unavailable.';
+    const githubIssueDigest = formatGithubIssues(githubIssues);
+    const releaseDigest = formatReleaseDigest(githubAnalysis.releases);
+    const communitySentiment = communityPages
+      .map((page) => `${page.title}: ${page.content || page.description} (${page.url})`)
+      .join('\n\n');
+    const repoHealthSummary = githubRepository
+      ? `${githubAnalysis.owner}/${githubAnalysis.repo} has ${formatCompactNumber(githubAnalysis.stars)} stars, ${githubAnalysis.openIssues} open issues, latest release ${githubAnalysis.latestRelease}, last push ${githubAnalysis.lastPush}.`
+      : 'GitHub repository data unavailable.';
+    const technologySources = dedupeResearchSources([
+      ...(docsResult.content
+        ? [
+            createResearchSource(
+              technology.name,
+              'Web fetch',
+              technology.docs_url,
+              `${technology.name} docs`,
+              docsResult.content,
+            ),
+          ]
+        : []),
+      ...(liveDocsResult.content
+        ? [
+            createResearchSource(
+              technology.name,
+              liveDocsResult.source === 'Context7' ? 'Context7' : 'Live docs',
+              technology.docs_url,
+              `${technology.name} live docs`,
+              liveDocsResult.content,
+            ),
+          ]
+        : []),
+      ...(changelogResult.content
+        ? [
+            createResearchSource(
+              technology.name,
+              'Web fetch',
+              technology.changelog_url,
+              `${technology.name} changelog`,
+              changelogResult.content,
+            ),
+          ]
+        : []),
+      ...(githubRepository
+        ? [
+            createResearchSource(
+              technology.name,
+              'GitHub',
+              technology.github_url,
+              `${githubAnalysis.owner}/${githubAnalysis.repo}`,
+              `${repoHealthSummary}\n\n${githubAnalysis.summary}\n\n${releaseDigest}`,
+            ),
+          ]
+        : []),
+      ...githubIssues.slice(0, 5).map((issue) =>
+        createResearchSource(technology.name, 'GitHub', issue.url, issue.title, issue.body),
+      ),
+      ...communityPages.map((page) =>
+        createResearchSource(
+          technology.name,
+          connectedTools.has_brave_search ? 'Brave Search' : 'Web search',
+          page.url,
+          page.title,
+          page.content || page.description,
+        ),
+      ),
+    ]);
+    const latestVersion =
+      githubAnalysis.latestRelease !== 'Unknown'
+        ? githubAnalysis.latestRelease
+        : liveDocsResult.version !== 'unknown'
+          ? liveDocsResult.version
+          : 'Unknown';
 
     fetchedSources.push({
       technology: technology.name,
       docs_url: technology.docs_url,
       github_url: technology.github_url,
       changelog_url: technology.changelog_url,
-      docs_content: docsContent,
-      changelog_content: changelogContent,
-      github_readme: githubResult.kind === 'github_repo' ? githubResult.readme : formatResearchFailure(githubResult),
-      latest_version: githubResult.kind === 'github_repo' ? githubResult.latest_version : 'Unknown',
-      last_commit_date: githubResult.kind === 'github_repo' ? githubResult.metadata.last_push_date : 'Unknown',
-      open_issues_count: githubResult.kind === 'github_repo' ? githubResult.metadata.open_issues_count : 0,
-      recent_breaking_changes:
-        githubResult.kind === 'github_repo'
-          ? [changelogContent, formatGitHubBreakingChanges(githubResult)].filter(Boolean).join('\n\n')
-          : [changelogContent, formatResearchFailure(githubResult)].filter(Boolean).join('\n\n'),
+      docs_content: docsContentSections.filter(Boolean).join('\n\n') || 'Documentation source unavailable.',
+      github_readme: githubAnalysis.readme || githubAnalysis.summary || 'GitHub repository data unavailable.',
+      latest_version: latestVersion,
+      last_commit_date: githubAnalysis.lastPush || 'Unknown',
+      open_issues_count: githubAnalysis.openIssues,
+      recent_breaking_changes: [changelogContent, releaseDigest, githubIssueDigest]
+        .filter(Boolean)
+        .join('\n\n'),
+      repo_health_summary: repoHealthSummary,
+      community_sentiment:
+        communitySentiment || formatSearchResults(searchResults) || 'Community sentiment unavailable.',
+      bug_report_digest: githubIssueDigest || 'No recent bug reports found.',
+      source_ledger: technologySources,
+      community_pages: communityPages,
     });
   }
+
+  const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
+  const dataQuality: Batch2FetchAndRead['data_quality'] = {
+    has_brave_search: connectedTools.has_brave_search,
+    has_github_token: connectedTools.has_github_token,
+    has_context7: connectedTools.has_context7,
+    technologies_researched: fetchedSources.length,
+    urls_fetched: sourceLedger.length,
+    issues_found: issuesFound,
+  };
 
   const input = {
     technologies: batch1.technologies,
     fetched_sources: fetchedSources,
+    data_quality: dataQuality,
   };
 
   const systemPrompt =
     'You are Scrimble’s technical research analyst. Turn fetched docs, readmes, metadata, and changelog snippets into a structured research corpus. Keep the important technical details concrete. Return only valid JSON.';
   const prompt = `Research the following fetched technology materials and convert them into a structured corpus.
 
-${JSON.stringify(fetchedSources, null, 2)}
+${JSON.stringify({ fetchedSources, dataQuality }, null, 2)}
 
 For each technology, return:
 - technology
@@ -1374,6 +1709,10 @@ For each technology, return:
 - last_commit_date
 - open_issues_count
 - recent_breaking_changes
+- repo_health_summary
+- community_sentiment
+- bug_report_digest
+- sources (copy the important sources you used as { technology, url, tool, title, summary })
 
 Preserve specific version and compatibility details.`;
 
@@ -1386,22 +1725,48 @@ Preserve specific version and compatibility details.`;
       schemaDescription: schemaDescriptions.batch_2_fetch_and_read,
     });
 
+    const researchByTechnology = new Map(
+      result.data.research.map((entry) => [entry.technology.toLowerCase(), entry] as const),
+    );
+    const finalResearch = fetchedSources.map((source) => {
+      const generated = researchByTechnology.get(source.technology.toLowerCase());
+
+      return {
+        technology: source.technology,
+        docs_content: generated?.docs_content || source.docs_content,
+        github_readme: generated?.github_readme || source.github_readme,
+        latest_version: generated?.latest_version || source.latest_version,
+        last_commit_date: generated?.last_commit_date || source.last_commit_date,
+        open_issues_count: generated?.open_issues_count ?? source.open_issues_count,
+        recent_breaking_changes: generated?.recent_breaking_changes || source.recent_breaking_changes,
+        repo_health_summary: generated?.repo_health_summary || source.repo_health_summary,
+        community_sentiment: generated?.community_sentiment || source.community_sentiment,
+        bug_report_digest: generated?.bug_report_digest || source.bug_report_digest,
+        sources: source.source_ledger,
+      };
+    });
+    const finalOutput: Batch2FetchAndRead = {
+      research: finalResearch,
+      sources: sourceLedger,
+      data_quality: dataQuality,
+    };
+
     await completeBatch(
       env,
       projectId,
       provider,
       'batch_2_fetch_and_read',
       input,
-      result.data,
+      finalOutput,
       result.attemptCount,
-      result.data,
+      finalOutput,
       Date.now() - startedAt,
     );
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
       kind: 'complete',
-      message: `Stack research complete — ${result.data.research.length} technologies analysed.`,
+      message: `Stack research complete — ${finalOutput.research.length} technologies analysed across ${finalOutput.data_quality.urls_fetched} sources.`,
     });
   } catch (error) {
     await failBatch(
@@ -1581,14 +1946,67 @@ Rules:
 
 async function executeBatch5(env: Bindings, projectId: string, provider: ProviderConfig) {
   const startedAt = Date.now();
+  const project = await getProjectById(env, projectId);
+  if (!project) {
+    throw new Error('Project not found.');
+  }
+
+  const adr = await loadBatchOutput(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
   const research = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const connectedTools = await getConnectedResearchTools(env, project.user_id);
+  const stepResearchContexts: StepResearchContext[] = [];
+
+  await emitBatchStart(env, projectId, 'batch_5_enrich_steps');
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_5_enrich_steps',
+    kind: 'fetch',
+    message: 'Refreshing every step with live docs, issues, and current implementation notes...',
+  });
+
+  for (const stage of plan.stages) {
+    for (const step of stage.steps) {
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_5_enrich_steps',
+        kind: 'fetch',
+        message: `Refreshing ${step.title} with live docs and current implementation notes...`,
+      });
+
+      const stepResearch = await collectStepResearchContext({
+        env,
+        userId: project.user_id,
+        stepId: step.id,
+        stepTitle: step.title,
+        stepObjective: step.objective,
+        stepWhyItMatters: step.why_it_matters,
+        stepCategory: step.category,
+        stepDoneWhen: step.done_when,
+        stepIsGate: step.is_gate,
+        adr,
+        research,
+        batchName: 'batch_5_enrich_steps',
+        projectId,
+        connectedTools,
+      });
+
+      stepResearchContexts.push(stepResearch);
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_5_enrich_steps',
+        kind: 'fetch',
+        message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
+      });
+    }
+  }
   const input = {
     plan,
     research,
+    step_research: stepResearchContexts,
   };
 
-  await emitBatchStart(env, projectId, 'batch_5_enrich_steps');
   await logActivity(env, {
     projectId,
     batchName: 'batch_5_enrich_steps',
@@ -1604,12 +2022,19 @@ ${JSON.stringify(plan, null, 2)}
 Research:
 ${JSON.stringify(research.research, null, 2)}
 
+Live step research:
+${stepResearchContexts.map((context) => formatStepResearchPrompt(context)).join('\n\n')}
+
 For every step, generate:
 - step_id
 - ai_output
 - prompts: [{ label, content }]
 
-The ai_output should read like a senior engineer’s first pass at the work, not vague suggestions.`;
+The ai_output should read like a senior engineer’s first pass at the work, not vague suggestions.
+Use the live documentation provided to generate specific, current guidance.
+Reference actual function names, hook names, and config options from the docs.
+If any open bugs were found, mention them in the ai_output and explain the workaround.
+For each step, obey any requirements array included in the live step research context.`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -1619,6 +2044,18 @@ The ai_output should read like a senior engineer’s first pass at the work, not
       schema: Batch5EnrichStepsSchema,
       schemaDescription: schemaDescriptions.batch_5_enrich_steps,
     });
+    const stepResearchById = new Map(stepResearchContexts.map((context) => [context.stepId, context] as const));
+    const finalEnrichments: Batch5EnrichSteps['enrichments'] = result.data.enrichments.map((enrichment) => ({
+      ...enrichment,
+      ai_output: appendResearchFooter(
+        enrichment.ai_output,
+        stepResearchById.get(enrichment.step_id)?.footer ||
+          `Researched ${new Date().toISOString().slice(0, 10)} — connect more tools in Settings for deeper results.`,
+      ),
+    }));
+    const finalResult: Batch5EnrichSteps = {
+      enrichments: finalEnrichments,
+    };
 
     await completeBatch(
       env,
@@ -1626,17 +2063,17 @@ The ai_output should read like a senior engineer’s first pass at the work, not
       provider,
       'batch_5_enrich_steps',
       input,
-      result.data,
+      finalResult,
       result.attemptCount,
-      result.data,
+      finalResult,
       Date.now() - startedAt,
     );
-    await applyStepEnrichments(env, projectId, result.data.enrichments);
+    await applyStepEnrichments(env, projectId, finalResult.enrichments);
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
       kind: 'complete',
-      message: `Step details complete — ${result.data.enrichments.length} steps enriched.`,
+      message: `Step details complete — ${finalResult.enrichments.length} steps enriched.`,
     });
   } catch (error) {
     await failBatch(
@@ -1858,7 +2295,7 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
         await executeBatch1(env, project, provider);
       // fall through
       case 'batch_1_research_stack':
-        await executeBatch2(env, project.id, provider);
+        await executeBatch2(env, project, provider);
       // fall through
       case 'batch_2_fetch_and_read':
         await executeBatch3(env, project.id, provider, project);

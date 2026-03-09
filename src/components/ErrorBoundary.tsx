@@ -48,16 +48,16 @@ export class ErrorBoundary extends Component<Props, State> {
           <motion.div
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            className="mb-6 flex h-16 w-16 items-center justify-center rounded-[16px] border border-status-error/20 bg-status-error/5 text-status-error"
+            className="mb-6 text-accent-primary"
           >
             <Hexagon className="h-8 w-8" />
           </motion.div>
 
           <h2 className="mb-2 font-serif text-2xl tracking-[-0.03em] text-text-primary">
-            Something went wrong
+            Something broke here
           </h2>
           <p className="mb-8 max-w-md text-text-secondary">
-            {this.props.name ? `The ${this.props.name} component` : 'This part of the app'} encountered an unexpected error. We've been notified.
+            {this.props.name ? `The ${this.props.name} view` : 'This part of the app'} hit a problem. Reload and pick up where you left off.
           </p>
 
           <div className="flex items-center gap-4">
@@ -70,7 +70,7 @@ export class ErrorBoundary extends Component<Props, State> {
             </button>
             <button
               onClick={this.handleGoHome}
-              className="btn-secondary flex items-center gap-2 rounded-lg px-6"
+              className="btn-ghost flex items-center gap-2 px-6"
             >
               <Home className="h-4 w-4" />
               Go home

@@ -39,7 +39,7 @@ export function TooltipContent({ children, className }: { children: React.ReactN
           exit={{ opacity: 0, y: 5 }}
           transition={{ duration: 0.15 }}
           className={cn(
-            "absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-text-primary text-bg-base text-xs rounded shadow-sm whitespace-nowrap z-50 pointer-events-none",
+            "absolute bottom-full left-1/2 z-50 mb-2 -translate-x-1/2 whitespace-nowrap rounded-[12px] border border-border-default bg-bg-overlay px-3 py-2 text-xs text-text-primary shadow-panel pointer-events-none",
             className
           )}
         >

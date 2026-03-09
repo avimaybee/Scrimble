@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Zap, X } from 'lucide-react';
+import { LockOpen, X } from 'lucide-react';
 
 interface UnlockToastProps {
   show: boolean;
@@ -17,13 +17,13 @@ export default function UnlockToast({ show, count, onClose }: UnlockToastProps) 
           animate={{ y: 0, opacity: 1, x: '-50%' }}
           exit={{ y: 20, opacity: 0, x: '-50%' }}
           transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-          className="fixed bottom-24 left-1/2 -translate-x-1/2 bg-bg-surface/90 backdrop-blur-md border border-accent-border px-6 py-3 rounded-full shadow-lg z-50 flex items-center gap-3"
+          className="fixed bottom-24 left-1/2 z-50 flex -translate-x-1/2 items-center gap-3 rounded-[16px] border border-accent-border bg-bg-surface/94 px-5 py-3 shadow-panel backdrop-blur-md"
         >
-          <div className="w-8 h-8 bg-accent-primary-muted rounded-full flex items-center justify-center shrink-0">
-            <Zap className="w-4 h-4 text-accent-primary" />
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[8px] border border-accent-border bg-accent-primary-muted">
+            <LockOpen className="h-4 w-4 text-accent-primary" />
           </div>
           <div className="text-sm font-medium text-text-primary whitespace-nowrap">
-            {count} {count > 1 ? 'nodes' : 'node'} unlocked!
+            {count} {count > 1 ? 'next steps are' : 'next step is'} ready.
           </div>
           <button 
             onClick={onClose}

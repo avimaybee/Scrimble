@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Hexagon } from 'lucide-react';
+import { ArrowRight, Hexagon } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { signInWithGoogle } from '../lib/firebase';
 
@@ -10,29 +10,6 @@ const pageVariants = {
   hidden: {},
   visible: {
     transition: {
-      staggerChildren: 0.1,
-    },
-  },
-};
-
-const panelVariants = {
-  hidden: { opacity: 0, y: 24, scale: 0.97 },
-  visible: {
-    opacity: 1,
-    y: 0,
-    scale: 1,
-    transition: {
-      duration: 0.6,
-      ease: EASE_OUT_EXPO,
-    },
-  },
-};
-
-const contentVariants = {
-  hidden: {},
-  visible: {
-    transition: {
-      delayChildren: 0.06,
       staggerChildren: 0.08,
     },
   },
@@ -44,14 +21,13 @@ const itemVariants = {
     opacity: 1,
     y: 0,
     transition: {
-      duration: 0.5,
+      duration: 0.48,
       ease: EASE_OUT_EXPO,
     },
   },
 };
 
-const inputClassName =
-  'h-12 w-full rounded-[8px] border border-border-default bg-bg-elevated px-4 text-[15px] text-text-primary placeholder:text-text-tertiary shadow-[inset_0_1px_0_rgba(255,252,242,0.02)] outline-none transition-[border-color,box-shadow,background-color] duration-200 focus:border-accent-primary focus:bg-bg-overlay focus:ring-2 focus:ring-accent-primary-muted';
+const inputClassName = 'field-input opacity-70 disabled:cursor-not-allowed disabled:bg-bg-base/60 disabled:text-text-tertiary';
 
 export default function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
   const navigate = useNavigate();
@@ -66,7 +42,7 @@ export default function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
       await signInWithGoogle();
       navigate(mode === 'signup' ? '/new' : '/dashboard');
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to authenticate');
+      setError(err instanceof Error ? err.message : 'Could not sign you in right now.');
     } finally {
       setLoading(false);
     }
@@ -74,145 +50,141 @@ export default function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-bg-base font-sans text-text-primary">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(235,94,40,0.08)_0%,transparent_34%),radial-gradient(circle_at_bottom_left,rgba(255,252,242,0.03)_0%,transparent_28%)]" />
-      <div className="pointer-events-none absolute left-[10%] top-[12%] h-44 w-44 rounded-full bg-accent-primary/10 blur-3xl" />
-      <div className="pointer-events-none absolute bottom-[10%] right-[10%] h-56 w-56 rounded-full bg-[rgba(255,252,242,0.04)] blur-3xl" />
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_78%_14%,rgba(235,94,40,0.08)_0%,transparent_30%),radial-gradient(circle_at_18%_90%,rgba(255,252,242,0.03)_0%,transparent_24%)]" />
 
-      <div className="relative flex min-h-screen items-center justify-center px-6 py-12">
+      <div className="relative mx-auto flex min-h-screen max-w-[1180px] items-center justify-center px-6 py-16">
         <motion.div
           initial="hidden"
           animate="visible"
           variants={pageVariants}
-          className="w-full max-w-[448px]"
+          className="w-full max-w-[460px]"
         >
-          <motion.div
-            variants={panelVariants}
-            className="relative overflow-hidden rounded-[16px] border border-border-default bg-[linear-gradient(180deg,rgba(30,29,27,0.98)_0%,rgba(24,23,21,0.98)_100%)] p-8 shadow-[0_32px_90px_rgba(0,0,0,0.48)] sm:p-10"
-          >
-            <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent_0%,rgba(235,94,40,0.6)_50%,transparent_100%)]" />
+          <motion.div variants={itemVariants} className="mb-8 text-center">
+            <div className="mb-5 flex justify-center">
+              <Hexagon className="h-9 w-9 text-accent-primary" />
+            </div>
+            <div className="section-label justify-center">Getting started</div>
+            <h1 className="mt-4 text-heading">
+              {mode === 'login' ? 'Pick up where you left off.' : 'Start your first plan.'}
+            </h1>
+            <p className="mt-3 text-body">
+              {mode === 'login'
+                ? 'Sign in and get straight back to the next step.'
+                : 'Sign in once, describe what you want to build, and let Scrimble do the heavy lifting.'}
+            </p>
+          </motion.div>
 
-            <motion.div variants={contentVariants} className="relative">
-              <motion.div variants={itemVariants} className="mb-8 flex flex-col items-center text-center">
-                <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-[14px] border border-accent-border bg-accent-primary-muted">
-                  <Hexagon className="h-6 w-6 text-accent-primary" />
-                </div>
-                <h1 className="text-heading">
-                  {mode === 'login' ? 'Welcome back' : 'Create an account'}
-                </h1>
-                <p className="mt-3 max-w-[300px] text-body">
-                  {mode === 'login'
-                    ? 'Sign in to pick up your plan where you left it.'
-                    : 'Start with a simple description and turn it into a build plan.'}
-                </p>
-              </motion.div>
+          <motion.section
+            variants={itemVariants}
+            className="surface-card overflow-hidden p-7 sm:p-8"
+          >
+            <div className="mb-6 border-b border-border-subtle pb-6">
+              <div className="mb-3 text-[13px] font-medium tracking-[-0.01em] text-text-primary">
+                Continue with Google
+              </div>
+              <p className="mb-4 text-sm leading-6 text-text-secondary">
+                Google sign-in is ready now and keeps your plan linked to one account.
+              </p>
 
               {error ? (
-                <motion.div
-                  variants={itemVariants}
-                  className="mb-6 rounded-[8px] border border-[rgba(248,113,113,0.22)] bg-status-skipped px-4 py-3 text-sm text-[#f7c4b4]"
-                >
+                <div className="mb-4 rounded-[14px] border border-[rgba(248,113,113,0.22)] bg-status-skipped px-4 py-3 text-sm leading-6 text-status-error">
                   {error}
-                </motion.div>
+                </div>
               ) : null}
 
-              <motion.button
-                variants={itemVariants}
+              <button
                 onClick={handleGoogleAuth}
                 disabled={loading}
-                className="flex h-12 w-full items-center justify-center gap-3 rounded-[8px] border border-border-default bg-bg-elevated px-4 text-[15px] font-medium text-[#f0e7db] shadow-[0_1px_0_rgba(255,252,242,0.02)] transition-all duration-200 hover:border-accent-border/50 hover:bg-bg-overlay hover:shadow-[0_0_20px_rgba(235,94,40,0.05)] disabled:cursor-not-allowed disabled:opacity-60"
+                className="btn-secondary w-full justify-between px-4"
               >
-                <svg className="h-5 w-5" viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                    fill="#4285F4"
-                  />
-                  <path
-                    d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                    fill="#34A853"
-                  />
-                  <path
-                    d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
-                    fill="#FBBC05"
-                  />
-                  <path
-                    d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
-                    fill="#EA4335"
-                  />
-                </svg>
-                {loading ? 'Connecting to Google...' : 'Continue with Google'}
-              </motion.button>
-
-              <motion.div variants={itemVariants} className="my-6 flex items-center">
-                <div className="h-px flex-1 bg-border-default" />
-                <span className="px-3 text-[10px] font-mono uppercase tracking-[0.18em] text-text-tertiary">
-                  or continue with email
+                <span className="flex items-center gap-3">
+                  <svg className="h-5 w-5" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                      fill="#4285F4"
+                    />
+                    <path
+                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                      fill="#34A853"
+                    />
+                    <path
+                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                      fill="#FBBC05"
+                    />
+                    <path
+                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                      fill="#EA4335"
+                    />
+                  </svg>
+                  <span>{loading ? 'Connecting to Google...' : 'Continue with Google'}</span>
                 </span>
-                <div className="h-px flex-1 bg-border-default" />
-              </motion.div>
+                <ArrowRight className="h-4 w-4 text-accent-primary" />
+              </button>
+            </div>
 
-              <motion.form
-                variants={contentVariants}
-                className="space-y-4"
-                onSubmit={(event) => event.preventDefault()}
-              >
-                <motion.div variants={itemVariants}>
-                  <label className="mb-2 block text-[13px] font-medium text-[#c5bcad]">
+            <div>
+              <div className="mb-4 flex items-center gap-3">
+                <div className="h-px flex-1 bg-border-subtle" />
+                <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                  Email sign-in is next
+                </span>
+                <div className="h-px flex-1 bg-border-subtle" />
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="mb-2 block text-[13px] font-medium text-text-secondary">
                     Email address
                   </label>
                   <input
                     type="email"
                     placeholder="you@example.com"
                     className={inputClassName}
+                    disabled
                   />
-                </motion.div>
+                </div>
 
-                <motion.div variants={itemVariants}>
-                  <label className="mb-2 block text-[13px] font-medium text-[#c5bcad]">
+                <div>
+                  <label className="mb-2 block text-[13px] font-medium text-text-secondary">
                     Password
                   </label>
                   <input
                     type="password"
                     placeholder="••••••••"
                     className={inputClassName}
+                    disabled
                   />
-                </motion.div>
+                </div>
 
-                <motion.button
-                  variants={itemVariants}
-                  type="button"
-                  className="btn-primary mt-2 flex h-11 w-full items-center justify-center rounded-[8px]"
+                <button type="button" className="btn-ghost w-full" disabled>
+                  Email sign-in is on the way
+                </button>
+              </div>
+            </div>
+          </motion.section>
+
+          <motion.div variants={itemVariants} className="mt-6 text-center text-sm text-text-secondary">
+            {mode === 'login' ? (
+              <>
+                Don&apos;t have an account yet?{' '}
+                <Link
+                  to="/signup"
+                  className="font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
                 >
-                  {mode === 'login' ? 'Sign in' : 'Sign up'}
-                </motion.button>
-              </motion.form>
-
-              <motion.div
-                variants={itemVariants}
-                className="mt-8 text-center text-sm text-[#b6ab99]"
-              >
-                {mode === 'login' ? (
-                  <>
-                    Don't have an account?{' '}
-                    <Link
-                      to="/signup"
-                      className="font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
-                    >
-                      Sign up
-                    </Link>
-                  </>
-                ) : (
-                  <>
-                    Already have an account?{' '}
-                    <Link
-                      to="/login"
-                      className="font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
-                    >
-                      Sign in
-                    </Link>
-                  </>
-                )}
-              </motion.div>
-            </motion.div>
+                  Start here
+                </Link>
+              </>
+            ) : (
+              <>
+                Already have an account?{' '}
+                <Link
+                  to="/login"
+                  className="font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
+                >
+                  Sign in
+                </Link>
+              </>
+            )}
           </motion.div>
         </motion.div>
       </div>

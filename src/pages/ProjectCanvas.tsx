@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   ReactFlow,
@@ -14,14 +14,22 @@ import {
   Panel
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Project, Plan, Stage, Step, Edge as AppEdge, ChecklistItem, StepStatus } from '../types';
+import {
+  Project,
+  Plan,
+  Stage,
+  Step,
+  Edge as AppEdge,
+  ChecklistItem,
+  StepStatus,
+  WorkflowUpdateActivity,
+} from '../types';
 import StepCard from '../components/StepCard';
 import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Hexagon, Download, Workflow, Pencil, Check, X, ArrowLeft, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
-import { updatePlan as aiUpdatePlan } from '../lib/ai';
+import { Activity, Hexagon, Download, LayoutPanelTop, Pencil, Check, X, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
 import { dbService } from '../lib/db';
 import { cn } from '../lib/utils';
 import ErrorBoundary from '../components/ErrorBoundary';
@@ -65,14 +73,15 @@ export default function ProjectCanvas() {
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
-  const [updateStatus, setUpdateStatus] = useState('');
   const [updateMessage, setUpdateMessage] = useState('');
+  const [updateActivities, setUpdateActivities] = useState<WorkflowUpdateActivity[]>([]);
   const [showUnlockToast, setShowUnlockToast] = useState(false);
   const [unlockedCount, setUnlockedCount] = useState(0);
   
   const [isEditingName, setIsEditingName] = useState(false);
   const [newName, setNewName] = useState('');
   const [guideStep, setGuideStep] = useState<number | null>(null);
+  const updateActivityLogRef = useRef<HTMLDivElement | null>(null);
 
   const fetchProjectData = useCallback(async () => {
     if (!id) return;
@@ -149,23 +158,25 @@ export default function ProjectCanvas() {
     if (!project || !updateMessage.trim()) return;
     
     setIsUpdating(true);
-    setUpdateStatus('Thinking about your changes...');
+    setUpdateActivities([]);
 
     try {
-      const planSummary = stages.map(stage => ({
-        stage: stage.title,
-        steps: appSteps
-          .filter(s => s.stage_id === stage.id)
-          .map(s => ({ id: s.id, title: s.title, status: s.status }))
-      }));
+      const plan = await dbService.getPlanByProjectId(project.id);
+      if (!plan) {
+        throw new Error('Could not find the current workflow.');
+      }
 
-      const diff = await aiUpdatePlan(planSummary, project.stack, updateMessage);
-      
-      setUpdateStatus(`Applying update: "${diff.summary}"`);
-      await dbService.applyPlanDiff(diff, project.id);
-      
-      setUpdateStatus('Done!');
-      toast.success(diff.summary);
+      const result = await dbService.updateWorkflow(
+        plan.id,
+        { message: updateMessage },
+        {
+          onActivity: (activity) => {
+            setUpdateActivities((previous) => [...previous, activity]);
+          },
+        },
+      );
+
+      toast.success(result.summary);
       
       // Refresh data
       await fetchProjectData();
@@ -173,16 +184,33 @@ export default function ProjectCanvas() {
       setTimeout(() => {
         setShowUpdateModal(false);
         setUpdateMessage('');
+        setUpdateActivities([]);
       }, 500);
     } catch (err) {
       console.error(err);
       const errorMessage = err instanceof Error ? err.message : "Failed to update your plan";
-      setUpdateStatus('Something went wrong. Let me try again.');
+      setUpdateActivities((previous) => [
+        ...previous,
+        {
+          icon: '⚠️',
+          message: errorMessage,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
       toast.error(errorMessage);
     } finally {
       setIsUpdating(false);
     }
   };
+
+  useEffect(() => {
+    const container = updateActivityLogRef.current;
+    if (!container) {
+      return;
+    }
+
+    container.scrollTop = container.scrollHeight;
+  }, [updateActivities]);
 
   useEffect(() => {
     if (appSteps.length === 0) return;
@@ -330,7 +358,7 @@ export default function ProjectCanvas() {
                      : step.status === 'skipped'  ? '⏭️' 
                      : '⬜';
         md += `### ${status} ${step.title}\n`;
-        if (step.objective) md += `**Objective:** ${step.objective}\n\n`;
+        if (step.objective) md += `**Goal:** ${step.objective}\n\n`;
         if (step.done_when) md += `**Done when:** ${step.done_when}\n\n`;
         
         const checklistItems = await dbService.getChecklistItemsByStepId(step.id);
@@ -364,7 +392,7 @@ export default function ProjectCanvas() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${project.name.replace(/\s+/g, '-').toLowerCase()}-workflow.json`;
+    a.download = `${project.name.replace(/\s+/g, '-').toLowerCase()}-plan.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -400,12 +428,12 @@ export default function ProjectCanvas() {
             repeat: Infinity, 
             ease: "easeInOut" 
           }}
-          className="mb-8 flex h-24 w-24 items-center justify-center rounded-[32px] bg-accent-primary-muted/20 border border-accent-primary/20 shadow-[0_0_40px_rgba(235,94,40,0.1)]"
+          className="mb-8 text-accent-primary"
         >
-          <Hexagon className="w-12 h-12 text-accent-primary" />
+          <Hexagon className="w-12 h-12" />
         </motion.div>
         <div className="flex flex-col items-center gap-2">
-          <h2 className="font-serif text-xl text-text-primary tracking-[-0.03em]">Accessing your plan...</h2>
+          <h2 className="font-serif text-xl text-text-primary tracking-[-0.03em]">Opening your plan...</h2>
           <div className="flex gap-1.5 h-1 items-center">
             {[0, 1, 2].map((i) => (
               <motion.div
@@ -491,7 +519,7 @@ export default function ProjectCanvas() {
                 <div className="text-sm font-medium text-text-primary">
                   {appSteps.filter(s => s.status === 'complete').length} of {appSteps.length} steps
                 </div>
-                <div className="text-xs text-text-secondary">completed</div>
+                <div className="text-xs text-text-secondary">done</div>
               </div>
             </div>
           </div>
@@ -501,7 +529,9 @@ export default function ProjectCanvas() {
               {stages.sort((a, b) => a.order_index - b.order_index).map(stage => {
                 const stageSteps = appSteps.filter(s => s.stage_id === stage.id);
                 const isComplete = stageSteps.length > 0 && stageSteps.every(s => s.status === 'complete');
-                const isActive = stageSteps.some(s => s.status === 'active' || s.status === 'waiting');
+                const isActive = stageSteps.some((s) =>
+                  ['active', 'waiting', 'agent_working', 'needs_review'].includes(s.status),
+                );
                 
                 return (
                   <div 
@@ -537,7 +567,7 @@ export default function ProjectCanvas() {
                   </span>
                 </TooltipTrigger>
                 {!aiFilesReady ? (
-                  <TooltipContent className="max-w-[240px] whitespace-normal bg-text-primary px-3 py-2 text-[12px] leading-5 text-bg-base">
+                  <TooltipContent className="max-w-[240px] whitespace-normal px-3 py-2 text-[12px] leading-5">
                     Files will be ready when your plan is complete.
                   </TooltipContent>
                 ) : null}
@@ -547,10 +577,13 @@ export default function ProjectCanvas() {
               Paste these into your IDE so your AI coding tool knows exactly what you&apos;re building.
             </p>
             <button 
-              onClick={() => setShowUpdateModal(true)}
+              onClick={() => {
+                setUpdateActivities([]);
+                setShowUpdateModal(true);
+              }}
               className="btn-ghost w-full flex items-center justify-center gap-2"
             >
-              <Workflow className="w-4 h-4 text-accent-primary" />
+              <LayoutPanelTop className="w-4 h-4 text-accent-primary" />
               Update plan
             </button>
 
@@ -568,7 +601,7 @@ export default function ProjectCanvas() {
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={exportAsJSON} className="flex gap-2">
                   <FileJson className="w-4 h-4" />
-                  <span>Download Workflow (.json)</span>
+                  <span>Download plan (.json)</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -579,8 +612,8 @@ export default function ProjectCanvas() {
           <ErrorBoundary
             fallback={
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-bg-base p-8 text-center">
-                <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-[16px] bg-accent-primary-muted/20">
-                  <Hexagon className="h-10 w-10 text-accent-primary" />
+                <div className="mb-6 flex justify-center text-accent-primary">
+                  <Hexagon className="h-10 w-10" />
                 </div>
                 <h3 className="text-2xl font-serif mb-3 text-text-primary">Something went wrong with your plan view.</h3>
                 <button 
@@ -639,18 +672,21 @@ export default function ProjectCanvas() {
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
               <div className="max-w-md p-8 bg-bg-surface border border-dashed border-border-strong rounded-[14px] shadow-panel text-center pointer-events-auto">
                 <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[8px] bg-accent-primary-muted/20">
-                  <Workflow className="h-8 w-8 text-accent-primary" />
+                  <LayoutPanelTop className="h-8 w-8 text-accent-primary" />
                 </div>
 
                 <h3 className="text-2xl font-serif mb-2">Ready to build?</h3>
                 <p className="text-text-secondary mb-6 leading-relaxed">
-                  Start by adding your first step or describe what you want to build using the Update button.
+                  Tell Scrimble what changed and it will reshape the plan from here.
                 </p>
                 <button 
-                  onClick={() => setShowUpdateModal(true)}
+                  onClick={() => {
+                    setUpdateActivities([]);
+                    setShowUpdateModal(true);
+                  }}
                   className="btn-primary"
                 >
-                  Describe your project
+                  Update this plan
                 </button>
               </div>
             </div>
@@ -663,25 +699,25 @@ export default function ProjectCanvas() {
                 initial={{ opacity: 0, scale: 0.9, y: 10 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: 10 }}
-                className="absolute left-64 top-[50%] z-[60] ml-8 w-64 p-5 bg-accent-primary text-white rounded-[16px] shadow-2xl"
+                className="absolute left-64 top-[50%] z-[60] ml-8 w-64 rounded-[16px] border border-accent-border bg-bg-overlay p-5 text-text-primary shadow-modal"
               >
                 <div className="flex gap-1 mb-2">
-                  <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
-                    <div className="h-full bg-white w-1/3" />
+                  <div className="h-1 flex-1 overflow-hidden rounded-[2px] bg-border-default">
+                    <div className="h-full w-1/3 bg-accent-primary" />
                   </div>
                 </div>
                 <h4 className="font-bold mb-1 flex items-center gap-2">
                   <Info className="w-4 h-4" />
-                  1. The Build Plan
+                  1. Your plan
                 </h4>
-                <p className="text-sm text-white/90 leading-relaxed mb-4">
-                  This sidebar shows your project stages. You can update the entire plan anytime.
+                <p className="mb-4 text-sm leading-relaxed text-text-secondary">
+                  This sidebar shows every stage. Use it to see progress and update the whole plan when things change.
                 </p>
                 <div className="flex justify-between items-center">
-                  <button onClick={dismissGuide} className="text-xs font-medium hover:underline text-white/70">Skip</button>
-                  <button onClick={() => setGuideStep(2)} className="px-3 py-1.5 bg-white text-accent-primary rounded-[8px] text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
+                  <button onClick={dismissGuide} className="text-xs font-medium text-text-muted hover:text-text-primary">Skip</button>
+                  <button onClick={() => setGuideStep(2)} className="btn-primary min-h-0 px-3 py-1.5 text-xs">Next</button>
                 </div>
-                <div className="absolute left-[-8px] top-[50%] translate-y-[-50%] w-0 h-0 border-y-8 border-y-transparent border-r-8 border-r-accent-primary" />
+                <div className="absolute left-[-8px] top-[50%] translate-y-[-50%] w-0 h-0 border-y-8 border-y-transparent border-r-8 border-r-bg-overlay" />
               </motion.div>
             )}
 
@@ -690,23 +726,23 @@ export default function ProjectCanvas() {
                 initial={{ opacity: 0, scale: 0.9, x: 10 }}
                 animate={{ opacity: 1, scale: 1, x: 0 }}
                 exit={{ opacity: 0, scale: 0.9, x: 10 }}
-                className="absolute left-[50%] top-[40%] translate-x-[-50%] z-[60] w-64 p-5 bg-accent-primary text-white rounded-[16px] shadow-2xl"
+                className="absolute left-[50%] top-[40%] z-[60] w-64 -translate-x-1/2 rounded-[16px] border border-accent-border bg-bg-overlay p-5 text-text-primary shadow-modal"
               >
                 <div className="flex gap-1 mb-2">
-                  <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
-                    <div className="h-full bg-white w-2/3" />
+                  <div className="h-1 flex-1 overflow-hidden rounded-[2px] bg-border-default">
+                    <div className="h-full w-2/3 bg-accent-primary" />
                   </div>
                 </div>
                 <h4 className="font-bold mb-1 flex items-center gap-2">
-                  <Workflow className="w-4 h-4" />
-                  2. Visual Workflow
+                  <LayoutPanelTop className="w-4 h-4" />
+                  2. Your plan view
                 </h4>
-                <p className="text-sm text-white/90 leading-relaxed mb-4">
-                  Everything is mapped visually here. Click any card to see detailed instructions.
+                <p className="mb-4 text-sm leading-relaxed text-text-secondary">
+                  Every step lives here. Click any card to open the work panel and see what to do next.
                 </p>
                 <div className="flex justify-between items-center">
-                  <button onClick={dismissGuide} className="text-xs font-medium hover:underline text-white/70">Skip</button>
-                  <button onClick={() => setGuideStep(3)} className="px-3 py-1.5 bg-white text-accent-primary rounded-[8px] text-xs font-bold hover:bg-white/90 transition-colors">Next</button>
+                  <button onClick={dismissGuide} className="text-xs font-medium text-text-muted hover:text-text-primary">Skip</button>
+                  <button onClick={() => setGuideStep(3)} className="btn-primary min-h-0 px-3 py-1.5 text-xs">Next</button>
                 </div>
               </motion.div>
             )}
@@ -716,24 +752,24 @@ export default function ProjectCanvas() {
                 initial={{ opacity: 0, scale: 0.9, y: -10 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: -10 }}
-                className="absolute right-8 bottom-32 z-[60] w-64 p-5 bg-accent-primary text-white rounded-[16px] shadow-2xl"
+                className="absolute right-8 bottom-32 z-[60] w-64 rounded-[16px] border border-accent-border bg-bg-overlay p-5 text-text-primary shadow-modal"
               >
                 <div className="flex gap-1 mb-2">
-                  <div className="h-1 flex-1 bg-white/40 rounded-full overflow-hidden">
-                    <div className="h-full bg-white w-full" />
+                  <div className="h-1 flex-1 overflow-hidden rounded-[2px] bg-border-default">
+                    <div className="h-full w-full bg-accent-primary" />
                   </div>
                 </div>
                 <h4 className="font-bold mb-1 flex items-center gap-2">
                   <Check className="w-4 h-4" />
-                  3. Finish & Export
+                  3. Keep it moving
                 </h4>
-                <p className="text-sm text-white/90 leading-relaxed mb-4">
-                  Once your plan is ready, export it as Markdown or JSON to start building!
+                <p className="mb-4 text-sm leading-relaxed text-text-secondary">
+                  Update the plan when things change, or export it when you&apos;re ready to build.
                 </p>
                 <div className="flex justify-end items-center">
-                  <button onClick={dismissGuide} className="px-4 py-1.5 bg-white text-accent-primary rounded-[8px] text-xs font-bold hover:bg-white/90 transition-colors">Got it!</button>
+                  <button onClick={dismissGuide} className="btn-primary min-h-0 px-4 py-1.5 text-xs">Got it</button>
                 </div>
-                <div className="absolute right-24 bottom-[-8px] w-0 h-0 border-x-8 border-x-transparent border-t-8 border-t-accent-primary" />
+                <div className="absolute right-24 bottom-[-8px] h-0 w-0 border-x-8 border-x-transparent border-t-8 border-t-bg-overlay" />
               </motion.div>
             )}
           </AnimatePresence>
@@ -755,7 +791,20 @@ export default function ProjectCanvas() {
       </div>
 
       {/* Update Modal */}
-      <Dialog open={showUpdateModal} onOpenChange={(open) => !isUpdating && setShowUpdateModal(open)}>
+      <Dialog
+        open={showUpdateModal}
+        onOpenChange={(open) => {
+          if (isUpdating) {
+            return;
+          }
+
+          if (!open) {
+            setUpdateActivities([]);
+          }
+
+          setShowUpdateModal(open);
+        }}
+      >
         <DialogContent className="sm:max-w-[560px] bg-bg-surface border-border-default shadow-modal">
           <DialogHeader>
             <DialogTitle className="text-heading">Update your build plan</DialogTitle>
@@ -774,21 +823,48 @@ export default function ProjectCanvas() {
             />
           </div>
           
-          {isUpdating && (
-            <div className="flex items-center gap-2 text-sm text-accent-primary">
-              <Activity className="w-4 h-4 animate-pulse" />
-              <span>{updateStatus}</span>
-              <span className="flex gap-0.5">
-                <motion.span animate={{ opacity: [0, 1, 0] }} transition={{ repeat: Infinity, duration: 1.5, delay: 0 }}>.</motion.span>
-                <motion.span animate={{ opacity: [0, 1, 0] }} transition={{ repeat: Infinity, duration: 1.5, delay: 0.2 }}>.</motion.span>
-                <motion.span animate={{ opacity: [0, 1, 0] }} transition={{ repeat: Infinity, duration: 1.5, delay: 0.4 }}>.</motion.span>
-              </span>
+          {(isUpdating || updateActivities.length > 0) && (
+            <div className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4">
+              <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-primary">
+                <Activity className={cn("h-4 w-4", isUpdating && "animate-pulse text-accent-primary")} />
+                <span>Update activity</span>
+              </div>
+              <div ref={updateActivityLogRef} className="max-h-[180px] space-y-2 overflow-y-auto pr-1">
+                {updateActivities.map((activity, index) => (
+                  <div key={`${activity.timestamp}-${index}`} className="flex items-start gap-3 rounded-[10px] bg-bg-base/60 px-3 py-2">
+                    <span className="text-sm leading-5">{activity.icon}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="font-sans text-[13px] leading-6 text-text-secondary">{activity.message}</div>
+                      <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                        {new Date(activity.timestamp).toLocaleTimeString('en-US', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                          hour12: false,
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {isUpdating && updateActivities.length === 0 ? (
+                  <div className="font-sans text-[13px] leading-6 text-text-secondary">
+                    Waiting for the update pipeline to respond...
+                  </div>
+                ) : null}
+              </div>
             </div>
           )}
           
           <DialogFooter>
             <button 
-              onClick={() => !isUpdating && setShowUpdateModal(false)}
+              onClick={() => {
+                if (isUpdating) {
+                  return;
+                }
+
+                setUpdateActivities([]);
+                setShowUpdateModal(false);
+              }}
               className="btn-ghost"
               disabled={isUpdating}
             >

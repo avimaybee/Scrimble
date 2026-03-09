@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, AlertTriangle, ExternalLink, RefreshCw, Copy, Activity, Workflow } from 'lucide-react';
+import { X, AlertTriangle, ExternalLink, RefreshCw, Copy, Activity } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import AnimatedCheckmark from './ui/AnimatedCheckmark';
 import { Step, ChecklistItem, Project } from '../types';
@@ -48,6 +48,31 @@ function parseJsonArray<T>(value: string | undefined): T[] {
   }
 }
 
+function splitResearchFooter(value: string) {
+  const match = value.match(/\n{2}(Researched \d{4}-\d{2}-\d{2}.*)$/s);
+  if (!match || match.index === undefined) {
+    return { body: value, footer: '' };
+  }
+
+  return {
+    body: value.slice(0, match.index).trimEnd(),
+    footer: match[1].trim(),
+  };
+}
+
+function getStepStatusLabel(status: Step['status']) {
+  switch (status) {
+    case 'agent_working':
+      return 'Working';
+    case 'needs_review':
+      return 'Needs review';
+    case 'waiting':
+      return 'Waiting';
+    default:
+      return status;
+  }
+}
+
 export default function DetailPanel({ stepId, project, onClose, onStepComplete }: DetailPanelProps) {
   const [step, setStep] = useState<Step | null>(null);
   const [checklist, setChecklist] = useState<ChecklistItem[]>([]);
@@ -67,6 +92,10 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
   const [isRejectDialogOpen, setIsRejectDialogOpen] = useState(false);
   const [feedback, setFeedback] = useState('');
   const [reviewAction, setReviewAction] = useState<'approve' | 'reject' | null>(null);
+  const renderedAiOutput = useMemo(
+    () => splitResearchFooter(editedOutput || step?.ai_output || 'No details generated.'),
+    [editedOutput, step?.ai_output],
+  );
 
   useEffect(() => {
     if (!stepId) return;
@@ -79,7 +108,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
       const stepData = await dbService.getStep(id);
       if (stepData) {
         setStep(stepData);
-        setEditedOutput(stepData.ai_output || '');
+        setEditedOutput(splitResearchFooter(stepData.ai_output || '').body);
         
         if (stepData.is_ai_enriched === false && project && !isExecuting) {
           enrichStep(stepData, project);
@@ -267,20 +296,21 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                     "px-2.5 py-1 rounded-[6px] text-xs font-medium uppercase tracking-wide",
                     step.status === 'locked' && "bg-status-locked text-text-secondary",
                     step.status === 'active' && "bg-accent-primary-muted text-accent-primary",
+                    step.status === 'agent_working' && "bg-accent-primary-muted text-accent-primary",
                     step.status === 'complete' && "bg-status-secure/20 text-status-secure",
-                    step.status === 'skipped' && "bg-status-skip text-text-secondary",
+                    step.status === 'skipped' && "bg-status-skipped text-text-secondary",
                     step.status === 'waiting' && "bg-status-waiting text-status-warning",
                     step.status === 'needs_review' && "bg-status-warning/20 text-status-warning animate-pulse",
                   )}>
-                    {step.status === 'needs_review' ? 'Needs Review' : step.status}
+                    {getStepStatusLabel(step.status)}
                   </span>
-                  
+                   
                   <span className={cn(
                     "px-2.5 py-1 rounded-[6px] text-xs font-medium flex items-center gap-1",
                     step.risk_level === 'low' && "bg-bg-elevated text-text-secondary",
                     step.risk_level === 'medium' && "bg-status-warning/20 text-status-warning",
-                    step.risk_level === 'high' && "bg-status-secure/20 text-status-secure",
-                    step.risk_level === 'critical' && "bg-status-secure text-white",
+                    step.risk_level === 'high' && "bg-accent-primary-muted text-accent-primary",
+                    step.risk_level === 'critical' && "bg-status-skipped text-status-error",
                   )}>
                     <AlertTriangle className="w-3 h-3" />
                     How important: {step.risk_level}
@@ -294,33 +324,33 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                   <section className="review-prompt-container">
                     <h3 className="review-prompt-heading">Before I continue — does this look right?</h3>
                     <p className="text-sm text-text-secondary">
-                      I've architected this step. Review my details below, edit if needed, and approve to move forward.
+                      I&apos;ve drafted this step. Review the details below, make any edits you want, and approve it when it feels right.
                     </p>
                   </section>
                 )}
 
-                {/* Objective */}
+                {/* Goal */}
                 <section>
-                  <h3 className="text-sm font-medium text-text-primary mb-2">Objective</h3>
+                  <h3 className="mb-2 text-sm font-medium text-text-primary">Goal</h3>
                   <p className="text-sm text-text-secondary leading-relaxed">
-                    {step.objective || "No objective defined."}
+                    {step.objective || 'No goal is saved for this step yet.'}
                   </p>
                 </section>
 
-                {/* Why It Matters */}
+                {/* Why this matters */}
                 <section>
-                  <h3 className="text-sm font-medium text-text-primary mb-2">Why It Matters</h3>
+                  <h3 className="mb-2 text-sm font-medium text-text-primary">Why this matters</h3>
                   <div className="bg-bg-elevated border border-border-default rounded-[10px] p-4">
                     <p className="text-sm text-text-secondary leading-relaxed">
-                      {step.why_it_matters || "No context provided."}
+                      {step.why_it_matters || 'No extra context has been added yet.'}
                     </p>
                   </div>
                 </section>
 
-                {/* AI OUTPUT SECTION */}
+                {/* AI output section */}
                 <section>
-                  <h3 className="text-sm font-medium text-text-primary mb-2">Details from AI</h3>
-                  
+                  <h3 className="mb-2 text-sm font-medium text-text-primary">What the AI prepared</h3>
+                   
                   {executionError && (
                     <div className="mb-4 p-3 bg-status-error/10 border border-status-error/20 rounded-[8px] text-xs text-status-error flex items-center gap-2">
                       <AlertTriangle className="w-4 h-4" />
@@ -329,7 +359,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                         onClick={handleRegenerate}
                         className="ml-auto underline font-medium"
                       >
-                        Retry
+                        Try again
                       </button>
                     </div>
                   )}
@@ -367,8 +397,13 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                                   code: ({ children }) => <code>{children}</code>
                                 }}
                                 >
-                                {editedOutput || step?.ai_output || "No details generated."}
+                                {renderedAiOutput.body || "No details generated."}
                               </ReactMarkdown>
+                              {renderedAiOutput.footer ? (
+                                <div className="mt-4 border-t border-border-default pt-3 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                                  {renderedAiOutput.footer}
+                                </div>
+                              ) : null}
                             </div>
                           )}
                         </div>
@@ -385,7 +420,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                             </button>
                           </TooltipTrigger>
                           <TooltipContent>
-                            <p>Get fresh details</p>
+                            <p>Refresh these details</p>
                           </TooltipContent>
                         </Tooltip>
                       )}
@@ -396,15 +431,15 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       <div className="skeleton-block h-3 w-[90%]" />
                       <div className="skeleton-block h-3 w-[85%]" />
                       <div className="pt-2">
-                        <span className="text-[10px] font-mono uppercase tracking-widest text-text-tertiary animate-pulse">Analysing step context...</span>
+                        <span className="text-[10px] font-mono uppercase tracking-widest text-text-tertiary animate-pulse">Getting details for this step...</span>
                       </div>
                     </div>
                   )}
                 </section>
 
-                {/* PROMPTS SECTION */}
+                {/* Prompts section */}
                 <section>
-                  <h3 className="text-sm font-medium text-text-primary mb-2">Helper Prompts</h3>
+                  <h3 className="mb-2 text-sm font-medium text-text-primary">Prompts to use</h3>
                   
                   {step.is_ai_enriched && !enrichmentLoading && !loading ? (
                     <div className="space-y-3">
@@ -425,7 +460,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>
-                                <p>Copy Prompt</p>
+                                <p>Copy prompt</p>
                               </TooltipContent>
                             </Tooltip>
                           </div>
@@ -446,7 +481,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                 {/* Suggested Tools */}
                 {suggestedTools.length > 0 && (
                   <section>
-                    <h3 className="text-sm font-medium text-text-primary mb-3">Tools to use</h3>
+                    <h3 className="mb-3 text-sm font-medium text-text-primary">Suggested tools</h3>
                     <div className="flex flex-wrap gap-2">
                       {suggestedTools.map((tool, idx: number) => (
                         <a 
@@ -467,7 +502,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                 {/* Checklist */}
                 <section>
                   <h3 className="text-sm font-medium text-text-primary mb-4 flex items-center justify-between">
-                    Checklist
+                    Things to check
                     <span className="text-xs font-mono text-text-tertiary">
                       {checklist.filter(i => i.is_completed).length}/{checklist.length}
                     </span>
@@ -496,7 +531,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                           )} />
                           <AnimatedCheckmark 
                             isChecked={item.is_completed} 
-                            className="absolute w-3.5 h-3.5 text-white z-10" 
+                            className="absolute z-10 h-3.5 w-3.5 text-text-primary" 
                           />
                         </div>
                         <div className="flex-1 min-w-0">
@@ -521,12 +556,12 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
 
                 {/* Done When */}
                 <section>
-                  <div className="bg-status-secure/10 border border-status-secure/30 rounded-[10px] p-4">
-                    <h3 className="text-xs font-semibold text-status-secure uppercase tracking-wider mb-2">Done when...</h3>
-                    <p className="text-sm text-text-primary leading-relaxed">
-                      {step.done_when || "Complete all items above."}
-                    </p>
-                  </div>
+                      <div className="bg-status-secure/10 border border-status-secure/30 rounded-[10px] p-4">
+                        <h3 className="text-xs font-semibold text-status-secure uppercase tracking-wider mb-2">Done when...</h3>
+                        <p className="text-sm text-text-primary leading-relaxed">
+                       {step.done_when || 'Complete the items above.'}
+                        </p>
+                      </div>
                 </section>
               </div>
 
@@ -541,7 +576,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                           className={cn(
                             "flex-1 py-2.5 rounded-[8px] text-sm font-medium border transition-all disabled:cursor-not-allowed disabled:opacity-60",
                             isEditing 
-                              ? "bg-accent-primary text-white border-accent-primary" 
+                              ? "bg-accent-primary text-text-primary border-accent-primary" 
                               : "bg-bg-elevated text-text-primary border-border-default hover:border-border-strong"
                         )}
                       >
@@ -552,7 +587,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                           disabled={reviewAction !== null}
                           className="flex-1 py-2.5 rounded-[8px] text-sm font-medium border border-status-warning/30 bg-status-warning/10 text-status-warning hover:bg-status-warning/20 transition-all disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          Reject, try again
+                          Rework this
                         </button>
                       </div>
                       <button 
@@ -570,7 +605,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       <div>
                         <h4 className="text-sm font-semibold text-text-primary">Skipping is risky</h4>
                         <p className="text-xs text-text-secondary mt-1">
-                          This step helps keep things stable. Skipping it might cause issues later.
+                          This step helps keep the plan steady. Skipping it could make later work harder.
                         </p>
                       </div>
                     </div>
@@ -585,7 +620,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                         onClick={handleSkip}
                         className="flex-1 bg-status-warning/20 text-status-warning hover:bg-status-warning/30 text-sm font-medium py-2 rounded-[8px] transition-colors"
                       >
-                        Skip anyway
+                        Skip this step
                       </button>
                     </div>
                   </div>
@@ -595,14 +630,14 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                       onClick={() => setShowSkipWarning(true)}
                       className="text-sm font-medium text-text-tertiary hover:text-text-primary transition-colors px-2"
                     >
-                      Skip
+                      Skip this
                     </button>
                     <button 
                       onClick={handleComplete}
                       disabled={!allRequiredChecked}
                       className="flex-1 btn-primary py-3"
                     >
-                      Mark as Done
+                      Mark as done
                     </button>
                   </div>
                 )}
@@ -622,7 +657,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
           <DialogHeader>
             <DialogTitle className="font-serif text-2xl tracking-[-0.03em] text-text-primary">What should I change?</DialogTitle>
             <DialogDescription className="text-body mt-2">
-              Tell me what's wrong or what's missing. I'll re-architect this step based on your feedback.
+              Tell me what feels off or what is missing. I&apos;ll rewrite this step around your feedback.
             </DialogDescription>
           </DialogHeader>
           
@@ -630,7 +665,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
             <textarea 
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
-              placeholder="e.g. This schema is too complex, just use a simple JSON column for now.&#10;Add a security check for the upload endpoint."
+              placeholder="e.g. Keep the data structure simpler for now.&#10;Add a security check for the upload step."
               className="w-full h-32 bg-bg-elevated border border-border-default focus:border-accent-border focus:ring-1 focus:ring-accent-border rounded-[14px] p-4 text-text-primary placeholder:text-text-tertiary transition-all duration-200 outline-none resize-none font-sans text-[15px]"
               autoFocus
             />

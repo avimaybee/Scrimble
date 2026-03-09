@@ -1,14 +1,20 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import {
+  BookText,
+  Cpu,
+  ExternalLink,
+  Github,
   KeyRound,
   Loader2,
   LogOut,
+  Search,
+  Server,
   ShieldCheck,
-  Cpu,
   Trash2,
   User as UserIcon,
+  type LucideIcon,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { useAuthStore } from '../store/authStore';
@@ -20,6 +26,15 @@ import {
   getAIProviders,
   saveAIProvider,
 } from '../lib/ai';
+import {
+  deleteMCPServer,
+  getMCPServers,
+  type MCPServer,
+  type MCPServerType,
+  type SaveMCPServerPayload,
+  saveMCPServer,
+  toggleMCPServer,
+} from '../lib/mcp';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -64,8 +79,8 @@ const providerOptions: Array<{
   },
   {
     value: 'gemini',
-    label: 'Google Gemini',
-    helper: 'Fast, reliable, and free for many use cases through Google AI Studio.',
+    label: 'Gemini',
+    helper: 'Use Gemini with your own key for fast plan drafting and step updates.',
     placeholder: 'AIza...',
   },
   {
@@ -79,12 +94,11 @@ const providerOptions: Array<{
 const providerLabels: Record<AIProviderType, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
-  gemini: 'Google Gemini',
+  gemini: 'Gemini',
   custom: 'Custom',
 };
 
-const inputClassName =
-  'h-12 w-full rounded-[8px] border border-border-default bg-bg-elevated px-4 text-[15px] text-text-primary placeholder:text-text-tertiary shadow-[inset_0_1px_0_rgba(255,252,242,0.02)] outline-none transition-[border-color,box-shadow,background-color] duration-200 focus:border-accent-primary focus:bg-bg-overlay focus:ring-2 focus:ring-accent-primary-muted';
+const inputClassName = 'field-input';
 
 type ProviderFormState = {
   provider: AIProviderType;
@@ -93,12 +107,138 @@ type ProviderFormState = {
   baseUrl: string;
 };
 
+type MCPFormFieldName = 'apiKey' | 'token' | 'name' | 'baseUrl';
+
+type MCPFormState = {
+  apiKey: string;
+  token: string;
+  name: string;
+  baseUrl: string;
+};
+
+type MCPFieldDefinition = {
+  key: MCPFormFieldName;
+  label: string;
+  placeholder: string;
+  type: 'password' | 'text' | 'url';
+  autoComplete?: string;
+  helper?: string;
+};
+
+type MCPCardDefinition = {
+  type: MCPServerType;
+  label: string;
+  description: string;
+  icon: LucideIcon;
+  recommended?: boolean;
+  getLinkHref?: string;
+  getLinkLabel?: string;
+  note?: string;
+  fields: MCPFieldDefinition[];
+};
+
 const defaultFormState: ProviderFormState = {
   provider: 'openai',
   apiKey: '',
   model: '',
   baseUrl: '',
 };
+
+const defaultMCPFormState: MCPFormState = {
+  apiKey: '',
+  token: '',
+  name: '',
+  baseUrl: '',
+};
+
+const defaultMCPForms: Record<MCPServerType, MCPFormState> = {
+  'brave-search': { ...defaultMCPFormState },
+  github: { ...defaultMCPFormState },
+  context7: { ...defaultMCPFormState },
+  custom: { ...defaultMCPFormState },
+};
+
+const mcpCardDefinitions: MCPCardDefinition[] = [
+  {
+    type: 'brave-search',
+    label: 'Brave Search',
+    description:
+      'Searches the web for the latest library news, community discussions, and real-world feedback.',
+    icon: Search,
+    recommended: true,
+    getLinkHref: 'https://brave.com/search/api',
+    getLinkLabel: 'brave.com/search/api',
+    fields: [
+      {
+        key: 'apiKey',
+        label: 'API key',
+        placeholder: 'Paste your Brave Search API key',
+        type: 'password',
+        autoComplete: 'off',
+      },
+    ],
+  },
+  {
+    type: 'github',
+    label: 'GitHub',
+    description: 'Checks library health, reads real bug reports, and compares alternatives.',
+    icon: Github,
+    getLinkHref: 'https://github.com/settings/tokens',
+    getLinkLabel: 'github.com/settings/tokens',
+    note: 'Scopes needed: public_repo.',
+    fields: [
+      {
+        key: 'token',
+        label: 'Personal Access Token (read-only)',
+        placeholder: 'ghp_...',
+        type: 'password',
+        autoComplete: 'off',
+        helper: 'Use a token with public_repo so Scrimble can inspect public repos and issues.',
+      },
+    ],
+  },
+  {
+    type: 'context7',
+    label: 'Context7',
+    description:
+      'Pulls live, structured documentation for any library — always current, never stale.',
+    icon: BookText,
+    recommended: true,
+    getLinkHref: 'https://context7.com',
+    getLinkLabel: 'context7.com',
+    fields: [
+      {
+        key: 'apiKey',
+        label: 'API key',
+        placeholder: 'Paste your Context7 key',
+        type: 'password',
+        autoComplete: 'off',
+      },
+    ],
+  },
+  {
+    type: 'custom',
+    label: 'Custom MCP',
+    description: 'Any MCP-compatible server you run yourself.',
+    icon: Server,
+    note: 'Use this for a private MCP endpoint that should only run inside your own stack.',
+    fields: [
+      {
+        key: 'name',
+        label: 'Server name',
+        placeholder: 'My research server',
+        type: 'text',
+      },
+      {
+        key: 'baseUrl',
+        label: 'Base URL',
+        placeholder: 'https://your-mcp.example.com',
+        type: 'url',
+        autoComplete: 'url',
+      },
+    ],
+  },
+];
 
 function getProviderSummary(provider: AIProvider) {
   if (provider.provider === 'custom' && provider.base_url) {
@@ -112,16 +252,45 @@ function getProviderSummary(provider: AIProvider) {
   return provider.name;
 }
 
+function getToolStatusText(server: MCPServer) {
+  return server.is_active ? 'Connected' : 'Paused';
+}
+
+function getToolStatusClasses(server: MCPServer) {
+  return server.is_active
+    ? 'border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)] text-status-secure'
+    : 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning';
+}
+
 export default function Settings() {
   const { user } = useAuthStore();
+  const mcpSectionRef = useRef<HTMLElement | null>(null);
+
   const [providers, setProviders] = useState<AIProvider[]>([]);
+  const [mcpServers, setMCPServers] = useState<MCPServer[]>([]);
   const [form, setForm] = useState<ProviderFormState>(defaultFormState);
+  const [mcpForms, setMCPForms] = useState<Record<MCPServerType, MCPFormState>>(defaultMCPForms);
+  const [expandedMCPType, setExpandedMCPType] = useState<MCPServerType | null>(null);
   const [isLoadingProviders, setIsLoadingProviders] = useState(true);
+  const [isLoadingMCPServers, setIsLoadingMCPServers] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [savingMCPType, setSavingMCPType] = useState<MCPServerType | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const [removingMCPId, setRemovingMCPId] = useState<string | null>(null);
+  const [togglingMCPId, setTogglingMCPId] = useState<string | null>(null);
 
   const selectedProvider =
     providerOptions.find((option) => option.value === form.provider) ?? providerOptions[0];
+
+  const mcpServersByType = mcpServers.reduce<Partial<Record<MCPServerType, MCPServer>>>(
+    (lookup, server) => {
+      lookup[server.server_type] = server;
+      return lookup;
+    },
+    {},
+  );
+
+  const activeResearchToolCount = mcpServers.filter((server) => server.is_active).length;
 
   const loadProviders = async (silent = false) => {
     setIsLoadingProviders(true);
@@ -140,8 +309,27 @@ export default function Settings() {
     }
   };
 
+  const loadMCPServers = async (silent = false) => {
+    setIsLoadingMCPServers(true);
+
+    try {
+      const result = await getMCPServers();
+      setMCPServers(result);
+    } catch (error: unknown) {
+      if (!silent) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : 'Could not load your research tools right now.',
+        );
+      }
+    } finally {
+      setIsLoadingMCPServers(false);
+    }
+  };
+
   useEffect(() => {
-    void loadProviders();
+    void Promise.all([loadProviders(), loadMCPServers()]);
   }, []);
 
   const handleSaveProvider = async (event: FormEvent<HTMLFormElement>) => {
@@ -200,6 +388,148 @@ export default function Settings() {
     }
   };
 
+  const handleMCPFieldChange = (
+    serverType: MCPServerType,
+    field: MCPFormFieldName,
+    value: string,
+  ) => {
+    setMCPForms((current) => ({
+      ...current,
+      [serverType]: {
+        ...current[serverType],
+        [field]: value,
+      },
+    }));
+  };
+
+  const resetMCPForm = (serverType: MCPServerType) => {
+    setMCPForms((current) => ({
+      ...current,
+      [serverType]: { ...defaultMCPFormState },
+    }));
+  };
+
+  const handleSaveMCPServer = async (
+    event: FormEvent<HTMLFormElement>,
+    serverType: MCPServerType,
+  ) => {
+    event.preventDefault();
+
+    const currentForm = mcpForms[serverType];
+    let payload: SaveMCPServerPayload | null = null;
+
+    if (serverType === 'brave-search') {
+      const apiKey = currentForm.apiKey.trim();
+      if (!apiKey) {
+        toast.error('Add your Brave Search API key first.');
+        return;
+      }
+      payload = {
+        serverType,
+        config: { apiKey },
+      };
+    }
+
+    if (serverType === 'github') {
+      const token = currentForm.token.trim();
+      if (!token) {
+        toast.error('Add your GitHub Personal Access Token first.');
+        return;
+      }
+      payload = {
+        serverType,
+        config: { token },
+      };
+    }
+
+    if (serverType === 'context7') {
+      const apiKey = currentForm.apiKey.trim();
+      if (!apiKey) {
+        toast.error('Add your Context7 API key first.');
+        return;
+      }
+      payload = {
+        serverType,
+        config: { apiKey },
+      };
+    }
+
+    if (serverType === 'custom') {
+      const name = currentForm.name.trim();
+      const baseUrl = currentForm.baseUrl.trim();
+
+      if (!name) {
+        toast.error('Give your custom MCP server a name.');
+        return;
+      }
+
+      if (!baseUrl) {
+        toast.error('Add the base URL for your custom MCP server.');
+        return;
+      }
+
+      payload = {
+        serverType,
+        name,
+        config: { baseUrl },
+      };
+    }
+
+    if (!payload) {
+      toast.error('Could not prepare that research tool connection.');
+      return;
+    }
+
+    setSavingMCPType(serverType);
+
+    try {
+      await saveMCPServer(payload);
+      await loadMCPServers(true);
+      resetMCPForm(serverType);
+      setExpandedMCPType(null);
+      toast.success('Research tool connected.');
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not connect that research tool.');
+    } finally {
+      setSavingMCPType(null);
+    }
+  };
+
+  const handleToggleMCPServer = async (server: MCPServer) => {
+    setTogglingMCPId(server.id);
+
+    try {
+      const result = await toggleMCPServer(server.id);
+      await loadMCPServers(true);
+      toast.success(result.is_active ? `${server.name} turned on.` : `${server.name} paused.`);
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not update that research tool.');
+    } finally {
+      setTogglingMCPId(null);
+    }
+  };
+
+  const handleRemoveMCPServer = async (server: MCPServer) => {
+    setRemovingMCPId(server.id);
+
+    try {
+      await deleteMCPServer(server.id);
+      await loadMCPServers(true);
+      if (expandedMCPType === server.server_type) {
+        setExpandedMCPType(null);
+      }
+      toast.success('Research tool disconnected.');
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not disconnect that research tool.');
+    } finally {
+      setRemovingMCPId(null);
+    }
+  };
+
+  const scrollToResearchTools = () => {
+    mcpSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
   return (
     <motion.main
       initial="hidden"
@@ -207,10 +537,11 @@ export default function Settings() {
       variants={containerVariants}
       className="mx-auto w-full max-w-[920px] px-6 pb-24 pt-20 font-sans"
     >
-      <motion.div variants={itemVariants} className="mb-10 max-w-[560px]">
+      <motion.div variants={itemVariants} className="mb-10 max-w-[620px]">
         <h1 className="text-heading mb-3">Settings</h1>
         <p className="text-body">
-          Keep your account close at hand and connect the AI tools you already use.
+          Keep your account close at hand, connect the AI tools you already use, and
+          give Scrimble better sources before every plan begins.
         </p>
       </motion.div>
 
@@ -257,7 +588,7 @@ export default function Settings() {
 
       <motion.section
         variants={itemVariants}
-        className="rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
+        className="mb-8 rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
       >
         <div className="mb-6 max-w-[640px]">
           <div className="mb-4 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
@@ -314,7 +645,7 @@ export default function Settings() {
                     type="button"
                     onClick={() => handleRemoveProvider(provider.id)}
                     disabled={removingId === provider.id}
-                    className="inline-flex h-11 items-center justify-center gap-2 rounded-[8px] border border-[rgba(248,113,113,0.22)] px-4 text-sm font-medium text-[#f0c4b8] transition-colors hover:border-[rgba(248,113,113,0.36)] hover:bg-status-skipped disabled:cursor-not-allowed disabled:opacity-60"
+                    className="btn-danger"
                   >
                     {removingId === provider.id ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
@@ -340,33 +671,34 @@ export default function Settings() {
           </div>
 
           <form onSubmit={handleSaveProvider} className="space-y-5">
-            {/* Accessibility: hidden username field to satisfy browser password managers */}
-            <input 
-              type="text" 
-              name="username" 
-              autoComplete="username" 
-              style={{ display: 'none' }} 
-              readOnly 
-              value={user?.email || 'user'} 
+            <input
+              type="text"
+              name="username"
+              autoComplete="username"
+              style={{ display: 'none' }}
+              readOnly
+              value={user?.email || 'user'}
             />
             <div>
-              <div className="grid gap-1 sm:grid-cols-4 rounded-[10px] border border-border-default bg-bg-elevated p-1">
+              <div className="grid gap-1 rounded-[10px] border border-border-default bg-bg-elevated p-1 sm:grid-cols-4">
                 {providerOptions.map((option) => (
                   <button
                     key={option.value}
                     type="button"
-                    onClick={() => setForm((current) => ({
-                      ...current,
-                      provider: option.value,
-                      apiKey: '',
-                      model: '',
-                      baseUrl: ''
-                    }))}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        provider: option.value,
+                        apiKey: '',
+                        model: '',
+                        baseUrl: '',
+                      }))
+                    }
                     className={cn(
                       'h-9 rounded-[6px] px-3 text-sm font-medium transition-all duration-200',
                       form.provider === option.value
                         ? 'bg-bg-surface text-accent-primary shadow-[0_0_0_1px_var(--color-accent-border)]'
-                        : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface/50'
+                        : 'text-text-secondary hover:bg-bg-surface/50 hover:text-text-primary',
                     )}
                   >
                     {option.label}
@@ -439,13 +771,245 @@ export default function Settings() {
           </form>
         </div>
 
-        <div className="mt-6 rounded-[10px] border border-accent-border bg-accent-primary-muted p-4">
+        <div className="mt-6 rounded-[14px] border border-accent-border bg-accent-primary-muted p-4">
           <div className="flex items-start gap-3">
             <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-accent-primary" />
             <p className="text-sm leading-relaxed text-text-primary">
-              Your privacy is priority. API keys are encrypted with <strong>AES-256</strong> before being stored in our isolated Cloudflare D1 database. Scrimble never stores them in plain text and only uses them to securely proxy your requests.
+              Your keys are encrypted before they are stored in Cloudflare D1. Scrimble never
+              keeps them in plain text and only uses them to run work on your projects.
             </p>
           </div>
+        </div>
+      </motion.section>
+
+      {activeResearchToolCount === 0 ? (
+        <motion.div
+          variants={itemVariants}
+          className="mb-8 rounded-[14px] border border-accent-border bg-accent-primary-muted px-4 py-3"
+        >
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-sm leading-relaxed text-text-secondary">
+              Connect research tools if you want deeper comparisons and better tradeoffs.
+            </p>
+            <button
+              type="button"
+              onClick={scrollToResearchTools}
+              className="inline-flex items-center gap-1 text-sm font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
+            >
+              Set up now
+            </button>
+          </div>
+        </motion.div>
+      ) : null}
+
+      <motion.section
+        ref={mcpSectionRef}
+        id="research-tools"
+        variants={itemVariants}
+        className="rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
+      >
+        <div className="mb-6 max-w-[720px]">
+          <div className="section-label mb-4">Research tools</div>
+          <h2 className="mb-2 text-2xl font-serif tracking-[-0.03em] text-text-primary">
+            Give your plan live research context.
+          </h2>
+          <p className="text-body">
+            Connect tools that let Scrimble do deeper research when building your plan. The more
+            you connect, the better your plan will be.
+          </p>
+        </div>
+
+        <div className="space-y-4">
+          {isLoadingMCPServers ? (
+            <div className="rounded-[14px] border border-border-default bg-bg-elevated/50 p-4 text-sm text-text-secondary">
+              Loading your research tools...
+            </div>
+          ) : (
+            mcpCardDefinitions.map((card) => {
+              const connectedServer = mcpServersByType[card.type];
+              const isConnected = Boolean(connectedServer);
+              const isExpanded = expandedMCPType === card.type;
+              const isSavingCard = savingMCPType === card.type;
+
+              return (
+                <div
+                  key={card.type}
+                  className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4"
+                >
+                  <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="flex gap-4">
+                      <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[12px] border border-border-default bg-bg-base/55">
+                        <card.icon className="h-5 w-5 text-accent-primary" />
+                      </div>
+
+                      <div className="max-w-[620px]">
+                        <div className="mb-2 flex flex-wrap items-center gap-2">
+                          <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
+                            {card.label}
+                          </h3>
+                          {card.recommended ? (
+                            <span className="rounded-[6px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-status-warning">
+                              Recommended
+                            </span>
+                          ) : null}
+                        </div>
+
+                        <p className="text-sm leading-relaxed text-text-secondary">
+                          {card.description}
+                        </p>
+
+                        {isConnected && connectedServer ? (
+                          <div className="mt-4 flex flex-wrap items-center gap-3">
+                            <span
+                              className={cn(
+                                'inline-flex items-center gap-2 rounded-[8px] border px-3 py-1 text-[12px] font-medium',
+                                getToolStatusClasses(connectedServer),
+                              )}
+                            >
+                              <span
+                                className={cn(
+                                  'h-2 w-2 rounded-full',
+                                  connectedServer.is_active ? 'bg-status-secure' : 'bg-status-warning',
+                                )}
+                              />
+                              {getToolStatusText(connectedServer)}
+                            </span>
+                            <p className="text-sm text-text-secondary">
+                              {connectedServer.masked_config}
+                            </p>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3">
+                      {isConnected && connectedServer ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleMCPServer(connectedServer)}
+                            disabled={togglingMCPId === connectedServer.id}
+                            className="inline-flex items-center gap-2 text-sm font-medium text-text-secondary transition-colors hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {togglingMCPId === connectedServer.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : null}
+                            {connectedServer.is_active ? 'Pause' : 'Turn on'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleRemoveMCPServer(connectedServer)}
+                            disabled={removingMCPId === connectedServer.id}
+                            className="inline-flex items-center gap-2 text-sm font-medium text-status-error transition-colors hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {removingMCPId === connectedServer.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : null}
+                            Disconnect
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedMCPType((current) => (current === card.type ? null : card.type))
+                          }
+                          className="inline-flex h-11 items-center justify-center rounded-[8px] border border-accent-border px-4 text-sm font-medium text-accent-primary transition-colors hover:bg-accent-primary-muted"
+                        >
+                          {isExpanded ? 'Close' : 'Connect'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {!isConnected && isExpanded ? (
+                    <div className="mt-5 rounded-[12px] border border-border-default bg-bg-base/45 p-4">
+                      <form
+                        onSubmit={(event) => void handleSaveMCPServer(event, card.type)}
+                        className="space-y-4"
+                      >
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div>
+                            <p className="text-[15px] font-medium text-text-primary">
+                              Connect {card.label}
+                            </p>
+                            {card.note ? (
+                              <p className="mt-1 text-sm text-text-secondary">{card.note}</p>
+                            ) : null}
+                          </div>
+
+                          {card.getLinkHref && card.getLinkLabel ? (
+                            <a
+                              href={card.getLinkHref}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1 text-sm font-medium text-accent-soft transition-colors hover:text-accent-primary"
+                            >
+                              {card.getLinkLabel}
+                              <ExternalLink className="h-3.5 w-3.5" />
+                            </a>
+                          ) : null}
+                        </div>
+
+                        <div
+                          className={cn(
+                            'grid gap-4',
+                            card.fields.length > 1 ? 'sm:grid-cols-2' : 'sm:grid-cols-1',
+                          )}
+                        >
+                          {card.fields.map((field) => (
+                            <div key={`${card.type}-${field.key}`}>
+                              <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                                {field.label}
+                              </label>
+                              <input
+                                type={field.type}
+                                autoComplete={field.autoComplete}
+                                value={mcpForms[card.type][field.key]}
+                                onChange={(event) =>
+                                  handleMCPFieldChange(card.type, field.key, event.target.value)
+                                }
+                                placeholder={field.placeholder}
+                                className={inputClassName}
+                              />
+                              {field.helper ? (
+                                <p className="mt-2 text-xs leading-relaxed text-text-tertiary">
+                                  {field.helper}
+                                </p>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+
+                        <div className="flex justify-end gap-3">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedMCPType(null)}
+                            className="inline-flex h-11 items-center justify-center rounded-[8px] border border-border-default px-4 text-sm font-medium text-text-secondary transition-colors hover:border-border-strong hover:text-text-primary"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="submit"
+                            disabled={isSavingCard}
+                            className="btn-primary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {isSavingCard ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                            {isSavingCard ? 'Connecting...' : 'Save connection'}
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div className="mt-5 px-1 text-[13px] leading-relaxed text-text-muted">
+          Scrimble only uses these tools while building your plan. Your tokens are encrypted and
+          never shared.
         </div>
       </motion.section>
     </motion.main>

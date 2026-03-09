@@ -64,9 +64,9 @@ export function DropdownMenuContent({ children, className, align = 'start' }: { 
           initial={{ opacity: 0, y: -5, scale: 0.95 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: -5, scale: 0.95 }}
-          transition={{ duration: 0.15 }}
+          transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
           className={cn(
-            "absolute z-50 mt-2 py-1 bg-bg-surface border border-border-default rounded-xl shadow-lg focus:outline-none",
+            "absolute z-50 mt-2 min-w-[180px] py-1.5 bg-bg-overlay border border-border-default rounded-[16px] shadow-panel focus:outline-none",
             alignClass,
             className
           )}
@@ -90,7 +90,7 @@ export function DropdownMenuItem({ children, className, onClick }: { children: R
   const { setOpen } = React.useContext(DropdownMenuContext);
   return (
     <div
-      className={cn("px-4 py-2 text-sm text-text-secondary hover:text-text-primary hover:bg-bg-elevated cursor-pointer transition-colors flex items-center outline-none mx-2 rounded-md", className)}
+      className={cn("mx-2 flex cursor-pointer items-center rounded-[10px] px-4 py-2.5 text-sm text-text-secondary outline-none transition-colors hover:bg-bg-elevated hover:text-text-primary", className)}
       onClick={() => {
         onClick?.();
         setOpen(false);

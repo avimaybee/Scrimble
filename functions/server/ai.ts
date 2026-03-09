@@ -88,6 +88,8 @@ export async function streamToText(stream: ReadableStream<Uint8Array>) {
   return fullContent;
 }
 
+const AI_TIMEOUT_MS = 600_000; // 10 minutes
+
 export async function callProvider(payload: {
   providerType: ProviderType;
   apiKey: string;
@@ -95,10 +97,16 @@ export async function callProvider(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
+  signal?: AbortSignal;
 }) {
+  const commonFetchOptions = {
+    method: 'POST',
+    signal: payload.signal,
+  };
+
   if (payload.providerType === 'anthropic') {
     return fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
+      ...commonFetchOptions,
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': payload.apiKey,
@@ -108,6 +116,7 @@ export async function callProvider(payload: {
         model: payload.model,
         system: payload.system || undefined,
         messages: [{ role: 'user', content: payload.prompt }],
+        max_tokens: 8192,
         stream: true,
       }),
     });
@@ -116,7 +125,7 @@ export async function callProvider(payload: {
   if (payload.providerType === 'gemini') {
     const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:streamGenerateContent?key=${payload.apiKey}`;
     return fetch(googleUrl, {
-      method: 'POST',
+      ...commonFetchOptions,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [
@@ -140,7 +149,7 @@ export async function callProvider(payload: {
   }
 
   return fetch(url, {
-    method: 'POST',
+    ...commonFetchOptions,
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${payload.apiKey}`,
@@ -151,6 +160,7 @@ export async function callProvider(payload: {
         ...(payload.system ? [{ role: 'system', content: payload.system }] : []),
         { role: 'user', content: payload.prompt },
       ],
+      max_tokens: 16384,
       stream: true,
     }),
   });
@@ -168,8 +178,12 @@ export async function callAIWithRetry(payload: {
   const backoffs = [1000, 3000, 7000];
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
     try {
-      const response = await callProvider(payload);
+      const response = await callProvider({ ...payload, signal: controller.signal });
+      clearTimeout(timeoutId);
 
       if (response.ok) {
         return response;

@@ -1,6 +1,19 @@
 import { z } from 'zod';
 
 const urlSchema = z.string().url();
+const searchResultSchema = z.object({
+  title: z.string().min(1),
+  url: urlSchema,
+  description: z.string().optional().default(''),
+});
+
+const researchSourceSchema = z.object({
+  technology: z.string().optional().default(''),
+  url: urlSchema,
+  tool: z.string().min(1),
+  title: z.string().optional().default(''),
+  summary: z.string().optional().default(''),
+});
 
 export const Batch1ResearchStackSchema = z.object({
   technologies: z.array(
@@ -9,6 +22,8 @@ export const Batch1ResearchStackSchema = z.object({
       docs_url: urlSchema,
       github_url: urlSchema,
       changelog_url: urlSchema,
+      community_search_results: z.array(searchResultSchema).optional().default([]),
+      breaking_change_search_results: z.array(searchResultSchema).optional().default([]),
     }),
   ),
 });
@@ -23,8 +38,28 @@ export const Batch2FetchAndReadSchema = z.object({
       last_commit_date: z.string(),
       open_issues_count: z.number().int().nonnegative(),
       recent_breaking_changes: z.string(),
+      repo_health_summary: z.string().optional().default(''),
+      community_sentiment: z.string().optional().default(''),
+      bug_report_digest: z.string().optional().default(''),
+      sources: z.array(researchSourceSchema).optional().default([]),
     }),
   ),
+  sources: z.array(researchSourceSchema).optional().default([]),
+  data_quality: z.object({
+    has_brave_search: z.boolean().default(false),
+    has_github_token: z.boolean().default(false),
+    has_context7: z.boolean().default(false),
+    technologies_researched: z.number().int().nonnegative().default(0),
+    urls_fetched: z.number().int().nonnegative().default(0),
+    issues_found: z.number().int().nonnegative().default(0),
+  }).optional().default({
+    has_brave_search: false,
+    has_github_token: false,
+    has_context7: false,
+    technologies_researched: 0,
+    urls_fetched: 0,
+    issues_found: 0,
+  }),
 });
 
 export const Batch3ArchitectSchema = z.object({
@@ -181,9 +216,9 @@ export const Batch6GenerateFilesSchema = z.object({
 
 export const schemaDescriptions = {
   batch_1_research_stack:
-    '{ technologies: [{ name: string, docs_url: url, github_url: url, changelog_url: url }] }',
+    '{ technologies: [{ name: string, docs_url: url, github_url: url, changelog_url: url, community_search_results?: [{ title, url, description }], breaking_change_search_results?: [{ title, url, description }] }] }',
   batch_2_fetch_and_read:
-    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string }] }',
+    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary? }] }], sources?: [{ technology?, url, tool, title?, summary? }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number } }',
   batch_3_architect:
     '{ project_name: string, project_type: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:

@@ -11,13 +11,14 @@ export function Dialog({ open, onOpenChange, children }: { open?: boolean, onOpe
             initial={{ opacity: 0 }} 
             animate={{ opacity: 1 }} 
             exit={{ opacity: 0 }} 
-            className="fixed inset-0 bg-[#0f0e0e]/60 backdrop-blur-sm"
+            className="fixed inset-0 bg-bg-base/72 backdrop-blur-sm"
             onClick={() => onOpenChange?.(false)}
           />
           <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.95 }}
+            initial={{ opacity: 0, scale: 0.96, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 12 }}
+            transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
             className="relative z-50 w-full max-w-lg"
           >
             {children}
@@ -30,7 +31,7 @@ export function Dialog({ open, onOpenChange, children }: { open?: boolean, onOpe
 
 export function DialogContent({ children, className }: { children: React.ReactNode, className?: string }) {
   return (
-    <div className={cn("bg-bg-surface border border-border-default rounded-[16px] shadow-modal overflow-hidden", className)}>
+    <div className={cn("surface-panel overflow-hidden", className)}>
       {children}
     </div>
   );
@@ -41,7 +42,7 @@ export function DialogHeader({ children, className }: { children: React.ReactNod
 }
 
 export function DialogTitle({ children, className }: { children: React.ReactNode, className?: string }) {
-  return <h2 className={cn("text-xl font-semibold text-text-primary", className)}>{children}</h2>;
+  return <h2 className={cn("font-serif text-[28px] tracking-[-0.03em] text-text-primary", className)}>{children}</h2>;
 }
 
 export function DialogDescription({ children, className }: { children: React.ReactNode, className?: string }) {

@@ -201,6 +201,41 @@ export interface ArchitectureReviewDataModelTable {
   columns: string[];
 }
 
+export interface ArchitectureReviewResearchSource {
+  technology?: string;
+  url: string;
+  tool: string;
+  title?: string;
+  summary?: string;
+}
+
+export interface ArchitectureReviewDataQuality {
+  has_brave_search: boolean;
+  has_github_token: boolean;
+  has_context7: boolean;
+  technologies_researched: number;
+  urls_fetched: number;
+  issues_found: number;
+}
+
+export interface GenerationPreparationState {
+  has_ai_provider: boolean;
+  has_brave_search: boolean;
+  has_github_token: boolean;
+  has_context7: boolean;
+}
+
+export interface WorkflowUpdateActivity {
+  icon: string;
+  message: string;
+  timestamp: string;
+}
+
+export interface WorkflowUpdateResult {
+  summary: string;
+  updated_steps: number;
+}
+
 export interface ArchitectureReviewResponse {
   project_id: string;
   project_name: string;
@@ -216,6 +251,8 @@ export interface ArchitectureReviewResponse {
   };
   stack_cards: ArchitectureReviewCard[];
   data_model: ArchitectureReviewDataModelTable[];
+  research_sources: ArchitectureReviewResearchSource[];
+  data_quality: ArchitectureReviewDataQuality;
   preferred_ide: PreferredIde;
   review_feedback: string;
   review_feedback_provided: boolean;

@@ -66,8 +66,8 @@ function StepCard({ data, selected }: { data: StepCardData; selected?: boolean }
           </div>
           
           {data.isGate && (
-            <div className="px-1.5 py-0.5 rounded bg-status-warning/10 border border-status-warning/20">
-              <span className="text-[8px] font-bold text-status-warning uppercase">Gate</span>
+            <div className="rounded-[6px] border border-status-warning/20 bg-status-warning/10 px-1.5 py-0.5">
+              <span className="text-[8px] font-bold uppercase text-status-warning">Review</span>
             </div>
           )}
         </div>
@@ -92,7 +92,7 @@ function StepCard({ data, selected }: { data: StepCardData; selected?: boolean }
             </span>
           </div>
           
-          <div className="w-12 h-1 bg-bg-elevated rounded-full overflow-hidden">
+          <div className="h-1 w-12 overflow-hidden rounded-[2px] bg-bg-elevated">
             <div 
               className="h-full bg-accent-primary transition-all duration-500" 
               style={{ width: `${data.progress}%` }} 

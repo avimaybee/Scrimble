@@ -1,21 +1,28 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Plus, Hexagon, ArrowRight, MoreVertical, Archive, Eye, Check } from 'lucide-react';
+import {
+  Archive,
+  ArrowRight,
+  FolderOpen,
+  MoreHorizontal,
+  Plus,
+  RotateCcw,
+  Undo2,
+} from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
+import { toast } from 'sonner';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
-import { Project } from '../types';
+import { Project, Stage, Step } from '../types';
 import { cn } from '../lib/utils';
-import { toast } from 'sonner';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuTrigger,
   DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import ErrorBoundary from '../components/ErrorBoundary';
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -40,25 +47,53 @@ const itemVariants = {
   },
 };
 
+type ProjectCardData = {
+  project: Project;
+  stages: Stage[];
+  steps: Step[];
+  nextStep: Step | null;
+  activeStepCount: number;
+};
+
+function getGreeting() {
+  const hour = new Date().getHours();
+
+  if (hour < 12) {
+    return 'Good morning.';
+  }
+
+  if (hour < 18) {
+    return 'Good afternoon.';
+  }
+
+  return 'Good evening.';
+}
+
+function getNextStep(steps: Step[]) {
+  const orderedSteps = [...steps].sort((left, right) => left.order_index - right.order_index);
+
+  return orderedSteps.find((step) => step.status === 'needs_review')
+    ?? orderedSteps.find((step) => step.status === 'agent_working')
+    ?? orderedSteps.find((step) => step.status === 'active' || step.status === 'waiting')
+    ?? orderedSteps.find((step) => step.status === 'locked')
+    ?? orderedSteps.find((step) => step.status !== 'complete' && step.status !== 'skipped')
+    ?? null;
+}
+
+function parseStack(stackValue: string) {
+  try {
+    return JSON.parse(stackValue) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
 export default function Dashboard() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectCards, setProjectCards] = useState<ProjectCardData[]>([]);
   const [loading, setLoading] = useState(true);
-  const [greeting, setGreeting] = useState('Good morning.');
   const [showArchived, setShowArchived] = useState(false);
-
-  useEffect(() => {
-    const hour = new Date().getHours();
-
-    if (hour < 12) {
-      setGreeting('Good morning.');
-    } else if (hour < 18) {
-      setGreeting('Good afternoon.');
-    } else {
-      setGreeting('Good evening.');
-    }
-  }, []);
 
   useEffect(() => {
     if (!user) {
@@ -66,76 +101,110 @@ export default function Dashboard() {
     }
 
     async function fetchProjects() {
+      setLoading(true);
+
       try {
-        const data = await dbService.getProjectsByUserId(user.uid);
-        setProjects(data);
+        const projects = await dbService.getProjectsByUserId(user.uid);
+        const cards = await Promise.all(
+          projects.map(async (project) => {
+            const [steps, stages] = await Promise.all([
+              dbService.getStepsByProjectId(project.id),
+              dbService.getStagesByProjectId(project.id),
+            ]);
+
+            return {
+              project,
+              stages,
+              steps,
+              nextStep: getNextStep(steps),
+              activeStepCount: steps.filter((step) => ['active', 'agent_working', 'needs_review', 'waiting'].includes(step.status)).length,
+            };
+          }),
+        );
+
+        setProjectCards(cards);
       } catch (error) {
         console.error('Error fetching projects:', error);
+        toast.error('Could not load your projects.');
       } finally {
         setLoading(false);
       }
     }
 
-    fetchProjects();
+    void fetchProjects();
   }, [user]);
 
-  const handleArchiveProject = async (e: React.MouseEvent, projectId: string) => {
-    e.stopPropagation();
+  const handleArchiveProject = async (projectId: string) => {
     try {
       await dbService.updateProject(projectId, { status: 'archived' });
-      setProjects(prev => prev.map(p => p.id === projectId ? { ...p, status: 'archived' } : p));
-      toast.success('Project archived');
+      setProjectCards((current) =>
+        current.map((entry) =>
+          entry.project.id === projectId
+            ? { ...entry, project: { ...entry.project, status: 'archived' } }
+            : entry,
+        ),
+      );
+      toast.success('Project moved to the archive.');
     } catch (error) {
       console.error('Error archiving project:', error);
-      toast.error('Failed to archive project');
+      toast.error('Could not archive that project.');
     }
   };
 
-  const handleUnarchiveProject = async (e: React.MouseEvent, projectId: string) => {
-    e.stopPropagation();
+  const handleRestoreProject = async (projectId: string) => {
     try {
       await dbService.updateProject(projectId, { status: 'active' });
-      setProjects(prev => prev.map(p => p.id === projectId ? { ...p, status: 'active' } : p));
-      toast.success('Project restored');
+      setProjectCards((current) =>
+        current.map((entry) =>
+          entry.project.id === projectId
+            ? { ...entry, project: { ...entry.project, status: 'active' } }
+            : entry,
+        ),
+      );
+      toast.success('Project restored.');
     } catch (error) {
       console.error('Error restoring project:', error);
-      toast.error('Failed to restore project');
+      toast.error('Could not restore that project.');
     }
   };
 
-  const filteredProjects = projects.filter(p => showArchived ? p.status === 'archived' : p.status === 'active');
+  const visibleCards = useMemo(
+    () => projectCards.filter((entry) => (showArchived ? entry.project.status === 'archived' : entry.project.status === 'active')),
+    [projectCards, showArchived],
+  );
+
+  const hasArchivedProjects = projectCards.some((entry) => entry.project.status === 'archived');
 
   return (
     <motion.main
       initial="hidden"
       animate="visible"
       variants={containerVariants}
-      className="mx-auto w-full max-w-6xl px-6 pb-24 pt-24 font-sans"
+      className="mx-auto w-full max-w-6xl px-6 pb-8 pt-20 font-sans"
     >
       <motion.header
         variants={containerVariants}
-        className="mb-12 flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between"
+        className="mb-10 flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between"
       >
-        <motion.div variants={itemVariants}>
-          <h1 className="mb-2 text-4xl font-serif tracking-[-0.03em] text-text-primary">
-            {greeting}
-          </h1>
+        <motion.div variants={itemVariants} className="max-w-[640px]">
+          <div className="section-label">Daily re-entry</div>
+          <h1 className="mt-4 text-heading">{getGreeting()}</h1>
+          <p className="mt-3 text-body">
+            Here&apos;s where your projects stand and what you should look at next.
+          </p>
         </motion.div>
 
-        <motion.div variants={itemVariants} className="flex items-center gap-3">
-          {projects.some(p => p.status === 'archived') && (
-            <button 
-              onClick={() => setShowArchived(!showArchived)}
-              className={cn(
-                "btn-ghost flex items-center gap-2 px-4 h-10 rounded-lg text-sm transition-all",
-                showArchived ? "bg-bg-elevated text-text-primary" : "text-text-tertiary"
-              )}
+        <motion.div variants={itemVariants} className="flex flex-wrap items-center gap-3">
+          {hasArchivedProjects ? (
+            <button
+              onClick={() => setShowArchived((current) => !current)}
+              className="btn-ghost"
             >
-              <Archive className="w-4 h-4" />
-              {showArchived ? 'Active projects' : 'View archive'}
+              <Archive className="h-4 w-4" />
+              {showArchived ? 'Back to active' : 'View archive'}
             </button>
-          )}
-          <Link to="/new" className="btn-primary inline-flex items-center gap-2 rounded-[8px]">
+          ) : null}
+          <Link to="/new" className="btn-primary">
             <Plus className="h-4 w-4" />
             Start something new
           </Link>
@@ -144,190 +213,190 @@ export default function Dashboard() {
 
       {loading ? (
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-          {[1, 2, 3].map((i) => (
-            <div key={i} className="h-[240px] rounded-[14px] border border-border-default bg-bg-surface p-6 shadow-panel">
-              <div className="mb-6 flex items-start justify-between">
+          {[1, 2, 3].map((item) => (
+            <div key={item} className="surface-card p-6">
+              <div className="mb-6 flex items-start justify-between gap-6">
                 <div className="space-y-2">
-                  <div className="skeleton-block h-6 w-48" />
-                  <div className="skeleton-block h-4 w-32" />
+                  <div className="skeleton-block h-7 w-48" />
+                  <div className="skeleton-block h-4 w-36" />
                 </div>
-                <div className="skeleton-block h-8 w-8 rounded-lg" />
+                <div className="skeleton-block h-10 w-10 rounded-[10px]" />
               </div>
               <div className="space-y-4">
-                <div className="flex justify-between">
-                  <div className="skeleton-block h-4 w-16" />
-                  <div className="skeleton-block h-4 w-8" />
-                </div>
-                <div className="skeleton-block h-2 w-full rounded-full" />
-                <div className="pt-4 flex justify-between">
+                <div className="skeleton-block h-14 w-full rounded-[12px]" />
+                <div className="skeleton-block h-[3px] w-full rounded-[2px]" />
+                <div className="flex justify-between gap-4">
                   <div className="flex gap-2">
-                    <div className="skeleton-block h-4 w-12" />
-                    <div className="skeleton-block h-4 w-12" />
+                    <div className="skeleton-block h-6 w-20 rounded-[6px]" />
+                    <div className="skeleton-block h-6 w-20 rounded-[6px]" />
                   </div>
-                  <div className="skeleton-block h-4 w-16" />
+                  <div className="skeleton-block h-6 w-16 rounded-[6px]" />
                 </div>
               </div>
             </div>
           ))}
         </div>
-      ) : projects.length === 0 ? (
-        <motion.div
-          variants={itemVariants}
-          className="rounded-[14px] border border-dashed border-border-strong bg-bg-surface p-16 text-center shadow-panel"
-        >
-          <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[14px] border border-accent-border bg-accent-primary-muted shadow-[0_0_20px_rgba(235,94,40,0.1)]">
-            <Hexagon className="h-8 w-8 text-accent-primary" />
+      ) : visibleCards.length === 0 ? (
+        <motion.div variants={itemVariants} className="surface-card px-8 py-14 text-center">
+          <div className="mb-5 flex justify-center">
+            <FolderOpen className="h-9 w-9 text-accent-primary" />
           </div>
-          <h2 className="mb-2 text-2xl font-serif tracking-[-0.03em] text-text-primary">
-            {showArchived ? 'No archived projects' : 'Ready to build?'}
+          <h2 className="text-[32px] font-serif tracking-[-0.03em] text-text-primary">
+            {showArchived ? 'Nothing is archived right now.' : 'You haven’t started anything yet.'}
           </h2>
-          <p className="mx-auto mb-8 max-w-sm text-text-secondary">
-            {showArchived 
-              ? 'Archived projects will appear here. You can restore them anytime.' 
-              : 'Describe your idea naturally. Scrimble will break it down into a plan you can actually finish.'}
+          <p className="mx-auto mt-3 max-w-[420px] text-body">
+            {showArchived
+              ? 'When you archive a project, it will stay here until you want it back.'
+              : 'Tell me what you want to build and I’ll turn it into a plan you can come back to every morning.'}
           </p>
-          {!showArchived && (
-            <Link to="/new" className="btn-primary inline-flex items-center gap-2 rounded-[8px]">
-              Build my first plan
+          {!showArchived ? (
+            <Link to="/new" className="btn-primary mt-8">
+              Start something new
               <ArrowRight className="h-4 w-4" />
             </Link>
-          )}
+          ) : null}
         </motion.div>
       ) : (
-      <ErrorBoundary
-        fallback={
-          <div className="w-full rounded-[14px] border border-border-default bg-bg-surface p-16 text-center shadow-panel">
-            <p className="mb-6 text-text-primary font-medium">Couldn't load your projects.</p>
-            <button 
-              onClick={() => window.location.reload()}
-              className="btn-primary"
-            >
-              Retry
-            </button>
-          </div>
-        }
-      >
-        <motion.div
-          variants={containerVariants}
-          className="grid grid-cols-1 gap-6 md:grid-cols-2"
-        >
-          {filteredProjects.map((project) => {
-            const stack = JSON.parse(project.stack || '{}') as {
-              frontend?: string;
-              database?: string;
-            };
+        <motion.div variants={containerVariants} className="grid grid-cols-1 gap-6 md:grid-cols-2">
+          {visibleCards.map(({ project, nextStep, stages, steps, activeStepCount }) => {
+            const stack = parseStack(project.stack || '{}');
+            const completedStageCount = stages.filter((stage) => stage.status === 'complete').length;
+            const stageTotal = stages.length || 1;
+            const stageProgress = Math.min(Math.max(completedStageCount, 0), stageTotal);
+            const statusLabel = nextStep?.status === 'needs_review'
+              ? 'Your review'
+              : nextStep?.status === 'agent_working'
+                ? 'Working now'
+                : 'Next up';
 
             return (
-              <motion.div
+              <motion.article
                 key={project.id}
                 variants={itemVariants}
                 onClick={() => navigate(`/project/${project.id}`)}
-                className="group relative cursor-pointer overflow-hidden rounded-[14px] border border-border-default bg-bg-surface p-6 shadow-panel transition-all duration-300 hover:border-accent-border hover:shadow-panel-hover"
+                className="surface-card group cursor-pointer p-6 transition-transform duration-200 hover:-translate-y-1"
               >
-                <div className="absolute left-0 top-0 h-full w-1 bg-accent-primary opacity-0 transition-opacity group-hover:opacity-100" />
-
-                <div className="mb-6 flex items-start justify-between">
+                <div className="mb-5 flex items-start justify-between gap-4">
                   <div>
-                    <h3 className="mb-1 text-xl font-medium text-text-primary transition-colors group-hover:text-accent-primary">
+                    <h2 className="text-[24px] font-serif tracking-[-0.03em] text-text-primary">
                       {project.name}
-                    </h3>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-mono uppercase tracking-wider text-text-tertiary">
-                        {project.project_type.replace('_', ' ')}
-                      </span>
-                      <span className="text-text-muted">•</span>
-                      <span className="text-xs text-text-tertiary">
-                        Updated {formatDistanceToNow(new Date(project.updated_at))} ago
-                      </span>
+                    </h2>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] font-mono uppercase tracking-[0.12em] text-text-muted">
+                      <span>{project.project_type.replace('_', ' ')}</span>
+                      <span>•</span>
+                      <span>Updated {formatDistanceToNow(new Date(project.updated_at))} ago</span>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild onClick={(e: any) => e.stopPropagation()}>
-                        <button className="p-2 hover:bg-bg-elevated rounded-lg text-text-tertiary transition-colors">
-                          <MoreVertical className="w-4 h-4" />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent className="bg-bg-surface border-border-default shadow-panel min-w-[160px]">
-                        <DropdownMenuItem onClick={() => navigate(`/project/${project.id}`)} className="flex items-center gap-2 py-2">
-                          <Eye className="w-4 h-4" />
-                          <span>Open project</span>
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator className="bg-border-subtle" />
-                        {project.status === 'archived' ? (
-                          <DropdownMenuItem onClick={() => { handleUnarchiveProject({ stopPropagation: () => {} } as any, project.id); }} className="flex items-center gap-2 py-2 text-accent-primary">
-                            <Check className="w-4 h-4" />
-                            <span>Restore project</span>
-                          </DropdownMenuItem>
-                        ) : (
-                          <DropdownMenuItem onClick={() => { handleArchiveProject({ stopPropagation: () => {} } as any, project.id); }} className="flex items-center gap-2 py-2 text-status-error">
-                            <Archive className="w-4 h-4" />
-                            <span>Archive project</span>
-                          </DropdownMenuItem>
-                        )}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                    <div className="flex gap-1">
-                      {[1, 2, 3, 4, 5, 6, 7, 8].map((stage) => (
-                        <div
-                          key={stage}
+
+                  <div className="flex items-start gap-3">
+                    <div className="flex items-center gap-1 pt-1">
+                      {Array.from({ length: stageTotal }).map((_, index) => (
+                        <span
+                          key={`${project.id}-stage-${index}`}
                           className={cn(
-                            "h-1.5 w-1.5 rounded-full transition-all duration-500",
-                            stage <= Math.ceil((project.progress / 100) * 8)
-                              ? 'bg-accent-primary shadow-[0_0_6px_rgba(235,94,40,0.5)]'
-                              : 'bg-bg-elevated'
+                            'h-1.5 w-1.5 rounded-full transition-colors duration-300',
+                            index < stageProgress
+                              ? 'bg-accent-primary shadow-[0_0_8px_rgba(235,94,40,0.38)]'
+                              : 'bg-bg-elevated',
                           )}
                         />
                       ))}
                     </div>
+
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          className="flex h-10 w-10 items-center justify-center rounded-[10px] border border-border-default bg-bg-elevated/60 text-text-tertiary transition-colors hover:text-text-primary"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <MoreHorizontal className="h-4 w-4" />
+                        </button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => navigate(`/project/${project.id}`)}>
+                          <FolderOpen className="mr-2 h-4 w-4" />
+                          Open project
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        {project.status === 'archived' ? (
+                          <DropdownMenuItem onClick={() => void handleRestoreProject(project.id)}>
+                            <Undo2 className="mr-2 h-4 w-4" />
+                            Restore project
+                          </DropdownMenuItem>
+                        ) : (
+                          <DropdownMenuItem
+                            onClick={() => void handleArchiveProject(project.id)}
+                            className="text-status-error hover:text-accent-soft"
+                          >
+                            <Archive className="mr-2 h-4 w-4" />
+                            Archive project
+                          </DropdownMenuItem>
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 </div>
 
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-text-secondary">Progress</span>
-                    <span className="font-mono font-medium text-accent-primary">{project.progress}%</span>
+                <div className="rounded-[12px] border border-accent-border bg-accent-primary-muted/50 px-4 py-3">
+                  <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.16em] text-accent-primary">
+                    {statusLabel}
                   </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-bg-elevated">
+                  <div className="flex items-center gap-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary">
+                    <ArrowRight className="h-4 w-4 text-accent-primary" />
+                    <span>{nextStep?.title ?? 'Plan details are still coming together.'}</span>
+                  </div>
+                </div>
+
+                <div className="mt-5">
+                  <div className="mb-2 flex items-center justify-between text-sm text-text-secondary">
+                    <span>Progress</span>
+                    <span className="font-mono text-[12px] uppercase tracking-[0.12em] text-text-muted">
+                      {project.progress}% · {steps.filter((step) => step.status === 'complete').length}/{steps.length || 0} done
+                    </span>
+                  </div>
+                  <div className="relative h-[3px] overflow-hidden rounded-[2px] bg-bg-elevated">
                     <motion.div
-                            initial={{ width: 0 }}
-                            animate={{ width: `${project.progress}%` }}
-                            transition={{ 
-                              type: "spring",
-                              stiffness: 100,
-                              damping: 20
-                            }}
-                      className="relative h-full bg-accent-primary"
-                    >
-                      <div className="absolute right-0 top-1/2 h-2 w-2 -translate-y-1/2 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]" />
-                    </motion.div>
-                  </div>
-
-                  <div className="mt-4 flex items-center justify-between border-t border-border-subtle pt-4">
-                    <div className="flex gap-2">
-                      {stack.frontend ? (
-                        <span className="rounded-[6px] bg-bg-elevated px-2 py-0.5 text-[10px] font-mono uppercase tracking-widest text-text-muted">
-                          {stack.frontend}
-                        </span>
-                      ) : null}
-                      {stack.database ? (
-                        <span className="rounded-[6px] bg-bg-elevated px-2 py-0.5 text-[10px] font-mono uppercase tracking-widest text-text-muted">
-                          {stack.database}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="flex items-center gap-1 text-accent-primary opacity-0 transition-all group-hover:translate-x-1 group-hover:opacity-100">
-                      <span className="text-xs font-medium">Continue</span>
-                      <ArrowRight className="h-4 w-4" />
-                    </div>
+                      initial={{ width: 0 }}
+                      animate={{ width: `${project.progress}%` }}
+                      transition={{ type: 'spring', stiffness: 100, damping: 20 }}
+                      className="absolute inset-y-0 left-0 bg-accent-primary"
+                    />
+                    <motion.div
+                      initial={{ left: 0 }}
+                      animate={{ left: `${Math.max(project.progress - 2, 0)}%` }}
+                      transition={{ type: 'spring', stiffness: 100, damping: 20 }}
+                      className="absolute top-1/2 h-2 w-2 -translate-y-1/2 rounded-full bg-accent-soft shadow-[0_0_10px_rgba(243,159,126,0.55)]"
+                    />
                   </div>
                 </div>
-              </motion.div>
+
+                <div className="mt-5 flex items-center justify-between gap-4 border-t border-border-subtle pt-4">
+                  <div className="flex flex-wrap gap-2">
+                    {Object.values(stack).filter(Boolean).slice(0, 3).map((item) => (
+                      <span
+                        key={`${project.id}-${item}`}
+                        className="rounded-[6px] border border-border-default bg-bg-elevated/70 px-2 py-1 text-[10px] font-mono uppercase tracking-[0.12em] text-text-muted"
+                      >
+                        {item}
+                      </span>
+                    ))}
+                  </div>
+
+                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">
+                    {activeStepCount > 0 ? `${activeStepCount} in play` : 'Quiet for now'}
+                  </div>
+                </div>
+              </motion.article>
             );
           })}
         </motion.div>
-      </ErrorBoundary>
       )}
+
+      {!loading && visibleCards.length > 0 ? (
+        <motion.div variants={itemVariants} className="mt-8 text-sm text-text-muted">
+          Open any project to see the full plan, finish the current step, or ask Scrimble to rework it.
+        </motion.div>
+      ) : null}
     </motion.main>
   );
 }

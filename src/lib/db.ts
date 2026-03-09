@@ -15,6 +15,8 @@ import {
   ProjectGenerationStatusResponse,
   Stage,
   Step,
+  WorkflowUpdateActivity,
+  WorkflowUpdateResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -31,6 +33,10 @@ interface CreateProjectResponse {
   generation_status: Project['generation_status'];
 }
 
+interface UpdateWorkflowOptions {
+  onActivity?: (activity: WorkflowUpdateActivity) => void;
+}
+
 interface StreamProjectGenerationOptions {
   signal?: AbortSignal;
   onBatchStart?: (event: ProjectGenerationBatchStartEvent) => void;
@@ -44,7 +50,7 @@ interface StreamProjectGenerationOptions {
 const generationBatchLabels: Record<ProjectGenerationBatchStartEvent['batch'], string> = {
   batch_1_research_stack: 'Identifying your stack',
   batch_2_fetch_and_read: 'Reading the docs',
-  batch_3_architect: 'Designing your architecture',
+  batch_3_architect: "Planning how it's built",
   batch_4_plan_build: 'Building your plan',
   batch_5_enrich_steps: 'Writing step details',
   batch_6_generate_files: 'Preparing your files',
@@ -440,5 +446,118 @@ export const dbService = {
       method: 'POST',
       body: JSON.stringify(diff),
     });
+  },
+
+  async updateWorkflow(
+    workflowId: string,
+    payload: { message: string; providerId?: string },
+    options: UpdateWorkflowOptions = {},
+  ): Promise<WorkflowUpdateResult> {
+    const response = await fetchWithAuth(`/workflows/${workflowId}/update`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      headers: {
+        Accept: 'text/event-stream',
+      },
+    });
+
+    if (!response.ok) {
+      const errorBody = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(errorBody?.error || 'Failed to update the workflow.');
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('Workflow update did not return a readable body.');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let currentEvent = 'message';
+    let currentData: string[] = [];
+    let finalResult: WorkflowUpdateResult | null = null;
+
+    const dispatchCurrentEvent = () => {
+      if (currentData.length === 0) {
+        currentEvent = 'message';
+        return;
+      }
+
+      const payloadText = currentData.join('\n');
+      currentData = [];
+
+      try {
+        const parsed = JSON.parse(payloadText) as Record<string, unknown>;
+
+        if (currentEvent === 'activity' && typeof parsed.message === 'string') {
+          options.onActivity?.({
+            icon: typeof parsed.icon === 'string' ? parsed.icon : '✦',
+            message: parsed.message,
+            timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : new Date().toISOString(),
+          });
+        }
+
+        if (currentEvent === 'complete' && typeof parsed.summary === 'string') {
+          finalResult = {
+            summary: parsed.summary,
+            updated_steps:
+              typeof parsed.updated_steps === 'number' && Number.isFinite(parsed.updated_steps)
+                ? parsed.updated_steps
+                : 0,
+          };
+        }
+
+        if (currentEvent === 'error') {
+          throw new Error(
+            typeof parsed.error === 'string' ? parsed.error : 'Failed to update the workflow.',
+          );
+        }
+      } finally {
+        currentEvent = 'message';
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split('\n');
+      buffer = chunks.pop() || '';
+
+      for (const rawLine of chunks) {
+        const line = rawLine.replace(/\r$/, '');
+
+        if (!line) {
+          dispatchCurrentEvent();
+          continue;
+        }
+
+        if (line.startsWith(':')) {
+          continue;
+        }
+
+        if (line.startsWith('event:')) {
+          currentEvent = line.slice(6).trim() || 'message';
+          continue;
+        }
+
+        if (line.startsWith('data:')) {
+          currentData.push(line.slice(5).trimStart());
+        }
+      }
+    }
+
+    if (currentData.length > 0) {
+      dispatchCurrentEvent();
+    }
+
+    if (!finalResult) {
+      throw new Error('Workflow update did not return a completion payload.');
+    }
+
+    return finalResult;
   },
 };

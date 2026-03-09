@@ -1,39 +1,38 @@
 import { Hono } from 'hono';
 import { handle } from 'hono/cloudflare-pages';
-import type { Context } from 'hono';
 import JSZip from 'jszip';
 import { z } from 'zod';
 import { verifyFirebaseToken } from '../middleware/auth';
 import { decrypt, encrypt } from '../utils/crypto';
 import { diffSchema } from '../types/diff';
-import { Batch6GenerateFilesSchema, SKILL_FILE_NAMES } from './generation-schemas';
-import { GENERATION_BATCHES, PREFERRED_IDES, type GenerationBatchName, type PreferredIde } from './types';
+import {
+  Batch2FetchAndReadSchema,
+  Batch3ArchitectSchema,
+  Batch6GenerateFilesSchema,
+  SKILL_FILE_NAMES,
+} from './generation-schemas';
+import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
 import {
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
+  loadBatchOutput,
   processProjectGeneration,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
-
-type Bindings = {
-  DB: any;
-  FIREBASE_PROJECT_ID: string;
-  ENCRYPTION_KEY: string;
-  GITHUB_TOKEN?: string;
-};
-
-type Variables = {
-  uid: string;
-};
-
-type AppEnv = {
-  Bindings: Bindings;
-  Variables: Variables;
-};
-
-type AppContext = Context<AppEnv>;
-type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom';
+import { applyPlanDiffToProject } from './plan-diff';
+import { appendResearchFooter, collectStepResearchContext, formatStepResearchPrompt } from './step-research';
+import { processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
+import {
+  GENERATION_BATCHES,
+  PREFERRED_IDES,
+  type AppContext,
+  type AppEnv,
+  type Bindings,
+  type GenerationBatchName,
+  type PreferredIde,
+  type ProviderType,
+} from './types';
 
 export const app = new Hono<AppEnv>().basePath('/api');
 
@@ -117,6 +116,16 @@ const reviewSchema = z
 
 function jsonError(message: string, status: number, details?: unknown) {
   return Response.json(details ? { error: message, details } : { error: message }, { status });
+}
+
+const updateStreamEncoder = new TextEncoder();
+
+async function writeUpdateStreamEvent(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  event: 'activity' | 'complete' | 'error',
+  payload: Record<string, unknown>,
+) {
+  await writer.write(updateStreamEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`));
 }
 
 function toBoolean(value: unknown): boolean {
@@ -430,7 +439,8 @@ async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
         ELSE CAST(ROUND(100.0 * SUM(CASE WHEN s.status = 'complete' THEN 1 ELSE 0 END) / COUNT(s.id)) AS INTEGER)
       END AS progress
     FROM projects p
-    LEFT JOIN steps s ON s.project_id = p.id
+    LEFT JOIN workflows w ON w.project_id = p.id
+    LEFT JOIN steps s ON s.workflow_id = w.id
     WHERE p.id = ? AND p.user_id = ?
     GROUP BY p.id
   `)
@@ -440,10 +450,11 @@ async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
 
 async function getOwnedStep(c: AppContext, stepId: string) {
   return c.env.DB.prepare(`
-    SELECT steps.*
-    FROM steps
-    INNER JOIN projects ON projects.id = steps.project_id
-    WHERE steps.id = ? AND projects.user_id = ?
+    SELECT s.*
+    FROM steps s
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    INNER JOIN projects p ON p.id = w.project_id
+    WHERE s.id = ? AND p.user_id = ?
   `)
     .bind(stepId, c.get('uid'))
     .first();
@@ -451,11 +462,12 @@ async function getOwnedStep(c: AppContext, stepId: string) {
 
 async function getOwnedChecklistItem(c: AppContext, checklistItemId: string) {
   return c.env.DB.prepare(`
-    SELECT checklist_items.*, steps.project_id
-    FROM checklist_items
-    INNER JOIN steps ON steps.id = checklist_items.step_id
-    INNER JOIN projects ON projects.id = steps.project_id
-    WHERE checklist_items.id = ? AND projects.user_id = ?
+    SELECT ci.*, w.project_id
+    FROM checklist_items ci
+    INNER JOIN steps s ON s.id = ci.step_id
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    INNER JOIN projects p ON p.id = w.project_id
+    WHERE ci.id = ? AND p.user_id = ?
   `)
     .bind(checklistItemId, c.get('uid'))
     .first();
@@ -751,6 +763,66 @@ app.delete('/ai/providers/:id', async (c) => {
   return c.json({ success: true });
 });
 
+app.get('/settings/mcp-servers', async (c) => {
+  const servers = await listUserMCPServers(c.env, c.get('uid'));
+  return c.json(servers);
+});
+
+app.post('/settings/mcp-servers', async (c) => {
+  const rawBody = await c.req.json().catch(() => null);
+  const parsed = mcpServerPayloadSchema.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid research tool payload', details: parsed.error.format() }, 400);
+  }
+
+  const result = await upsertUserMCPServer(c.env, c.get('uid'), parsed.data);
+  return c.json({ success: true, id: result.id });
+});
+
+app.patch('/settings/mcp-servers/:id', async (c) => {
+  const serverId = c.req.param('id');
+  const existingServer = await c.env.DB.prepare(`
+    SELECT id, is_active
+    FROM mcp_servers
+    WHERE id = ? AND user_id = ?
+  `)
+    .bind(serverId, c.get('uid'))
+    .first();
+
+  if (!existingServer) {
+    return c.json({ error: 'Research tool not found' }, 404);
+  }
+
+  const nextIsActive = toBoolean(existingServer.is_active) ? 0 : 1;
+
+  await c.env.DB.prepare(`
+    UPDATE mcp_servers
+    SET is_active = ?
+    WHERE id = ? AND user_id = ?
+  `)
+    .bind(nextIsActive, serverId, c.get('uid'))
+    .run();
+
+  return c.json({ success: true, is_active: nextIsActive === 1 });
+});
+
+app.delete('/settings/mcp-servers/:id', async (c) => {
+  const serverId = c.req.param('id');
+  const existingServer = await c.env.DB.prepare('SELECT id FROM mcp_servers WHERE id = ? AND user_id = ?')
+    .bind(serverId, c.get('uid'))
+    .first();
+
+  if (!existingServer) {
+    return c.json({ error: 'Research tool not found' }, 404);
+  }
+
+  await c.env.DB.prepare('DELETE FROM mcp_servers WHERE id = ? AND user_id = ?')
+    .bind(serverId, c.get('uid'))
+    .run();
+
+  return c.json({ success: true });
+});
+
 app.get('/projects', async (c) => {
   const projects = await c.env.DB.prepare(`
     SELECT
@@ -760,7 +832,8 @@ app.get('/projects', async (c) => {
         ELSE CAST(ROUND(100.0 * SUM(CASE WHEN s.status = 'complete' THEN 1 ELSE 0 END) / COUNT(s.id)) AS INTEGER)
       END AS progress
     FROM projects p
-    LEFT JOIN steps s ON s.project_id = p.id
+    LEFT JOIN workflows w ON w.project_id = p.id
+    LEFT JOIN steps s ON s.workflow_id = w.id
     WHERE p.user_id = ?
     GROUP BY p.id
     ORDER BY p.updated_at DESC
@@ -779,6 +852,11 @@ app.post('/projects', async (c) => {
 
   if (!c.env.AGENT_QUEUE) {
     return c.json({ error: 'Project generation queue is not configured.' }, 500);
+  }
+
+  const providerRecord = await resolveProvider(c, parsed.data.providerId);
+  if (!providerRecord) {
+    return c.json({ error: 'You need to add an AI key first.' }, 400);
   }
 
   const id = crypto.randomUUID();
@@ -1047,7 +1125,7 @@ app.get('/plans', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const plans = await c.env.DB.prepare('SELECT * FROM plans WHERE project_id = ? ORDER BY version DESC, created_at DESC')
+  const plans = await c.env.DB.prepare('SELECT * FROM workflows WHERE project_id = ? ORDER BY version DESC, created_at DESC')
     .bind(projectId)
     .all();
 
@@ -1067,7 +1145,7 @@ app.post('/plans', async (c) => {
   }
 
   const id = crypto.randomUUID();
-  await c.env.DB.prepare('INSERT INTO plans (id, project_id, version, canvas_state) VALUES (?, ?, ?, ?)')
+  await c.env.DB.prepare('INSERT INTO workflows (id, project_id, version, canvas_state) VALUES (?, ?, ?, ?)')
     .bind(id, projectId, asNumber(body.version, 1), serializeJson(body.canvas_state) || '{}')
     .run();
 
@@ -1086,7 +1164,13 @@ app.get('/stages', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const stages = await c.env.DB.prepare('SELECT * FROM stages WHERE project_id = ? ORDER BY order_index ASC, created_at ASC')
+  const stages = await c.env.DB.prepare(`
+    SELECT st.*, w.project_id
+    FROM stages st
+    INNER JOIN workflows w ON w.id = st.workflow_id
+    WHERE w.project_id = ?
+    ORDER BY st.order_index ASC, st.created_at ASC
+  `)
     .bind(projectId)
     .all();
 
@@ -1108,9 +1192,15 @@ app.post('/stages', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
+  const workflowRecord = await c.env.DB.prepare('SELECT id FROM workflows WHERE project_id = ?').bind(projectId).first();
+  if (!workflowRecord) {
+    return c.json({ error: 'Workflow not found for this project' }, 404);
+  }
+  const workflowId = workflowRecord.id;
+
   const id = crypto.randomUUID();
-  await c.env.DB.prepare('INSERT INTO stages (id, project_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(id, projectId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
+  await c.env.DB.prepare('INSERT INTO stages (id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(id, workflowId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
     .run();
 
   await touchProject(c, projectId);
@@ -1128,7 +1218,13 @@ app.get('/steps', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const steps = await c.env.DB.prepare('SELECT * FROM steps WHERE project_id = ? ORDER BY order_index ASC, created_at ASC')
+  const steps = await c.env.DB.prepare(`
+    SELECT s.*, w.project_id
+    FROM steps s
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    WHERE w.project_id = ?
+    ORDER BY s.order_index ASC, s.created_at ASC
+  `)
     .bind(projectId)
     .all();
 
@@ -1167,16 +1263,22 @@ app.post('/steps', async (c) => {
   });
 
   const id = crypto.randomUUID();
+  const workflowRecord = await c.env.DB.prepare('SELECT id FROM workflows WHERE project_id = ?').bind(projectId).first();
+  if (!workflowRecord) {
+    return c.json({ error: 'Workflow not found for this project' }, 404);
+  }
+  const workflowId = workflowRecord.id;
+
   await c.env.DB.prepare(`
     INSERT INTO steps (
-      id, project_id, stage_id, title, type, category, position_x, position_y, status,
+      id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
       is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools,
       done_when, ai_output, prompts, is_ai_enriched
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
-      projectId,
+      workflowId,
       optionalText(body.stage_id),
       title,
       optionalText(body.type) || 'task',
@@ -1344,7 +1446,12 @@ app.get('/edges', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const edges = await c.env.DB.prepare('SELECT * FROM edges WHERE project_id = ?').bind(projectId).all();
+  const edges = await c.env.DB.prepare(`
+    SELECT e.*, w.project_id
+    FROM edges e
+    INNER JOIN workflows w ON w.id = e.workflow_id
+    WHERE w.project_id = ?
+  `).bind(projectId).all();
   return c.json(edges.results.map(mapEdgeRow));
 });
 
@@ -1480,136 +1587,9 @@ app.post('/projects/:id/plan-diff', async (c) => {
     return c.json({ error: 'Malformed diff', details: parsed.error.format() }, 400);
   }
 
-  const statements: any[] = [];
-
-  for (const change of parsed.data.changes) {
-    if (change.action === 'update_step') {
-      const existingStep = await c.env.DB.prepare('SELECT * FROM steps WHERE id = ? AND project_id = ?')
-        .bind(change.step_id, projectId)
-        .first();
-
-      if (!existingStep) {
-        continue;
-      }
-
-      const nextTitle = change.updates.title || existingStep.title;
-      const nextObjective = change.updates.objective || existingStep.objective;
-      const nextWhyItMatters = change.updates.why_it_matters || existingStep.why_it_matters;
-      const nextDoneWhen = change.updates.done_when || existingStep.done_when;
-      const nextSuggestedTools = change.updates.suggested_tools
-        ? JSON.stringify(change.updates.suggested_tools)
-        : existingStep.suggested_tools;
-      const nextIsGate = inferGateFlag({
-        title: nextTitle,
-        objective: nextObjective,
-        why_it_matters: nextWhyItMatters,
-        category: existingStep.category,
-        done_when: nextDoneWhen,
-      });
-
-      statements.push(
-        c.env.DB.prepare(`
-          UPDATE steps
-          SET title = ?, objective = ?, why_it_matters = ?, suggested_tools = ?, done_when = ?, is_gate = ?, is_ai_enriched = 0, updated_at = datetime("now")
-          WHERE id = ? AND project_id = ?
-        `).bind(
-          nextTitle,
-          nextObjective,
-          nextWhyItMatters,
-          nextSuggestedTools,
-          nextDoneWhen,
-          nextIsGate ? 1 : 0,
-          change.step_id,
-          projectId,
-        ),
-      );
-      continue;
-    }
-
-    if (change.action === 'add_step') {
-      const stageRecord = await c.env.DB.prepare('SELECT * FROM stages WHERE id = ? AND project_id = ?')
-        .bind(change.stage_id, projectId)
-        .first();
-
-      if (!stageRecord) {
-        continue;
-      }
-
-      const placement = await c.env.DB.prepare(`
-        SELECT
-          COALESCE(MAX(order_index), -1) AS max_order_index,
-          COALESCE(MAX(position_x), 0) AS max_position_x,
-          COALESCE(MAX(position_y), ?) AS max_position_y
-        FROM steps
-        WHERE project_id = ? AND stage_id = ?
-      `)
-        .bind(asNumber(stageRecord.order_index, 0) * 400 + 100, projectId, change.stage_id)
-        .first();
-
-      const stepId = crypto.randomUUID();
-      const nextOrderIndex = asNumber(placement?.max_order_index, -1) + 1;
-      const nextPositionX = asNumber(placement?.max_position_x, 0) + 250;
-      const nextPositionY = asNumber(placement?.max_position_y, asNumber(stageRecord.order_index, 0) * 400 + 100);
-      const nextIsGate = inferGateFlag({
-        title: change.step.title,
-        objective: change.step.objective,
-        why_it_matters: change.step.why_it_matters,
-        category: stageRecord.type as string,
-        done_when: change.step.done_when,
-      });
-
-      statements.push(
-        c.env.DB.prepare(`
-          INSERT INTO steps (
-            id, project_id, stage_id, title, type, category, position_x, position_y, status,
-            is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when, is_ai_enriched
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        `).bind(
-          stepId,
-          projectId,
-          change.stage_id,
-          change.step.title,
-          change.step.type,
-          stageRecord.type,
-          nextPositionX,
-          nextPositionY,
-          'locked',
-          nextIsGate ? 1 : 0,
-          change.step.risk_level,
-          nextOrderIndex,
-          change.step.objective || '',
-          change.step.why_it_matters || '',
-          change.step.suggested_tools ? JSON.stringify(change.step.suggested_tools) : null,
-          change.step.done_when || '',
-        ),
-      );
-
-      if (change.step.checklist?.length) {
-        change.step.checklist.forEach((item, index) => {
-          statements.push(
-            c.env.DB.prepare(`
-              INSERT INTO checklist_items (id, step_id, label, is_required, is_completed, order_index)
-              VALUES (?, ?, ?, ?, 0, ?)
-            `).bind(crypto.randomUUID(), stepId, item.label, item.is_required ? 1 : 0, index),
-          );
-        });
-      }
-
-      continue;
-    }
-
-    if (change.action === 'remove_step') {
-      statements.push(
-        c.env.DB.prepare(
-          'DELETE FROM steps WHERE id = ? AND project_id = ? AND status NOT IN ("complete", "needs_review")',
-        ).bind(change.step_id, projectId),
-      );
-    }
-  }
-
   try {
-    if (statements.length > 0) {
-      await c.env.DB.batch(statements);
+    const applyResult = await applyPlanDiffToProject(c.env, projectId, parsed.data);
+    if (applyResult.appliedChangeCount > 0) {
       await touchProject(c, projectId);
     }
 
@@ -1618,6 +1598,106 @@ app.post('/projects/:id/plan-diff', async (c) => {
     const message = error instanceof Error ? error.message : 'Unknown diff failure';
     return c.json({ error: `Failed to apply diff: ${message}` }, 500);
   }
+});
+
+app.post('/workflows/:id/update', async (c) => {
+  const workflowId = c.req.param('id');
+  const workflowRecord = await c.env.DB.prepare(`
+    SELECT
+      w.id,
+      w.project_id,
+      p.user_id,
+      p.name,
+      p.description,
+      p.stack
+    FROM workflows w
+    INNER JOIN projects p ON p.id = w.project_id
+    WHERE w.id = ? AND p.user_id = ?
+    ORDER BY w.version DESC
+    LIMIT 1
+  `)
+    .bind(workflowId, c.get('uid'))
+    .first();
+
+  if (!workflowRecord) {
+    return c.json({ error: 'Workflow not found or access denied' }, 404);
+  }
+
+  const parsed = workflowUpdateRequestSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid workflow update payload', details: parsed.error.format() }, 400);
+  }
+
+  const providerRecord = await resolveProvider(c, parsed.data.providerId);
+  if (!providerRecord) {
+    return c.json({ error: 'You need to add an AI key first.' }, 400);
+  }
+
+  let apiKey: string;
+  try {
+    apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
+  } catch {
+    return c.json({ error: 'Failed to decrypt API key' }, 500);
+  }
+
+  const providerType = providerRecord.provider as ProviderType;
+  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
+  const baseUrl = providerRecord.base_url as string | null;
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+
+  c.executionCtx.waitUntil(
+    (async () => {
+      try {
+        const result = await processWorkflowUpdate({
+          env: c.env,
+          workflowId,
+          project: {
+            id: asText(workflowRecord.project_id),
+            user_id: asText(workflowRecord.user_id),
+            name: asText(workflowRecord.name, 'Untitled project'),
+            description: optionalText(workflowRecord.description),
+            stack: optionalText(workflowRecord.stack),
+          },
+          provider: {
+            providerType,
+            apiKey,
+            model,
+            baseUrl,
+          },
+          message: parsed.data.message,
+          onProgress: async (progress) => {
+            await writeUpdateStreamEvent(writer, 'activity', {
+              icon: progress.icon,
+              message: progress.message,
+              timestamp: new Date().toISOString(),
+            });
+          },
+        });
+
+        await writeUpdateStreamEvent(writer, 'complete', {
+          ...result,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to update the workflow.';
+        await writeUpdateStreamEvent(writer, 'error', {
+          error: message,
+          timestamp: new Date().toISOString(),
+        });
+      } finally {
+        await writer.close();
+      }
+    })(),
+  );
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
 });
 
 app.post('/steps/:id/enrich', async (c) => {
@@ -1640,6 +1720,32 @@ app.post('/steps/:id/enrich', async (c) => {
   if (!projectRecord) {
     return c.json({ error: 'Project not found or access denied' }, 403);
   }
+
+  let adrContext;
+  let researchContext;
+  try {
+    [adrContext, researchContext] = await Promise.all([
+      loadBatchOutput(c.env, projectId, 'batch_3_architect', Batch3ArchitectSchema),
+      loadBatchOutput(c.env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Project research context is unavailable.';
+    return c.json({ error: message }, 400);
+  }
+
+  const stepResearchContext = await collectStepResearchContext({
+    env: c.env,
+    userId: asText(projectRecord.user_id),
+    stepId,
+    stepTitle: asText(stepRecord.title, 'Untitled step'),
+    stepObjective: asText(stepRecord.objective, ''),
+    stepWhyItMatters: asText(stepRecord.why_it_matters, ''),
+    stepCategory: asText(stepRecord.category, ''),
+    stepDoneWhen: asText(stepRecord.done_when, ''),
+    stepIsGate: toBoolean(stepRecord.is_gate),
+    adr: adrContext,
+    research: researchContext,
+  });
 
   const providerRecord = await resolveProvider(c, providerId);
   if (!providerRecord) {
@@ -1666,6 +1772,8 @@ app.post('/steps/:id/enrich', async (c) => {
     `Step objective: ${stepRecord.objective || 'Not specified yet.'}`,
     `Why it matters: ${stepRecord.why_it_matters || 'Not specified yet.'}`,
     `Done when: ${stepRecord.done_when || 'Not specified yet.'}`,
+    `Live research context:\n${formatStepResearchPrompt(stepResearchContext)}`,
+    'Use the live documentation provided to generate specific, current guidance. Reference actual function names, hook names, and config options from the docs. If any open bugs were found, mention them in the ai_output and explain the workaround. Follow any requirements listed in the live research context exactly.',
   ];
 
   if (editedOutput) {
@@ -1736,6 +1844,7 @@ app.post('/steps/:id/enrich', async (c) => {
           }
 
           const data = validated.data;
+          const aiOutputWithFooter = appendResearchFooter(data.ai_output, stepResearchContext.footer);
           const nextStatus = toBoolean(stepRecord.is_gate) ? 'needs_review' : 'complete';
  
           await c.env.DB.batch([
@@ -1744,7 +1853,7 @@ app.post('/steps/:id/enrich', async (c) => {
               SET ai_output = ?, prompts = ?, is_ai_enriched = 1, status = ?, updated_at = datetime("now")
               WHERE id = ?
             `).bind(
-              data.ai_output || null,
+              aiOutputWithFooter || null,
               JSON.stringify(data.prompts || []),
               nextStatus,
               stepId,

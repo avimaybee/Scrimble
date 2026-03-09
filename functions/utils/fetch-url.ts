@@ -1,10 +1,10 @@
-const DOC_MAX_TOKENS = 8000;
-const README_MAX_TOKENS = 4000;
+const DOC_MAX_TOKENS = 100000;
+const README_MAX_TOKENS = 50000;
 const RELEASE_BODY_MAX_TOKENS = 1200;
 const ISSUE_BODY_MAX_TOKENS = 600;
 const RELEASE_LIMIT = 3;
 const ISSUE_LIMIT = 10;
-const FETCH_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 120_000;
 const USER_AGENT = 'ScrimbleAgent/1.0';
 
 export type GitHubRepositoryRef = {
