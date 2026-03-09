@@ -1,8 +1,123 @@
 import type { ProviderType } from './types';
 
 type StreamCallbacks = {
-  onReasoningDelta?: (delta: string) => Promise<void> | void;
+  onReasoningDelta?: (delta: string) => void;
 };
+
+export function extractJSON(raw: string): string {
+  const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  return match ? match[1].trim() : raw.trim();
+}
+
+export function containsStreamTransportMarkers(raw: string) {
+  return (
+    raw.includes('"object":"chat.completion.chunk"') ||
+    raw.includes('"reasoning_content"') ||
+    (raw.includes('"choices":[') && raw.includes('"delta":'))
+  );
+}
+
+export function defaultModelForProvider(provider: ProviderType): string {
+  switch (provider) {
+    case 'anthropic':
+      return 'claude-3-5-sonnet-latest';
+    case 'gemini':
+      return 'gemini-2.0-flash';
+    case 'custom':
+      return 'gpt-4o-mini';
+    case 'openai':
+    default:
+      return 'gpt-4o-mini';
+  }
+}
+
+export async function streamToText(
+  stream: ReadableStream<Uint8Array>,
+  callbacks?: {
+    onReasoningDelta?: (delta: string) => void;
+  },
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let contentBuffer = '';
+  let leftover = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    const chunk = leftover + decoder.decode(value, { stream: true });
+    const lines = chunk.split('\n');
+    leftover = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':')) {
+        continue;
+      }
+      if (!trimmed.startsWith('data:')) {
+        continue;
+      }
+
+      const data = trimmed.slice(5).trim();
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: Array<{
+            delta?: {
+              reasoning_content?: string;
+              content?: string;
+            };
+          }>;
+        };
+        const delta = parsed?.choices?.[0]?.delta;
+        if (!delta) {
+          continue;
+        }
+
+        if (delta.reasoning_content) {
+          callbacks?.onReasoningDelta?.(delta.reasoning_content);
+        }
+
+        if (typeof delta.content === 'string' && delta.content) {
+          contentBuffer += delta.content;
+        }
+      } catch {
+        // malformed chunk — skip silently
+      }
+    }
+  }
+
+  const remaining = leftover + decoder.decode();
+  if (remaining.trim()) {
+    const trimmed = remaining.trim();
+    if (trimmed.startsWith('data:')) {
+      const data = trimmed.slice(5).trim();
+      if (data && data !== '[DONE]') {
+        try {
+          const parsed = JSON.parse(data) as {
+            choices?: Array<{
+              delta?: {
+                content?: string;
+              };
+            }>;
+          };
+          const delta = parsed?.choices?.[0]?.delta;
+          if (delta?.content) {
+            contentBuffer += delta.content;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return contentBuffer;
+}
 
 function extractTextParts(value: unknown): string {
   if (typeof value === 'string') {
@@ -155,179 +270,86 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
   return extractString(value.delta?.thinking);
 }
 
-type RecoveredProviderEvent =
-  | { kind: 'reasoning'; value: string }
-  | { kind: 'content'; value: string };
-
-function recoverProviderEventsFromFragment(fragment: string) {
-  const events: RecoveredProviderEvent[] = [];
-  let finishReason: string | null = null;
-  const fieldPattern = /"(reasoning_content|reasoning|content|finish_reason)":("(?:(?:\\.|[^"\\])*)"|null)/g;
-
-  for (const match of fragment.matchAll(fieldPattern)) {
-    const field = match[1];
-    const rawValue = match[2];
-    if (!rawValue || rawValue === 'null') {
-      continue;
-    }
-
-    let value = '';
-    try {
-      const parsedValue = JSON.parse(rawValue) as unknown;
-      value = typeof parsedValue === 'string' ? parsedValue : '';
-    } catch {
-      value = rawValue.replace(/^"|"$/g, '');
-    }
-
-    if (!value) {
-      continue;
-    }
-
-    if (field === 'finish_reason') {
-      finishReason = value;
-      continue;
-    }
-
-    events.push({
-      kind: field === 'content' ? 'content' : 'reasoning',
-      value,
-    });
-  }
-
-  return {
-    events,
-    finishReason,
-  };
-}
-
-export function extractJSON(raw: string): string {
-  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch) {
-    return fenceMatch[1].trim();
-  }
-
-  return raw.trim();
-}
-
-export function containsStreamTransportMarkers(raw: string) {
-  return (
-    raw.includes('"object":"chat.completion.chunk"') ||
-    raw.includes('"reasoning_content"') ||
-    (raw.includes('"choices":[') && raw.includes('"delta":'))
-  );
-}
-
-export function defaultModelForProvider(provider: ProviderType): string {
-  switch (provider) {
-    case 'anthropic':
-      return 'claude-3-5-sonnet-latest';
-    case 'gemini':
-      return 'gemini-2.0-flash';
-    case 'custom':
-      return 'gpt-4o-mini';
-    case 'openai':
-    default:
-      return 'gpt-4o-mini';
-  }
-}
-
-async function processStreamLine(
-  line: string,
-  fullContent: { value: string },
+async function streamStructuredProviderText(
+  stream: ReadableStream<Uint8Array>,
   callbacks?: StreamCallbacks,
-) {
-  const trimmed = line.trim();
-  if (!trimmed || trimmed.startsWith(':') || trimmed.startsWith('event:')) {
-    return false;
-  }
-
-  const candidate = trimmed.startsWith('data:') ? trimmed.slice(5).trimStart() : trimmed;
-  if (!candidate) {
-    return false;
-  }
-
-  if (candidate === '[DONE]') {
-    return true;
-  }
-
-  try {
-    const parsed = JSON.parse(candidate) as unknown;
-    const reasoningDelta = extractReasoningFromProviderChunk(parsed);
-    if (reasoningDelta) {
-      await callbacks?.onReasoningDelta?.(reasoningDelta);
-    }
-
-    const contentDelta = extractTextFromProviderChunk(parsed);
-    if (contentDelta) {
-      fullContent.value += contentDelta;
-    }
-
-    const finishReason = (parsed as { choices?: Array<{ finish_reason?: string | null }> }).choices?.[0]?.finish_reason;
-    return finishReason === 'stop';
-  } catch {
-    const recovered = recoverProviderEventsFromFragment(candidate);
-    if (recovered.events.length > 0 || recovered.finishReason) {
-      for (const event of recovered.events) {
-        if (event.kind === 'reasoning') {
-          await callbacks?.onReasoningDelta?.(event.value);
-        } else {
-          fullContent.value += event.value;
-        }
-      }
-
-      return recovered.finishReason === 'stop';
-    }
-
-    const looksLikeProviderChunk =
-      candidate.includes('"object":"chat.completion.chunk"') ||
-      candidate.includes('"choices":[') ||
-      candidate.includes('"candidates":[');
-
-    if (looksLikeProviderChunk) {
-      return false;
-    }
-
-    if (!trimmed.startsWith('data:')) {
-      fullContent.value += candidate;
-    }
-
-    return false;
-  }
-}
-
-export async function streamToText(stream: ReadableStream<Uint8Array>, callbacks?: StreamCallbacks) {
+): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
-  const fullContent = { value: '' };
-  let buffer = '';
-  let shouldStop = false;
+  let contentBuffer = '';
+  let leftover = '';
 
-  while (!shouldStop) {
+  while (true) {
     const { done, value } = await reader.read();
     if (done) {
       break;
     }
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
+    const chunk = leftover + decoder.decode(value, { stream: true });
+    const lines = chunk.split('\n');
+    leftover = lines.pop() ?? '';
 
     for (const line of lines) {
-      shouldStop = await processStreamLine(line, fullContent, callbacks);
-      if (shouldStop) {
-        break;
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':')) {
+        continue;
+      }
+      if (!trimmed.startsWith('data:')) {
+        continue;
+      }
+
+      const data = trimmed.slice(5).trim();
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(data) as unknown;
+        const reasoningDelta = extractReasoningFromProviderChunk(parsed);
+        if (reasoningDelta) {
+          callbacks?.onReasoningDelta?.(reasoningDelta);
+        }
+
+        const contentDelta = extractTextFromProviderChunk(parsed);
+        if (contentDelta) {
+          contentBuffer += contentDelta;
+        }
+      } catch {
+        // malformed chunk — skip silently
       }
     }
   }
 
-  if (!shouldStop) {
-    buffer += decoder.decode();
-    if (buffer.trim()) {
-      await processStreamLine(buffer, fullContent, callbacks);
+  const remaining = leftover + decoder.decode();
+  if (remaining.trim()) {
+    const trimmed = remaining.trim();
+    if (trimmed.startsWith('data:')) {
+      const data = trimmed.slice(5).trim();
+      if (data && data !== '[DONE]') {
+        try {
+          const parsed = JSON.parse(data) as unknown;
+          const contentDelta = extractTextFromProviderChunk(parsed);
+          if (contentDelta) {
+            contentBuffer += contentDelta;
+          }
+        } catch {}
+      }
     }
   }
 
-  return fullContent.value;
+  return contentBuffer;
+}
+
+export async function streamProviderText(
+  providerType: ProviderType,
+  stream: ReadableStream<Uint8Array>,
+  callbacks?: StreamCallbacks,
+): Promise<string> {
+  if (providerType === 'custom' || providerType === 'openai') {
+    return streamToText(stream, callbacks);
+  }
+
+  return streamStructuredProviderText(stream, callbacks);
 }
 
 const AI_TIMEOUT_MS = 600_000; // 10 minutes
@@ -339,14 +361,12 @@ export async function callProvider(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
-  stream?: boolean;
   signal?: AbortSignal;
 }) {
   const commonFetchOptions = {
     method: 'POST',
     signal: payload.signal,
   };
-  const useStreaming = payload.stream !== false;
 
   if (payload.providerType === 'anthropic') {
     return fetch('https://api.anthropic.com/v1/messages', {
@@ -361,14 +381,13 @@ export async function callProvider(payload: {
         system: payload.system || undefined,
         messages: [{ role: 'user', content: payload.prompt }],
         max_tokens: 8192,
-        stream: useStreaming,
+        stream: true,
       }),
     });
   }
 
   if (payload.providerType === 'gemini') {
-    const endpoint = useStreaming ? 'streamGenerateContent' : 'generateContent';
-    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:${endpoint}?key=${payload.apiKey}`;
+    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:streamGenerateContent?key=${payload.apiKey}`;
     return fetch(googleUrl, {
       ...commonFetchOptions,
       headers: { 'Content-Type': 'application/json' },
@@ -406,7 +425,7 @@ export async function callProvider(payload: {
         { role: 'user', content: payload.prompt },
       ],
       max_tokens: 16384,
-      stream: useStreaming,
+      stream: true,
     }),
   });
 }
@@ -418,7 +437,6 @@ export async function callAIWithRetry(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
-  stream?: boolean;
 }): Promise<Response> {
   const maxRetries = 3;
   const backoffs = [1000, 3000, 7000];
@@ -436,6 +454,7 @@ export async function callAIWithRetry(payload: {
       }
 
       if (response.status === 429) {
+        clearTimeout(timeoutId);
         return Response.json(
           {
             error: 'rate_limited',
@@ -446,6 +465,7 @@ export async function callAIWithRetry(payload: {
       }
 
       if (response.status === 401) {
+        clearTimeout(timeoutId);
         return Response.json(
           {
             error: 'invalid_key',
@@ -460,6 +480,7 @@ export async function callAIWithRetry(payload: {
         continue;
       }
 
+      clearTimeout(timeoutId);
       return Response.json(
         {
           error: 'provider_unavailable',
@@ -468,6 +489,8 @@ export async function callAIWithRetry(payload: {
         { status: 503 },
       );
     } catch {
+      clearTimeout(timeoutId);
+
       if (attempt < maxRetries) {
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
@@ -492,6 +515,19 @@ export async function callAIWithRetry(payload: {
   );
 }
 
+function getAIErrorMessage(status: number) {
+  switch (status) {
+    case 401:
+      return 'Your AI key was rejected. Check it in Settings.';
+    case 429:
+      return 'Your AI provider is rate limited. Wait a moment and try again.';
+    case 503:
+      return "Your AI provider isn't responding. Try again shortly.";
+    default:
+      return 'AI call failed.';
+  }
+}
+
 export async function callAIText(payload: {
   providerType: ProviderType;
   apiKey: string;
@@ -499,30 +535,20 @@ export async function callAIText(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
-  stream?: boolean;
-  onReasoningDelta?: (delta: string) => Promise<void> | void;
+  onReasoningDelta?: (delta: string) => void;
 }) {
   const response = await callAIWithRetry(payload);
   if (!response.ok) {
-    const errorData = await response.clone().json().catch(() => ({ message: 'AI call failed.' })) as { message?: string };
-    throw new Error(errorData.message || 'AI call failed.');
+    throw new Error(getAIErrorMessage(response.status));
   }
 
-  let text = '';
-  if (payload.stream === false) {
-    const parsedBody = await response.clone().json().catch(() => null) as unknown;
-    text =
-      extractTextFromProviderChunk(parsedBody) ||
-      (await response.text().catch(() => ''));
-  } else {
-    if (!response.body) {
-      throw new Error('AI provider did not return a response body.');
-    }
-
-    text = await streamToText(response.body, {
-      onReasoningDelta: payload.onReasoningDelta,
-    });
+  if (!response.body) {
+    throw new Error('AI provider did not return a response body.');
   }
+
+  const text = await streamProviderText(payload.providerType, response.body, {
+    onReasoningDelta: payload.onReasoningDelta,
+  });
 
   return { response, text };
 }

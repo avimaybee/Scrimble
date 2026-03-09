@@ -13,7 +13,25 @@ import {
 } from './generation-schemas';
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
-import { extractJSON, streamToText as consumeProviderStream } from './ai';
+import {
+  callAIWithRetry,
+  defaultModelForProvider,
+  extractJSON,
+  streamProviderText,
+} from './ai';
+import {
+  BUILDER_PROFILE_CATEGORY_KEYS,
+  TOOL_PROFICIENCIES,
+} from '../../src/lib/builder-profile';
+import {
+  appendProjectBriefSystemPrompt,
+  appendProjectIntakeMessage,
+  createFallbackStructuredBrief,
+  getProjectBrief,
+  listProjectIntakeMessages,
+  loadProjectBriefContext,
+  upsertProjectBrief,
+} from './project-briefs';
 import {
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
@@ -21,9 +39,11 @@ import {
   processProjectGeneration,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
+import { runProjectIntakeTurn } from './project-intake';
 import { applyPlanDiffToProject } from './plan-diff';
 import { appendResearchFooter, collectStepResearchContext, formatStepResearchPrompt } from './step-research';
-import { processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
+import { buildToolsContext, deleteUserTool, listUserTools, updateUserTool, upsertUserTool } from './user-tools';
+import { WorkflowBriefDriftError, processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
 import {
   GENERATION_BATCHES,
   PREFERRED_IDES,
@@ -86,10 +106,37 @@ const createProjectSchema = z.object({
   providerId: z.string().trim().optional(),
 });
 
+const intakeStartSchema = createProjectSchema;
+
+const intakeRespondSchema = z.object({
+  message: z.string().trim().min(1),
+  providerId: z.string().trim().optional(),
+});
+
+const intakeConfirmSchema = z.object({
+  providerId: z.string().trim().optional(),
+});
+
 const architectureReviewApprovalSchema = z.object({
   feedback: z.string().optional().default(''),
   preferredIde: z.enum(PREFERRED_IDES).optional().default('cursor'),
 });
+
+const userToolSchema = z.object({
+  category: z.enum(BUILDER_PROFILE_CATEGORY_KEYS),
+  name: z.string().trim().min(1).max(80),
+  proficiency: z.enum(TOOL_PROFICIENCIES).default('comfortable'),
+  notes: z.string().trim().max(200).optional(),
+});
+
+const userToolUpdateSchema = z
+  .object({
+    proficiency: z.enum(TOOL_PROFICIENCIES).optional(),
+    notes: z.string().trim().max(200).nullable().optional(),
+  })
+  .refine((value) => value.proficiency !== undefined || value.notes !== undefined, {
+    message: 'Add something to update.',
+  });
  
 const StepDetailSchema = z.object({
   ai_output: z.string(),
@@ -117,6 +164,19 @@ const reviewSchema = z
 
 function jsonError(message: string, status: number, details?: unknown) {
   return Response.json(details ? { error: message, details } : { error: message }, { status });
+}
+
+function getAIErrorMessage(status: number, fallback: string) {
+  switch (status) {
+    case 401:
+      return 'Your AI key was rejected. Check it in Settings.';
+    case 429:
+      return 'Your AI provider is rate limited. Wait a moment and try again.';
+    case 503:
+      return "Your AI provider isn't responding. Try again shortly.";
+    default:
+      return fallback;
+  }
 }
 
 const updateStreamEncoder = new TextEncoder();
@@ -185,20 +245,6 @@ function toUint8ArrayStream(bytes: Uint8Array) {
       controller.close();
     },
   });
-}
-
-function defaultModelForProvider(provider: ProviderType): string {
-  switch (provider) {
-    case 'anthropic':
-      return 'claude-3-5-sonnet-latest';
-    case 'gemini':
-      return 'gemini-2.0-flash';
-    case 'custom':
-      return 'gpt-4o-mini';
-    case 'openai':
-    default:
-      return 'gpt-4o-mini';
-  }
 }
 
 function inferGateFlag(source: {
@@ -344,6 +390,35 @@ async function getOwnedProject(c: AppContext, projectId: string) {
   return c.env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, c.get('uid')).first();
 }
 
+async function buildIntakeResponse(c: AppContext, projectId: string) {
+  const [project, brief, messages] = await Promise.all([
+    getOwnedProject(c, projectId),
+    getProjectBrief(c.env, projectId),
+    listProjectIntakeMessages(c.env, projectId),
+  ]);
+
+  if (!project || !brief) {
+    throw new Error('Project intake state is unavailable.');
+  }
+
+  const latestAgentMessage = [...messages].reverse().find((message) => message.role === 'agent') || null;
+  const ready = latestAgentMessage?.content.startsWith('READY:') || false;
+
+  return {
+    project_id: projectId,
+    generation_status: (project.generation_status as string | null) || 'intake',
+    ready,
+    agent_message: latestAgentMessage?.content || '',
+    messages,
+    brief: {
+      ...brief,
+      summary: latestAgentMessage?.content.startsWith('READY:')
+        ? latestAgentMessage.content.replace(/^READY:\s*/, '').trim()
+        : brief.what_it_is || brief.raw_description,
+    },
+  };
+}
+
 async function loadStoredSkillFiles(c: AppContext, projectId: string) {
   const projectFiles = await c.env.DB.prepare(`
     SELECT id, filename, content, created_at, updated_at
@@ -464,6 +539,32 @@ async function resolveProvider(c: AppContext, providerId?: string) {
     .first();
 }
 
+async function resolveProviderContext(c: AppContext, providerId?: string) {
+  const providerRecord = await resolveProvider(c, providerId);
+  if (!providerRecord) {
+    return null;
+  }
+
+  let apiKey: string;
+  try {
+    apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
+  } catch {
+    throw new Error('Failed to decrypt API key');
+  }
+
+  const providerType = providerRecord.provider as ProviderType;
+  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
+  const baseUrl = providerRecord.base_url as string | null;
+
+  return {
+    providerId: providerRecord.id as string,
+    providerType,
+    apiKey,
+    model,
+    baseUrl,
+  };
+}
+
 async function insertAgentRun(
   c: AppContext,
   payload: {
@@ -496,139 +597,6 @@ async function insertAgentRun(
     .run();
 
   return id;
-}
-
-async function streamToText(stream: ReadableStream<Uint8Array>) {
-  return consumeProviderStream(stream);
-}
-
-async function callProvider(payload: {
-  providerType: ProviderType;
-  apiKey: string;
-  model: string;
-  baseUrl?: string | null;
-  system?: string | null;
-  prompt: string;
-}) {
-  if (payload.providerType === 'anthropic') {
-    return fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': payload.apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: payload.model,
-        system: payload.system || undefined,
-        messages: [{ role: 'user', content: payload.prompt }],
-        stream: true,
-      }),
-    });
-  }
-
-  if (payload.providerType === 'gemini') {
-    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:streamGenerateContent?key=${payload.apiKey}`;
-    return fetch(googleUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: payload.system ? `${payload.system}\n\n${payload.prompt}` : payload.prompt }],
-          },
-        ],
-      }),
-    });
-  }
-
-  let url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
-  
-  if (payload.providerType === 'custom' && payload.baseUrl) {
-    // If user provided a base URL like ".../v1", append the endpoint
-    if (url.endsWith('/v1')) {
-      url = `${url}/chat/completions`;
-    } else if (!url.includes('/chat/completions') && !url.includes('/v1/')) {
-      // If it looks like a host only, append the typical path
-      url = url.endsWith('/') ? `${url}v1/chat/completions` : `${url}/v1/chat/completions`;
-    }
-  }
-
-  return fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${payload.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: payload.model,
-      messages: [
-        ...(payload.system ? [{ role: 'system', content: payload.system }] : []),
-        { role: 'user', content: payload.prompt },
-      ],
-      stream: true,
-    }),
-  });
-}
-
-async function callAIWithRetry(payload: {
-  providerType: ProviderType;
-  apiKey: string;
-  model: string;
-  baseUrl?: string | null;
-  system?: string | null;
-  prompt: string;
-}): Promise<Response> {
-  const MAX_RETRIES = 3;
-  const BACKOFFS = [1000, 3000, 7000];
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const response = await callProvider(payload);
-
-      if (response.ok) return response;
-
-      if (response.status === 429) {
-        return Response.json({
-          error: 'rate_limited',
-          message: 'Your AI provider is rate limited. Wait a moment and try again.'
-        }, { status: 429 });
-      }
-
-      if (response.status === 401) {
-        return Response.json({
-          error: 'invalid_key',
-          message: 'Your AI key was rejected. Check it in Settings.'
-        }, { status: 401 });
-      }
-
-      if (attempt < MAX_RETRIES && (response.status >= 500 || response.status === 0)) {
-        await new Promise(resolve => setTimeout(resolve, BACKOFFS[attempt]));
-        continue;
-      }
-
-      return Response.json({
-        error: 'provider_unavailable',
-        message: "Your AI provider isn't responding. Try again shortly."
-      }, { status: 503 });
-
-    } catch (error) {
-      if (attempt < MAX_RETRIES) {
-        await new Promise(resolve => setTimeout(resolve, BACKOFFS[attempt]));
-        continue;
-      }
-      return Response.json({
-        error: 'provider_unavailable',
-        message: "Your AI provider isn't responding. Try again shortly."
-      }, { status: 503 });
-    }
-  }
-
-  return Response.json({
-    error: 'provider_unavailable',
-    message: "Your AI provider isn't responding. Try again shortly."
-  }, { status: 503 });
 }
 
 app.use('*', async (c, next) => {
@@ -765,6 +733,48 @@ app.delete('/settings/mcp-servers/:id', async (c) => {
   return c.json({ success: true });
 });
 
+app.get('/settings/user-tools', async (c) => {
+  const tools = await listUserTools(c.env, c.get('uid'));
+  return c.json(tools);
+});
+
+app.put('/settings/user-tools', async (c) => {
+  const parsed = userToolSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid builder profile tool payload', details: parsed.error.format() }, 400);
+  }
+
+  const tool = await upsertUserTool(c.env, c.get('uid'), parsed.data);
+  if (!tool) {
+    return c.json({ error: 'Could not save that tool right now.' }, 500);
+  }
+
+  return c.json(tool);
+});
+
+app.patch('/settings/user-tools/:id', async (c) => {
+  const parsed = userToolUpdateSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid builder profile update payload', details: parsed.error.format() }, 400);
+  }
+
+  const tool = await updateUserTool(c.env, c.get('uid'), c.req.param('id'), parsed.data);
+  if (!tool) {
+    return c.json({ error: 'Builder profile tool not found' }, 404);
+  }
+
+  return c.json(tool);
+});
+
+app.delete('/settings/user-tools/:id', async (c) => {
+  const deleted = await deleteUserTool(c.env, c.get('uid'), c.req.param('id'));
+  if (!deleted) {
+    return c.json({ error: 'Builder profile tool not found' }, 404);
+  }
+
+  return c.json({ success: true });
+});
+
 app.get('/projects', async (c) => {
   const projects = await c.env.DB.prepare(`
     SELECT
@@ -784,6 +794,212 @@ app.get('/projects', async (c) => {
     .all();
 
   return c.json(projects.results.map(mapProjectRow));
+});
+
+app.post('/intake/start', async (c) => {
+  const parsed = intakeStartSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: 'A project description is required.', details: parsed.error.format() }, 400);
+  }
+
+  if (!c.env.AGENT_QUEUE) {
+    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+  }
+
+  let providerContext;
+  try {
+    providerContext = await resolveProviderContext(c, parsed.data.providerId);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'Failed to load AI provider.' }, 500);
+  }
+
+  if (!providerContext) {
+    return c.json({ error: 'You need to add an AI key first.' }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  const description = parsed.data.description.trim();
+  const provisionalNameBase = description.split(/\s+/).slice(0, 8).join(' ');
+  const provisionalName =
+    provisionalNameBase.length < description.length ? `${provisionalNameBase}...` : provisionalNameBase;
+  const toolsContext = await buildToolsContext(c.get('uid'), c.env);
+
+  await c.env.DB.prepare(`
+    INSERT INTO projects (
+      id, user_id, name, description, project_type, stack, status, risk_score, generation_status, generation_error
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      id,
+      c.get('uid'),
+      provisionalName || 'Untitled project',
+      description,
+      null,
+      '{}',
+      'active',
+      0,
+      'intake',
+      null,
+    )
+    .run();
+
+  await appendProjectIntakeMessage(c.env, id, 'user', description);
+  await upsertProjectBrief(c.env, {
+    projectId: id,
+    rawDescription: description,
+    structuredBrief: createFallbackStructuredBrief(description),
+    toolsContext,
+    conversationTurns: 0,
+  });
+
+  const intakeTurn = await runProjectIntakeTurn({
+    env: c.env,
+    userId: c.get('uid'),
+    rawDescription: description,
+    messages: await listProjectIntakeMessages(c.env, id),
+    provider: providerContext,
+    conversationTurns: 1,
+  });
+
+  await appendProjectIntakeMessage(c.env, id, 'agent', intakeTurn.agentReply);
+  await upsertProjectBrief(c.env, {
+    projectId: id,
+    rawDescription: description,
+    structuredBrief: intakeTurn.structuredBrief,
+    toolsContext: intakeTurn.toolsContext,
+    conversationTurns: 1,
+  });
+
+  return c.json(await buildIntakeResponse(c, id), 202);
+});
+
+app.post('/intake/:id/respond', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  if ((project.generation_status || 'intake') !== 'intake') {
+    return c.json({ error: 'This intake conversation is no longer active.' }, 409);
+  }
+
+  const parsed = intakeRespondSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: 'Add a reply before sending.', details: parsed.error.format() }, 400);
+  }
+
+  let providerContext;
+  try {
+    providerContext = await resolveProviderContext(c, parsed.data.providerId);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'Failed to load AI provider.' }, 500);
+  }
+
+  if (!providerContext) {
+    return c.json({ error: 'You need to add an AI key first.' }, 400);
+  }
+
+  await appendProjectIntakeMessage(c.env, projectId, 'user', parsed.data.message);
+  const messages = await listProjectIntakeMessages(c.env, projectId);
+  const brief = await getProjectBrief(c.env, projectId);
+  const conversationTurns = (brief?.conversation_turns || 0) + 1;
+
+  const intakeTurn = await runProjectIntakeTurn({
+    env: c.env,
+    userId: c.get('uid'),
+    rawDescription: asText(project.description, ''),
+    messages,
+    provider: providerContext,
+    conversationTurns,
+  });
+
+  await appendProjectIntakeMessage(c.env, projectId, 'agent', intakeTurn.agentReply);
+  await upsertProjectBrief(c.env, {
+    projectId,
+    rawDescription: asText(project.description, ''),
+    structuredBrief: intakeTurn.structuredBrief,
+    toolsContext: intakeTurn.toolsContext,
+    conversationTurns,
+  });
+
+  return c.json(await buildIntakeResponse(c, projectId));
+});
+
+app.post('/intake/:id/confirm', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  if ((project.generation_status || 'intake') !== 'intake') {
+    return c.json({ error: 'This project has already moved past intake.' }, 409);
+  }
+
+  if (!c.env.AGENT_QUEUE) {
+    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+  }
+
+  const parsed = intakeConfirmSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid intake confirmation payload', details: parsed.error.format() }, 400);
+  }
+
+  let providerContext;
+  try {
+    providerContext = await resolveProviderContext(c, parsed.data.providerId);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'Failed to load AI provider.' }, 500);
+  }
+
+  if (!providerContext) {
+    return c.json({ error: 'You need to add an AI key first.' }, 400);
+  }
+
+  const briefContext = await loadProjectBriefContext(c.env, projectId, c.get('uid'), {
+    rawDescription: asText(project.description, ''),
+    projectStack: asText(project.stack, '{}'),
+  });
+  const nextNameBase = (briefContext.effectiveBrief.what_it_is || asText(project.name, 'Untitled project'))
+    .split(/\s+/)
+    .slice(0, 8)
+    .join(' ');
+  const nextName =
+    nextNameBase.length < (briefContext.effectiveBrief.what_it_is || '').length
+      ? `${nextNameBase}...`
+      : nextNameBase || asText(project.name, 'Untitled project');
+
+  await c.env.DB.prepare(`
+    UPDATE projects
+    SET name = ?, generation_status = 'queued', generation_error = NULL, updated_at = datetime("now")
+    WHERE id = ? AND user_id = ?
+  `)
+    .bind(nextName, projectId, c.get('uid'))
+    .run();
+
+  await c.env.AGENT_QUEUE.send({
+    type: 'generate_project',
+    projectId,
+    userId: c.get('uid'),
+    providerId: providerContext.providerId,
+  });
+
+  return c.json({
+    success: true,
+    project_id: projectId,
+    generation_status: 'queued',
+  });
+});
+
+app.get('/intake/:id/brief', async (c) => {
+  const project = await getOwnedProject(c, c.req.param('id'));
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  return c.json(await buildIntakeResponse(c, c.req.param('id')));
 });
 
 app.post('/projects', async (c) => {
@@ -876,6 +1092,7 @@ app.get('/projects/:id/status', async (c) => {
     completed_batch_count: completedBatches.length,
     total_batches: GENERATION_BATCHES.length,
     progress_percent: Math.round((completedBatches.length / GENERATION_BATCHES.length) * 100),
+    is_intake: (project.generation_status || 'complete') === 'intake',
     is_complete: (project.generation_status || 'complete') === 'complete',
     is_failed: (project.generation_status || 'complete') === 'failed',
     is_review_required: (project.generation_status || 'complete') === 'awaiting_review',
@@ -1649,6 +1866,7 @@ app.post('/workflows/:id/update', async (c) => {
             baseUrl,
           },
           message: parsed.data.message,
+          driftResolution: parsed.data.driftResolution,
           onProgress: async (progress) => {
             await writeUpdateStreamEvent(writer, 'activity', {
               icon: progress.icon,
@@ -1663,6 +1881,16 @@ app.post('/workflows/:id/update', async (c) => {
           timestamp: new Date().toISOString(),
         });
       } catch (error) {
+        if (error instanceof WorkflowBriefDriftError) {
+          await writeUpdateStreamEvent(writer, 'error', {
+            error: error.message,
+            error_code: 'brief_drift',
+            drift: error.drift,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
         const message = error instanceof Error ? error.message : 'Failed to update the workflow.';
         await writeUpdateStreamEvent(writer, 'error', {
           error: message,
@@ -1729,6 +1957,15 @@ app.post('/steps/:id/enrich', async (c) => {
     adr: adrContext,
     research: researchContext,
   });
+  const projectBriefContext = await loadProjectBriefContext(
+    c.env,
+    projectId,
+    asText(projectRecord.user_id),
+    {
+      rawDescription: asText(projectRecord.description, ''),
+      projectStack: asText(projectRecord.stack, '{}'),
+    },
+  );
 
   const providerRecord = await resolveProvider(c, providerId);
   if (!providerRecord) {
@@ -1746,11 +1983,14 @@ app.post('/steps/:id/enrich', async (c) => {
   const providerType = providerRecord.provider as ProviderType;
   const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
   const baseUrl = providerRecord.base_url as string | null;
-  const systemPrompt = `You are Scrimble's step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.`;
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    `You are Scrimble's step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.`,
+    projectBriefContext.promptContext,
+  );
   const promptSections = [
     `Step title: ${stepRecord.title}`,
     `Project name: ${projectRecord.name}`,
-    `Project brief: ${projectRecord.description || 'No project description provided.'}`,
+    `Project brief: ${projectBriefContext.summary}`,
     `Project stack: ${projectRecord.stack || '{}'}`,
     `Step objective: ${stepRecord.objective || 'Not specified yet.'}`,
     `Why it matters: ${stepRecord.why_it_matters || 'Not specified yet.'}`,
@@ -1793,8 +2033,7 @@ app.post('/steps/:id/enrich', async (c) => {
     });
 
     if (!aiResponse.ok) {
-      const errorData = await aiResponse.clone().json().catch(() => ({ message: 'AI Enrichment Error' }));
-      const message = errorData.message || 'AI Enrichment Error';
+      const message = getAIErrorMessage(aiResponse.status, 'AI Enrichment Error');
       
       await c.env.DB.batch([
         c.env.DB.prepare('UPDATE steps SET status = "active", updated_at = datetime("now") WHERE id = ?').bind(stepId),
@@ -1817,7 +2056,7 @@ app.post('/steps/:id/enrich', async (c) => {
 
     c.executionCtx.waitUntil(
       (async () => {
-        const fullContent = await streamToText(stream2);
+        const fullContent = await streamProviderText(providerType, stream2);
 
         try {
           const parsedContent = JSON.parse(extractJSON(fullContent));
@@ -1930,8 +2169,7 @@ app.post('/ai/proxy', async (c) => {
     });
 
     if (!response.ok) {
-      const errorData = await response.clone().json().catch(() => ({ message: 'AI Proxy Error' }));
-      const message = errorData.message || 'AI Proxy Error';
+      const message = getAIErrorMessage(response.status, 'AI Proxy Error');
 
       if (runId) {
         await c.env.DB.prepare(`

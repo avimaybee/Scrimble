@@ -11,6 +11,7 @@ export type GenerationBatchName =
 export type PreferredIde = 'cursor' | 'windsurf' | 'vscode' | 'claude_desktop';
 export type GenerationStatus =
   | GenerationBatchName
+  | 'intake'
   | 'queued'
   | 'awaiting_review'
   | 'approved'
@@ -178,10 +179,67 @@ export interface ProjectGenerationStatusResponse {
   completed_batch_count: number;
   total_batches: number;
   progress_percent: number;
+  is_intake: boolean;
   is_complete: boolean;
   is_failed: boolean;
   is_review_required: boolean;
   is_approved: boolean;
+}
+
+export interface ProjectIntakeMessage {
+  id: number;
+  project_id: string;
+  role: 'agent' | 'user';
+  content: string;
+  created_at: string;
+}
+
+export interface ProjectBrief {
+  id: string;
+  project_id: string;
+  raw_description: string;
+  enriched_brief: string;
+  what_it_is: string;
+  who_its_for: string;
+  problem_solved: string;
+  v1_scope: {
+    in: string[];
+    out: string[];
+  };
+  stack_context: {
+    confirmed: string[];
+    existing_tools: string[];
+    open_to: string[];
+    notes: string;
+  };
+  definition_done: string;
+  constraints: {
+    budget: string;
+    timeline: string;
+    existing_codebase: string;
+    dependencies: string[];
+    other: string[];
+  };
+  future_ideas: string[];
+  conversation_turns: number;
+  created_at: string;
+  summary: string;
+}
+
+export interface ProjectIntakeSession {
+  project_id: string;
+  generation_status: GenerationStatus;
+  ready: boolean;
+  agent_message: string;
+  messages: ProjectIntakeMessage[];
+  brief: ProjectBrief;
+}
+
+export interface WorkflowBriefDrift {
+  message: string;
+  change_label: string;
+  recommendation_add_now: string;
+  recommendation_save_for_later: string;
 }
 
 export interface GeneratedProjectFile {

@@ -1,15 +1,22 @@
-import { useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ArrowRight, ChevronRight, ExternalLink, Hexagon, KeyRound, Sparkles } from 'lucide-react';
+import { ArrowRight, ChevronRight, Hexagon, KeyRound, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
 import { getAIProviders } from '../lib/ai';
 import { getMCPServers } from '../lib/mcp';
 import { cn } from '../lib/utils';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog';
 import type { AIProvider } from '../lib/ai';
-import type { GenerationPreparationState } from '../types';
+import type { GenerationPreparationState, ProjectBrief, ProjectIntakeSession } from '../types';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -34,20 +41,101 @@ const itemVariants = {
   },
 };
 
+type IntakeScreenState = 'initial' | 'conversation' | 'confirm';
+
+function formatDetailValue(brief: ProjectBrief, key: string) {
+  switch (key) {
+    case 'v1_scope':
+      return `IN: ${brief.v1_scope.in.length > 0 ? brief.v1_scope.in.join(', ') : 'Not locked yet.'} | OUT: ${brief.v1_scope.out.length > 0 ? brief.v1_scope.out.join(', ') : 'Nothing explicitly out yet.'}`;
+    case 'stack_context':
+      return [
+        `Confirmed: ${brief.stack_context.confirmed.length > 0 ? brief.stack_context.confirmed.join(', ') : 'Not locked yet.'}`,
+        `Already have: ${brief.stack_context.existing_tools.length > 0 ? brief.stack_context.existing_tools.join(', ') : 'Not specified.'}`,
+        `Open to: ${brief.stack_context.open_to.length > 0 ? brief.stack_context.open_to.join(', ') : 'Not specified.'}`,
+        brief.stack_context.notes ? `Notes: ${brief.stack_context.notes}` : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+    case 'constraints':
+      return [
+        brief.constraints.timeline ? `Timeline: ${brief.constraints.timeline}` : '',
+        brief.constraints.budget ? `Budget: ${brief.constraints.budget}` : '',
+        brief.constraints.existing_codebase
+          ? `Existing codebase: ${brief.constraints.existing_codebase}`
+          : '',
+        brief.constraints.dependencies.length > 0
+          ? `Dependencies: ${brief.constraints.dependencies.join(', ')}`
+          : '',
+        brief.constraints.other.length > 0 ? `Other: ${brief.constraints.other.join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join(' ') || 'No hard constraints confirmed yet.';
+    default:
+      return '';
+  }
+}
+
+function getCurrentAgentMessage(session: ProjectIntakeSession | null) {
+  if (!session) {
+    return '';
+  }
+
+  const latestAgent = [...session.messages].reverse().find((message) => message.role === 'agent');
+  return latestAgent?.content || session.agent_message || '';
+}
+
 export default function NewProject() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const historyRef = useRef<HTMLDivElement | null>(null);
 
   const [prompt, setPrompt] = useState('');
+  const [reply, setReply] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingSteps, setLoadingSteps] = useState<string[]>([]);
   const [error, setError] = useState('');
   const [generationPreparation, setGenerationPreparation] = useState<GenerationPreparationState | null>(null);
   const [isPreparationLoading, setIsPreparationLoading] = useState(true);
+  const [builderProfileCount, setBuilderProfileCount] = useState(0);
   const [providers, setProviders] = useState<AIProvider[]>([]);
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [intakeSession, setIntakeSession] = useState<ProjectIntakeSession | null>(null);
+  const [screenState, setScreenState] = useState<IntakeScreenState>('initial');
+  const [isStartingIntake, setIsStartingIntake] = useState(false);
+  const [isSendingReply, setIsSendingReply] = useState(false);
+  const [isResumingIntake, setIsResumingIntake] = useState(false);
+  const [showBriefDetails, setShowBriefDetails] = useState(false);
+  const [manualPrompt, setManualPrompt] = useState('');
+
+  const intakeProjectId = searchParams.get('intake');
+  const currentAgentMessage = manualPrompt || getCurrentAgentMessage(intakeSession);
+  const conversationProgress = Math.min(Math.max(intakeSession?.brief.conversation_turns || 1, 1), 4);
+
+  const historyMessages = useMemo(() => {
+    if (!intakeSession) {
+      return [];
+    }
+
+    if (manualPrompt) {
+      return intakeSession.messages;
+    }
+
+    const latestAgentMessage = getCurrentAgentMessage(intakeSession);
+    return intakeSession.messages.filter((message, index, allMessages) => {
+      if (message.role !== 'agent') {
+        return true;
+      }
+
+      const isLastAgent =
+        index ===
+        allMessages.map((entry) => entry.role).lastIndexOf('agent');
+
+      return !isLastAgent || message.content !== latestAgentMessage;
+    });
+  }, [intakeSession, manualPrompt]);
 
   const resizeTextarea = () => {
     const textarea = textareaRef.current;
@@ -65,25 +153,39 @@ export default function NewProject() {
   }, [prompt]);
 
   useEffect(() => {
+    const historyElement = historyRef.current;
+    if (!historyElement) {
+      return;
+    }
+
+    historyElement.scrollTop = historyElement.scrollHeight;
+  }, [historyMessages.length, currentAgentMessage]);
+
+  useEffect(() => {
     let isMounted = true;
 
     const loadPreparationState = async () => {
       try {
-        const [providers, servers] = await Promise.all([getAIProviders(), getMCPServers()]);
+        const [providerList, servers, userTools] = await Promise.all([
+          getAIProviders(),
+          getMCPServers(),
+          dbService.getUserTools(),
+        ]);
         const activeServers = servers.filter((server) => server.is_active);
 
         if (!isMounted) {
           return;
         }
 
-        setProviders(providers);
-        const defaultProvider = providers.find(p => p.is_default) || providers[0];
+        setProviders(providerList);
+        setBuilderProfileCount(userTools.length);
+        const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
         if (defaultProvider) {
           setSelectedProviderId(defaultProvider.id);
         }
 
         setGenerationPreparation({
-          has_ai_provider: providers.length > 0,
+          has_ai_provider: providerList.length > 0,
           has_brave_search: activeServers.some((server) => server.server_type === 'brave-search'),
           has_github_token: activeServers.some((server) => server.server_type === 'github'),
           has_context7: activeServers.some((server) => server.server_type === 'context7'),
@@ -109,7 +211,110 @@ export default function NewProject() {
     };
   }, []);
 
-  const handleGenerate = async () => {
+  useEffect(() => {
+    if (!user || !intakeProjectId) {
+      if (!intakeProjectId) {
+        setIntakeSession(null);
+        setScreenState('initial');
+        setManualPrompt('');
+        setShowBriefDetails(false);
+      }
+      return;
+    }
+
+    let isMounted = true;
+    setIsResumingIntake(true);
+
+    const loadIntakeSession = async () => {
+      try {
+        const project = await dbService.getProject(intakeProjectId);
+        if (!project) {
+          if (isMounted) {
+            setSearchParams({}, { replace: true });
+            setScreenState('initial');
+          }
+          return;
+        }
+
+        if (project.generation_status !== 'intake') {
+          if (project.generation_status === 'complete') {
+            navigate(`/project/${intakeProjectId}`, { replace: true });
+            return;
+          }
+
+          navigate(`/project/${intakeProjectId}/generating`, {
+            replace: true,
+            state: {
+              preparation: generationPreparation,
+            },
+          });
+          return;
+        }
+
+        const session = await dbService.getProjectIntake(intakeProjectId);
+        if (!isMounted) {
+          return;
+        }
+
+        setPrompt(session.brief.raw_description);
+        setIntakeSession(session);
+        setScreenState(session.ready ? 'confirm' : 'conversation');
+        setManualPrompt('');
+        setError('');
+      } catch (loadError) {
+        if (!isMounted) {
+          return;
+        }
+
+        console.error('Failed to resume intake conversation:', loadError);
+        setError(loadError instanceof Error ? loadError.message : 'Could not reopen this intake conversation.');
+      } finally {
+        if (isMounted) {
+          setIsResumingIntake(false);
+        }
+      }
+    };
+
+    void loadIntakeSession();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [generationPreparation, intakeProjectId, navigate, setSearchParams, user]);
+
+  const handleConfirmIntake = async () => {
+    if (!intakeSession || !generationPreparation?.has_ai_provider) {
+      return;
+    }
+
+    setLoading(true);
+    setLoadingSteps(['Saving your brief...']);
+    setError('');
+
+    try {
+      await dbService.confirmProjectIntake(intakeSession.project_id, {
+        providerId: selectedProviderId || undefined,
+      });
+      setLoadingSteps((previous) => [...previous.slice(-2), 'Starting the research pipeline...']);
+      window.setTimeout(() => {
+        navigate(`/project/${intakeSession.project_id}/generating`, {
+          state: {
+            preparation: generationPreparation,
+          },
+        });
+      }, 250);
+    } catch (confirmError: unknown) {
+      console.error('Failed to confirm intake:', confirmError);
+      setLoading(false);
+      setError(
+        confirmError instanceof Error
+          ? confirmError.message
+          : 'Could not start your plan. Check your AI key and try again.',
+      );
+    }
+  };
+
+  const handleStartIntake = async () => {
     const trimmedPrompt = prompt.trim();
 
     if (!user || !trimmedPrompt) {
@@ -121,35 +326,74 @@ export default function NewProject() {
       return;
     }
 
-    setLoading(true);
-    setLoadingSteps([]);
+    setIsStartingIntake(true);
     setError('');
 
     try {
-      setLoadingSteps((previous) => [...previous, 'Saving your project brief...']);
-      const project = await dbService.createProject({
+      const session = await dbService.startProjectIntake({
         description: trimmedPrompt,
         providerId: selectedProviderId || undefined,
       });
 
-      setLoadingSteps((previous) => [...previous.slice(-2), 'Starting the plan builder...']);
-      window.setTimeout(() => {
-        navigate(`/project/${project.id}/generating`, {
-          state: {
-            preparation: generationPreparation,
-          },
-        });
-      }, 250);
-    } catch (err: unknown) {
-      console.error('Error generating plan:', err);
-      setLoading(false);
+      setIntakeSession(session);
+      setScreenState(session.ready ? 'confirm' : 'conversation');
+      setSearchParams({ intake: session.project_id }, { replace: true });
+      setManualPrompt('');
+    } catch (startError: unknown) {
+      console.error('Error starting intake:', startError);
       setError(
-        err instanceof Error
-          ? err.message
-          : 'Could not start your plan. Check your AI key and try again.',
+        startError instanceof Error
+          ? startError.message
+          : 'Could not start the intake conversation. Try again.',
       );
+    } finally {
+      setIsStartingIntake(false);
     }
   };
+
+  const handleReplySubmit = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+
+    if (!intakeSession || !reply.trim()) {
+      return;
+    }
+
+    setIsSendingReply(true);
+    setError('');
+
+    try {
+      const session = await dbService.respondToProjectIntake(intakeSession.project_id, {
+        message: reply.trim(),
+        providerId: selectedProviderId || undefined,
+      });
+
+      setReply('');
+      setIntakeSession(session);
+      setScreenState(session.ready ? 'confirm' : 'conversation');
+      setManualPrompt('');
+    } catch (replyError: unknown) {
+      console.error('Error sending intake reply:', replyError);
+      setError(
+        replyError instanceof Error
+          ? replyError.message
+          : 'Could not send that reply. Try again.',
+      );
+    } finally {
+      setIsSendingReply(false);
+    }
+  };
+
+  const detailRows = intakeSession
+    ? [
+        { label: 'What it is', value: intakeSession.brief.what_it_is || 'Not locked yet.', key: 'what_it_is' },
+        { label: "Who it's for", value: intakeSession.brief.who_its_for || 'Not locked yet.', key: 'who_its_for' },
+        { label: 'Problem it solves', value: intakeSession.brief.problem_solved || 'Not locked yet.', key: 'problem_solved' },
+        { label: 'V1 scope', value: formatDetailValue(intakeSession.brief, 'v1_scope'), key: 'v1_scope' },
+        { label: 'Stack confirmed', value: formatDetailValue(intakeSession.brief, 'stack_context'), key: 'stack_context' },
+        { label: 'Done when', value: intakeSession.brief.definition_done || 'Not locked yet.', key: 'definition_done' },
+        { label: 'Constraints', value: formatDetailValue(intakeSession.brief, 'constraints'), key: 'constraints' },
+      ]
+    : [];
 
   if (loading) {
     return (
@@ -210,78 +454,269 @@ export default function NewProject() {
 
       <AnimatePresence mode="wait">
         <motion.div
-          key="new-project"
+          key={screenState}
           initial="hidden"
           animate="visible"
           exit={{ opacity: 0, y: -20 }}
           variants={containerVariants}
           className="relative z-10 mx-auto w-full max-w-[760px]"
         >
-          <motion.div variants={itemVariants} className="mb-10 text-center">
-            <div className="mb-5 flex justify-center">
-              <Hexagon className="h-10 w-10 text-accent-primary" />
-            </div>
-            <div className="section-label justify-center">New project</div>
-            <h1 className="mt-4 text-heading">What do you want to build?</h1>
-            <p className="mx-auto mt-3 max-w-[560px] text-body text-[16px]">
-              Describe it in your own words. The more context you give, the better the plan will be.
-            </p>
-          </motion.div>
+          {screenState === 'initial' ? (
+            <>
+              <motion.div variants={itemVariants} className="mb-10 text-center">
+                <div className="mb-5 flex justify-center">
+                  <Hexagon className="h-10 w-10 text-accent-primary" />
+                </div>
+                <div className="section-label justify-center">New project</div>
+                <h1 className="mt-4 text-heading">What do you want to build?</h1>
+                <p className="mx-auto mt-3 max-w-[560px] text-body text-[16px]">
+                  Describe it in your own words. The more context you give, the better the intake conversation starts.
+                </p>
+              </motion.div>
 
-          <motion.div variants={itemVariants} className="surface-card p-3 sm:p-4">
-            <div className="rounded-[12px] border border-border-default bg-bg-elevated/55 px-4 py-4 sm:px-5">
-              <textarea
-                ref={textareaRef}
-                value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
-                placeholder='e.g. "I want to build a tool for freelancers to track invoices, send reminders, and see what got paid."'
-                className="min-h-[170px] w-full resize-none overflow-hidden bg-transparent text-[18px] leading-8 text-text-primary outline-none placeholder:text-text-tertiary"
-                autoFocus
-              />
-            </div>
+              <motion.div variants={itemVariants} className="surface-card p-3 sm:p-4">
+                <div className="rounded-[12px] border border-border-default bg-bg-elevated/55 px-4 py-4 sm:px-5">
+                  <textarea
+                    ref={textareaRef}
+                    value={prompt}
+                    onChange={(event) => setPrompt(event.target.value)}
+                    placeholder='e.g. "I want to build a tool for freelancers to track invoices, send reminders, and see what got paid."'
+                    className="min-h-[170px] w-full resize-none overflow-hidden bg-transparent text-[18px] leading-8 text-text-primary outline-none placeholder:text-text-tertiary"
+                    autoFocus
+                  />
+                </div>
 
-            <div className="flex flex-col gap-4 px-3 pb-2 pt-4 sm:flex-row sm:items-end sm:justify-between">
-              <div className="flex items-start gap-3 text-left">
-                <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-accent-primary" />
+                {!isPreparationLoading && builderProfileCount === 0 ? (
+                  <div className="mx-3 mt-4 rounded-[12px] border border-[rgba(244,187,102,0.26)] bg-[rgba(244,187,102,0.08)] px-4 py-3 text-sm leading-6 text-status-warning sm:mx-2">
+                    Your builder profile is empty - I'll have to ask more questions than usual. Add your tools in Settings to skip this every time.
+                  </div>
+                ) : null}
+
+                <div className="flex flex-col gap-4 px-3 pb-2 pt-4 sm:flex-row sm:items-end sm:justify-between">
+                  <div className="flex items-start gap-3 text-left">
+                    <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-accent-primary" />
+                    <div>
+                      <div className="text-sm text-text-secondary">
+                        {isPreparationLoading
+                          ? 'Checking your saved AI and research settings...'
+                          : generationPreparation?.has_ai_provider
+                            ? (
+                              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                <span>Scrimble will use</span>
+                                <span className="inline-flex items-center gap-1 font-medium text-text-primary">
+                                  {providers.find((provider) => provider.id === selectedProviderId)?.name || 'Default key'}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => setIsModalOpen(true)}
+                                  className="inline-flex items-center gap-0.5 font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
+                                >
+                                  (Change)
+                                </button>
+                              </div>
+                            )
+                            : 'You need to add an AI key first.'}
+                      </div>
+                      <div className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                        Plain language works best here
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={handleStartIntake}
+                    disabled={!prompt.trim() || isPreparationLoading || !generationPreparation?.has_ai_provider || isStartingIntake}
+                    className="btn-primary self-end"
+                  >
+                    {isStartingIntake ? 'Starting...' : "Let's figure this out"}
+                    <ArrowRight className="h-4 w-4" />
+                  </button>
+                </div>
+              </motion.div>
+            </>
+          ) : null}
+
+          {screenState === 'conversation' ? (
+            <motion.section
+              variants={itemVariants}
+              initial={{ opacity: 0, y: 24 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -24 }}
+              transition={{ duration: 0.3, ease: EASE_OUT_EXPO }}
+              className="relative rounded-[24px] border border-border-default bg-bg-surface/90 px-6 py-7 shadow-panel sm:px-8"
+            >
+              <div className="mb-8 flex items-start justify-between gap-6">
                 <div>
-                  <div className="text-sm text-text-secondary">
-                    {isPreparationLoading
-                      ? 'Checking your saved AI and research settings...'
-                      : generationPreparation?.has_ai_provider
-                        ? (
-                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                            <span>Scrimble will use</span>
-                            <span className="inline-flex items-center gap-1 font-medium text-text-primary">
-                              {providers.find(p => p.id === selectedProviderId)?.name || 'Default key'}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => setIsModalOpen(true)}
-                              className="inline-flex items-center gap-0.5 font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
-                            >
-                              (Change)
-                            </button>
-                          </div>
-                        )
-                        : 'You need to add an AI key first.'}
-                  </div>
-                  <div className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
-                    Plain language works best here
-                  </div>
+                  <div className="section-label">Intake conversation</div>
+                  <p className="mt-3 max-w-[420px] text-body">
+                    I am tightening the brief before the research pipeline starts.
+                  </p>
+                </div>
+                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
+                  Building context... {conversationProgress}/4
                 </div>
               </div>
 
-              <button
-                onClick={handleGenerate}
-                disabled={!prompt.trim() || isPreparationLoading || !generationPreparation?.has_ai_provider}
-                className="btn-primary self-end"
-              >
-                Build my plan
-                <ArrowRight className="h-4 w-4" />
-              </button>
-            </div>
-          </motion.div>
+              {historyMessages.length > 0 ? (
+                <div
+                  ref={historyRef}
+                  className="mb-6 max-h-[220px] space-y-4 overflow-y-auto pr-2"
+                >
+                  {historyMessages.map((message) => (
+                    <div
+                      key={`${message.id}-${message.role}`}
+                      className={cn(
+                        message.role === 'agent' ? '' : 'pl-5',
+                      )}
+                    >
+                      <p
+                        className={cn(
+                          message.role === 'agent'
+                            ? 'font-serif text-[16px] leading-8 text-text-primary'
+                            : 'text-[14px] leading-7 text-text-secondary',
+                        )}
+                      >
+                        {message.content.replace(/^READY:\s*/, '')}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
 
+              <div className="mb-8">
+                <p className="max-w-[620px] font-serif text-[20px] leading-9 tracking-[-0.02em] text-text-primary">
+                  {currentAgentMessage.replace(/^READY:\s*/, '')}
+                </p>
+              </div>
+
+              <form onSubmit={handleReplySubmit} className="space-y-4">
+                <div className="flex items-center gap-3 rounded-[16px] border border-border-default bg-bg-elevated/60 px-4 py-3">
+                  <input
+                    value={reply}
+                    onChange={(event) => setReply(event.target.value)}
+                    placeholder="Your answer..."
+                    className="h-11 flex-1 bg-transparent text-[15px] text-text-primary outline-none placeholder:text-text-tertiary"
+                    autoFocus
+                    disabled={isSendingReply}
+                  />
+                  <button
+                    type="submit"
+                    disabled={!reply.trim() || isSendingReply}
+                    className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-accent-primary text-white transition-colors hover:bg-accent-primary-hover disabled:cursor-not-allowed disabled:opacity-60"
+                    aria-label="Send reply"
+                  >
+                    <ArrowRight className="h-4 w-4" />
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between gap-4">
+                  <button
+                    type="button"
+                    onClick={() => void handleConfirmIntake()}
+                    className="text-sm text-text-tertiary transition-colors hover:text-text-secondary"
+                  >
+                    Skip - use my description as-is
+                  </button>
+                  <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                    {isSendingReply ? 'Thinking...' : 'One question at a time'}
+                  </div>
+                </div>
+              </form>
+            </motion.section>
+          ) : null}
+
+          {screenState === 'confirm' && intakeSession ? (
+            <motion.section
+              variants={itemVariants}
+              initial={{ opacity: 0, y: 24 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -24 }}
+              transition={{ duration: 0.3, ease: EASE_OUT_EXPO }}
+              className="rounded-[24px] border border-border-default bg-bg-surface/92 px-6 py-7 shadow-panel sm:px-8"
+            >
+              <div className="mb-8">
+                <div className="section-label">Ready to brief the pipeline</div>
+                <h2 className="mt-4 font-serif text-[24px] tracking-[-0.03em] text-text-primary">
+                  Here's what I understand
+                </h2>
+                <p className="mt-4 max-w-[640px] text-[16px] leading-8 text-text-secondary">
+                  {intakeSession.brief.summary}
+                </p>
+              </div>
+
+              <div className="rounded-[16px] border border-border-default bg-bg-elevated/55 p-4">
+                <button
+                  type="button"
+                  onClick={() => setShowBriefDetails((current) => !current)}
+                  className="flex w-full items-center justify-between gap-4 text-left"
+                >
+                  <span className="font-medium text-text-primary">
+                    {showBriefDetails ? 'Hide the details' : 'See the details ->'}
+                  </span>
+                  <ChevronRight
+                    className={cn(
+                      'h-4 w-4 text-accent-primary transition-transform',
+                      showBriefDetails && 'rotate-90',
+                    )}
+                  />
+                </button>
+
+                <AnimatePresence initial={false}>
+                  {showBriefDetails ? (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
+                      className="overflow-hidden"
+                    >
+                      <div className="mt-4 grid gap-4 sm:grid-cols-[140px_1fr]">
+                        {detailRows.map((row) => (
+                          <div key={row.key} className="contents">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
+                              {row.label}
+                            </div>
+                            <div className="text-[14px] leading-7 text-text-secondary">{row.value}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
+
+              <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:justify-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScreenState('conversation');
+                    setManualPrompt('What part of that summary feels off, and what should I correct before I brief the pipeline?');
+                    setReply('');
+                  }}
+                  className="btn-ghost"
+                >
+                  That's not right - let me clarify
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmIntake()}
+                  className="btn-primary"
+                >
+                  Yes, build my plan
+                  <ArrowRight className="h-4 w-4" />
+                </button>
+              </div>
+            </motion.section>
+          ) : null}
+
+          {isResumingIntake ? (
+            <motion.div
+              variants={itemVariants}
+              className="mt-5 rounded-[14px] border border-border-default bg-bg-elevated/45 px-4 py-3 text-sm leading-6 text-text-secondary"
+            >
+              Reopening your intake conversation...
+            </motion.div>
+          ) : null}
 
           {error ? (
             <motion.div
@@ -305,48 +740,50 @@ export default function NewProject() {
               <DialogHeader>
                 <DialogTitle>Choose your AI</DialogTitle>
                 <DialogDescription>
-                  Select which model should architect this project and generate your plan.
+                  Select which model should run the intake conversation and build this project plan.
                 </DialogDescription>
               </DialogHeader>
 
               <div className="space-y-2 px-6 py-2">
-                {providers.map((p) => (
+                {providers.map((provider) => (
                   <button
-                    key={p.id}
+                    key={provider.id}
                     onClick={() => {
-                      setSelectedProviderId(p.id);
+                      setSelectedProviderId(provider.id);
                       setIsModalOpen(false);
                     }}
                     className={cn(
-                      "group flex w-full items-center justify-between rounded-xl border p-4 text-left transition-all duration-200",
-                      selectedProviderId === p.id
-                        ? "border-accent-border bg-accent-primary-muted"
-                        : "border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60"
+                      'group flex w-full items-center justify-between rounded-xl border p-4 text-left transition-all duration-200',
+                      selectedProviderId === provider.id
+                        ? 'border-accent-border bg-accent-primary-muted'
+                        : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
                     )}
                   >
                     <div className="flex items-center gap-3">
-                      <div className={cn(
-                        "flex h-9 w-9 items-center justify-center rounded-lg border transition-colors",
-                        selectedProviderId === p.id
-                          ? "border-accent-border bg-bg-surface text-accent-primary"
-                          : "border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary"
-                      )}>
+                      <div
+                        className={cn(
+                          'flex h-9 w-9 items-center justify-center rounded-lg border transition-colors',
+                          selectedProviderId === provider.id
+                            ? 'border-accent-border bg-bg-surface text-accent-primary'
+                            : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
+                        )}
+                      >
                         <Sparkles className="h-4.5 w-4.5" />
                       </div>
                       <div>
                         <div className="text-[15px] font-medium text-text-primary">
-                          {p.name}
+                          {provider.name}
                         </div>
                         <div className="text-[12px] text-text-tertiary">
-                          {p.model || p.provider}
+                          {provider.model || provider.provider}
                         </div>
                       </div>
                     </div>
-                    {selectedProviderId === p.id && (
+                    {selectedProviderId === provider.id ? (
                       <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
                         <ChevronRight className="h-3 w-3" />
                       </div>
-                    )}
+                    ) : null}
                   </button>
                 ))}
               </div>

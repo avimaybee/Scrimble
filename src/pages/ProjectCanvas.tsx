@@ -22,6 +22,7 @@ import {
   Edge as AppEdge,
   ChecklistItem,
   StepStatus,
+  WorkflowBriefDrift,
   WorkflowUpdateActivity,
 } from '../types';
 import StepCard from '../components/StepCard';
@@ -31,6 +32,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../com
 import { motion, AnimatePresence } from 'framer-motion';
 import { Activity, Hexagon, Download, LayoutPanelTop, Pencil, Check, X, FileJson, FileText, Info, RotateCcw, Trash2 } from 'lucide-react';
 import { dbService } from '../lib/db';
+import { WorkflowBriefDriftError } from '../lib/db';
 import { cn } from '../lib/utils';
 import ErrorBoundary from '../components/ErrorBoundary';
 import {
@@ -75,6 +77,8 @@ export default function ProjectCanvas() {
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
   const [updateActivities, setUpdateActivities] = useState<WorkflowUpdateActivity[]>([]);
+  const [workflowDrift, setWorkflowDrift] = useState<WorkflowBriefDrift | null>(null);
+  const [pendingDriftResolution, setPendingDriftResolution] = useState<'apply_now' | 'save_for_later' | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showUnlockToast, setShowUnlockToast] = useState(false);
@@ -91,6 +95,11 @@ export default function ProjectCanvas() {
       const proj = await dbService.getProject(id);
       if (!proj) {
         setProject(null);
+        return;
+      }
+
+      if (proj.generation_status === 'intake') {
+        navigate(`/new?intake=${id}`, { replace: true });
         return;
       }
 
@@ -156,11 +165,14 @@ export default function ProjectCanvas() {
     }
   };
 
-  const handlePlanUpdate = async () => {
+  const handlePlanUpdate = async (driftResolution?: 'apply_now' | 'save_for_later') => {
     if (!project || !updateMessage.trim()) return;
     
     setIsUpdating(true);
-    setUpdateActivities([]);
+    if (!driftResolution) {
+      setUpdateActivities([]);
+    }
+    setWorkflowDrift(null);
 
     try {
       const plan = await dbService.getPlanByProjectId(project.id);
@@ -170,7 +182,7 @@ export default function ProjectCanvas() {
 
       const result = await dbService.updateWorkflow(
         plan.id,
-        { message: updateMessage },
+        { message: updateMessage, driftResolution },
         {
           onActivity: (activity) => {
             setUpdateActivities((previous) => [...previous, activity]);
@@ -187,9 +199,22 @@ export default function ProjectCanvas() {
         setShowUpdateModal(false);
         setUpdateMessage('');
         setUpdateActivities([]);
+        setWorkflowDrift(null);
       }, 500);
     } catch (err) {
       console.error(err);
+      if (err instanceof WorkflowBriefDriftError) {
+        setWorkflowDrift(err.drift);
+        setUpdateActivities((previous) => [
+          ...previous,
+          {
+            icon: '⚠️',
+            message: err.message,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+        return;
+      }
       const errorMessage = err instanceof Error ? err.message : "Failed to update your plan";
       setUpdateActivities((previous) => [
         ...previous,
@@ -202,6 +227,7 @@ export default function ProjectCanvas() {
       toast.error(errorMessage);
     } finally {
       setIsUpdating(false);
+      setPendingDriftResolution(null);
     }
   };
 
@@ -826,6 +852,8 @@ export default function ProjectCanvas() {
 
           if (!open) {
             setUpdateActivities([]);
+            setWorkflowDrift(null);
+            setPendingDriftResolution(null);
           }
 
           setShowUpdateModal(open);
@@ -848,6 +876,45 @@ export default function ProjectCanvas() {
               disabled={isUpdating}
             />
           </div>
+
+          {workflowDrift ? (
+            <div className="rounded-[14px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-4">
+              <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-status-warning">
+                Brief drift detected
+              </div>
+              <p className="mt-2 text-sm leading-7 text-text-primary">
+                {workflowDrift.message}
+              </p>
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingDriftResolution('save_for_later');
+                    void handlePlanUpdate('save_for_later');
+                  }}
+                  disabled={isUpdating}
+                  className="btn-ghost"
+                >
+                  {pendingDriftResolution === 'save_for_later' && isUpdating
+                    ? 'Saving...'
+                    : workflowDrift.recommendation_save_for_later}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingDriftResolution('apply_now');
+                    void handlePlanUpdate('apply_now');
+                  }}
+                  disabled={isUpdating}
+                  className="btn-primary"
+                >
+                  {pendingDriftResolution === 'apply_now' && isUpdating
+                    ? 'Updating brief...'
+                    : workflowDrift.recommendation_add_now}
+                </button>
+              </div>
+            </div>
+          ) : null}
           
           {(isUpdating || updateActivities.length > 0) && (
             <div className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4">
@@ -889,6 +956,8 @@ export default function ProjectCanvas() {
                 }
 
                 setUpdateActivities([]);
+                setWorkflowDrift(null);
+                setPendingDriftResolution(null);
                 setShowUpdateModal(false);
               }}
               className="btn-ghost"
@@ -897,7 +966,7 @@ export default function ProjectCanvas() {
               Cancel
             </button>
             <button 
-              onClick={handlePlanUpdate}
+              onClick={() => void handlePlanUpdate()}
               className="btn-primary"
               disabled={isUpdating || !updateMessage.trim()}
             >

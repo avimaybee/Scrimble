@@ -19,6 +19,7 @@ export type PreferredIde = (typeof PREFERRED_IDES)[number];
 
 export type ProjectGenerationStatus =
   | GenerationBatchName
+  | 'intake'
   | 'queued'
   | 'awaiting_review'
   | 'approved'

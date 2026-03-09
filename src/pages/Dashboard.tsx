@@ -101,6 +101,7 @@ export default function Dashboard() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
   const [projectCards, setProjectCards] = useState<ProjectCardData[]>([]);
+  const [builderProfileCount, setBuilderProfileCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [showArchived, setShowArchived] = useState(false);
   const [projectToDelete, setProjectToDelete] = useState<string | null>(null);
@@ -115,7 +116,10 @@ export default function Dashboard() {
       setLoading(true);
 
       try {
-        const projects = await dbService.getProjectsByUserId(user.uid);
+        const [projects, userTools] = await Promise.all([
+          dbService.getProjectsByUserId(user.uid),
+          dbService.getUserTools(),
+        ]);
         const cards = await Promise.all(
           projects.map(async (project) => {
             const [steps, stages] = await Promise.all([
@@ -134,6 +138,7 @@ export default function Dashboard() {
         );
 
         setProjectCards(cards);
+        setBuilderProfileCount(userTools.length);
       } catch (error) {
         console.error('Error fetching projects:', error);
         toast.error('Could not load your projects.');
@@ -239,6 +244,39 @@ export default function Dashboard() {
         </motion.div>
       </motion.header>
 
+      {!loading && !showArchived && builderProfileCount < 3 ? (
+        <motion.div
+          variants={itemVariants}
+          className="mb-8 overflow-hidden rounded-[18px] border border-border-default bg-bg-surface"
+        >
+          <div className="flex h-full flex-col gap-5 border-l-[3px] border-accent-primary px-5 py-5 sm:flex-row sm:items-end sm:justify-between sm:px-6">
+            <div className="max-w-[560px]">
+              <div className="font-mono text-[11px] uppercase tracking-[0.18em] text-accent-primary">
+                ◈ {builderProfileCount === 0 ? 'Your builder profile is empty' : 'Your builder profile needs a little more detail'}
+              </div>
+              <p className="mt-3 text-[15px] leading-7 text-text-primary">
+                {builderProfileCount === 0
+                  ? "Without it, every plan I build will be generic. Tell me your tools once - I'll use them everywhere."
+                  : 'Add a few more tools and I can stop defaulting to generic stack advice. Once you hit three, your plans get much sharper.'}
+              </p>
+            </div>
+
+            <div className="flex items-center justify-between gap-4 sm:flex-col sm:items-end">
+              <Link
+                to="/settings#builder-profile"
+                className="inline-flex items-center gap-2 text-[15px] font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
+              >
+                {builderProfileCount === 0 ? 'Set up my profile' : 'Finish my profile'}
+                <ArrowRight className="h-4 w-4" />
+              </Link>
+              <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                {builderProfileCount === 0 ? '2 min setup' : `${builderProfileCount}/3 saved`}
+              </span>
+            </div>
+          </div>
+        </motion.div>
+      ) : null}
+
       {loading ? (
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
           {[1, 2, 3].map((item) => (
@@ -291,17 +329,25 @@ export default function Dashboard() {
             const completedStageCount = stages.filter((stage) => stage.status === 'complete').length;
             const stageTotal = stages.length || 1;
             const stageProgress = Math.min(Math.max(completedStageCount, 0), stageTotal);
-            const statusLabel = nextStep?.status === 'needs_review'
-              ? 'Your review'
-              : nextStep?.status === 'agent_working'
-                ? 'Working now'
-                : 'Next up';
+            const statusLabel = project.generation_status === 'intake'
+              ? 'Continue intake'
+              : nextStep?.status === 'needs_review'
+                ? 'Your review'
+                : nextStep?.status === 'agent_working'
+                  ? 'Working now'
+                  : 'Next up';
 
             return (
               <motion.article
                 key={project.id}
                 variants={itemVariants}
-                onClick={() => navigate(`/project/${project.id}`)}
+                onClick={() =>
+                  navigate(
+                    project.generation_status === 'intake'
+                      ? `/new?intake=${project.id}`
+                      : `/project/${project.id}`,
+                  )
+                }
                 className="surface-card group cursor-pointer p-6 transition-transform duration-200 hover:-translate-y-1"
               >
                 <div className="mb-5 flex items-start justify-between gap-4">
@@ -382,7 +428,11 @@ export default function Dashboard() {
                   </div>
                   <div className="flex items-center gap-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary">
                     <ArrowRight className="h-4 w-4 text-accent-primary" />
-                    <span>{nextStep?.title ?? 'Plan details are still coming together.'}</span>
+                    <span>
+                      {project.generation_status === 'intake'
+                        ? 'Finish the intake conversation.'
+                        : nextStep?.title ?? 'Plan details are still coming together.'}
+                    </span>
                   </div>
                 </div>
 

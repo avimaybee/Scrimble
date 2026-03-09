@@ -262,6 +262,11 @@ export default function ProjectGeneration() {
       throw new Error('Project not found.');
     }
 
+    if (projectData.generation_status === 'intake') {
+      navigate(`/new?intake=${id}`, { replace: true });
+      return;
+    }
+
     setProject(projectData);
     setStatus(statusData);
 

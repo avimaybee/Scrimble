@@ -14,11 +14,18 @@ import {
   ProjectGenerationEvent,
   ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
+  ProjectIntakeSession,
   Stage,
   Step,
+  WorkflowBriefDrift,
   WorkflowUpdateActivity,
   WorkflowUpdateResult,
 } from '../types';
+import type {
+  BuilderProfileCategory,
+  BuilderProfileTool,
+  ToolProficiency,
+} from './builder-profile';
 
 const API_BASE = '/api';
 
@@ -37,6 +44,42 @@ interface CreateProjectResponse {
 interface UpdateWorkflowOptions {
   onActivity?: (activity: WorkflowUpdateActivity) => void;
 }
+
+type IntakeStartPayload = {
+  description: string;
+  providerId?: string;
+};
+
+type IntakeRespondPayload = {
+  message: string;
+  providerId?: string;
+};
+
+type IntakeConfirmPayload = {
+  providerId?: string;
+};
+
+export class WorkflowBriefDriftError extends Error {
+  drift: WorkflowBriefDrift;
+
+  constructor(drift: WorkflowBriefDrift) {
+    super(drift.message);
+    this.name = 'WorkflowBriefDriftError';
+    this.drift = drift;
+  }
+}
+
+type SaveUserToolPayload = {
+  category: BuilderProfileCategory;
+  name: string;
+  proficiency?: ToolProficiency;
+  notes?: string | null;
+};
+
+type UpdateUserToolPayload = {
+  proficiency?: ToolProficiency;
+  notes?: string | null;
+};
 
 interface StreamProjectGenerationOptions {
   signal?: AbortSignal;
@@ -128,6 +171,35 @@ export const dbService = {
 
   async getProjectGenerationStatus(projectId: string): Promise<ProjectGenerationStatusResponse> {
     return fetchAPI<ProjectGenerationStatusResponse>(`/projects/${projectId}/status`);
+  },
+
+  async startProjectIntake(payload: IntakeStartPayload): Promise<ProjectIntakeSession> {
+    return fetchAPI<ProjectIntakeSession>('/intake/start', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async respondToProjectIntake(projectId: string, payload: IntakeRespondPayload): Promise<ProjectIntakeSession> {
+    return fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async confirmProjectIntake(projectId: string, payload: IntakeConfirmPayload = {}): Promise<{
+    success: boolean;
+    project_id: string;
+    generation_status: Project['generation_status'];
+  }> {
+    return fetchAPI(`/intake/${projectId}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getProjectIntake(projectId: string): Promise<ProjectIntakeSession> {
+    return fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/brief`);
   },
 
   async getGeneratedFiles(projectId: string): Promise<GeneratedProjectFile[]> {
@@ -468,7 +540,7 @@ export const dbService = {
 
   async updateWorkflow(
     workflowId: string,
-    payload: { message: string; providerId?: string },
+    payload: { message: string; providerId?: string; driftResolution?: 'apply_now' | 'save_for_later' },
     options: UpdateWorkflowOptions = {},
   ): Promise<WorkflowUpdateResult> {
     const response = await fetchWithAuth(`/workflows/${workflowId}/update`, {
@@ -480,7 +552,14 @@ export const dbService = {
     });
 
     if (!response.ok) {
-      const errorBody = (await response.json().catch(() => null)) as { error?: string } | null;
+      const errorBody = (await response.json().catch(() => null)) as {
+        error?: string;
+        error_code?: string;
+        drift?: WorkflowBriefDrift;
+      } | null;
+      if (errorBody?.error_code === 'brief_drift' && errorBody.drift) {
+        throw new WorkflowBriefDriftError(errorBody.drift);
+      }
       throw new Error(errorBody?.error || 'Failed to update the workflow.');
     }
 
@@ -526,6 +605,10 @@ export const dbService = {
         }
 
         if (currentEvent === 'error') {
+          if (parsed.error_code === 'brief_drift' && parsed.drift && typeof parsed.drift === 'object') {
+            throw new WorkflowBriefDriftError(parsed.drift as WorkflowBriefDrift);
+          }
+
           throw new Error(
             typeof parsed.error === 'string' ? parsed.error : 'Failed to update the workflow.',
           );
@@ -581,6 +664,30 @@ export const dbService = {
 
   async deleteProject(projectId: string): Promise<void> {
     await fetchAPI<void>(`/projects/${projectId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async getUserTools(): Promise<BuilderProfileTool[]> {
+    return fetchAPI<BuilderProfileTool[]>('/settings/user-tools');
+  },
+
+  async saveUserTool(payload: SaveUserToolPayload): Promise<BuilderProfileTool> {
+    return fetchAPI<BuilderProfileTool>('/settings/user-tools', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async updateUserTool(id: string, payload: UpdateUserToolPayload): Promise<BuilderProfileTool> {
+    return fetchAPI<BuilderProfileTool>(`/settings/user-tools/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async deleteUserTool(id: string): Promise<void> {
+    await fetchAPI<void>(`/settings/user-tools/${id}`, {
       method: 'DELETE',
     });
   },

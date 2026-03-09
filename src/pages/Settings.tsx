@@ -35,6 +35,7 @@ import {
   saveMCPServer,
   toggleMCPServer,
 } from '../lib/mcp';
+import { BuilderProfileSection } from '../components/settings/builder-profile-section';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -585,6 +586,10 @@ export default function Settings() {
           </button>
         </div>
       </motion.section>
+
+      <motion.div variants={itemVariants} className="mb-8">
+        <BuilderProfileSection />
+      </motion.div>
 
       <motion.section
         variants={itemVariants}

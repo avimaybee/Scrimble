@@ -53,13 +53,23 @@ import {
   type GithubIssue,
   type GithubRepoAnalysis,
 } from '../../workers/tools';
+import {
+  getBuilderProfileDocsTopic,
+  getBuilderProfileResearchUrls,
+  normalizeBuilderProfileName,
+} from '../../src/lib/builder-profile';
 import { getConnectedResearchTools } from './mcp-servers';
+import { appendProjectBriefSystemPrompt, loadProjectBriefContext } from './project-briefs';
 import {
   appendResearchFooter,
   collectStepResearchContext,
   formatStepResearchPrompt,
   type StepResearchContext,
 } from './step-research';
+import {
+  buildSkillFileProfileInstructions,
+  loadBuilderProfileContext,
+} from './user-tools';
 
 type ProviderConfig = {
   providerId: string;
@@ -166,6 +176,20 @@ type FetchedTechnologyResearch = {
   bug_report_digest: string;
   source_ledger: Batch2FetchAndRead['sources'];
   community_pages: FetchedCommunitySource[];
+};
+
+type LoadedBuilderProfileContext = Awaited<ReturnType<typeof loadBuilderProfileContext>>;
+type LoadedProjectBriefContext = Awaited<ReturnType<typeof loadProjectBriefContext>>;
+
+type ResearchTechnologyTarget = {
+  name: string;
+  docs_url: string;
+  github_url: string;
+  changelog_url: string;
+  docs_topic: string;
+  community_search_results: SearchResult[];
+  breaking_change_search_results: SearchResult[];
+  source: 'brief' | 'profile' | 'inferred';
 };
 
 type ActiveStepSummary = {
@@ -312,6 +336,91 @@ function dedupeResearchSources(sources: Batch2FetchAndRead['sources']) {
     seen.add(key);
     return true;
   });
+}
+
+function dedupeResearchTargets(targets: ResearchTechnologyTarget[]) {
+  const merged = new Map<string, ResearchTechnologyTarget>();
+
+  for (const target of targets) {
+    const key = normalizeBuilderProfileName(target.name);
+    const existing = merged.get(key);
+
+    if (!existing) {
+      merged.set(key, target);
+      continue;
+    }
+
+    merged.set(key, {
+      ...existing,
+      docs_url: existing.docs_url || target.docs_url,
+      github_url: existing.github_url || target.github_url,
+      changelog_url: existing.changelog_url || target.changelog_url,
+      docs_topic: existing.docs_topic || target.docs_topic,
+      community_search_results: dedupeSearchResults([
+        ...existing.community_search_results,
+        ...target.community_search_results,
+      ]),
+      breaking_change_search_results: dedupeSearchResults([
+        ...existing.breaking_change_search_results,
+        ...target.breaking_change_search_results,
+      ]),
+    });
+  }
+
+  return Array.from(merged.values());
+}
+
+function buildResearchTargets(
+  inferredTechnologies: Batch1ResearchStack['technologies'],
+  builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
+  const inferredTargets: ResearchTechnologyTarget[] = inferredTechnologies.map((technology) => ({
+    ...technology,
+    docs_topic: 'installation, migration, compatibility, breaking changes, best practices',
+    source: 'inferred',
+  }));
+
+  const briefTargets: ResearchTechnologyTarget[] = projectBrief.confirmedStackTools.map((technology) => {
+    const researchUrls = getBuilderProfileResearchUrls(technology);
+    return {
+      name: technology,
+      docs_url: researchUrls.docsUrl,
+      github_url: researchUrls.githubUrl,
+      changelog_url: researchUrls.changelogUrl,
+      docs_topic:
+        researchUrls.docsUrl || researchUrls.githubUrl || researchUrls.changelogUrl
+          ? getBuilderProfileDocsTopic('frontend', technology)
+          : 'installation, migration, compatibility, breaking changes, best practices',
+      community_search_results: [],
+      breaking_change_search_results: [],
+      source: 'brief',
+    };
+  });
+
+  const profileTargets: ResearchTechnologyTarget[] = builderProfile.declaredTools.map((tool) => ({
+    name: tool.name,
+    docs_url: tool.docs_url,
+    github_url: tool.github_url,
+    changelog_url: tool.changelog_url,
+    docs_topic:
+      tool.proficiency === 'learning'
+        ? `${tool.docs_topic}, beginner setup, common mistakes`
+        : tool.docs_topic,
+    community_search_results: [],
+    breaking_change_search_results: [],
+      source: 'profile',
+  }));
+
+  return dedupeResearchTargets([...briefTargets, ...profileTargets, ...inferredTargets]);
+}
+
+function emptyFetchedSource(url: string, title: string) {
+  return {
+    content: '',
+    title,
+    url,
+  };
 }
 
 function createResearchSource(
@@ -1015,7 +1124,6 @@ async function callValidatedBatch<T>(
       baseUrl: provider.baseUrl,
       system: options.systemPrompt,
       prompt,
-      stream: attempt === 1,
       onReasoningDelta:
         attempt === 1
           ? (delta) => emitThinking(options.env, options.projectId, options.runType, delta)
@@ -1356,10 +1464,16 @@ async function updateProjectMetadataFromAdr(env: Bindings, projectId: string, ad
     .run();
 }
 
-async function executeBatch1(env: Bindings, project: ProjectRecord, provider: ProviderConfig) {
+async function executeBatch1(
+  env: Bindings,
+  project: ProjectRecord,
+  provider: ProviderConfig,
+  _builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
   const startedAt = Date.now();
   const input = {
-    description: project.description || '',
+    description: projectBrief.summary || project.description || '',
   };
   const currentYear = new Date().getFullYear();
   const toolEnv: ToolEnv = {
@@ -1378,10 +1492,12 @@ async function executeBatch1(env: Bindings, project: ProjectRecord, provider: Pr
     message: 'Scanning your brief for technologies, services, and infrastructure choices...',
   });
 
-  const systemPrompt =
-    'You are Scrimble’s stack research scout. Infer every technology, library, framework, hosted service, and infrastructure tool implied by the project description. Return only valid JSON.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s stack research scout. Infer every technology, library, framework, hosted service, and infrastructure tool implied by the project description. Return only valid JSON.',
+    projectBrief.promptContext,
+  );
   const prompt = `Project description:
-${project.description || 'No description provided.'}
+${projectBrief.summary || project.description || 'No description provided.'}
 
 Identify the stack implied by the idea. For each technology, provide:
 - name
@@ -1488,10 +1604,17 @@ Only include technologies that matter to implementation.`;
   }
 }
 
-async function executeBatch2(env: Bindings, project: ProjectRecord, provider: ProviderConfig) {
+async function executeBatch2(
+  env: Bindings,
+  project: ProjectRecord,
+  provider: ProviderConfig,
+  builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
   const startedAt = Date.now();
   const projectId = project.id;
   const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
+  const researchTargets = buildResearchTargets(batch1.technologies, builderProfile, projectBrief);
   const fetchedSources: FetchedTechnologyResearch[] = [];
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   let issuesFound = 0;
@@ -1508,31 +1631,58 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
     projectId,
     batchName: 'batch_2_fetch_and_read',
     kind: 'fetch',
-    message: `Reading the docs for ${batch1.technologies.length} technolog${batch1.technologies.length === 1 ? 'y' : 'ies'}...`,
+      message:
+        projectBrief.confirmedStackTools.length > 0
+          ? `Reading the docs for ${researchTargets.length} technologies, starting with ${projectBrief.confirmedStackTools.length} confirmed stack tool${projectBrief.confirmedStackTools.length === 1 ? '' : 's'} from your brief...`
+          : builderProfile.declaredTools.length > 0
+            ? `Reading the docs for ${researchTargets.length} technologies, starting with ${builderProfile.declaredTools.length} saved tool${builderProfile.declaredTools.length === 1 ? '' : 's'} from your builder profile...`
+          : `Reading the docs for ${researchTargets.length} technolog${researchTargets.length === 1 ? 'y' : 'ies'}...`,
   });
 
-  for (const technology of batch1.technologies) {
+  for (const technology of researchTargets) {
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
       kind: 'fetch',
-      message: `Researching ${technology.name} with every source you've connected...`,
+      message:
+        technology.source === 'brief'
+          ? `Researching your confirmed stack tool ${technology.name} before anything else...`
+          : technology.source === 'profile'
+          ? `Researching your saved tool ${technology.name} before anything else...`
+          : `Researching ${technology.name} with every source you've connected...`,
     });
 
     const githubRepository = extractGitHubRepository(technology.github_url);
+    const communitySearchResults =
+      technology.community_search_results.length > 0
+        ? technology.community_search_results
+        : dedupeSearchResults(
+            await searchWeb(`${technology.name} vs alternatives ${new Date().getFullYear()}`, project.user_id, toolEnv),
+          );
+    const breakingChangeSearchResults =
+      technology.breaking_change_search_results.length > 0
+        ? technology.breaking_change_search_results
+        : dedupeSearchResults(
+            await searchWeb(
+              `${technology.name} breaking changes deprecations ${new Date().getFullYear()}`,
+              project.user_id,
+              toolEnv,
+            ),
+          );
     const searchResults = dedupeSearchResults([
-      ...technology.community_search_results,
-      ...technology.breaking_change_search_results,
+      ...communitySearchResults,
+      ...breakingChangeSearchResults,
     ]);
+    const docsUrl = technology.docs_url.trim();
+    const changelogUrl = technology.changelog_url.trim();
     const [docsResult, changelogResult, liveDocsResult, githubAnalysis, githubIssues] = await Promise.all([
-      fetchUrl(technology.docs_url, toolEnv),
-      fetchUrl(technology.changelog_url, toolEnv),
-      getLibraryDocs(
-        technology.name,
-        'installation, migration, compatibility, breaking changes, best practices',
-        project.user_id,
-        toolEnv,
-      ),
+      docsUrl
+        ? fetchUrl(docsUrl, toolEnv)
+        : Promise.resolve(emptyFetchedSource('', `${technology.name} docs`)),
+      changelogUrl
+        ? fetchUrl(changelogUrl, toolEnv)
+        : Promise.resolve(emptyFetchedSource('', `${technology.name} changelog`)),
+      getLibraryDocs(technology.name, technology.docs_topic, project.user_id, toolEnv),
       githubRepository
         ? analyzeGithubRepo(githubRepository.owner, githubRepository.repo, project.user_id, toolEnv)
         : Promise.resolve(emptyGithubRepoAnalysis()),
@@ -1649,7 +1799,7 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
     }
 
     if (githubRepository && githubAnalysis.summary) {
-      const recentBreakingSignals = githubIssues.length + technology.breaking_change_search_results.length;
+      const recentBreakingSignals = githubIssues.length + breakingChangeSearchResults.length;
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
@@ -1682,7 +1832,7 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
             createResearchSource(
               technology.name,
               'Web fetch',
-              technology.docs_url,
+              docsUrl || liveDocsResult.source,
               `${technology.name} docs`,
               docsResult.content,
             ),
@@ -1693,7 +1843,7 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
             createResearchSource(
               technology.name,
               liveDocsResult.source === 'Context7' ? 'Context7' : 'Live docs',
-              technology.docs_url,
+              liveDocsResult.source.startsWith('http') ? liveDocsResult.source : docsUrl,
               `${technology.name} live docs`,
               liveDocsResult.content,
             ),
@@ -1704,7 +1854,7 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
             createResearchSource(
               technology.name,
               'Web fetch',
-              technology.changelog_url,
+              changelogUrl,
               `${technology.name} changelog`,
               changelogResult.content,
             ),
@@ -1743,9 +1893,9 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
 
     fetchedSources.push({
       technology: technology.name,
-      docs_url: technology.docs_url,
+      docs_url: docsUrl,
       github_url: technology.github_url,
-      changelog_url: technology.changelog_url,
+      changelog_url: changelogUrl,
       docs_content: docsContentSections.filter(Boolean).join('\n\n') || 'Documentation source unavailable.',
       github_readme: githubAnalysis.readme || githubAnalysis.summary || 'GitHub repository data unavailable.',
       latest_version: latestVersion,
@@ -1775,12 +1925,23 @@ async function executeBatch2(env: Bindings, project: ProjectRecord, provider: Pr
 
   const input = {
     technologies: batch1.technologies,
+    declared_tools: builderProfile.declaredTools.map((tool) => ({
+      category: tool.category,
+      name: tool.name,
+      proficiency: tool.proficiency,
+    })),
+    research_targets: researchTargets.map((target) => ({
+      name: target.name,
+      source: target.source,
+    })),
     fetched_sources: fetchedSources,
     data_quality: dataQuality,
   };
 
-  const systemPrompt =
-    'You are Scrimble’s technical research analyst. Turn fetched docs, readmes, metadata, and changelog snippets into a structured research corpus. Keep the important technical details concrete. Return only valid JSON.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s technical research analyst. Turn fetched docs, readmes, metadata, and changelog snippets into a structured research corpus. Keep the important technical details concrete. Return only valid JSON.',
+    projectBrief.promptContext,
+  );
   const prompt = `Research the following fetched technology materials and convert them into a structured corpus.
 
 ${JSON.stringify({ fetchedSources, dataQuality }, null, 2)}
@@ -1867,11 +2028,18 @@ Preserve specific version and compatibility details.`;
   }
 }
 
-async function executeBatch3(env: Bindings, projectId: string, provider: ProviderConfig, project: ProjectRecord) {
+async function executeBatch3(
+  env: Bindings,
+  projectId: string,
+  provider: ProviderConfig,
+  project: ProjectRecord,
+  _builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
   const startedAt = Date.now();
   const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const input = {
-    project_description: project.description || '',
+    project_description: projectBrief.summary || project.description || '',
     provider_id: provider.providerId,
     preferred_ide: 'cursor',
     research: batch2.research,
@@ -1887,10 +2055,12 @@ async function executeBatch3(env: Bindings, projectId: string, provider: Provide
     message: 'Designing your data model...',
   });
 
-  const systemPrompt =
-    'You are Scrimble’s staff engineer architect. Use the research corpus to produce a clear architecture decision record with explicit package and service choices. Return only valid JSON.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s staff engineer architect. Use the research corpus to produce a clear architecture decision record with explicit package and service choices. Return only valid JSON.',
+    projectBrief.promptContext,
+  );
   const prompt = `Project description:
-${project.description || 'No description provided.'}
+${projectBrief.summary || project.description || 'No description provided.'}
 
 Research corpus:
 ${JSON.stringify(batch2.research, null, 2)}
@@ -1956,7 +2126,13 @@ Base every recommendation on the provided research corpus.`;
   }
 }
 
-async function executeBatch4(env: Bindings, projectId: string, provider: ProviderConfig) {
+async function executeBatch4(
+  env: Bindings,
+  projectId: string,
+  provider: ProviderConfig,
+  _builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
   const input = {
@@ -1973,8 +2149,10 @@ async function executeBatch4(env: Bindings, projectId: string, provider: Provide
     message: 'Building your execution plan...',
   });
 
-  const systemPrompt =
-    'You are Scrimble’s build planner. Generate the full staged implementation plan in JSON. Every step must reference the exact packages, services, and versions from the approved architecture context, including any human-reviewed changes. Return only valid JSON.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s build planner. Generate the full staged implementation plan in JSON. Every step must reference the exact packages, services, and versions from the approved architecture context, including any human-reviewed changes. Return only valid JSON.',
+    projectBrief.promptContext,
+  );
   const prompt = `Architecture decision record:
 ${JSON.stringify(reviewContext.adr, null, 2)}
 
@@ -2034,7 +2212,13 @@ Rules:
   }
 }
 
-async function executeBatch5(env: Bindings, projectId: string, provider: ProviderConfig) {
+async function executeBatch5(
+  env: Bindings,
+  projectId: string,
+  provider: ProviderConfig,
+  _builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
   const startedAt = Date.now();
   const project = await getProjectById(env, projectId);
   if (!project) {
@@ -2104,8 +2288,10 @@ async function executeBatch5(env: Bindings, projectId: string, provider: Provide
     message: 'Writing step details for every part of the plan...',
   });
 
-  const systemPrompt =
-    'You are Scrimble’s step enrichment agent. Enrich every step in one pass with concrete AI output and copy-paste prompts. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s step enrichment agent. Enrich every step in one pass with concrete AI output and copy-paste prompts. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.',
+    projectBrief.promptContext,
+  );
   const prompt = `Plan:
 ${JSON.stringify(plan, null, 2)}
 
@@ -2180,7 +2366,13 @@ For each step, obey any requirements array included in the live step research co
   }
 }
 
-async function executeBatch6(env: Bindings, projectId: string, provider: ProviderConfig) {
+async function executeBatch6(
+  env: Bindings,
+  projectId: string,
+  provider: ProviderConfig,
+  builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
@@ -2204,8 +2396,13 @@ async function executeBatch6(env: Bindings, projectId: string, provider: Provide
     message: 'Preparing your downloadable files...',
   });
 
-  const systemPrompt =
-    'You are Scrimble’s file generator. Produce every downloadable AI context file from the approved architecture and enriched plan. Return only valid JSON with the exact required filenames and complete file contents.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s file generator. Produce every downloadable AI context file from the approved architecture and enriched plan. Return only valid JSON with the exact required filenames and complete file contents.',
+    projectBrief.promptContext,
+  );
+  const skillFileProfileInstructions = buildSkillFileProfileInstructions(
+    builderProfile.primaryCodingEnvironment,
+  );
   const prompt = `Architecture:
 ${JSON.stringify(reviewContext.adr, null, 2)}
 
@@ -2267,7 +2464,10 @@ Rules:
 - use exact package names and versions from the approved architecture context, applying any human review changes everywhere they matter
 - if the approved feedback changes a package choice, the generated files must reflect the approved choice, not the original ADR wording
 - use ${currentActiveStep ? `"${currentActiveStep.title}" in stage "${currentActiveStep.stage_title}"` : 'the first step in the plan order'} as the current-step context
-- the scrimble-mcp.json file should stay valid JSONC-style text and use the configuration shape expected by the selected IDE`;
+- the scrimble-mcp.json file should stay valid JSONC-style text and use the configuration shape expected by the selected IDE
+
+Builder profile file rules:
+${skillFileProfileInstructions}`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -2369,6 +2569,12 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
   }
 
   const provider = await resolveProviderConfiguration(env, message.userId, message.providerId);
+  const builderProfile = await loadBuilderProfileContext(message.userId, env);
+  const projectBrief = await loadProjectBriefContext(env, message.projectId, message.userId, {
+    rawDescription: project.description || '',
+    projectStack: project.stack,
+    existingTools: builderProfile.declaredTools.map((tool) => tool.name),
+  });
 
   try {
     if (currentStatus === 'queued') {
@@ -2385,26 +2591,28 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
     }
 
     switch (currentStatus) {
+      case 'intake':
+        return;
       case 'queued':
-        await executeBatch1(env, project, provider);
+        await executeBatch1(env, project, provider, builderProfile, projectBrief);
       // fall through
       case 'batch_1_research_stack':
-        await executeBatch2(env, project, provider);
+        await executeBatch2(env, project, provider, builderProfile, projectBrief);
       // fall through
       case 'batch_2_fetch_and_read':
-        await executeBatch3(env, project.id, provider, project);
+        await executeBatch3(env, project.id, provider, project, builderProfile, projectBrief);
       // fall through
       case 'batch_3_architect':
         await pauseForArchitectureReview(env, project.id);
         return;
       case 'approved':
-        await executeBatch4(env, project.id, provider);
+        await executeBatch4(env, project.id, provider, builderProfile, projectBrief);
       // fall through
       case 'batch_4_plan_build':
-        await executeBatch5(env, project.id, provider);
+        await executeBatch5(env, project.id, provider, builderProfile, projectBrief);
       // fall through
       case 'batch_5_enrich_steps':
-        await executeBatch6(env, project.id, provider);
+        await executeBatch6(env, project.id, provider, builderProfile, projectBrief);
       // fall through
       case 'batch_6_generate_files':
         await finalizeProjectGeneration(env, project.id);

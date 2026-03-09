@@ -8,6 +8,7 @@ import {
   type SearchResult,
 } from '../../workers/tools';
 import { callAIText, extractJSON } from './ai';
+import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
 import {
   Batch2FetchAndReadSchema,
   Batch3ArchitectSchema,
@@ -16,6 +17,12 @@ import {
 } from './generation-schemas';
 import { loadBatchOutput } from './generation-pipeline';
 import { applyPlanDiffToProject } from './plan-diff';
+import {
+  appendProjectBriefSystemPrompt,
+  loadProjectBriefContext,
+  upsertProjectBrief,
+  type StoredProjectBrief,
+} from './project-briefs';
 import { appendResearchFooter, collectStepResearchContext, formatStepResearchPrompt } from './step-research';
 import type { PlanDiff } from '../types/diff';
 import { diffSchema } from '../types/diff';
@@ -61,6 +68,8 @@ type WorkflowUpdateProgress = {
   message: string;
 };
 
+type WorkflowDriftResolution = 'apply_now' | 'save_for_later';
+
 type WorkflowUpdateIntent = {
   summary: string;
   changes: Array<{
@@ -80,7 +89,23 @@ type WorkflowMiniResearchItem = Batch2FetchAndRead['research'][number];
 const workflowUpdateRequestSchema = z.object({
   message: z.string().trim().min(1),
   providerId: z.string().trim().optional(),
+  driftResolution: z.enum(['apply_now', 'save_for_later']).optional(),
 });
+
+export class WorkflowBriefDriftError extends Error {
+  drift: {
+    message: string;
+    change_label: string;
+    recommendation_add_now: string;
+    recommendation_save_for_later: string;
+  };
+
+  constructor(drift: WorkflowBriefDriftError['drift']) {
+    super(drift.message);
+    this.name = 'WorkflowBriefDriftError';
+    this.drift = drift;
+  }
+}
 
 const workflowUpdateIntentSchema = z.object({
   summary: z.string(),
@@ -284,9 +309,12 @@ async function analyzeWorkflowUpdateIntent(options: {
   adr: Batch3Architect;
   research: Batch2FetchAndRead;
   message: string;
+  projectBriefPrompt: string;
 }) {
-  const systemPrompt =
-    'You are Scrimble’s plan update analyzer. Read the requested plan change, identify the technologies that are being added, removed, swapped, or substantially updated, and return only valid JSON.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s plan update analyzer. Read the requested plan change, identify the technologies that are being added, removed, swapped, or substantially updated, and return only valid JSON.',
+    options.projectBriefPrompt,
+  );
   const prompt = `Project:
 ${JSON.stringify(
     {
@@ -485,9 +513,12 @@ async function generatePlanDiff(options: {
   intent: WorkflowUpdateIntent;
   miniResearch: WorkflowMiniResearchItem[];
   message: string;
+  projectBriefPrompt: string;
 }) {
-  const systemPrompt =
-    'You are Scrimble’s plan adapter. Update the workflow surgically based on the user’s request and the live research corpus. Return only valid JSON that matches the required diff schema.';
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s plan adapter. Update the workflow surgically based on the user’s request and the live research corpus. Return only valid JSON that matches the required diff schema.',
+    options.projectBriefPrompt,
+  );
   const prompt = `Project:
 ${JSON.stringify(
     {
@@ -569,6 +600,7 @@ async function reEnrichAffectedSteps(options: {
   research: Batch2FetchAndRead;
   miniResearch: WorkflowMiniResearchItem[];
   affectedStepIds: string[];
+  projectBriefPrompt: string;
   onProgress?: (progress: WorkflowUpdateProgress) => Promise<void> | void;
 }) {
   const affectedSteps = await loadAffectedSteps(options.env, options.workflowId, options.affectedStepIds);
@@ -594,12 +626,14 @@ async function reEnrichAffectedSteps(options: {
       additionalResearch: options.miniResearch,
     });
 
-    const systemPrompt =
-      'You are Scrimble’s step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.';
+    const systemPrompt = appendProjectBriefSystemPrompt(
+      'You are Scrimble’s step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.',
+      options.projectBriefPrompt,
+    );
     const prompt = [
       `Step title: ${step.title}`,
       `Project name: ${options.project.name}`,
-      `Project brief: ${options.project.description || 'No project description provided.'}`,
+      'Project brief: Follow the structured project brief in the system prompt before applying any step-level changes.',
       `Project stack: ${options.project.stack || '{}'}`,
       `Step objective: ${step.objective || 'Not specified yet.'}`,
       `Why it matters: ${step.why_it_matters || 'Not specified yet.'}`,
@@ -630,12 +664,85 @@ async function reEnrichAffectedSteps(options: {
   }
 }
 
+function normalizeBriefKey(value: string) {
+  return normalizeBuilderProfileName(value).replace(/[^a-z0-9]+/g, ' ');
+}
+
+function mergeIntentIntoBrief(brief: StoredProjectBrief, intent: WorkflowUpdateIntent) {
+  const changedTechnologies = intent.changes
+    .filter((change) => change.action !== 'remove')
+    .map((change) => change.technology)
+    .filter(Boolean);
+  const changedTechnologyKeys = new Set(changedTechnologies.map(normalizeBriefKey));
+
+  return {
+    what_it_is: brief.what_it_is,
+    who_its_for: brief.who_its_for,
+    problem_solved: brief.problem_solved,
+    v1_scope: {
+      in: Array.from(new Set([...brief.v1_scope.in, ...changedTechnologies])),
+      out: brief.v1_scope.out.filter((entry) => !changedTechnologyKeys.has(normalizeBriefKey(entry))),
+    },
+    stack_context: {
+      ...brief.stack_context,
+      confirmed: Array.from(new Set([...brief.stack_context.confirmed, ...changedTechnologies])),
+    },
+    definition_done: brief.definition_done,
+    constraints: brief.constraints,
+  };
+}
+
+function detectWorkflowBriefDrift(brief: StoredProjectBrief | null, intent: WorkflowUpdateIntent) {
+  if (!brief) {
+    return null;
+  }
+
+  const knownStack = new Set(
+    [
+      ...brief.stack_context.confirmed,
+      ...brief.stack_context.existing_tools,
+      ...brief.stack_context.open_to,
+      ...brief.v1_scope.in,
+      ...brief.future_ideas,
+    ].map(normalizeBriefKey),
+  );
+  const explicitlyOut = new Set(brief.v1_scope.out.map(normalizeBriefKey));
+
+  const conflict = intent.changes.find((change) => {
+    if (!change.technology || change.action === 'remove') {
+      return false;
+    }
+
+    const key = normalizeBriefKey(change.technology);
+    return !knownStack.has(key) || explicitlyOut.has(key);
+  });
+
+  if (!conflict) {
+    return null;
+  }
+
+  const actionLabel =
+    conflict.action === 'replace'
+      ? `switching to ${conflict.technology}`
+      : conflict.action === 'update'
+        ? `changing the stack to include ${conflict.technology}`
+        : `adding ${conflict.technology}`;
+
+  return {
+    message: `Heads up - ${actionLabel} here wasn't in your original v1 scope. Do you want to add it to your plan and update your brief, or keep it for later?`,
+    change_label: conflict.technology,
+    recommendation_add_now: 'Add it now',
+    recommendation_save_for_later: 'Save for later',
+  };
+}
+
 export async function processWorkflowUpdate(options: {
   env: Bindings;
   workflowId: string;
   project: WorkflowUpdateProjectRecord;
   provider: WorkflowUpdateProviderContext;
   message: string;
+  driftResolution?: WorkflowDriftResolution;
   onProgress?: (progress: WorkflowUpdateProgress) => Promise<void> | void;
 }) {
   const [adr, research, workflowSnapshot] = await Promise.all([
@@ -643,6 +750,15 @@ export async function processWorkflowUpdate(options: {
     loadBatchOutput(options.env, options.project.id, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema),
     loadWorkflowSnapshot(options.env, options.workflowId),
   ]);
+  let projectBriefContext = await loadProjectBriefContext(
+    options.env,
+    options.project.id,
+    options.project.user_id,
+    {
+      rawDescription: options.project.description || '',
+      projectStack: options.project.stack,
+    },
+  );
 
   await options.onProgress?.({
     icon: '🔍',
@@ -655,7 +771,65 @@ export async function processWorkflowUpdate(options: {
     adr,
     research,
     message: options.message,
+    projectBriefPrompt: projectBriefContext.promptContext,
   });
+
+  const briefDrift = detectWorkflowBriefDrift(projectBriefContext.brief, intent);
+  if (briefDrift && !options.driftResolution) {
+    throw new WorkflowBriefDriftError(briefDrift);
+  }
+
+  if (briefDrift && options.driftResolution === 'save_for_later') {
+    if (projectBriefContext.brief) {
+      await upsertProjectBrief(options.env, {
+        projectId: options.project.id,
+        rawDescription: projectBriefContext.effectiveBrief.raw_description,
+        structuredBrief: {
+          what_it_is: projectBriefContext.effectiveBrief.what_it_is,
+          who_its_for: projectBriefContext.effectiveBrief.who_its_for,
+          problem_solved: projectBriefContext.effectiveBrief.problem_solved,
+          v1_scope: projectBriefContext.effectiveBrief.v1_scope,
+          stack_context: projectBriefContext.effectiveBrief.stack_context,
+          definition_done: projectBriefContext.effectiveBrief.definition_done,
+          constraints: projectBriefContext.effectiveBrief.constraints,
+        },
+        toolsContext: projectBriefContext.toolsContext,
+        conversationTurns: projectBriefContext.effectiveBrief.conversation_turns,
+        futureIdeas: [
+          ...projectBriefContext.effectiveBrief.future_ideas,
+          briefDrift.change_label,
+        ],
+      });
+    }
+
+    return {
+      summary: `Saved ${briefDrift.change_label} for later without changing the current plan.`,
+      updated_steps: 0,
+    };
+  }
+
+  if (briefDrift && options.driftResolution === 'apply_now' && projectBriefContext.brief) {
+    const updatedBrief = mergeIntentIntoBrief(projectBriefContext.effectiveBrief, intent);
+    await upsertProjectBrief(options.env, {
+      projectId: options.project.id,
+      rawDescription: projectBriefContext.effectiveBrief.raw_description,
+      structuredBrief: updatedBrief,
+      toolsContext: projectBriefContext.toolsContext,
+      conversationTurns: projectBriefContext.effectiveBrief.conversation_turns,
+      futureIdeas: projectBriefContext.effectiveBrief.future_ideas.filter(
+        (idea) => normalizeBriefKey(idea) !== normalizeBriefKey(briefDrift.change_label),
+      ),
+    });
+    projectBriefContext = await loadProjectBriefContext(
+      options.env,
+      options.project.id,
+      options.project.user_id,
+      {
+        rawDescription: options.project.description || '',
+        projectStack: options.project.stack,
+      },
+    );
+  }
 
   const miniResearch = await runMiniResearch({
     env: options.env,
@@ -680,6 +854,7 @@ export async function processWorkflowUpdate(options: {
     intent,
     miniResearch,
     message: options.message,
+    projectBriefPrompt: projectBriefContext.promptContext,
   });
 
   const applyResult = await applyPlanDiffToProject(options.env, options.project.id, diff);
@@ -697,6 +872,7 @@ export async function processWorkflowUpdate(options: {
       research,
       miniResearch,
       affectedStepIds: applyResult.affectedStepIds,
+      projectBriefPrompt: projectBriefContext.promptContext,
       onProgress: options.onProgress,
     });
   }
