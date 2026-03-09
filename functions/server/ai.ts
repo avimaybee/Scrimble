@@ -97,8 +97,16 @@ export async function streamToText(
   }
 
   console.log('[STREAM_DEBUG] final contentBuffer:', contentBuffer.slice(0, 200));
+
+  if (!contentBuffer && leftover.trim()) {
+    // If we have reasoning but no content yet, and the stream suddenly ends,
+    // it might be a silent cut-off or a thought-loop exit.
+    console.warn('[STREAM_DEBUG] Stream ended with no content but leftover reasoning/chunks.');
+  }
+
   return contentBuffer;
 }
+
 
 function extractTextParts(value: unknown): string {
   if (typeof value === 'string') {
@@ -383,15 +391,20 @@ export async function callProvider(payload: {
     });
   }
 
-  let url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
+  const url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
 
   if (payload.providerType === 'custom' && payload.baseUrl) {
-    if (url.endsWith('/v1')) {
-      url = `${url}/chat/completions`;
-    } else if (!url.includes('/chat/completions') && !url.includes('/v1/')) {
-      url = url.endsWith('/') ? `${url}v1/chat/completions` : `${url}/v1/chat/completions`;
+    const urlObj = new URL(url);
+    if (urlObj.pathname.endsWith('/v1')) {
+      urlObj.pathname = `${urlObj.pathname}/chat/completions`;
+    } else if (!urlObj.pathname.includes('/chat/completions') && !urlObj.pathname.includes('/v1/')) {
+      urlObj.pathname = urlObj.pathname.endsWith('/') ? `${urlObj.pathname}v1/chat/completions` : `${urlObj.pathname}/v1/chat/completions`;
     }
   }
+
+  const max_tokens = (payload.providerType === 'openai' || payload.providerType === 'custom') ? 16384 : 8192;
+
+
 
   return fetch(url, {
     ...commonFetchOptions,
@@ -405,11 +418,12 @@ export async function callProvider(payload: {
         ...(payload.system ? [{ role: 'system', content: payload.system }] : []),
         { role: 'user', content: payload.prompt },
       ],
-      max_tokens: 16384,
+      max_tokens,
       stream: true,
     }),
   });
 }
+
 
 export async function callAIWithRetry(payload: {
   providerType: ProviderType;
@@ -527,9 +541,37 @@ export async function callAIText(payload: {
     throw new Error('AI provider did not return a response body.');
   }
 
+  let reasoningReceived = false;
   const text = await streamProviderText(payload.providerType, response.body, {
-    onReasoningDelta: payload.onReasoningDelta,
+    onReasoningDelta: (delta) => {
+      reasoningReceived = true;
+      payload.onReasoningDelta?.(delta);
+    },
   });
 
+  // GLM-5/DeepSeek Guard: If we got reasoning but NO content, the model likely 
+  // timed out or got stuck in a thought loop. Retry once with a harder nudge.
+  if (!text.trim() && reasoningReceived) {
+    console.warn('[callAIText] Model returned reasoning but no content. Retrying with explicit JSON instruction...');
+    const retryPayload = {
+      ...payload,
+      system: (payload.system || '') + '\n\nIMPORTANT: You previously only provided reasoning. Please provide the JSON output now. Do not provide extensive reasoning.',
+    };
+    const retryResponse = await callAIWithRetry(retryPayload);
+    if (retryResponse.ok && retryResponse.body) {
+      const retryText = await streamProviderText(payload.providerType, retryResponse.body, {
+        onReasoningDelta: payload.onReasoningDelta,
+      });
+      return { response: retryResponse, text: retryText };
+    }
+  }
+
   return { response, text };
+}
+
+
+export function trimToLimit(value: string | null | undefined, maxChars: number): string {
+  if (!value) return '';
+  if (value.length <= maxChars) return value;
+  return value.slice(0, maxChars) + '... [TRUNCATED]';
 }

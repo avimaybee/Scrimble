@@ -39,7 +39,10 @@ import {
   containsStreamTransportMarkers,
   defaultModelForProvider,
   extractJSON,
+  trimToLimit,
 } from './ai';
+
+
 import { decrypt } from '../utils/crypto';
 import { extractGitHubRepository } from '../utils/fetch-url';
 import {
@@ -1902,15 +1905,16 @@ async function executeBatch2(
       docsContentSections.push(`${sourceLabel}\n${liveDocsResult.content}`);
     }
 
-    const changelogContent = changelogResult.content || 'Release notes unavailable.';
-    const githubIssueDigest = formatGithubIssues(githubIssues);
-    const releaseDigest = formatReleaseDigest(githubAnalysis.releases);
+    const changelogContent = trimToLimit(changelogResult.content, 5000) || 'Release notes unavailable.';
+    const githubIssueDigest = formatGithubIssues(githubIssues); // formatGithubIssues already truncates to 1400 per issue
+    const releaseDigest = formatReleaseDigest(githubAnalysis.releases); // formatReleaseDigest already truncates to 1200 per release
     const communitySentiment = communityPages
-      .map((page) => `${page.title}: ${page.content || page.description} (${page.url})`)
+      .map((page) => `${page.title}: ${trimToLimit(page.content || page.description, 2000)} (${page.url})`)
       .join('\n\n');
     const repoHealthSummary = githubRepository
       ? `${githubAnalysis.owner}/${githubAnalysis.repo} has ${formatCompactNumber(githubAnalysis.stars)} stars, ${githubAnalysis.openIssues} open issues, latest release ${githubAnalysis.latestRelease}, last push ${githubAnalysis.lastPush}.`
       : 'GitHub repository data unavailable.';
+
     const technologySources = dedupeResearchSources([
       ...(docsResult.content
         ? [
@@ -1981,21 +1985,22 @@ async function executeBatch2(
       docs_url: docsUrl,
       github_url: technology.github_url,
       changelog_url: changelogUrl,
-      docs_content: docsContentSections.filter(Boolean).join('\n\n') || 'Documentation source unavailable.',
-      github_readme: githubAnalysis.readme || githubAnalysis.summary || 'GitHub repository data unavailable.',
+      docs_content: trimToLimit(docsContentSections.filter(Boolean).join('\n\n'), 15000) || 'Documentation source unavailable.',
+      github_readme: trimToLimit(githubAnalysis.readme || githubAnalysis.summary, 10000) || 'GitHub repository data unavailable.',
       latest_version: latestVersion,
       last_commit_date: githubAnalysis.lastPush || 'Unknown',
       open_issues_count: githubAnalysis.openIssues,
-      recent_breaking_changes: [changelogContent, releaseDigest, githubIssueDigest]
+      recent_breaking_changes: trimToLimit([changelogContent, releaseDigest, githubIssueDigest]
         .filter(Boolean)
-        .join('\n\n'),
+        .join('\n\n'), 8000),
       repo_health_summary: repoHealthSummary,
       community_sentiment:
-        communitySentiment || formatSearchResults(searchResults) || 'Community sentiment unavailable.',
+        trimToLimit(communitySentiment || formatSearchResults(searchResults), 5000) || 'Community sentiment unavailable.',
       bug_report_digest: githubIssueDigest || 'No recent bug reports found.',
       source_ledger: technologySources,
       community_pages: communityPages,
     });
+
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));

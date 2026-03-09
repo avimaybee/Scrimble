@@ -271,18 +271,9 @@ export async function resetGenerationThinkingState(
   batchName: GenerationBatchName | null,
 ) {
   await ensureGenerationThinkingTable(env);
-  await env.DB.prepare(`
-    INSERT INTO project_generation_live_state (project_id, batch_name, content, sequence, updated_at)
-    VALUES (?, ?, '', 0, datetime('now'))
-    ON CONFLICT(project_id) DO UPDATE SET
-      batch_name = excluded.batch_name,
-      content = '',
-      sequence = 0,
-      updated_at = datetime('now')
-  `)
-    .bind(projectId, batchName)
-    .run();
+  await env.DB.prepare('DELETE FROM project_generation_live_state WHERE project_id = ?').bind(projectId).run();
 }
+
 
 export async function appendGenerationThinkingDelta(
   env: Bindings,
