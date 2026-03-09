@@ -1,6 +1,5 @@
-#:schema node_modules/wrangler/config-schema.json
-name = "scrimble"
-pages_build_output_dir = "dist"
+name = "scrimble-consumer"
+main = "worker-consumer.ts"
 compatibility_date = "2024-03-08"
 
 [[d1_databases]]
@@ -12,6 +11,7 @@ database_id = "d3b8a50c-89ff-47a8-9aaa-58802343bd73"
 ENVIRONMENT = "production"
 FIREBASE_PROJECT_ID = "scrimble-auth"
 
-[[queues.producers]]
-binding = "AGENT_QUEUE"
+[[queues.consumers]]
 queue = "scrimble"
+max_batch_size = 1
+max_batch_timeout = 30
