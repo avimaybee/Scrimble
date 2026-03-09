@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ArrowRight, Sparkles, Key } from 'lucide-react';
+import { ArrowRight, Workflow, Key } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
 import { cn } from '../lib/utils';
@@ -98,7 +98,7 @@ export default function NewProject() {
           transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
           className="mb-12 flex h-20 w-20 items-center justify-center rounded-[16px] bg-accent-primary-muted/20 border border-accent-primary/20 shadow-[0_0_40px_rgba(235,94,40,0.1)]"
         >
-          <Sparkles className="h-10 w-10 text-accent-primary" />
+          <Workflow className="h-10 w-10 text-accent-primary" />
         </motion.div>
         
         <div className="w-full max-w-[320px] space-y-4">
@@ -156,7 +156,7 @@ export default function NewProject() {
         >
           <motion.div variants={itemVariants} className="mb-12 text-center">
             <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[14px] bg-bg-elevated shadow-node">
-              <Sparkles className="h-8 w-8 text-accent-primary" />
+              <Workflow className="h-8 w-8 text-accent-primary" />
             </div>
             <h1 className="mb-4 text-4xl font-serif tracking-[-0.03em] text-text-primary md:text-5xl">
               What do you want to build?
@@ -177,35 +177,32 @@ export default function NewProject() {
                 className="min-h-[160px] w-full resize-none overflow-hidden bg-transparent p-4 font-sans text-[17px] leading-relaxed text-text-primary outline-none placeholder:text-text-tertiary"
                 autoFocus
               />
-              <div className="flex flex-col gap-4 px-4 pb-3 sm:flex-row sm:items-end sm:justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="text-[13px] text-text-tertiary">The more detail, the better.</div>
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Key className="h-3.5 w-3.5 text-text-tertiary opacity-70 hover:opacity-100 transition-opacity" />
-                      </TooltipTrigger>
-                      <TooltipContent className="bg-bg-elevated border-border-default text-text-primary text-xs">
-                        <p>Runs through your saved AI provider</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-
-                <div className="flex items-center gap-3 self-end">
-                  <div className="text-[11px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
-                    {prompt.length} / 2000
+                <div className="flex flex-col gap-4 px-4 pb-3 sm:flex-row sm:items-end sm:justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="text-[13px] text-text-tertiary">The more detail, the better.</div>
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Key className="h-3.5 w-3.5 text-text-tertiary opacity-70 hover:opacity-100 transition-opacity" />
+                        </TooltipTrigger>
+                        <TooltipContent className="bg-bg-elevated border-border-default text-text-primary text-xs">
+                          <p>Runs through your saved AI provider</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
                   </div>
-                  <button
-                    onClick={handleGenerate}
-                    disabled={!prompt.trim()}
-                    className="btn-primary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    Build my plan
-                    <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
-                  </button>
+
+                  <div className="flex items-center gap-3 self-end">
+                    <button
+                      onClick={handleGenerate}
+                      disabled={!prompt.trim()}
+                      className="btn-primary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Build my plan
+                      <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
+                    </button>
+                  </div>
                 </div>
-              </div>
             </div>
           </motion.div>
 

@@ -20,7 +20,7 @@ import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Hexagon, Download, Sparkles, Pencil, Check, X, ArrowLeft, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
+import { Hexagon, Download, Workflow, Pencil, Check, X, ArrowLeft, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
 import { updatePlan as aiUpdatePlan } from '../lib/ai';
 import { dbService } from '../lib/db';
 import { cn } from '../lib/utils';
@@ -550,9 +550,10 @@ export default function ProjectCanvas() {
               onClick={() => setShowUpdateModal(true)}
               className="btn-ghost w-full flex items-center justify-center gap-2"
             >
-              <Sparkles className="w-4 h-4 text-accent-primary" />
+              <Workflow className="w-4 h-4 text-accent-primary" />
               Update plan
             </button>
+
             <DropdownMenu>
               <DropdownMenuTrigger className="w-full">
                 <button className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-[8px] text-sm font-medium transition-colors">
@@ -638,8 +639,9 @@ export default function ProjectCanvas() {
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
               <div className="max-w-md p-8 bg-bg-surface border border-dashed border-border-strong rounded-[14px] shadow-panel text-center pointer-events-auto">
                 <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[8px] bg-accent-primary-muted/20">
-                  <Sparkles className="h-8 w-8 text-accent-primary" />
+                  <Workflow className="h-8 w-8 text-accent-primary" />
                 </div>
+
                 <h3 className="text-2xl font-serif mb-2">Ready to build?</h3>
                 <p className="text-text-secondary mb-6 leading-relaxed">
                   Start by adding your first step or describe what you want to build using the Update button.
@@ -696,7 +698,7 @@ export default function ProjectCanvas() {
                   </div>
                 </div>
                 <h4 className="font-bold mb-1 flex items-center gap-2">
-                  <Sparkles className="w-4 h-4" />
+                  <Workflow className="w-4 h-4" />
                   2. Visual Workflow
                 </h4>
                 <p className="text-sm text-white/90 leading-relaxed mb-4">
@@ -774,7 +776,7 @@ export default function ProjectCanvas() {
           
           {isUpdating && (
             <div className="flex items-center gap-2 text-sm text-accent-primary">
-              <Sparkles className="w-4 h-4 animate-pulse" />
+              <Activity className="w-4 h-4 animate-pulse" />
               <span>{updateStatus}</span>
               <span className="flex gap-0.5">
                 <motion.span animate={{ opacity: [0, 1, 0] }} transition={{ repeat: Infinity, duration: 1.5, delay: 0 }}>.</motion.span>

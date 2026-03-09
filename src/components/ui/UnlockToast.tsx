@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Sparkles, X } from 'lucide-react';
+import { Zap, X } from 'lucide-react';
 
 interface UnlockToastProps {
   show: boolean;
@@ -20,7 +20,7 @@ export default function UnlockToast({ show, count, onClose }: UnlockToastProps) 
           className="fixed bottom-24 left-1/2 -translate-x-1/2 bg-bg-surface/90 backdrop-blur-md border border-accent-border px-6 py-3 rounded-full shadow-lg z-50 flex items-center gap-3"
         >
           <div className="w-8 h-8 bg-accent-primary-muted rounded-full flex items-center justify-center shrink-0">
-            <Sparkles className="w-4 h-4 text-accent-primary" />
+            <Zap className="w-4 h-4 text-accent-primary" />
           </div>
           <div className="text-sm font-medium text-text-primary whitespace-nowrap">
             {count} {count > 1 ? 'nodes' : 'node'} unlocked!

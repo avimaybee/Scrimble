@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, AlertTriangle, ExternalLink, RefreshCw, Copy, Sparkles } from 'lucide-react';
+import { X, AlertTriangle, ExternalLink, RefreshCw, Copy, Activity, Workflow } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import AnimatedCheckmark from './ui/AnimatedCheckmark';
 import { Step, ChecklistItem, Project } from '../types';
@@ -381,7 +381,7 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                               className="absolute top-2 right-2 p-1.5 text-text-tertiary hover:text-text-primary bg-bg-surface border border-border-default rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 text-xs"
                               onClick={handleRegenerate}
                             >
-                              <RefreshCw className="w-3 h-3" />
+                              <Activity className="w-3 h-3" />
                             </button>
                           </TooltipTrigger>
                           <TooltipContent>

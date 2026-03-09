@@ -6,9 +6,18 @@
  */
 export async function encrypt(data: string, encryptionKey: string): Promise<string> {
   // SECURITY: key material never logged
+  if (!encryptionKey || encryptionKey.length < 32) {
+    throw new Error('ENCRYPTION_KEY is missing or invalid. Check your environment settings.');
+  }
+
   const iv = crypto.getRandomValues(new Uint8Array(12));
+  const matches = encryptionKey.match(/.{1,2}/g);
+  if (!matches) {
+    throw new Error('ENCRYPTION_KEY is not a valid hexadecimal string.');
+  }
+
   const keyBuffer = Uint8Array.from(
-    encryptionKey.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    matches.map((byte) => parseInt(byte, 16))
   );
 
   const cryptoKey = await crypto.subtle.importKey(
@@ -46,8 +55,18 @@ export async function decrypt(encryptedData: string, encryptionKey: string): Pro
 
   const iv = Uint8Array.from(atob(ivBase64), (c) => c.charCodeAt(0));
   const ciphertext = Uint8Array.from(atob(ciphertextBase64), (c) => c.charCodeAt(0));
+
+  if (!encryptionKey || encryptionKey.length < 32) {
+    throw new Error('ENCRYPTION_KEY is missing or invalid. Check your environment settings.');
+  }
+
+  const matches = encryptionKey.match(/.{1,2}/g);
+  if (!matches) {
+    throw new Error('ENCRYPTION_KEY is not a valid hexadecimal string.');
+  }
+
   const keyBuffer = Uint8Array.from(
-    encryptionKey.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    matches.map((byte) => parseInt(byte, 16))
   );
 
   const cryptoKey = await crypto.subtle.importKey(

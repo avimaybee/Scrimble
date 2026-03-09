@@ -37,6 +37,17 @@ type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom';
 
 export const app = new Hono<AppEnv>().basePath('/api');
 
+app.onError((error, c) => {
+  console.error('[Hono Error]', error);
+  const status = error instanceof z.ZodError ? 400 : 500;
+  const message = error instanceof Error ? error.message : 'Internal Server Error';
+  
+  return c.json({ 
+    error: message,
+    details: error instanceof z.ZodError ? error.format() : undefined
+  }, status as any);
+});
+
 app.use('*', async (c, next) => {
   await next();
   c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://identitytoolkit.googleapis.com https://firebaseinstallations.googleapis.com https://securetoken.googleapis.com; img-src 'self' data: https://lh3.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
@@ -796,22 +807,12 @@ app.post('/projects', async (c) => {
     )
     .run();
 
-  c.executionCtx.waitUntil(
-    processProjectGeneration(c.env, {
-      projectId: id,
-      userId: c.get('uid'),
-      providerId: parsed.data.providerId,
-    }).catch(async (error) => {
-      const message = error instanceof Error ? error.message : 'Failed project generation background task.';
-      await c.env.DB.prepare(`
-        UPDATE projects
-        SET generation_status = 'failed', generation_error = ?, updated_at = datetime("now")
-        WHERE id = ?
-      `)
-        .bind(message, id)
-        .run();
-    })
-  );
+  await c.env.AGENT_QUEUE.send({
+    type: 'generate_project',
+    projectId: id,
+    userId: c.get('uid'),
+    providerId: parsed.data.providerId,
+  });
 
   return c.json({ success: true, id, generation_status: 'queued' }, 202);
 });
@@ -910,22 +911,12 @@ app.post('/projects/:id/architecture-review', async (c) => {
     return c.json({ error: message }, 409);
   }
 
-  c.executionCtx.waitUntil(
-    processProjectGeneration(c.env, {
-      projectId,
-      userId: c.get('uid'),
-      providerId,
-    }).catch(async (error) => {
-      const message = error instanceof Error ? error.message : 'Failed project generation background task.';
-      await c.env.DB.prepare(`
-        UPDATE projects
-        SET generation_status = 'failed', generation_error = ?, updated_at = datetime("now")
-        WHERE id = ?
-      `)
-        .bind(message, projectId)
-        .run();
-    })
-  );
+  await c.env.AGENT_QUEUE.send({
+    type: 'generate_project',
+    projectId,
+    userId: c.get('uid'),
+    providerId,
+  });
 
   await persistGenerationStreamEvent(c.env, {
     projectId,

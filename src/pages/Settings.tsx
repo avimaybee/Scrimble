@@ -6,7 +6,7 @@ import {
   Loader2,
   LogOut,
   ShieldCheck,
-  Sparkles,
+  Cpu,
   Trash2,
   User as UserIcon,
 } from 'lucide-react';
@@ -335,18 +335,33 @@ export default function Settings() {
 
         <div className="mt-6 rounded-[14px] border border-border-default bg-bg-elevated/40 p-5">
           <div className="mb-4 flex items-center gap-2 text-[15px] font-medium text-text-primary">
-            <Sparkles className="h-4 w-4 text-accent-primary" />
+            <Cpu className="h-4 w-4 text-accent-primary" />
             Add another AI
           </div>
 
           <form onSubmit={handleSaveProvider} className="space-y-5">
+            {/* Accessibility: hidden username field to satisfy browser password managers */}
+            <input 
+              type="text" 
+              name="username" 
+              autoComplete="username" 
+              style={{ display: 'none' }} 
+              readOnly 
+              value={user?.email || 'user'} 
+            />
             <div>
               <div className="grid gap-1 sm:grid-cols-4 rounded-[10px] border border-border-default bg-bg-elevated p-1">
                 {providerOptions.map((option) => (
                   <button
                     key={option.value}
                     type="button"
-                    onClick={() => setForm((current) => ({ ...current, provider: option.value }))}
+                    onClick={() => setForm((current) => ({
+                      ...current,
+                      provider: option.value,
+                      apiKey: '',
+                      model: '',
+                      baseUrl: ''
+                    }))}
                     className={cn(
                       'h-9 rounded-[6px] px-3 text-sm font-medium transition-all duration-200',
                       form.provider === option.value
