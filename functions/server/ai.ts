@@ -44,9 +44,7 @@ export async function streamToText(
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
+    if (done) break;
 
     const chunk = leftover + decoder.decode(value, { stream: true });
     const lines = chunk.split('\n');
@@ -54,31 +52,23 @@ export async function streamToText(
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(':')) {
-        continue;
-      }
-      if (!trimmed.startsWith('data:')) {
-        continue;
+      if (!trimmed) continue;
+
+      let jsonStr: string;
+      if (trimmed.startsWith('data:')) {
+        jsonStr = trimmed.slice(5).trim();
+      } else {
+        const jsonStart = trimmed.indexOf('{');
+        if (jsonStart === -1) continue;
+        jsonStr = trimmed.slice(jsonStart);
       }
 
-      const data = trimmed.slice(5).trim();
-      if (!data || data === '[DONE]') {
-        continue;
-      }
+      if (!jsonStr || jsonStr === '[DONE]') continue;
 
       try {
-        const parsed = JSON.parse(data) as {
-          choices?: Array<{
-            delta?: {
-              reasoning_content?: string;
-              content?: string;
-            };
-          }>;
-        };
+        const parsed = JSON.parse(jsonStr);
         const delta = parsed?.choices?.[0]?.delta;
-        if (!delta) {
-          continue;
-        }
+        if (!delta) continue;
 
         if (delta.reasoning_content) {
           callbacks?.onReasoningDelta?.(delta.reasoning_content);
@@ -95,24 +85,13 @@ export async function streamToText(
 
   const remaining = leftover + decoder.decode();
   if (remaining.trim()) {
-    const trimmed = remaining.trim();
-    if (trimmed.startsWith('data:')) {
-      const data = trimmed.slice(5).trim();
-      if (data && data !== '[DONE]') {
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{
-              delta?: {
-                content?: string;
-              };
-            }>;
-          };
-          const delta = parsed?.choices?.[0]?.delta;
-          if (delta?.content) {
-            contentBuffer += delta.content;
-          }
-        } catch {}
-      }
+    const jsonStart = remaining.indexOf('{');
+    if (jsonStart !== -1) {
+      try {
+        const parsed = JSON.parse(remaining.slice(jsonStart));
+        const delta = parsed?.choices?.[0]?.delta;
+        if (delta?.content) contentBuffer += delta.content;
+      } catch {}
     }
   }
 
