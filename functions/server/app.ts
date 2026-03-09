@@ -1189,9 +1189,10 @@ app.post('/projects/:id/resume', async (c) => {
   }
 
   const status = project.generation_status || 'queued';
-  if (status === 'complete' || status === 'failed') {
-    return c.json({ error: 'Cannot resume a project that is already complete or failed.' }, 409);
+  if (status === 'complete') {
+    return c.json({ error: 'Cannot resume a project that is already complete.' }, 409);
   }
+
 
   // Find the last provider used for this project to re-enqueue
   const lastRun = await c.env.DB.prepare(

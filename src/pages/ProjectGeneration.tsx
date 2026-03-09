@@ -1006,10 +1006,9 @@ export default function ProjectGeneration() {
                   <button
                     type="button"
                     onClick={() => {
-                      setError('');
-                      setStreamConnectionKey((previous) => previous + 1);
-                      void syncProjectState();
+                      void handleResume();
                     }}
+
                     className="btn-primary mt-5"
                   >
                     Try again
