@@ -18,7 +18,6 @@ import type {
 } from '../types';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
-const INITIAL_ESTIMATE_SECONDS = 12 * 60;
 
 const generationBatches: Array<{
   id: GenerationBatchName;
@@ -93,12 +92,6 @@ function formatTimestamp(value: string) {
   }).format(date);
 }
 
-function formatRemainingTime(totalSeconds: number) {
-  const safeSeconds = Math.max(totalSeconds, 0);
-  const minutes = Math.floor(safeSeconds / 60);
-  const seconds = safeSeconds % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
 
 function isGenerationBatchName(value: string | null | undefined): value is GenerationBatchName {
   return generationBatches.some((batch) => batch.id === value);
@@ -162,7 +155,6 @@ export default function ProjectGeneration() {
   const [hasPreparationCompleted, setHasPreparationCompleted] = useState(!initialPreparationState);
   const [generationPreparation] = useState<GenerationPreparationState | null>(initialPreparationState);
   const [streamConnectionKey, setStreamConnectionKey] = useState(0);
-  const [now, setNow] = useState(() => Date.now());
   const hasNavigatedRef = useRef(false);
   const activityKeysRef = useRef(new Set<string>());
   const currentActivityRef = useRef<ActivityFeedItem | null>(null);
@@ -292,13 +284,6 @@ export default function ProjectGeneration() {
     }
   }, [id, loadReviewData, reviewData, scheduleProjectNavigation]);
 
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      setNow(Date.now());
-    }, 1000);
-
-    return () => window.clearInterval(intervalId);
-  }, []);
 
   const needsPreparationNudge = Boolean(
     generationPreparation &&
@@ -503,33 +488,7 @@ export default function ProjectGeneration() {
   const resolvedCurrentBatchIndex = currentBatchIndex >= 0 ? currentBatchIndex : fallbackBatchIndex;
   const currentBatch = generationBatches[resolvedCurrentBatchIndex] || generationBatches[0];
 
-  const elapsedSeconds = useMemo(() => {
-    if (!project?.generation_started_at) {
-      return 0;
-    }
 
-    const startedAt = Date.parse(project.generation_started_at);
-    if (Number.isNaN(startedAt)) {
-      return 0;
-    }
-
-    return Math.max(Math.floor((now - startedAt) / 1000), 0);
-  }, [now, project?.generation_started_at]);
-
-  const progressPercent = Math.min(Math.round((completedBatchCount / generationBatches.length) * 100), 99);
-  const totalCompletedDurationSeconds = completedEvents.reduce(
-    (sum, event) => sum + ((event.duration_ms ?? 0) / 1000),
-    0,
-  );
-  const averageBatchDurationSeconds = completedBatchCount > 0
-    ? totalCompletedDurationSeconds / completedBatchCount
-    : INITIAL_ESTIMATE_SECONDS / generationBatches.length;
-  const remainingBatchCount = status?.is_complete
-    ? 0
-    : Math.max(generationBatches.length - completedBatchCount, 0);
-  const estimatedRemainingSeconds = completedBatchCount > 0
-    ? Math.max(Math.round(remainingBatchCount * averageBatchDurationSeconds), 0)
-    : Math.max(INITIAL_ESTIMATE_SECONDS - elapsedSeconds, 0);
 
   const liveActivity = currentActivity ?? {
     key: `live-placeholder-${status?.generation_status ?? currentBatch.id}`,
@@ -1117,33 +1076,7 @@ export default function ProjectGeneration() {
                     </div>
                   </div>
 
-                  <div className="mt-8 grid w-full gap-3 sm:grid-cols-3">
-                    <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Time left</div>
-                      <div className="mt-2 font-serif text-[28px] tracking-[-0.03em] text-text-primary">
-                        {status?.is_complete ? '00:00' : formatRemainingTime(estimatedRemainingSeconds)}
-                      </div>
-                    </div>
-                    <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Progress</div>
-                      <div className="mt-2 font-serif text-[28px] tracking-[-0.03em] text-text-primary">
-                        {status?.is_complete ? '100%' : `${progressPercent}%`}
-                      </div>
-                    </div>
-                    <div className="rounded-[14px] border border-border-default bg-bg-surface/76 px-4 py-4 text-left">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Current batch</div>
-                      <div className="mt-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary">
-                        {currentBatch.shortLabel}
-                      </div>
-                      <div className="mt-1 font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">
-                        {completedBatchCount} of {generationBatches.length} batches done
-                      </div>
-                    </div>
-                  </div>
 
-                  {isLoading ? (
-                    <div className="mt-4 text-[12px] font-sans text-text-tertiary">Loading the current generation state...</div>
-                  ) : null}
                   {error ? (
                     <div className="mt-4 flex items-center gap-2 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-status-warning">
                       <TriangleAlert className="h-4 w-4" />

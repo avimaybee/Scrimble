@@ -20,6 +20,10 @@ function extractString(value: unknown): string {
 }
 
 function extractTextFromProviderChunk(parsed: unknown): string {
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => extractTextFromProviderChunk(item)).join('');
+  }
+
   if (!parsed || typeof parsed !== 'object') {
     return '';
   }
@@ -58,6 +62,10 @@ function extractTextFromProviderChunk(parsed: unknown): string {
 }
 
 function extractReasoningFromProviderChunk(parsed: unknown): string {
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => extractReasoningFromProviderChunk(item)).join('');
+  }
+
   if (!parsed || typeof parsed !== 'object') {
     return '';
   }
@@ -92,6 +100,51 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
   }
 
   return extractString(value.delta?.thinking);
+}
+
+type RecoveredProviderEvent =
+  | { kind: 'reasoning'; value: string }
+  | { kind: 'content'; value: string };
+
+function recoverProviderEventsFromFragment(fragment: string) {
+  const events: RecoveredProviderEvent[] = [];
+  let finishReason: string | null = null;
+  const fieldPattern = /"(reasoning_content|reasoning|content|finish_reason)":("(?:(?:\\.|[^"\\])*)"|null)/g;
+
+  for (const match of fragment.matchAll(fieldPattern)) {
+    const field = match[1];
+    const rawValue = match[2];
+    if (!rawValue || rawValue === 'null') {
+      continue;
+    }
+
+    let value = '';
+    try {
+      const parsedValue = JSON.parse(rawValue) as unknown;
+      value = typeof parsedValue === 'string' ? parsedValue : '';
+    } catch {
+      value = rawValue.replace(/^"|"$/g, '');
+    }
+
+    if (!value) {
+      continue;
+    }
+
+    if (field === 'finish_reason') {
+      finishReason = value;
+      continue;
+    }
+
+    events.push({
+      kind: field === 'content' ? 'content' : 'reasoning',
+      value,
+    });
+  }
+
+  return {
+    events,
+    finishReason,
+  };
 }
 
 export function extractJSON(raw: string): string {
@@ -151,6 +204,28 @@ async function processStreamLine(
     const finishReason = (parsed as { choices?: Array<{ finish_reason?: string | null }> }).choices?.[0]?.finish_reason;
     return finishReason === 'stop';
   } catch {
+    const recovered = recoverProviderEventsFromFragment(candidate);
+    if (recovered.events.length > 0 || recovered.finishReason) {
+      for (const event of recovered.events) {
+        if (event.kind === 'reasoning') {
+          await callbacks?.onReasoningDelta?.(event.value);
+        } else {
+          fullContent.value += event.value;
+        }
+      }
+
+      return recovered.finishReason === 'stop';
+    }
+
+    const looksLikeProviderChunk =
+      candidate.includes('"object":"chat.completion.chunk"') ||
+      candidate.includes('"choices":[') ||
+      candidate.includes('"candidates":[');
+
+    if (looksLikeProviderChunk) {
+      return false;
+    }
+
     if (!trimmed.startsWith('data:')) {
       fullContent.value += candidate;
     }

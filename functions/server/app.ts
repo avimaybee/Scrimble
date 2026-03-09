@@ -13,6 +13,7 @@ import {
 } from './generation-schemas';
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
+import { extractJSON, streamToText as consumeProviderStream } from './ai';
 import {
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
@@ -227,30 +228,6 @@ function inferGateFlag(source: {
     'database migration',
     'environment variable',
   ].some((keyword) => haystack.includes(keyword));
-}
-
-function extractTextFromProviderChunk(parsed: any): string {
-  if (parsed.choices?.[0]?.delta?.content) {
-    return parsed.choices[0].delta.content as string;
-  }
-
-  if (parsed.choices?.[0]?.message?.content) {
-    return parsed.choices[0].message.content as string;
-  }
-
-  if (parsed.content?.[0]?.text) {
-    return parsed.content[0].text as string;
-  }
-
-  if (parsed.delta?.text) {
-    return parsed.delta.text as string;
-  }
-
-  if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
-    return parsed.candidates[0].content.parts[0].text as string;
-  }
-
-  return '';
 }
 
 function mapProviderRow(row: any) {
@@ -522,42 +499,7 @@ async function insertAgentRun(
 }
 
 async function streamToText(stream: ReadableStream<Uint8Array>) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let fullContent = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    const chunk = decoder.decode(value);
-    const lines = chunk.split('\n');
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(':')) {
-        continue;
-      }
-
-      const candidate = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
-      if (!candidate || candidate === '[DONE]') {
-        continue;
-      }
-
-      try {
-        const parsed = JSON.parse(candidate);
-        fullContent += extractTextFromProviderChunk(parsed);
-      } catch {
-        if (!trimmed.startsWith('data: ')) {
-          fullContent += candidate;
-        }
-      }
-    }
-  }
-
-  return fullContent;
+  return consumeProviderStream(stream);
 }
 
 async function callProvider(payload: {
@@ -1837,7 +1779,7 @@ app.post('/steps/:id/enrich', async (c) => {
         const fullContent = await streamToText(stream2);
 
         try {
-          const parsedContent = JSON.parse(fullContent);
+          const parsedContent = JSON.parse(extractJSON(fullContent));
           const validated = StepDetailSchema.safeParse(parsedContent);
           if (!validated.success) {
             throw new Error(`AI enrichment validation failed: ${validated.error.message}`);

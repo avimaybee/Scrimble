@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ArrowRight, ExternalLink, Hexagon, KeyRound } from 'lucide-react';
+import { ArrowRight, ChevronRight, ExternalLink, Hexagon, KeyRound, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
 import { getAIProviders } from '../lib/ai';
 import { getMCPServers } from '../lib/mcp';
 import { cn } from '../lib/utils';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../components/ui/dialog';
+import type { AIProvider } from '../lib/ai';
 import type { GenerationPreparationState } from '../types';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
@@ -43,6 +45,9 @@ export default function NewProject() {
   const [error, setError] = useState('');
   const [generationPreparation, setGenerationPreparation] = useState<GenerationPreparationState | null>(null);
   const [isPreparationLoading, setIsPreparationLoading] = useState(true);
+  const [providers, setProviders] = useState<AIProvider[]>([]);
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
 
   const resizeTextarea = () => {
     const textarea = textareaRef.current;
@@ -69,6 +74,12 @@ export default function NewProject() {
 
         if (!isMounted) {
           return;
+        }
+
+        setProviders(providers);
+        const defaultProvider = providers.find(p => p.is_default) || providers[0];
+        if (defaultProvider) {
+          setSelectedProviderId(defaultProvider.id);
         }
 
         setGenerationPreparation({
@@ -118,6 +129,7 @@ export default function NewProject() {
       setLoadingSteps((previous) => [...previous, 'Saving your project brief...']);
       const project = await dbService.createProject({
         description: trimmedPrompt,
+        providerId: selectedProviderId || undefined,
       });
 
       setLoadingSteps((previous) => [...previous.slice(-2), 'Starting the plan builder...']);
@@ -236,7 +248,21 @@ export default function NewProject() {
                     {isPreparationLoading
                       ? 'Checking your saved AI and research settings...'
                       : generationPreparation?.has_ai_provider
-                        ? 'Scrimble will use the AI key you saved in settings.'
+                        ? (
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                            <span>Scrimble will use</span>
+                            <span className="inline-flex items-center gap-1 font-medium text-text-primary">
+                              {providers.find(p => p.id === selectedProviderId)?.name || 'Default key'}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setIsModalOpen(true)}
+                              className="inline-flex items-center gap-0.5 font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
+                            >
+                              (Change)
+                            </button>
+                          </div>
+                        )
                         : 'You need to add an AI key first.'}
                   </div>
                   <div className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
@@ -273,6 +299,68 @@ export default function NewProject() {
               ) : null}
             </motion.div>
           ) : null}
+
+          <Dialog open={isModalOpen} onOpenChange={setIsModalOpen}>
+            <DialogContent className="max-w-[420px]">
+              <DialogHeader>
+                <DialogTitle>Choose your AI</DialogTitle>
+                <DialogDescription>
+                  Select which model should architect this project and generate your plan.
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="space-y-2 px-6 py-2">
+                {providers.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => {
+                      setSelectedProviderId(p.id);
+                      setIsModalOpen(false);
+                    }}
+                    className={cn(
+                      "group flex w-full items-center justify-between rounded-xl border p-4 text-left transition-all duration-200",
+                      selectedProviderId === p.id
+                        ? "border-accent-border bg-accent-primary-muted"
+                        : "border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60"
+                    )}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={cn(
+                        "flex h-9 w-9 items-center justify-center rounded-lg border transition-colors",
+                        selectedProviderId === p.id
+                          ? "border-accent-border bg-bg-surface text-accent-primary"
+                          : "border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary"
+                      )}>
+                        <Sparkles className="h-4.5 w-4.5" />
+                      </div>
+                      <div>
+                        <div className="text-[15px] font-medium text-text-primary">
+                          {p.name}
+                        </div>
+                        <div className="text-[12px] text-text-tertiary">
+                          {p.model || p.provider}
+                        </div>
+                      </div>
+                    </div>
+                    {selectedProviderId === p.id && (
+                      <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
+                        <ChevronRight className="h-3 w-3" />
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              <DialogFooter className="border-t border-border-default bg-bg-elevated/30 p-4">
+                <button
+                  onClick={() => setIsModalOpen(false)}
+                  className="btn-ghost py-2 text-sm"
+                >
+                  Close
+                </button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </motion.div>
       </AnimatePresence>
     </main>
