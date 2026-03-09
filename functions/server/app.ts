@@ -1193,16 +1193,25 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'Cannot resume a project that is already complete or failed.' }, 409);
   }
 
-  // Find the last providerId used for this project to re-enqueue
+  // Find the last provider used for this project to re-enqueue
   const lastRun = await c.env.DB.prepare(
-    'SELECT provider_id FROM agent_runs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1'
-  ).bind(projectId).first<{ provider_id: string | null }>();
+    'SELECT provider FROM agent_runs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(projectId).first<{ provider: string | null }>();
+
+  // If we found a provider string (e.g. 'anthropic'), we need to find the user's provider record for it
+  let providerId: string | undefined;
+  if (lastRun?.provider) {
+    const providerRecord = await c.env.DB.prepare(
+      'SELECT id FROM ai_providers WHERE user_id = ? AND provider = ? ORDER BY is_default DESC LIMIT 1'
+    ).bind(c.get('uid'), lastRun.provider).first<{ id: string }>();
+    providerId = providerRecord?.id;
+  }
 
   await c.env.AGENT_QUEUE.send({
     type: 'generate_project',
     projectId,
     userId: c.get('uid'),
-    providerId: lastRun?.provider_id || undefined,
+    providerId,
   });
 
   return c.json({
