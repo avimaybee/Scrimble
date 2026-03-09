@@ -8,6 +8,7 @@ import {
   MoreHorizontal,
   Plus,
   RotateCcw,
+  Trash2,
   Undo2,
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
@@ -23,6 +24,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -94,6 +103,8 @@ export default function Dashboard() {
   const [projectCards, setProjectCards] = useState<ProjectCardData[]>([]);
   const [loading, setLoading] = useState(true);
   const [showArchived, setShowArchived] = useState(false);
+  const [projectToDelete, setProjectToDelete] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     if (!user) {
@@ -165,6 +176,23 @@ export default function Dashboard() {
     } catch (error) {
       console.error('Error restoring project:', error);
       toast.error('Could not restore that project.');
+    }
+  };
+
+  const handleDeleteProject = async () => {
+    if (!projectToDelete) return;
+
+    setIsDeleting(true);
+    try {
+      await dbService.deleteProject(projectToDelete);
+      setProjectCards((current) => current.filter((entry) => entry.project.id !== projectToDelete));
+      toast.success('Project deleted permanently.');
+      setProjectToDelete(null);
+    } catch (error) {
+      console.error('Error deleting project:', error);
+      toast.error('Could not delete project.');
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -332,6 +360,17 @@ export default function Dashboard() {
                             Archive project
                           </DropdownMenuItem>
                         )}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setProjectToDelete(project.id);
+                          }}
+                          className="text-status-error hover:bg-status-error/10"
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" />
+                          Delete project
+                        </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>
@@ -397,6 +436,33 @@ export default function Dashboard() {
           Open any project to see the full plan, finish the current step, or ask Scrimble to rework it.
         </motion.div>
       ) : null}
+
+      <Dialog open={!!projectToDelete} onOpenChange={(open) => !open && setProjectToDelete(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete Project</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this project? This action cannot be undone and all associated data will be permanently removed.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-6 flex gap-3">
+            <button
+              onClick={() => setProjectToDelete(null)}
+              className="btn-ghost"
+              disabled={isDeleting}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleDeleteProject}
+              className="btn-primary bg-status-error hover:bg-status-error/90 border-status-error/20"
+              disabled={isDeleting}
+            >
+              {isDeleting ? 'Deleting...' : 'Delete permanently'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </motion.main>
   );
 }

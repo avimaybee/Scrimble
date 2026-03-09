@@ -86,20 +86,20 @@ export function DropdownMenuSeparator({ className }: { className?: string }) {
   return <div className={cn("h-px bg-border-subtle my-1 mx-2", className)} />;
 }
 
-export function DropdownMenuItem({ children, className, onClick }: { children: React.ReactNode, className?: string, onClick?: () => void }) {
+export function DropdownMenuItem({ children, className, onClick }: { children: React.ReactNode, className?: string, onClick?: (e: React.MouseEvent) => void }) {
   const { setOpen } = React.useContext(DropdownMenuContext);
   return (
     <div
       className={cn("mx-2 flex cursor-pointer items-center rounded-[10px] px-4 py-2.5 text-sm text-text-secondary outline-none transition-colors hover:bg-bg-elevated hover:text-text-primary", className)}
-      onClick={() => {
-        onClick?.();
+      onClick={(e) => {
+        onClick?.(e);
         setOpen(false);
       }}
       role="menuitem"
       tabIndex={0}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
-          onClick?.();
+          onClick?.(e as any);
           setOpen(false);
         }
       }}

@@ -29,7 +29,7 @@ import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Activity, Hexagon, Download, LayoutPanelTop, Pencil, Check, X, FileJson, FileText, Info, RotateCcw } from 'lucide-react';
+import { Activity, Hexagon, Download, LayoutPanelTop, Pencil, Check, X, FileJson, FileText, Info, RotateCcw, Trash2 } from 'lucide-react';
 import { dbService } from '../lib/db';
 import { cn } from '../lib/utils';
 import ErrorBoundary from '../components/ErrorBoundary';
@@ -75,6 +75,8 @@ export default function ProjectCanvas() {
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
   const [updateActivities, setUpdateActivities] = useState<WorkflowUpdateActivity[]>([]);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [showUnlockToast, setShowUnlockToast] = useState(false);
   const [unlockedCount, setUnlockedCount] = useState(0);
   
@@ -200,6 +202,22 @@ export default function ProjectCanvas() {
       toast.error(errorMessage);
     } finally {
       setIsUpdating(false);
+    }
+  };
+
+  const handleDeleteProject = async () => {
+    if (!project) return;
+    
+    setIsDeleting(true);
+    try {
+      await dbService.deleteProject(project.id);
+      toast.success('Project deleted permanently');
+      navigate('/', { replace: true });
+    } catch (error) {
+      console.error(error);
+      toast.error('Failed to delete project');
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -587,6 +605,14 @@ export default function ProjectCanvas() {
               Update plan
             </button>
 
+            <button 
+              onClick={() => setShowDeleteDialog(true)}
+              className="btn-ghost w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-status-error hover:bg-status-error/5"
+            >
+              <Trash2 className="w-4 h-4" />
+              Delete project
+            </button>
+
             <DropdownMenu>
               <DropdownMenuTrigger className="w-full">
                 <button className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-[8px] text-sm font-medium transition-colors">
@@ -876,6 +902,34 @@ export default function ProjectCanvas() {
               disabled={isUpdating || !updateMessage.trim()}
             >
               {isUpdating ? 'Updating...' : 'Update'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={showDeleteDialog} onOpenChange={(open) => !open && setShowDeleteDialog(false)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete Project</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this project? This action cannot be undone and all associated data will be permanently removed.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-6 flex gap-3">
+            <button
+              onClick={() => setShowDeleteDialog(false)}
+              className="btn-ghost"
+              disabled={isDeleting}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleDeleteProject}
+              className="btn-primary bg-status-error hover:bg-status-error/90 border-status-error/20"
+              disabled={isDeleting}
+            >
+              {isDeleting ? 'Deleting...' : 'Delete permanently'}
             </button>
           </DialogFooter>
         </DialogContent>

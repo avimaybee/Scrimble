@@ -1056,6 +1056,47 @@ app.patch('/projects/:id', async (c) => {
   return c.json(updatedProject ? mapProjectRow(updatedProject) : { success: true });
 });
 
+app.delete('/projects/:id', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  // Delete all related records in the correct order to avoid foreign key / dependency issues
+  // Note: D1 doesn't always strictly enforce FKs depending on config, but good practice applies.
+  await c.env.DB.batch([
+    // Delete checklist items (via steps)
+    c.env.DB.prepare(`
+      DELETE FROM checklist_items 
+      WHERE step_id IN (SELECT id FROM steps WHERE project_id = ?)
+    `).bind(projectId),
+    
+    // Delete agent runs
+    c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
+    
+    // Delete generation events
+    c.env.DB.prepare('DELETE FROM generation_stream_events WHERE project_id = ?').bind(projectId),
+    
+    // Delete edges
+    c.env.DB.prepare('DELETE FROM edges WHERE project_id = ?').bind(projectId),
+    
+    // Delete steps
+    c.env.DB.prepare('DELETE FROM steps WHERE project_id = ?').bind(projectId),
+    
+    // Delete stages
+    c.env.DB.prepare('DELETE FROM stages WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),
+    
+    // Delete workflows
+    c.env.DB.prepare('DELETE FROM workflows WHERE project_id = ?').bind(projectId),
+    
+    // Finally delete the project
+    c.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(projectId),
+  ]);
+
+  return c.body(null, 204);
+});
+
 app.get('/plans', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
