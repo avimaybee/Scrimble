@@ -23,10 +23,17 @@ type PersistedGenerationEvent = LiveGenerationEventEnvelope & {
 };
 
 type LiveGenerationListener = (event: LiveGenerationEventEnvelope) => void;
+type GenerationThinkingState = {
+  batchName: GenerationBatchName | null;
+  content: string;
+  sequence: number;
+};
 
 const encoder = new TextEncoder();
 const TERMINAL_EVENT_TYPES = new Set<GenerationStreamEvent['type']>(['pipeline_complete', 'pipeline_failed']);
 const liveGenerationListeners = new Map<string, Set<LiveGenerationListener>>();
+const EVENT_POLL_INTERVAL_MS = 750;
+let ensureThinkingTablePromise: Promise<void> | null = null;
 
 const batchLabels: Record<GenerationBatchName, string> = {
   batch_1_research_stack: 'Identifying your stack',
@@ -215,6 +222,98 @@ export function getBatchStartLabel(batchName: GenerationBatchName) {
   return batchLabels[batchName];
 }
 
+async function ensureGenerationThinkingTable(env: Bindings) {
+  if (!ensureThinkingTablePromise) {
+    ensureThinkingTablePromise = env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS project_generation_live_state (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        batch_name TEXT,
+        content TEXT NOT NULL DEFAULT '',
+        sequence INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT DEFAULT (datetime('now'))
+      )
+    `)
+      .run()
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        ensureThinkingTablePromise = null;
+        throw error;
+      });
+  }
+
+  return ensureThinkingTablePromise;
+}
+
+async function loadGenerationThinkingState(env: Bindings, projectId: string) {
+  await ensureGenerationThinkingTable(env);
+  const row = await env.DB.prepare(`
+    SELECT batch_name, content, sequence
+    FROM project_generation_live_state
+    WHERE project_id = ?
+  `)
+    .bind(projectId)
+    .first();
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    batchName: (asText(row.batch_name) || null) as GenerationBatchName | null,
+    content: asText(row.content),
+    sequence: asNumber(row.sequence),
+  } satisfies GenerationThinkingState;
+}
+
+export async function resetGenerationThinkingState(
+  env: Bindings,
+  projectId: string,
+  batchName: GenerationBatchName | null,
+) {
+  await ensureGenerationThinkingTable(env);
+  await env.DB.prepare(`
+    INSERT INTO project_generation_live_state (project_id, batch_name, content, sequence, updated_at)
+    VALUES (?, ?, '', 0, datetime('now'))
+    ON CONFLICT(project_id) DO UPDATE SET
+      batch_name = excluded.batch_name,
+      content = '',
+      sequence = 0,
+      updated_at = datetime('now')
+  `)
+    .bind(projectId, batchName)
+    .run();
+}
+
+export async function appendGenerationThinkingDelta(
+  env: Bindings,
+  payload: {
+    projectId: string;
+    batchName: GenerationBatchName;
+    content: string;
+  },
+) {
+  await ensureGenerationThinkingTable(env);
+  await env.DB.prepare(`
+    INSERT INTO project_generation_live_state (project_id, batch_name, content, sequence, updated_at)
+    VALUES (?, ?, ?, 1, datetime('now'))
+    ON CONFLICT(project_id) DO UPDATE SET
+      batch_name = excluded.batch_name,
+      content = CASE
+        WHEN project_generation_live_state.batch_name = excluded.batch_name
+          THEN project_generation_live_state.content || excluded.content
+        ELSE excluded.content
+      END,
+      sequence = CASE
+        WHEN project_generation_live_state.batch_name = excluded.batch_name
+          THEN project_generation_live_state.sequence + 1
+        ELSE 1
+      END,
+      updated_at = datetime('now')
+  `)
+    .bind(payload.projectId, payload.batchName, payload.content)
+    .run();
+}
+
 export async function persistGenerationStreamEvent(
   env: Bindings,
   payload: {
@@ -293,8 +392,15 @@ export function createGenerationSseStream(
   let replayComplete = false;
   let latestEventId = payload.lastEventId;
   let pingInterval: ReturnType<typeof setInterval> | null = null;
+  let pollInterval: ReturnType<typeof setInterval> | null = null;
   const bufferedEvents: LiveGenerationEventEnvelope[] = [];
   let writeChain = Promise.resolve();
+  let latestThinkingState: GenerationThinkingState = {
+    batchName: null,
+    content: '',
+    sequence: 0,
+  };
+  let pollInFlight = false;
 
   const cleanup = () => {
     if (isClosed) {
@@ -305,6 +411,9 @@ export function createGenerationSseStream(
     unsubscribe();
     if (pingInterval !== null) {
       clearInterval(pingInterval);
+    }
+    if (pollInterval !== null) {
+      clearInterval(pollInterval);
     }
 
     void writeChain.finally(async () => {
@@ -341,6 +450,35 @@ export function createGenerationSseStream(
     if (event.id !== null) {
       latestEventId = event.id;
     }
+
+    if (event.event.type === 'batch_start') {
+      latestThinkingState = {
+        batchName: event.event.batch,
+        content: '',
+        sequence: 0,
+      };
+    } else if (event.event.type === 'thinking') {
+      if (latestThinkingState.batchName !== event.batchName) {
+        latestThinkingState = {
+          batchName: event.batchName,
+          content: '',
+          sequence: 0,
+        };
+      }
+
+      latestThinkingState = {
+        ...latestThinkingState,
+        content: `${latestThinkingState.content}${event.event.content}`,
+        sequence: latestThinkingState.sequence + 1,
+      };
+    } else if (event.event.type === 'batch_complete' || isTerminalGenerationEvent(event.event)) {
+      latestThinkingState = {
+        batchName: event.batchName,
+        content: '',
+        sequence: 0,
+      };
+    }
+
     enqueueChunk(formatSseEvent(event));
 
     if (isTerminalGenerationEvent(event.event)) {
@@ -351,9 +489,78 @@ export function createGenerationSseStream(
   const unsubscribe = subscribeToLiveGenerationEvents(payload.projectId, dispatchEvent);
   payload.signal.addEventListener('abort', cleanup, { once: true });
 
+  const pollForNewEvents = async () => {
+    if (isClosed || pollInFlight) {
+      return;
+    }
+
+    pollInFlight = true;
+
+    try {
+      const [persistedEvents, thinkingState] = await Promise.all([
+        listPersistedGenerationEventsSince(env, payload.projectId, latestEventId),
+        loadGenerationThinkingState(env, payload.projectId),
+      ]);
+
+      for (const event of persistedEvents) {
+        dispatchEvent(event);
+      }
+
+      if (!thinkingState) {
+        latestThinkingState = {
+          batchName: null,
+          content: '',
+          sequence: 0,
+        };
+        return;
+      }
+
+      const batchChanged = thinkingState.batchName !== latestThinkingState.batchName;
+      const sequenceReset = thinkingState.sequence < latestThinkingState.sequence;
+      const contentReset = thinkingState.content.length < latestThinkingState.content.length;
+
+      if (batchChanged || sequenceReset || contentReset) {
+        latestThinkingState = thinkingState;
+        return;
+      }
+
+      if (
+        thinkingState.sequence > latestThinkingState.sequence &&
+        thinkingState.content.length > latestThinkingState.content.length
+      ) {
+        const delta = thinkingState.content.slice(latestThinkingState.content.length);
+        latestThinkingState = thinkingState;
+
+        if (delta) {
+          dispatchEvent({
+            id: null,
+            projectId: payload.projectId,
+            batchName: thinkingState.batchName,
+            createdAt: new Date().toISOString(),
+            event: {
+              type: 'thinking',
+              content: delta,
+            },
+          });
+        }
+      }
+    } catch (error) {
+      console.warn('[generation-stream-poll-failed]', {
+        projectId: payload.projectId,
+        error: error instanceof Error ? error.message : 'Unknown polling error',
+      });
+    } finally {
+      pollInFlight = false;
+    }
+  };
+
   void (async () => {
     try {
       const replayEvents = await listPersistedGenerationEventsSince(env, payload.projectId, payload.lastEventId);
+      const initialThinkingState = await loadGenerationThinkingState(env, payload.projectId);
+      if (initialThinkingState) {
+        latestThinkingState = initialThinkingState;
+      }
 
       for (const event of replayEvents) {
         latestEventId = Math.max(latestEventId, event.id);
@@ -369,18 +576,7 @@ export function createGenerationSseStream(
       replayComplete = true;
 
       bufferedEvents.forEach((event) => {
-        if (event.id !== null && event.id <= latestEventId) {
-          return;
-        }
-
-        if (event.id !== null) {
-          latestEventId = event.id;
-        }
-        enqueueChunk(formatSseEvent(event));
-
-        if (isTerminalGenerationEvent(event.event)) {
-          cleanup();
-        }
+        dispatchEvent(event);
       });
 
       if (isClosed) {
@@ -390,6 +586,9 @@ export function createGenerationSseStream(
       pingInterval = setInterval(() => {
         enqueueChunk(': ping\n\n');
       }, 20_000);
+      pollInterval = setInterval(() => {
+        void pollForNewEvents();
+      }, EVENT_POLL_INTERVAL_MS);
     } catch {
       enqueueChunk(
         `event: pipeline_failed\ndata: ${JSON.stringify({

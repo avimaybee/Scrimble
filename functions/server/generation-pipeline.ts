@@ -28,11 +28,18 @@ import {
   type QueueMessageBody,
 } from './types';
 import {
+  appendGenerationThinkingDelta,
   emitTransientGenerationStreamEvent,
   getBatchStartLabel,
   persistGenerationStreamEvent,
+  resetGenerationThinkingState,
 } from './generation-events';
-import { callAIText, defaultModelForProvider, extractJSON } from './ai';
+import {
+  callAIText,
+  containsStreamTransportMarkers,
+  defaultModelForProvider,
+  extractJSON,
+} from './ai';
 import { decrypt } from '../utils/crypto';
 import { extractGitHubRepository } from '../utils/fetch-url';
 import {
@@ -653,6 +660,7 @@ function activityIconForKind(kind: ActivityKind) {
 }
 
 async function emitBatchStart(env: Bindings, projectId: string, batchName: GenerationBatchName) {
+  await resetGenerationThinkingState(env, projectId, batchName);
   await persistGenerationStreamEvent(env, {
     projectId,
     batchName,
@@ -716,6 +724,7 @@ async function insertGenerationEvent(
           duration_ms: Number(payload.body.duration_ms) || 0,
         },
       });
+      await resetGenerationThinkingState(env, payload.projectId, payload.batchName || null);
       return;
     case 'review_required':
       if (payload.body.adr) {
@@ -738,6 +747,7 @@ async function insertGenerationEvent(
           project_id: asText(payload.body.project_id, payload.projectId),
         },
       });
+      await resetGenerationThinkingState(env, payload.projectId, null);
       return;
     case 'generation_failed':
       await persistGenerationStreamEvent(env, {
@@ -748,6 +758,7 @@ async function insertGenerationEvent(
           error: asText(payload.body.error, 'Project generation failed.'),
         },
       });
+      await resetGenerationThinkingState(env, payload.projectId, null);
       return;
   }
 }
@@ -787,6 +798,18 @@ function emitThinking(env: Bindings, projectId: string, batchName: GenerationBat
       type: 'thinking',
       content,
     },
+  });
+
+  void appendGenerationThinkingDelta(env, {
+    projectId,
+    batchName,
+    content,
+  }).catch((error) => {
+    console.warn('[generation-thinking-relay-failed]', {
+      projectId,
+      batchName,
+      error: error instanceof Error ? error.message : 'Unknown relay failure',
+    });
   });
 }
 
@@ -946,6 +969,29 @@ Required schema:
 ${schemaDescription}`;
 }
 
+function formatTransportRetryPrompt(basePrompt: string, schemaDescription: string) {
+  return `${basePrompt}
+
+your previous response was interrupted by provider transport formatting. return ONLY a single valid JSON object with no markdown fences, no reasoning, and no extra text.
+
+Required schema:
+${schemaDescription}`;
+}
+
+function logBatchResponseFailure(
+  runType: GenerationBatchName,
+  stage: 'transport' | 'json' | 'schema',
+  responseText: string,
+) {
+  console.warn('[generation-ai-parse-failure]', {
+    runType,
+    stage,
+    responseLength: responseText.length,
+    containsStreamMarkers: containsStreamTransportMarkers(responseText),
+    hasMarkdownFence: responseText.includes('```'),
+  });
+}
+
 async function callValidatedBatch<T>(
   provider: ProviderConfig,
   options: {
@@ -969,20 +1015,32 @@ async function callValidatedBatch<T>(
       baseUrl: provider.baseUrl,
       system: options.systemPrompt,
       prompt,
-      onReasoningDelta: (delta) => emitThinking(options.env, options.projectId, options.runType, delta),
+      stream: attempt === 1,
+      onReasoningDelta:
+        attempt === 1
+          ? (delta) => emitThinking(options.env, options.projectId, options.runType, delta)
+          : undefined,
     });
 
     let parsed: unknown;
+    const cleanedText = extractJSON(text);
     try {
-      parsed = JSON.parse(extractJSON(text));
+      parsed = JSON.parse(cleanedText);
     } catch {
+      logBatchResponseFailure(
+        options.runType,
+        containsStreamTransportMarkers(text) ? 'transport' : 'json',
+        text,
+      );
       lastError = `The AI response for ${options.runType} was not valid JSON.`;
       if (attempt === 1) {
-        prompt = formatValidationRetryPrompt(options.prompt, text, options.schemaDescription);
+        prompt = containsStreamTransportMarkers(text)
+          ? formatTransportRetryPrompt(options.prompt, options.schemaDescription)
+          : formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
         continue;
       }
 
-      throw new GenerationPipelineError(`${lastError}\nRaw response: ${text}`);
+      throw new GenerationPipelineError(`${lastError} Please retry.`);
     }
 
     const validated = options.schema.safeParse(parsed);
@@ -995,12 +1053,13 @@ async function callValidatedBatch<T>(
     }
 
     lastError = `Validation failed for ${options.runType}: ${validated.error.message}`;
+    logBatchResponseFailure(options.runType, 'schema', cleanedText);
     if (attempt === 1) {
-      prompt = formatValidationRetryPrompt(options.prompt, text, options.schemaDescription);
+      prompt = formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
       continue;
     }
 
-    throw new GenerationPipelineError(`${lastError}\nRaw response: ${text}`);
+    throw new GenerationPipelineError(`${lastError} Please retry.`);
   }
 
   throw new GenerationPipelineError(lastError);

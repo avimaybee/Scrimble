@@ -183,6 +183,7 @@ export const dbService = {
   async streamProjectGeneration(projectId: string, options: StreamProjectGenerationOptions = {}): Promise<void> {
     let lastEventId = 0;
     let reachedTerminalEvent = false;
+    const seenEventIds = new Set<number>();
 
     while (!options.signal?.aborted && !reachedTerminalEvent) {
       try {
@@ -223,7 +224,15 @@ export const dbService = {
 
           try {
             const parsed = JSON.parse(payload) as Record<string, unknown>;
-            lastEventId = currentEventId || lastEventId;
+            const persistedEventId = currentEventId > 0 ? currentEventId : null;
+            if (persistedEventId !== null) {
+              if (seenEventIds.has(persistedEventId)) {
+                return;
+              }
+
+              seenEventIds.add(persistedEventId);
+              lastEventId = persistedEventId;
+            }
 
             if (currentEvent === 'batch_start' && typeof parsed.batch === 'string' && typeof parsed.label === 'string') {
               options.onBatchStart?.({
@@ -343,7 +352,7 @@ export const dbService = {
       }
 
       if (!options.signal?.aborted && !reachedTerminalEvent) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
   },
@@ -571,13 +580,8 @@ export const dbService = {
   },
 
   async deleteProject(projectId: string): Promise<void> {
-    const response = await fetch(`${API_BASE}/projects/${projectId}`, {
+    await fetchAPI<void>(`/projects/${projectId}`, {
       method: 'DELETE',
     });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Failed to delete project' }));
-      throw new Error(error.error || 'Failed to delete project');
-    }
   },
 };

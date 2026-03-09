@@ -4,6 +4,31 @@ type StreamCallbacks = {
   onReasoningDelta?: (delta: string) => Promise<void> | void;
 };
 
+function extractTextParts(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (!Array.isArray(value)) {
+    return '';
+  }
+
+  return value
+    .map((part) => {
+      if (typeof part === 'string') {
+        return part;
+      }
+
+      if (part && typeof part === 'object' && 'text' in part) {
+        return extractString((part as { text?: unknown }).text);
+      }
+
+      return '';
+    })
+    .filter(Boolean)
+    .join('');
+}
+
 function extractString(value: unknown): string {
   if (typeof value === 'string') {
     return value;
@@ -31,23 +56,51 @@ function extractTextFromProviderChunk(parsed: unknown): string {
   const value = parsed as {
     choices?: Array<{
       delta?: { content?: string };
-      message?: { content?: string };
+      message?: { content?: unknown };
+      text?: string;
     }>;
     content?: Array<{ text?: string; type?: string; thinking?: string }>;
     delta?: { text?: string };
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    output_text?: string;
+    text?: string;
   };
+
+  if (value.output_text) {
+    return value.output_text;
+  }
+
+  if (value.text) {
+    return value.text;
+  }
 
   if (value.choices?.[0]?.delta?.content) {
     return value.choices[0].delta.content;
   }
 
-  if (value.choices?.[0]?.message?.content) {
-    return value.choices[0].message.content;
+  const messageContent = value.choices?.[0]?.message?.content;
+  if (typeof messageContent === 'string') {
+    return messageContent;
   }
 
-  if (value.content?.[0]?.text) {
-    return value.content[0].text;
+  if (messageContent) {
+    return extractTextParts(messageContent);
+  }
+
+  if (value.choices?.[0]?.text) {
+    return value.choices[0].text;
+  }
+
+  if (value.content?.length) {
+    const textBlocks = value.content
+      .filter((block) => block.type !== 'thinking')
+      .map((block) => extractString(block.text))
+      .filter(Boolean)
+      .join('');
+
+    if (textBlocks) {
+      return textBlocks;
+    }
   }
 
   if (value.delta?.text) {
@@ -154,6 +207,14 @@ export function extractJSON(raw: string): string {
   }
 
   return raw.trim();
+}
+
+export function containsStreamTransportMarkers(raw: string) {
+  return (
+    raw.includes('"object":"chat.completion.chunk"') ||
+    raw.includes('"reasoning_content"') ||
+    (raw.includes('"choices":[') && raw.includes('"delta":'))
+  );
 }
 
 export function defaultModelForProvider(provider: ProviderType): string {
@@ -278,12 +339,14 @@ export async function callProvider(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
+  stream?: boolean;
   signal?: AbortSignal;
 }) {
   const commonFetchOptions = {
     method: 'POST',
     signal: payload.signal,
   };
+  const useStreaming = payload.stream !== false;
 
   if (payload.providerType === 'anthropic') {
     return fetch('https://api.anthropic.com/v1/messages', {
@@ -298,13 +361,14 @@ export async function callProvider(payload: {
         system: payload.system || undefined,
         messages: [{ role: 'user', content: payload.prompt }],
         max_tokens: 8192,
-        stream: true,
+        stream: useStreaming,
       }),
     });
   }
 
   if (payload.providerType === 'gemini') {
-    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:streamGenerateContent?key=${payload.apiKey}`;
+    const endpoint = useStreaming ? 'streamGenerateContent' : 'generateContent';
+    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${payload.model}:${endpoint}?key=${payload.apiKey}`;
     return fetch(googleUrl, {
       ...commonFetchOptions,
       headers: { 'Content-Type': 'application/json' },
@@ -342,7 +406,7 @@ export async function callProvider(payload: {
         { role: 'user', content: payload.prompt },
       ],
       max_tokens: 16384,
-      stream: true,
+      stream: useStreaming,
     }),
   });
 }
@@ -354,6 +418,7 @@ export async function callAIWithRetry(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
+  stream?: boolean;
 }): Promise<Response> {
   const maxRetries = 3;
   const backoffs = [1000, 3000, 7000];
@@ -434,6 +499,7 @@ export async function callAIText(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
+  stream?: boolean;
   onReasoningDelta?: (delta: string) => Promise<void> | void;
 }) {
   const response = await callAIWithRetry(payload);
@@ -442,12 +508,21 @@ export async function callAIText(payload: {
     throw new Error(errorData.message || 'AI call failed.');
   }
 
-  if (!response.body) {
-    throw new Error('AI provider did not return a response body.');
+  let text = '';
+  if (payload.stream === false) {
+    const parsedBody = await response.clone().json().catch(() => null) as unknown;
+    text =
+      extractTextFromProviderChunk(parsedBody) ||
+      (await response.text().catch(() => ''));
+  } else {
+    if (!response.body) {
+      throw new Error('AI provider did not return a response body.');
+    }
+
+    text = await streamToText(response.body, {
+      onReasoningDelta: payload.onReasoningDelta,
+    });
   }
 
-  const text = await streamToText(response.body, {
-    onReasoningDelta: payload.onReasoningDelta,
-  });
   return { response, text };
 }

@@ -1857,7 +1857,7 @@ app.post('/steps/:id/enrich', async (c) => {
               UPDATE agent_runs
               SET status = 'failed', output = ?, completed_at = datetime("now")
               WHERE id = ?
-            `).bind(`JSON Parse Error: ${message}\nRaw: ${fullContent}`, runId),
+            `).bind(`JSON Parse Error: ${message}`, runId),
           ]);
         }
       })(),
