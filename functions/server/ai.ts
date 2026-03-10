@@ -399,7 +399,7 @@ export async function callProvider(payload: {
     });
   }
 
-  const url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
+  let url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
 
   if (payload.providerType === 'custom' && payload.baseUrl) {
     const urlObj = new URL(url);
@@ -408,6 +408,7 @@ export async function callProvider(payload: {
     } else if (!urlObj.pathname.includes('/chat/completions') && !urlObj.pathname.includes('/v1/')) {
       urlObj.pathname = urlObj.pathname.endsWith('/') ? `${urlObj.pathname}v1/chat/completions` : `${urlObj.pathname}/v1/chat/completions`;
     }
+    url = urlObj.toString();
   }
 
   const max_tokens = (payload.providerType === 'openai' || payload.providerType === 'custom') ? 16384 : 8192;
@@ -443,21 +444,25 @@ export async function callAIWithRetry(payload: {
 }): Promise<Response> {
   const maxRetries = 3;
   const backoffs = [1000, 3000, 7000];
+  const logTag = `[callAIWithRetry] [${payload.providerType}/${payload.model}]`;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
     try {
+      console.log(`${logTag} attempt ${attempt + 1}/${maxRetries + 1} starting...`);
       const response = await callProvider({ ...payload, signal: controller.signal });
       clearTimeout(timeoutId);
 
       if (response.ok) {
+        console.log(`${logTag} attempt ${attempt + 1} succeeded (${response.status})`);
         return response;
       }
 
+      console.error(`${logTag} attempt ${attempt + 1} got HTTP ${response.status}`);
+
       if (response.status === 429) {
-        clearTimeout(timeoutId);
         return Response.json(
           {
             error: 'rate_limited',
@@ -468,7 +473,6 @@ export async function callAIWithRetry(payload: {
       }
 
       if (response.status === 401) {
-        clearTimeout(timeoutId);
         return Response.json(
           {
             error: 'invalid_key',
@@ -479,11 +483,15 @@ export async function callAIWithRetry(payload: {
       }
 
       if (attempt < maxRetries && (response.status >= 500 || response.status === 0)) {
+        console.warn(`${logTag} retrying after ${backoffs[attempt]}ms (server error ${response.status})...`);
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
       }
 
-      clearTimeout(timeoutId);
+      // Try to read error body for diagnostics
+      const errorBody = await response.text().catch(() => '(unreadable)');
+      console.error(`${logTag} FINAL FAILURE: HTTP ${response.status}, body: ${errorBody.slice(0, 500)}`);
+
       return Response.json(
         {
           error: 'provider_unavailable',
@@ -491,13 +499,18 @@ export async function callAIWithRetry(payload: {
         },
         { status: 503 },
       );
-    } catch {
+    } catch (err) {
       clearTimeout(timeoutId);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`${logTag} attempt ${attempt + 1} EXCEPTION: ${errMsg}`);
 
       if (attempt < maxRetries) {
+        console.warn(`${logTag} retrying after ${backoffs[attempt]}ms...`);
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
       }
+
+      console.error(`${logTag} ALL RETRIES EXHAUSTED. Last error: ${errMsg}`);
 
       return Response.json(
         {
@@ -509,6 +522,8 @@ export async function callAIWithRetry(payload: {
     }
   }
 
+  console.error(`${logTag} UNREACHABLE: fell through retry loop`);
+
   return Response.json(
     {
       error: 'provider_unavailable',
@@ -517,6 +532,7 @@ export async function callAIWithRetry(payload: {
     { status: 503 },
   );
 }
+
 
 function getAIErrorMessage(status: number) {
   switch (status) {

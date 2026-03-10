@@ -1230,6 +1230,7 @@ async function callValidatedBatch<T>(
 
     const validated = options.schema.safeParse(parsed);
     if (validated.success) {
+      console.log(`[GENERATION_DEBUG] ${options.runType} validation successful on attempt ${attempt}`);
       await emitter.flush();
       return {
         data: validated.data,
@@ -2659,7 +2660,10 @@ async function getCompletedBatches(projectId: string, env: Bindings): Promise<st
   return rows.results.map((r: any) => r.run_type as string);
 }
 
+const PIPELINE_VERSION = '1.0.2-diag';
+
 export async function processProjectGeneration(env: Bindings, message: QueueMessageBody) {
+  console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}`);
   const project = await getProjectById(env, message.projectId);
   if (!project) {
     throw new GenerationPipelineError('The queued project no longer exists.');
