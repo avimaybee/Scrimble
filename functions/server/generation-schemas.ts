@@ -19,9 +19,9 @@ export const Batch1ResearchStackSchema = z.object({
   technologies: z.array(
     z.object({
       name: z.string().min(1),
-      docs_url: urlSchema,
-      github_url: urlSchema,
-      changelog_url: urlSchema,
+      docs_url: z.string().nullable().optional().transform((v) => v || ''),
+      github_url: z.string().nullable().optional().transform((v) => v || ''),
+      changelog_url: z.string().nullable().optional().transform((v) => v || ''),
       community_search_results: z.array(searchResultSchema).optional().default([]),
       breaking_change_search_results: z.array(searchResultSchema).optional().default([]),
     }),
