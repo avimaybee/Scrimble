@@ -64,8 +64,10 @@ type WorkflowUpdateStepRecord = {
 };
 
 type WorkflowUpdateProgress = {
-  icon: string;
-  message: string;
+  icon?: string;
+  message?: string;
+  thinking?: string;
+  reasoning?: string;
 };
 
 type WorkflowDriftResolution = 'apply_now' | 'save_for_later';
@@ -649,6 +651,7 @@ async function reEnrichAffectedSteps(options: {
       baseUrl: options.provider.baseUrl,
       system: systemPrompt,
       prompt,
+      onReasoningDelta: (delta) => options.onProgress?.({ thinking: delta }),
     });
 
     const enriched = parseJsonResponse(text, stepDetailSchema, `Failed to re-enrich ${step.title}`);

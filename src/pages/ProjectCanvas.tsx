@@ -53,6 +53,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Skeleton } from '@/components/ui/Skeleton';
+import { ThinkingBubble } from '@/components/ui/ThinkingBubble';
+import { Brain, LucideIcon, Sparkles } from 'lucide-react';
 
 const nodeTypes = {
   custom: StepCard,
@@ -461,32 +464,25 @@ export default function ProjectCanvas() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-bg-base flex flex-col items-center justify-center">
-        <motion.div
-          animate={{ 
-            scale: [0.95, 1.05, 0.95],
-            opacity: [0.5, 1, 0.5] 
-          }}
-          transition={{ 
-            duration: 2, 
-            repeat: Infinity, 
-            ease: "easeInOut" 
-          }}
-          className="mb-8 text-accent-primary"
-        >
-          <Hexagon className="w-12 h-12" />
-        </motion.div>
-        <div className="flex flex-col items-center gap-2">
-          <h2 className="font-serif text-xl text-text-primary tracking-[-0.03em]">Opening your plan...</h2>
-          <div className="flex gap-1.5 h-1 items-center">
-            {[0, 1, 2].map((i) => (
-              <motion.div
-                key={i}
-                animate={{ opacity: [0.3, 1, 0.3] }}
-                transition={{ duration: 1, repeat: Infinity, delay: i * 0.2 }}
-                className="w-1 h-1 rounded-full bg-accent-primary"
-              />
-            ))}
+      <div className="min-h-screen bg-bg-base flex flex-col items-center justify-center p-8">
+        <div className="w-full max-w-6xl space-y-8">
+          <div className="flex gap-8">
+            <div className="w-[280px] shrink-0 space-y-6">
+              <Skeleton className="h-24 w-full" />
+              <div className="space-y-3">
+                {[1, 2, 3, 4, 5].map(i => (
+                  <Skeleton key={i} className="h-10 w-full" />
+                ))}
+              </div>
+            </div>
+            <div className="flex-1 space-y-8">
+              <div className="grid grid-cols-3 gap-6">
+                {[1, 2, 3, 4, 5, 6].map(i => (
+                  <Skeleton key={i} className="h-32 w-full rounded-xl" />
+                ))}
+              </div>
+              <Skeleton className="h-64 w-full rounded-2xl" />
+            </div>
           </div>
         </div>
       </div>
@@ -917,33 +913,43 @@ export default function ProjectCanvas() {
           ) : null}
           
           {(isUpdating || updateActivities.length > 0) && (
-            <div className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4">
-              <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-primary">
-                <Activity className={cn("h-4 w-4", isUpdating && "animate-pulse text-accent-primary")} />
-                <span>Update activity</span>
-              </div>
-              <div ref={updateActivityLogRef} className="max-h-[180px] space-y-2 overflow-y-auto pr-1">
-                {updateActivities.map((activity, index) => (
-                  <div key={`${activity.timestamp}-${index}`} className="flex items-start gap-3 rounded-[10px] bg-bg-base/60 px-3 py-2">
-                    <span className="text-sm leading-5">{activity.icon}</span>
-                    <div className="min-w-0 flex-1">
-                      <div className="font-sans text-[13px] leading-6 text-text-secondary">{activity.message}</div>
-                      <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
-                        {new Date(activity.timestamp).toLocaleTimeString('en-US', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                          hour12: false,
-                        })}
+            <div className="space-y-4">
+              {isUpdating && (
+                <ThinkingBubble 
+                   content={updateActivities.find(a => a.icon === '🧠' || a.icon === '💬')?.message}
+                   isStreaming={isUpdating}
+                   className="animate-in fade-in slide-in-from-bottom-2 duration-500"
+                />
+              )}
+              
+              <div className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4">
+                <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-primary">
+                  <Activity className={cn("h-4 w-4", isUpdating && "animate-pulse text-accent-primary")} />
+                  <span>Update activity</span>
+                </div>
+                <div ref={updateActivityLogRef} className="max-h-[180px] space-y-2 overflow-y-auto pr-1">
+                  {updateActivities.map((activity, index) => (
+                    <div key={`${activity.timestamp}-${index}`} className="flex items-start gap-3 rounded-[10px] bg-bg-base/60 px-3 py-2">
+                      <span className="text-sm leading-5">{activity.icon}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-sans text-[13px] leading-6 text-text-secondary">{activity.message}</div>
+                        <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                          {new Date(activity.timestamp).toLocaleTimeString('en-US', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                            hour12: false,
+                          })}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
-                {isUpdating && updateActivities.length === 0 ? (
-                  <div className="font-sans text-[13px] leading-6 text-text-secondary">
-                    Waiting for the update pipeline to respond...
-                  </div>
-                ) : null}
+                  ))}
+                  {isUpdating && updateActivities.length === 0 ? (
+                    <div className="font-sans text-[13px] leading-6 text-text-secondary">
+                      Waiting for the update pipeline to respond...
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
           )}

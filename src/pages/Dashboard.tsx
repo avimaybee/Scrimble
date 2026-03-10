@@ -32,6 +32,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { Skeleton } from '@/components/ui/Skeleton';
+import { Brain, LucideIcon, Sparkles } from 'lucide-react';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -279,24 +281,24 @@ export default function Dashboard() {
 
       {loading ? (
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-          {[1, 2, 3].map((item) => (
+          {[1, 2, 3, 4].map((item) => (
             <div key={item} className="surface-card p-6">
               <div className="mb-6 flex items-start justify-between gap-6">
-                <div className="space-y-2">
-                  <div className="skeleton-block h-7 w-48" />
-                  <div className="skeleton-block h-4 w-36" />
+                <div className="space-y-3">
+                  <Skeleton variant="heading" className="w-48" />
+                  <Skeleton variant="body" className="w-32" />
                 </div>
-                <div className="skeleton-block h-10 w-10 rounded-[10px]" />
+                <Skeleton variant="circle" className="h-10 w-10 rounded-[10px]" />
               </div>
               <div className="space-y-4">
-                <div className="skeleton-block h-14 w-full rounded-[12px]" />
-                <div className="skeleton-block h-[3px] w-full rounded-[2px]" />
+                <Skeleton className="h-14 w-full rounded-[12px]" />
+                <Skeleton className="h-[3px] w-full" />
                 <div className="flex justify-between gap-4">
                   <div className="flex gap-2">
-                    <div className="skeleton-block h-6 w-20 rounded-[6px]" />
-                    <div className="skeleton-block h-6 w-20 rounded-[6px]" />
+                    <Skeleton variant="badge" className="w-20" />
+                    <Skeleton variant="badge" className="w-20" />
                   </div>
-                  <div className="skeleton-block h-6 w-16 rounded-[6px]" />
+                  <Skeleton variant="badge" className="w-16" />
                 </div>
               </div>
             </div>
@@ -329,11 +331,13 @@ export default function Dashboard() {
             const completedStageCount = stages.filter((stage) => stage.status === 'complete').length;
             const stageTotal = stages.length || 1;
             const stageProgress = Math.min(Math.max(completedStageCount, 0), stageTotal);
+            const isAgentWorking = ['queued', 'batch_1_research_stack', 'batch_2_fetch_and_read', 'batch_3_architect', 'batch_4_plan_build', 'batch_5_enrich_steps', 'batch_6_generate_files'].includes(project.generation_status || '') || nextStep?.status === 'agent_working';
+
             const statusLabel = project.generation_status === 'intake'
               ? 'Continue intake'
               : nextStep?.status === 'needs_review'
                 ? 'Your review'
-                : nextStep?.status === 'agent_working'
+                : isAgentWorking
                   ? 'Working now'
                   : 'Next up';
 
@@ -422,12 +426,44 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                <div className="rounded-[12px] border border-accent-border bg-accent-primary-muted/50 px-4 py-3">
-                  <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.16em] text-accent-primary">
-                    {statusLabel}
+                <div className={cn(
+                  "rounded-[12px] border px-4 py-3 relative overflow-hidden",
+                  isAgentWorking 
+                    ? "border-accent-border/40 bg-accent-primary-muted/20" 
+                    : "border-accent-border bg-accent-primary-muted/50"
+                )}>
+                  {isAgentWorking && (
+                    <motion.div
+                      initial={{ left: '-100%' }}
+                      animate={{ left: '100%' }}
+                      transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
+                      className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-accent-primary/10 to-transparent z-0"
+                    />
+                  )}
+                  
+                  <div className="flex items-center justify-between mb-1 relative z-10">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-accent-primary">
+                      {statusLabel}
+                    </div>
+                    {isAgentWorking && (
+                      <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent-primary/10 border border-accent-primary/20">
+                        <motion.div
+                          animate={{ rotate: 360 }}
+                          transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
+                        >
+                          <Sparkles className="w-2.5 h-2.5 text-accent-primary" />
+                        </motion.div>
+                        <span className="text-[9px] font-mono text-accent-primary uppercase tracking-wider font-bold">Live</span>
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary">
-                    <ArrowRight className="h-4 w-4 text-accent-primary" />
+                  
+                  <div className="flex items-center gap-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary relative z-10">
+                    {isAgentWorking ? (
+                      <Brain className="h-4 w-4 text-accent-primary animate-pulse" />
+                    ) : (
+                      <ArrowRight className="h-4 w-4 text-accent-primary" />
+                    )}
                     <span>
                       {project.generation_status === 'intake'
                         ? 'Finish the intake conversation.'

@@ -530,8 +530,11 @@ export async function callAIText(payload: {
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
-  onReasoningDelta?: (delta: string) => void;
-}) {
+  onReasoningDelta?: (delta: string) => void | Promise<void>;
+}): Promise<{
+  text: string;
+  response: Response;
+}> {
   const response = await callAIWithRetry(payload);
   if (!response.ok) {
     throw new Error(getAIErrorMessage(response.status));

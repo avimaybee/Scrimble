@@ -28,9 +28,10 @@ import {
   type QueueMessageBody,
 } from './types';
 import {
-  appendGenerationThinkingDelta,
+  createThrottledThinkingEmitter,
   emitTransientGenerationStreamEvent,
   getBatchStartLabel,
+  isTerminalGenerationEvent,
   persistGenerationStreamEvent,
   resetGenerationThinkingState,
 } from './generation-events';
@@ -983,6 +984,7 @@ async function logActivity(
 }
 
 function emitThinking(env: Bindings, projectId: string, batchName: GenerationBatchName, content: string) {
+  // Provided for backwards compatibility or single-shot emits.
   const trimmed = content.trim();
   if (!trimmed) {
     return;
@@ -995,18 +997,6 @@ function emitThinking(env: Bindings, projectId: string, batchName: GenerationBat
       type: 'thinking',
       content,
     },
-  });
-
-  void appendGenerationThinkingDelta(env, {
-    projectId,
-    batchName,
-    content,
-  }).catch((error) => {
-    console.warn('[generation-thinking-relay-failed]', {
-      projectId,
-      batchName,
-      error: error instanceof Error ? error.message : 'Unknown relay failure',
-    });
   });
 }
 
@@ -1203,6 +1193,7 @@ async function callValidatedBatch<T>(
 ) {
   let prompt = options.prompt;
   let lastError = 'The AI response was empty.';
+  const emitter = createThrottledThinkingEmitter(options.env, options.projectId, options.runType);
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const { text } = await callAIText({
@@ -1212,10 +1203,7 @@ async function callValidatedBatch<T>(
       baseUrl: provider.baseUrl,
       system: options.systemPrompt,
       prompt,
-      onReasoningDelta:
-        attempt === 1
-          ? (delta) => emitThinking(options.env, options.projectId, options.runType, delta)
-          : undefined,
+      onReasoningDelta: emitter.onReasoningDelta,
     });
 
     let parsed: unknown;
@@ -1236,11 +1224,13 @@ async function callValidatedBatch<T>(
         continue;
       }
 
+      await emitter.flush();
       throw new GenerationPipelineError(`${lastError} Please retry.`);
     }
 
     const validated = options.schema.safeParse(parsed);
     if (validated.success) {
+      await emitter.flush();
       return {
         data: validated.data,
         rawResponse: JSON.stringify(validated.data),
@@ -1251,13 +1241,15 @@ async function callValidatedBatch<T>(
     lastError = `Validation failed for ${options.runType}: ${validated.error.message}`;
     logBatchResponseFailure(options.runType, 'schema', cleanedText);
     if (attempt === 1) {
-      prompt = formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
-      continue;
+        prompt = formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
+        continue;
     }
 
+    await emitter.flush();
     throw new GenerationPipelineError(`${lastError} Please retry.`);
   }
 
+  await emitter.flush();
   throw new GenerationPipelineError(lastError);
 }
 
@@ -2050,6 +2042,17 @@ For each technology, return:
 - sources (copy the important sources you used as { technology, url, tool, title, summary })
 
 Preserve specific version and compatibility details.`;
+
+  console.log('[BATCH2_DEBUG] starting research analyst AI call', {
+    projectId,
+    technologies: researchTargets.map(t => t.name),
+    fetchedSourcesCount: fetchedSources.length,
+    firstSourceSample: fetchedSources[0] ? { 
+      tech: fetchedSources[0].technology, 
+      docsLen: fetchedSources[0].docs_content.length,
+      readmeLen: fetchedSources[0].github_readme.length 
+    } : null
+  });
 
   try {
     const result = await callValidatedBatch(provider, {

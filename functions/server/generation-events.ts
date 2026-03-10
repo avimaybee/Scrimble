@@ -354,6 +354,79 @@ export function emitTransientGenerationStreamEvent(payload: {
   return transientEvent;
 }
 
+export function createThrottledThinkingEmitter(
+  env: Bindings,
+  projectId: string,
+  batchName: GenerationBatchName,
+  flushIntervalMs = 1000,
+) {
+  let buffer = '';
+  let flushTimeout: ReturnType<typeof setTimeout> | null = null;
+  let activeFlushPromise: Promise<void> | null = null;
+
+  const flushBuffer = async () => {
+    if (flushTimeout !== null) {
+      clearTimeout(flushTimeout);
+      flushTimeout = null;
+    }
+
+    const currentBuffer = buffer;
+    if (!currentBuffer) {
+      return;
+    }
+
+    // Capture the flush promise so we can safely await it at the end
+    activeFlushPromise = (async () => {
+      try {
+        await appendGenerationThinkingDelta(env, {
+          projectId,
+          batchName,
+          content: currentBuffer,
+        });
+        // Only clear from the buffer what we successfully wrote,
+        // in case the buffer grew while we were writing (though we re-slice below)
+      } catch (error) {
+        console.warn('[createThrottledThinkingEmitter] Failed to flush thinking delta to D1:', error);
+      }
+    })();
+
+    await activeFlushPromise;
+    // Remove the executed portion from the buffer
+    buffer = buffer.slice(currentBuffer.length);
+    activeFlushPromise = null;
+  };
+
+  return {
+    onReasoningDelta: (delta: string) => {
+      // 1. Immediately emit a transient event for connected frontend clients
+      emitTransientGenerationStreamEvent({
+        projectId,
+        batchName,
+        event: { type: 'thinking', content: delta },
+      });
+
+      // 2. Buffer for D1 writing
+      buffer += delta;
+
+      // 3. Schedule flush
+      if (flushTimeout === null && !activeFlushPromise) {
+        flushTimeout = setTimeout(() => {
+          void flushBuffer();
+        }, flushIntervalMs);
+      }
+    },
+    flush: async () => {
+      // Wait for any ongoing flush, then do one last flush
+      if (activeFlushPromise) {
+        await activeFlushPromise;
+      }
+      if (buffer) {
+        await flushBuffer();
+      }
+    },
+  };
+}
+
 export async function listPersistedGenerationEventsSince(env: Bindings, projectId: string, lastEventId: number) {
   const rows = await env.DB.prepare(`
     SELECT id, project_id, event_type, batch_name, payload, created_at

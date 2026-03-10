@@ -183,7 +183,7 @@ const updateStreamEncoder = new TextEncoder();
 
 async function writeUpdateStreamEvent(
   writer: WritableStreamDefaultWriter<Uint8Array>,
-  event: 'activity' | 'complete' | 'error',
+  event: 'activity' | 'thinking' | 'complete' | 'error',
   payload: Record<string, unknown>,
 ) {
   await writer.write(updateStreamEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`));
@@ -1064,7 +1064,7 @@ app.get('/projects/:id', async (c) => {
 
 app.get('/projects/:id/status', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProjectWithProgress(c, projectId);
+  const project = await getOwnedProject(c, projectId);
   if (!project) {
     return c.json({ error: 'Project not found' }, 404);
   }
@@ -1208,6 +1208,12 @@ app.post('/projects/:id/resume', async (c) => {
     providerId = providerRecord?.id;
   }
 
+  await c.env.DB.prepare(`
+    UPDATE projects 
+    SET generation_status = 'queued', generation_error = NULL, updated_at = datetime("now")
+    WHERE id = ? AND user_id = ?
+  `).bind(projectId, c.get('uid')).run();
+
   await c.env.AGENT_QUEUE.send({
     type: 'generate_project',
     projectId,
@@ -1329,7 +1335,9 @@ app.delete('/projects/:id', async (c) => {
   // Using CASCADE would be ideal, but we'll do explicit deletes for safety.
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM project_generation_events WHERE project_id = ?').bind(projectId),
-    c.env.DB.prepare('DELETE FROM generation_stream_events WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM project_generation_live_state WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM project_intake_messages WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM project_briefs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM edges WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM checklist_items WHERE step_id IN (SELECT id FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?))').bind(projectId),
@@ -1339,10 +1347,11 @@ app.delete('/projects/:id', async (c) => {
     c.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(projectId),
   ]);
 
+
   return c.body(null, 204);
 });
 
-app.get('/plans', async (c) => {
+app.get('/api/plans', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1381,7 +1390,7 @@ app.post('/plans', async (c) => {
   return c.json({ success: true, id });
 });
 
-app.get('/stages', async (c) => {
+app.get('/api/stages', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1435,7 +1444,7 @@ app.post('/stages', async (c) => {
   return c.json({ success: true, id });
 });
 
-app.get('/steps', async (c) => {
+app.get('/api/steps', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1663,7 +1672,7 @@ app.post('/steps/:id/review', async (c) => {
   return c.json({ success: true, decision: 'reject', regenerate: true });
 });
 
-app.get('/edges', async (c) => {
+app.get('/api/edges', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1718,7 +1727,7 @@ app.post('/edges', async (c) => {
   return c.json({ success: true, id });
 });
 
-app.get('/checklist-items', async (c) => {
+app.get('/api/checklist-items', async (c) => {
   const stepId = c.req.query('stepId');
   if (!stepId) {
     return c.json({ error: 'stepId is required' }, 400);
@@ -1881,9 +1890,9 @@ app.post('/workflows/:id/update', async (c) => {
           env: c.env,
           workflowId,
           project: {
-            id: asText(workflowRecord.project_id),
-            user_id: asText(workflowRecord.user_id),
-            name: asText(workflowRecord.name, 'Untitled project'),
+            id: workflowRecord.project_id,
+            user_id: workflowRecord.user_id,
+            name: optionalText(workflowRecord.name),
             description: optionalText(workflowRecord.description),
             stack: optionalText(workflowRecord.stack),
           },
@@ -1901,6 +1910,12 @@ app.post('/workflows/:id/update', async (c) => {
               message: progress.message,
               timestamp: new Date().toISOString(),
             });
+            if (progress.thinking) {
+              await writeUpdateStreamEvent(writer, 'thinking', {
+                content: progress.thinking,
+                timestamp: new Date().toISOString(),
+              });
+            }
           },
         });
 

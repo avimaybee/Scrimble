@@ -63,12 +63,15 @@ function parseIntakeAgentResponse(rawText: string) {
 }
 
 export async function runProjectIntakeTurn(options: {
-  env: Bindings;
   userId: string;
+  env: Bindings;
   rawDescription: string;
   messages: ProjectIntakeMessage[];
   provider: IntakeProviderContext;
   conversationTurns: number;
+  onThinking?: (delta: string) => Promise<void> | void;
+  stepId?: string;
+  projectId?: string;
 }) {
   const builderProfile = await loadBuilderProfileContext(options.userId, options.env);
   const systemPrompt = `You are Scrimble's project intake agent. Your job is to understand what the builder wants to create well enough that a research pipeline can fetch the exact right documentation, libraries, and community knowledge before building their plan.
@@ -134,6 +137,7 @@ Update the structured brief from the full conversation, not just the last messag
     baseUrl: options.provider.baseUrl,
     system: systemPrompt,
     prompt,
+    onReasoningDelta: options.onThinking,
   });
 
   const parsed = parseIntakeAgentResponse(text);

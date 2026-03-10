@@ -558,7 +558,14 @@ transition: { duration: 0.25, ease: [0.16, 1, 0.3, 1] }
 // layoutId="active-pill" on the active indicator for smooth morphing
 ```
 
+### 10.14 Thinking State & Loading Transparency
+Animations alone aren’t enough — Scrimble must be transparent about *why* the user is waiting.
+- **Agent Thinking**: The `ThinkingBubble` component renders a dedicated, persistent but transient "Agent Thoughts" card. It uses a spinning `Sparkles` icon and a breathing `Brain` pulse to signal active reasoning. Content is streamed via the `thinking` SSE event.
+- **Modular Skeletons**: The `Skeleton` component provides four consistent variants (`body`, `heading`, `circle`, `badge`) to bridge the gap between initial mount and data arrival.
+- **Progressive Disclosure**: As the agent works, the UI never blocks. It populates skeletons in the detail panels while the `ThinkingBubble` streams the latest reasoning in real-time.
+
 ---
+
 
 ## 11. Information Architecture
 
@@ -787,10 +794,19 @@ CREATE INDEX IF NOT EXISTS idx_stages_workflow    ON stages(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_workflow     ON steps(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
-CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project_id);
-CREATE INDEX IF NOT EXISTS idx_ai_providers_user  ON ai_providers(user_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_user   ON mcp_servers(user_id);
+
+-- ────────────────────────────────────────────
+-- TRANSIENT STATE (Thinking / Reasoning Relay)
+-- Rows are physically DELETED on batch/pipeline completion
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_generation_live_state (
+  project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  reasoning       TEXT,                 -- the current accumulated thinking block
+  updated_at      TEXT DEFAULT (datetime('now'))
+);
 ```
+
 
 ---
 
@@ -831,7 +847,9 @@ PATCH  /api/settings/mcp-servers/:id → Toggle research tool active/inactive
 DELETE /api/settings/mcp-servers/:id → Remove research tool connection
 
 POST   /api/ai/proxy               → Proxied AI call (uses user's stored key)
+POST   /api/projects/:id/resume    → Re-enqueue a failed or interrupted project
 ```
+
 
 ### Cloudflare Queue — Async Agent Jobs
 
@@ -867,10 +885,17 @@ Each batch executes in order with **Smart Caps** to ensure extreme thoroughness 
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
 - **AI Patience**: 10-minute timeout per AI provider call (managed via AbortController).
 - **Research Liberty**: 2-minute timeout for documentation fetches; up to 100,000 tokens processed per document.
-- **Output Freedom**: Up to 16,384 tokens per AI response (provider-dependent).
-- **Input Freedom**: Zero character limits on natural language project intake.
+- **Token Guardrails**: Aggressive truncation on all research fields (Docs: 15k chars, Readme: 10k chars, Issues: 8k chars) ensures prompts stay within model sweet spots and avoids execution timeouts.
+- **Output Freedom**: Up to 16,384 tokens per AI response to provide headroom for models with extensive reasoning/thinking blocks (e.g., GLM-5, DeepSeek-R1).
+- **Thought-Only Guard**: If a model exhausts its output window with reasoning but provides no JSON content, the system automatically triggers a single "JSON-only" retry.
 
 Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved. The review payload (including feedback and preferred IDE) is stored and forwarded to batches 4‑6 so every subsequent step honors the builder’s choices.
+
+### Resume & Retry Flow
+The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or budget limit), it enters a `failed` state.
+1. **Backend Support**: The `/api/projects/:id/resume` endpoint allows re-enqueuing even `failed` projects, picking up from the last incomplete batch.
+2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend re-enqueue, reconnecting the SSE stream only after the task is back in the queue.
+
 
 ### Professional Icon System
 Scrimble strictly uses technical, engineering-focused icons (Lucide React) to maintain a professional aesthetic:
@@ -880,8 +905,14 @@ Scrimble strictly uses technical, engineering-focused icons (Lucide React) to ma
 - **Action/Trigger**: `Zap`
 - *Prohibited: Any whimsical, magic, sparkle, or glitter-themed icons.*
 
-The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`.
- That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate queue consumer worker. Event payloads now include `thinking` alongside the durable batch events (`batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, `pipeline_failed`), which the frontend decodes to drive the live status feed, review panel, and progress dots. Durable events still replay from `project_generation_events`; transient reasoning is relayed through a lightweight `project_generation_live_state` row that is overwritten in place and never treated as part of the long-term audit trail.
+The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. 
+That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate queue consumer worker. 
+
+To handle the high-frequency nature of AI reasoning deltas from distributed global isolates, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`). This utility buffers incoming reasoning tokens in memory and performs a single `ON CONFLICT DO UPDATE` write to the `project_generation_live_state` table every 1000ms. This prevents D1 row-locking congestion while maintaining a fluid user experience.
+
+On terminal events (`pipeline_complete`, `pipeline_failed`), the system explicitly calls `writer.close()` after the final flush to ensure the browser strictly severs the connection and doesn't leave "ghost" streams polling the edge.
+
+
 
 ### API Key Security
 ```
@@ -947,7 +978,15 @@ Scrimble’s “start a project” flow now enqueues a Cloudflare Queue job that
 
 The queue consumer owns this pipeline completely. It does not hold a browser `WritableStream`, depend on an open tab, or await any frontend connection before continuing its work. If the user refreshes, disconnects, or closes the tab, the worker keeps running, persists each durable milestone to D1, and the generation screen rebuilds itself later from replay plus fresh polling.
 
-Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer before `extractJSON()` strips markdown fences for the final Zod-validated parse. This fixes the malformed-buffer failure mode where transport metadata or partial chunks leaked into the raw response. Step enrichment is now deeper too: auth steps fetch security/session docs plus recent vulnerability chatter, database steps pull schema+migration references, deployment steps read platform docs/issues/checklists, and payment steps pull live Stripe checkout + webhook guidance before the AI writes the final step artifact. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
+Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. **Token Guardrails** (aggressive truncation of raw research data) prevent prompt-size failures. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
+
+**Resilience Features**:
+- **Reasoning-Only Guard**: Models with high-effort reasoning (GLM-5, DeepSeek-R1) can sometimes exhaust their output limit with thought alone. If the stream closes with reasoning but an empty JSON body, the system triggers a single retry with a "JSON-only, no reasoning" system prompt override.
+- **Privacy Purge**: To protect intellectual property and user privacy, all transient reasoning/thinking data is physically DELETED from D1 as soon as a batch or the entire pipeline completes.
+- **JSON Security**: The `extractJSON()` utility strips markdown fences and handles malformed-buffer edge cases where transport metadata might leak into the response.
+
+Step enrichment is now deeper too: auth steps fetch security/session docs plus recent vulnerability chatter, database steps pull schema+migration references, deployment steps read platform docs/issues/checklists, and payment steps pull live Stripe checkout + webhook guidance before the AI writes the final step artifact. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
+
 Batch 2 also records a `research_sources` ledger (tool, source URL, one-line summary) and a `data_quality` object (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`) so the architecture checkpoint can explain which tools were consulted, how deep the research went, and which sources the agent actually read.
 
 The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, the historical activity log, progress dots, ETA counter, and review gate. The `/api/projects/:id/generation-stream` route always replays missed durable events first using `Last-Event-ID`, then polls D1 for new rows every ~1 second so queue-written updates still flow even though the browser and queue worker live in separate runtimes. Provider reasoning chunks are streamed separately as transient `thinking` events: the queue consumer updates the per-project live-state relay as they arrive, and the SSE route forwards only the latest delta to the browser while continuing to replay the durable history from D1. This split lets Scrimble stream live model thinking without polluting the long-term audit trail or waiting for the entire provider response to finish.
@@ -1401,6 +1440,8 @@ disconnected per connection.
 | `HumanReviewPanel` | Gate review UI inside StepPanel |
 | `SectionLabel` | Mono uppercase + paprika dash |
 | `StackChip` | Technology tag |
+| `Skeleton` | Modular shimmer loading state (body, heading, circle, badge) |
+| `ThinkingBubble` | Animated agent status and reasoning content display |
 | `ProjectCard` | Dashboard project card |
 | `AIProviderCard` | Settings — connected provider display |
 
@@ -1431,8 +1472,18 @@ disconnected per connection.
 - AI step enrichment ( Gemini/OpenAI integration + D1 persistence)
 - AI plan update (natural language diffing + D1 mutation)
 - Sequential 6-batch generation pipeline (research stack → fetch/read → architect → plan build → enrich → file generation) with single-AI-call batches, Zod validation, `agent_runs` auditing, and SSE event persistence so the frontend always knows what the agent is doing.
+- **Robustness & Privacy (Latest Updates)**:
+  - **Token Guardrails**: Aggressive truncation in Batch 2 (15k docs, 10k readme) to ensure prompts stay within model sweet spots.
+  - **Reasoning Guards**: Automatic JSON-only retry if a model emits only thoughts and no content (GLM-5/DeepSeek protection).
+  - **Privacy Purge**: Reasoning data is physically deleted from D1 on batch/pipeline completion or project deletion.
+  - **Pipeline Fallthrough Prevention**: Individual `executeBatch` functions now propagate errors by throwing a `GenerationPipelineError`. This prevents the pipeline from falling through to subsequent batches and masking the root cause with "Missing output" errors.
+  - **Improved Retry Flow**: Backend `/resume` resets the project status to `queued` and clears error flags, allowing the worker to re-run the failed batch. Frontend "Try again" triggers a real re-enqueue.
 - Batch 2 now relies on the Worker-side tools layer (`fetchUrl`, `analyzeGithubRepo`, `getLibraryDocs`, `getLibraryIssues`, `searchWeb`), collecting docs, releases, issues, and Brave Search chatter, while also writing the `research_sources` ledger plus `data_quality` stats (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`). These metadata power the Research depth badges, "What I read" list, and per-step footers. Batch 6 still returns the six required skill/context files that are stored in D1 and zipped through `/api/projects/:id/skill-files` for download.
+
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
+- **SSE Streaming Overhaul**: Fully migrated AI reasoning deltas to a throttled, D1-buffered polling model. This architecture supports distributed Cloudflare Queue workers without triggering SQLite performance bottlenecks, ensuring smooth "thinking" streams for project generation, step enrichment, and plan updates.
+- **Connection Safety**: Implemented strict stream lifecycle management; `writer.close()` is now guaranteed on all terminal pipeline events and server-side cleanups.
+- **UI Transparency**: Introduced `Skeleton` and `ThinkingBubble` components across the dashboard and project canvas to maintain transparency during agent work.
 - Research depth badges and the "Researched {date} using {tools}" footer inject transparency into the detail panel and architecture review, highlighting when Context7, Brave Search, or GitHub were used and nudging builders to connect any missing tools for deeper next-time results.
 - Live generation screen now streams durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` events plus transient `thinking` deltas: animated batch headings, a dedicated “Currently working” live line, icon-coded history entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
 - Canvas sidebar exposes a "Download AI files" button with download icon, hint text ("Paste these into your IDE…"), and tooltip-disabled state until the files are ready.

@@ -231,6 +231,7 @@ export interface ProjectIntakeSession {
   generation_status: GenerationStatus;
   ready: boolean;
   agent_message: string;
+  agent_thinking?: string;
   messages: ProjectIntakeMessage[];
   brief: ProjectBrief;
 }

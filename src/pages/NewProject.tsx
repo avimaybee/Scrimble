@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '../components/ui/dialog';
 import type { AIProvider } from '../lib/ai';
+import { ThinkingBubble } from '@/components/ui/ThinkingBubble';
 import type { GenerationPreparationState, ProjectBrief, ProjectIntakeSession } from '../types';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
@@ -609,18 +610,26 @@ export default function NewProject() {
                   </button>
                 </div>
 
-                <div className="flex items-center justify-between gap-4">
-                  <button
-                    type="button"
-                    onClick={() => void handleConfirmIntake()}
-                    className="text-sm text-text-tertiary transition-colors hover:text-text-secondary"
-                  >
-                    Skip - use my description as-is
-                  </button>
-                  <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                    {isSendingReply ? 'Thinking...' : 'One question at a time'}
+                  {isSendingReply && (
+                    <ThinkingBubble 
+                      content={intakeSession?.agent_thinking}
+                      isStreaming={isSendingReply}
+                      className="mt-6 mb-2"
+                    />
+                  )}
+
+                  <div className="flex items-center justify-between gap-4">
+                    <button
+                      type="button"
+                      onClick={() => void handleConfirmIntake()}
+                      className="text-sm text-text-tertiary transition-colors hover:text-text-secondary"
+                    >
+                      Skip - use my description as-is
+                    </button>
+                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                      {isSendingReply ? 'Agent is working...' : 'One question at a time'}
+                    </div>
                   </div>
-                </div>
               </form>
             </motion.section>
           ) : null}
