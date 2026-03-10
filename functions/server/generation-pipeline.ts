@@ -1685,6 +1685,8 @@ Only include technologies that matter to implementation.`;
   }
 }
 
+const MAX_DEEP_RESEARCH_TECHS = 6;
+
 async function executeBatch2(
   env: Bindings,
   project: ProjectRecord,
@@ -1707,6 +1709,15 @@ async function executeBatch2(
     },
   };
 
+  // Circuit-breakers: stop calling tools that consistently fail
+  let contextSevenBroken = false;
+  let githubIssuesBroken = false;
+
+  // Cap deep research to avoid Cloudflare subrequest limits
+  const deepTargets = researchTargets.slice(0, MAX_DEEP_RESEARCH_TECHS);
+  const stubTargets = researchTargets.slice(MAX_DEEP_RESEARCH_TECHS);
+  console.log(`[BATCH2_BUDGET] ${researchTargets.length} technologies total. Deep research: ${deepTargets.length}, Stub: ${stubTargets.length}`);
+
   await emitBatchStart(env, projectId, 'batch_2_fetch_and_read');
   await logActivity(env, {
     projectId,
@@ -1714,13 +1725,13 @@ async function executeBatch2(
     kind: 'fetch',
       message:
         projectBrief.confirmedStackTools.length > 0
-          ? `Reading the docs for ${researchTargets.length} technologies, starting with ${projectBrief.confirmedStackTools.length} confirmed stack tool${projectBrief.confirmedStackTools.length === 1 ? '' : 's'} from your brief...`
+          ? `Reading the docs for ${deepTargets.length} of ${researchTargets.length} technologies, starting with ${projectBrief.confirmedStackTools.length} confirmed stack tool${projectBrief.confirmedStackTools.length === 1 ? '' : 's'} from your brief...`
           : builderProfile.declaredTools.length > 0
-            ? `Reading the docs for ${researchTargets.length} technologies, starting with ${builderProfile.declaredTools.length} saved tool${builderProfile.declaredTools.length === 1 ? '' : 's'} from your builder profile...`
-          : `Reading the docs for ${researchTargets.length} technolog${researchTargets.length === 1 ? 'y' : 'ies'}...`,
+            ? `Reading the docs for ${deepTargets.length} of ${researchTargets.length} technologies, starting with ${builderProfile.declaredTools.length} saved tool${builderProfile.declaredTools.length === 1 ? '' : 's'} from your builder profile...`
+          : `Reading the docs for ${deepTargets.length} of ${researchTargets.length} technolog${researchTargets.length === 1 ? 'y' : 'ies'}...`,
   });
 
-  for (const technology of researchTargets) {
+  for (const technology of deepTargets) {
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
@@ -1763,11 +1774,17 @@ async function executeBatch2(
       changelogUrl
         ? fetchUrl(changelogUrl, toolEnv)
         : Promise.resolve(emptyFetchedSource('', `${technology.name} changelog`)),
-      getLibraryDocs(technology.name, technology.docs_topic, project.user_id, toolEnv),
+      contextSevenBroken
+        ? Promise.resolve({ content: '', source: 'Context7', version: 'unknown' })
+        : getLibraryDocs(technology.name, technology.docs_topic, project.user_id, toolEnv).catch((err) => {
+            console.warn(`[BATCH2_CIRCUIT] Context7 failed for ${technology.name}: ${err instanceof Error ? err.message : err}. Disabling for remaining technologies.`);
+            contextSevenBroken = true;
+            return { content: '', source: 'Context7', version: 'unknown' };
+          }),
       githubRepository
         ? analyzeGithubRepo(githubRepository.owner, githubRepository.repo, project.user_id, toolEnv)
         : Promise.resolve(emptyGithubRepoAnalysis()),
-      githubRepository
+      githubRepository && !githubIssuesBroken
         ? getLibraryIssues(
             githubRepository.owner,
             githubRepository.repo,
@@ -1775,23 +1792,18 @@ async function executeBatch2(
             90,
             project.user_id,
             toolEnv,
-          )
-        : Promise.resolve([]),
+          ).catch((err) => {
+            console.warn(`[BATCH2_CIRCUIT] GitHub Issues failed for ${technology.name}: ${err instanceof Error ? err.message : err}. Disabling for remaining technologies.`);
+            githubIssuesBroken = true;
+            return [] as GithubIssue[];
+          })
+        : Promise.resolve([] as GithubIssue[]),
     ]);
-    const communityPages = (
-      await Promise.all(
-        searchResults.map(async (result) => {
-          const page = await fetchUrl(result.url, toolEnv);
-
-          return {
-            title: result.title,
-            url: result.url,
-            description: result.description,
-            content: page.content,
-          };
-        }),
-      )
-    ).filter((page): page is FetchedCommunitySource => Boolean(page.content || page.description));
+    // Skip community page fetching to conserve subrequests.
+    // Use search result text summaries instead of fetching each page.
+    const communityPages: FetchedCommunitySource[] = searchResults
+      .filter((r) => r.description)
+      .map((r) => ({ title: r.title, url: r.url, description: r.description, content: r.description }));
     issuesFound += githubIssues.length;
 
     if (!docsResult.content && !liveDocsResult.content) {
@@ -1994,6 +2006,27 @@ async function executeBatch2(
       community_pages: communityPages,
     });
 
+  }
+
+  // Add stub entries for technologies that didn't get deep research
+  for (const technology of stubTargets) {
+    fetchedSources.push({
+      technology: technology.name,
+      docs_url: technology.docs_url.trim(),
+      github_url: technology.github_url,
+      changelog_url: technology.changelog_url.trim(),
+      docs_content: 'Documentation not fetched — research was capped to conserve subrequests.',
+      github_readme: 'GitHub data not fetched.',
+      latest_version: 'Unknown',
+      last_commit_date: 'Unknown',
+      open_issues_count: 0,
+      recent_breaking_changes: 'Not analyzed.',
+      repo_health_summary: 'Not analyzed.',
+      community_sentiment: 'Not analyzed.',
+      bug_report_digest: 'Not analyzed.',
+      source_ledger: [],
+      community_pages: [],
+    });
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
