@@ -2,6 +2,12 @@ import { handleProjectGenerationQueue } from './functions/server/generation-pipe
 
 export default {
   async queue(batch: any, env: any, ctx: any) {
-    return handleProjectGenerationQueue(batch, env, ctx);
+    console.log('[CONSUMER_ENTRY] Queue handler invoked. Batch size:', batch.messages?.length, 'Has ENCRYPTION_KEY:', !!env.ENCRYPTION_KEY, 'Has DB:', !!env.DB);
+    try {
+      return await handleProjectGenerationQueue(batch, env, ctx);
+    } catch (err) {
+      console.error('[CONSUMER_ENTRY] UNCAUGHT ERROR:', err instanceof Error ? err.message : String(err));
+      throw err;
+    }
   },
 };
