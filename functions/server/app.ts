@@ -1351,7 +1351,7 @@ app.delete('/projects/:id', async (c) => {
   return c.body(null, 204);
 });
 
-app.get('/api/plans', async (c) => {
+app.get('/plans', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1390,7 +1390,7 @@ app.post('/plans', async (c) => {
   return c.json({ success: true, id });
 });
 
-app.get('/api/stages', async (c) => {
+app.get('/stages', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1444,7 +1444,7 @@ app.post('/stages', async (c) => {
   return c.json({ success: true, id });
 });
 
-app.get('/api/steps', async (c) => {
+app.get('/steps', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1672,7 +1672,7 @@ app.post('/steps/:id/review', async (c) => {
   return c.json({ success: true, decision: 'reject', regenerate: true });
 });
 
-app.get('/api/edges', async (c) => {
+app.get('/edges', async (c) => {
   const projectId = c.req.query('projectId');
   if (!projectId) {
     return c.json({ error: 'projectId is required' }, 400);
@@ -1727,7 +1727,7 @@ app.post('/edges', async (c) => {
   return c.json({ success: true, id });
 });
 
-app.get('/api/checklist-items', async (c) => {
+app.get('/checklist-items', async (c) => {
   const stepId = c.req.query('stepId');
   if (!stepId) {
     return c.json({ error: 'stepId is required' }, 400);
