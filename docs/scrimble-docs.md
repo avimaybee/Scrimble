@@ -848,6 +848,12 @@ DELETE /api/settings/mcp-servers/:id → Remove research tool connection
 
 POST   /api/ai/proxy               → Proxied AI call (uses user's stored key)
 POST   /api/projects/:id/resume    → Re-enqueue a failed or interrupted project
+
+> [!IMPORTANT]
+> **Routing Gotcha**: Hono is configured with `.basePath('/api')`. When defining new routes, **do not** start the route string with `/api/`. 
+> - Correct: `app.get('/steps', ...)` (mounts at `/api/steps`)
+> - Incorrect: `app.get('/api/steps', ...)` (mounts at `/api/api/steps`, causing 404s)
+
 ```
 
 
@@ -1418,6 +1424,42 @@ more accurate."
 Research tools are only used during plan building. Tokens
 are encrypted, masked in the UI, and can be paused or
 disconnected per connection.
+```
+
+### AI Schema Resilience
+When building Zod schemas for AI outputs (especially for researchers), always prioritize resilience over strictness for non-critical fields.
+- **Problem**: AI models sometimes return `null` for fields like `github_url` or `changelog_url` if they cannot find one.
+- **Solution**: Use `.nullable().transform(val => val ?? "")` or `.optional().transform(val => val ?? "")`.
+- **Reason**: A strict `.url()` or `.string()` check will cause a Zod validation error, which in turn throws a `GenerationPipelineError`, halting the entire pipeline.
+- **Golden Rule**: If a piece of metadata is nice-to-have but not critical for the next batch, make it resilient to `null` or missing data.
+
+### AI Proxy Connection Hanging (Stream Traps)
+When consuming SSE (Server-Sent Events) from a 3rd party AI proxy or a self-hosted model (like serving GLM-5 or DeepSeek-R1 via Modal), **the connection might not close cleanly**. Some proxies send the `data: [DONE]` payload but keep the underlying HTTP TCP connection open for keep-alive or connection pooling.
+
+If your stream reader loop uses `while (true)` and relies solely on `!done` from the `ReadableStream` to break, it will **hang indefinitely** on these proxies, killing the pipeline.
+
+**Always defensively break on the `[DONE]` marker**, not just the HTTP chunk signal:
+
+```typescript
+  let isDone = false;
+  while (!isDone) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    // ... chunking logic ...
+
+    for (const line of lines) {
+      const data = line.slice(5).trim();
+      if (!data) continue;
+      
+      // CRITICAL: Explicitly break the stream loop, do not just continue it.
+      if (data === '[DONE]') {
+        isDone = true;
+        break;
+      }
+      // ... parse JSON ...
+    }
+  }
 ```
 
 ---

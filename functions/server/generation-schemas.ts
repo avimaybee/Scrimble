@@ -8,20 +8,20 @@ const searchResultSchema = z.object({
 });
 
 const researchSourceSchema = z.object({
-  technology: z.string().optional().default(''),
-  url: urlSchema,
-  tool: z.string().min(1),
-  title: z.string().optional().default(''),
-  summary: z.string().optional().default(''),
+  technology: z.string().nullish().transform((v) => v || ''),
+  url: z.string().nullish().transform((v) => v || ''),
+  tool: z.string().nullish().transform((v) => v || 'Web fetch'),
+  title: z.string().nullish().transform((v) => v || ''),
+  summary: z.string().nullish().transform((v) => v || ''),
 });
 
 export const Batch1ResearchStackSchema = z.object({
   technologies: z.array(
     z.object({
       name: z.string().min(1),
-      docs_url: z.string().nullable().optional().transform((v) => v || ''),
-      github_url: z.string().nullable().optional().transform((v) => v || ''),
-      changelog_url: z.string().nullable().optional().transform((v) => v || ''),
+      docs_url: z.string().nullish().transform((v) => v || ''),
+      github_url: z.string().nullish().transform((v) => v || ''),
+      changelog_url: z.string().nullish().transform((v) => v || ''),
       community_search_results: z.array(searchResultSchema).optional().default([]),
       breaking_change_search_results: z.array(searchResultSchema).optional().default([]),
     }),
@@ -32,15 +32,15 @@ export const Batch2FetchAndReadSchema = z.object({
   research: z.array(
     z.object({
       technology: z.string().min(1),
-      docs_content: z.string(),
-      github_readme: z.string(),
-      latest_version: z.string(),
-      last_commit_date: z.string(),
-      open_issues_count: z.number().int().nonnegative(),
-      recent_breaking_changes: z.string(),
-      repo_health_summary: z.string().optional().default(''),
-      community_sentiment: z.string().optional().default(''),
-      bug_report_digest: z.string().optional().default(''),
+      docs_content: z.string().nullish().transform((v) => v || ''),
+      github_readme: z.string().nullish().transform((v) => v || ''),
+      latest_version: z.string().nullish().transform((v) => v || 'Unknown'),
+      last_commit_date: z.string().nullish().transform((v) => v || 'Unknown'),
+      open_issues_count: z.number().nullish().transform((v) => v || 0),
+      recent_breaking_changes: z.string().nullish().transform((v) => v || ''),
+      repo_health_summary: z.string().nullish().transform((v) => v || ''),
+      community_sentiment: z.string().nullish().transform((v) => v || ''),
+      bug_report_digest: z.string().nullish().transform((v) => v || ''),
       sources: z.array(researchSourceSchema).optional().default([]),
     }),
   ),

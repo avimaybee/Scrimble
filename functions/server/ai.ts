@@ -41,8 +41,9 @@ export async function streamToText(
   const decoder = new TextDecoder();
   let contentBuffer = '';
   let leftover = '';
+  let isDone = false;
 
-  while (true) {
+  while (!isDone) {
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -64,7 +65,11 @@ export async function streamToText(
         jsonStr = trimmed.slice(jsonStart);
       }
 
-      if (!jsonStr || jsonStr === '[DONE]') continue;
+      if (!jsonStr) continue;
+      if (jsonStr === '[DONE]') {
+        isDone = true;
+        break;
+      }
 
       try {
         const parsed = JSON.parse(jsonStr);
@@ -267,8 +272,9 @@ async function streamStructuredProviderText(
   const decoder = new TextDecoder();
   let contentBuffer = '';
   let leftover = '';
+  let isDone = false;
 
-  while (true) {
+  while (!isDone) {
     const { done, value } = await reader.read();
     if (done) {
       break;
@@ -288,8 +294,10 @@ async function streamStructuredProviderText(
       }
 
       const data = trimmed.slice(5).trim();
-      if (!data || data === '[DONE]') {
-        continue;
+      if (!data) continue;
+      if (data === '[DONE]') {
+        isDone = true;
+        break;
       }
 
       try {
