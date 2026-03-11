@@ -22,6 +22,15 @@ export async function sendGenerationDispatch(
   env: Bindings,
   payload: DispatchPayload,
 ) {
+  console.log("[DEBUG] sendGenerationDispatch - Start");
+  console.log("[DEBUG] env exists:", !!env);
+  console.log("[DEBUG] env keys:", Object.keys(env || {}));
+  console.log("[DEBUG] AGENT_QUEUE exists:", !!env?.AGENT_QUEUE);
+  
+  if (!env.AGENT_QUEUE) {
+    console.error("[ERROR] AGENT_QUEUE is undefined in Bindings");
+  }
+
   const dispatchId = crypto.randomUUID();
   const queueBody = {
     type: 'generate_project' as const,

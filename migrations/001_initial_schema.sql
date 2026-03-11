@@ -43,16 +43,21 @@ CREATE TABLE IF NOT EXISTS ai_providers (
 -- PROJECTS
 -- ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS projects (
-  id              TEXT PRIMARY KEY,
-  user_id         TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-  name            TEXT NOT NULL,
-  description     TEXT,                 -- raw natural language description from user
-  project_type    TEXT,                 -- AI-inferred: 'saas_mvp' | 'client_site' | 'internal_tool' | 'other'
-  stack           TEXT,                 -- JSON: { frontend, backend, auth, deploy, ai_tools, payments }
-  status          TEXT DEFAULT 'active',-- 'active' | 'completed' | 'archived'
-  risk_score      INTEGER DEFAULT 0,    -- 0-100, recalculated on step changes
-  created_at      TEXT DEFAULT (datetime('now')),
-  updated_at      TEXT DEFAULT (datetime('now'))
+  id                      TEXT PRIMARY KEY,
+  user_id                 TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  name                    TEXT NOT NULL,
+  description             TEXT,                 -- raw natural language description from user
+  project_type            TEXT,                 -- AI-inferred: 'saas_mvp' | 'client_site' | 'internal_tool' | 'other'
+  stack                   TEXT,                 -- JSON: { frontend, backend, auth, deploy, ai_tools, payments }
+  status                  TEXT DEFAULT 'active',-- 'active' | 'completed' | 'archived'
+  risk_score              INTEGER DEFAULT 0,    -- 0-100, recalculated on step changes
+  generation_status       TEXT DEFAULT 'complete', -- 'intake' | 'queued' | 'complete' | 'failed' | 'awaiting_review' | 'approved'
+  generation_error        TEXT,
+  generation_run_id       TEXT,
+  generation_provider_id  TEXT,
+  generation_heartbeat_at TEXT,
+  created_at              TEXT DEFAULT (datetime('now')),
+  updated_at              TEXT DEFAULT (datetime('now'))
 );
 
 -- ────────────────────────────────────────────
@@ -157,6 +162,60 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 
 -- ────────────────────────────────────────────
+-- GENERATION DISPATCHES (audit log of queue tasks)
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS generation_dispatches (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id          TEXT NOT NULL,
+  dispatch_kind   TEXT NOT NULL,
+  previous_status TEXT,
+  target_status   TEXT,
+  queue_body      TEXT,
+  status          TEXT DEFAULT 'pending', -- 'pending' | 'success' | 'failed'
+  created_at      TEXT DEFAULT (datetime('now')),
+  updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- GENERATION CHECKPOINTS (durable task state)
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS generation_checkpoints (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id          TEXT NOT NULL,
+  batch_name      TEXT NOT NULL,
+  current_index   INTEGER DEFAULT 0,
+  payload_inline  TEXT,
+  payload_r2_key  TEXT,
+  size_bytes      INTEGER DEFAULT 0,
+  created_at      TEXT DEFAULT (datetime('now')),
+  updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- PROJECT GENERATION EVENTS (SSE event persistence)
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_generation_events (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  event_type      TEXT NOT NULL,
+  batch_name      TEXT,
+  payload         TEXT NOT NULL,
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- TRANSIENT STATE (Thinking / Reasoning Relay)
+-- Rows are physically DELETED on batch/pipeline completion
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_generation_live_state (
+  project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  reasoning       TEXT,                 -- the current accumulated thinking block
+  updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
 -- INDEXES
 -- ────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_projects_user      ON projects(user_id);
@@ -167,3 +226,6 @@ CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_ai_providers_user  ON ai_providers(user_id);
+CREATE INDEX IF NOT EXISTS idx_generation_checkpoints_project ON generation_checkpoints(project_id);
+CREATE INDEX IF NOT EXISTS idx_generation_dispatches_project  ON generation_dispatches(project_id);
+CREATE INDEX IF NOT EXISTS idx_generation_events_project      ON project_generation_events(project_id);

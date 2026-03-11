@@ -38,19 +38,18 @@ export type ProjectGenerationStatus =
 
 export type Bindings = {
   DB: any;
+  ENVIRONMENT: string;
   FIREBASE_PROJECT_ID: string;
   ENCRYPTION_KEY: string;
-  AGENT_QUEUE?: {
+  AGENT_QUEUE: {
     send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
   };
-  ASSETS?: {
-    fetch(request: Request): Promise<Response>;
-  };
-  CHECKPOINT_BUCKET?: {
+  CHECKPOINT_BUCKET: {
     put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
     get(key: string): Promise<R2Object | null>;
     delete(key: string): Promise<void>;
   };
+  R2?: any;
 };
 
 export type GenerationEventType =

@@ -1054,6 +1054,14 @@ app.get('/intake/:id/brief', async (c) => {
   return c.json(await buildIntakeResponse(c, c.req.param('id')));
 });
 
+app.get('/debug-env', (c) => {
+  return c.json({
+    envKeys: Object.keys(c.env || {}),
+    hasQueue: !!c.env.AGENT_QUEUE,
+    environment: c.env.ENVIRONMENT,
+  });
+});
+
 app.post('/projects', async (c) => {
   const parsed = createProjectSchema.safeParse(await c.req.json());
   if (!parsed.success) {
@@ -1061,7 +1069,10 @@ app.post('/projects', async (c) => {
   }
 
   if (!c.env.AGENT_QUEUE) {
-    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+    return c.json({ 
+      error: 'Project generation queue is not configured.',
+      envKeys: Object.keys(c.env || {})
+    }, 500);
   }
 
   const providerRecord = await resolveProvider(c, parsed.data.providerId);
