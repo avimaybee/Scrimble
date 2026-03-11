@@ -1,5 +1,15 @@
 import type { Context } from 'hono';
 
+export interface R2Object {
+  key: string;
+  size: number;
+  httpEtag: string;
+  customMetadata?: Record<string, string>;
+  body: ReadableStream;
+  text(): Promise<string>;
+  json<T = unknown>(): Promise<T>;
+}
+
 export type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom';
 
 export const GENERATION_BATCHES = [
@@ -36,6 +46,11 @@ export type Bindings = {
   ASSETS?: {
     fetch(request: Request): Promise<Response>;
   };
+  CHECKPOINT_BUCKET?: {
+    put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
+    get(key: string): Promise<R2Object | null>;
+    delete(key: string): Promise<void>;
+  };
 };
 
 export type GenerationEventType =
@@ -67,6 +82,7 @@ export type QueueMessageBody = {
   projectId: string;
   userId: string;
   providerId?: string;
+  runId?: string;
 };
 
 export type QueueMessage<T = QueueMessageBody> = {

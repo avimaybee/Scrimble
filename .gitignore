@@ -39,3 +39,4 @@ images/
 # Local Database / Wrangler
 .wrangler/
 wrangler.toml.bak
+debug

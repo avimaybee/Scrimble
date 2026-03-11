@@ -350,6 +350,62 @@ export async function streamProviderText(
 }
 
 const AI_TIMEOUT_MS = 600_000; // 10 minutes
+const PROVIDER_UNAVAILABLE_MESSAGE = "Your AI provider isn't responding. Try again shortly.";
+const PROVIDER_TIMEOUT_MESSAGE = 'Your AI provider took too long to respond. Retry to continue from the latest checkpoint.';
+const PROVIDER_UPSTREAM_MESSAGE = 'Your AI provider had a temporary upstream error. Try again shortly.';
+const RUNTIME_BUDGET_MESSAGE =
+  'Scrimble hit a Cloudflare runtime limit while researching your project. Resume generation to continue from the latest checkpoint.';
+
+export class RetryableAIError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'RetryableAIError';
+  }
+}
+
+function createAIErrorResponse(status: number, error: string, message: string) {
+  return Response.json({ error, message }, { status });
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+function isRuntimeBudgetError(message: string) {
+  const haystack = message.toLowerCase();
+  return (
+    haystack.includes('subrequest') ||
+    haystack.includes('too many requests to origin') ||
+    haystack.includes('too many open connections') ||
+    haystack.includes('worker exceeded resource limits') ||
+    haystack.includes('resource limit') ||
+    haystack.includes('runtime limit')
+  );
+}
+
+async function readAIErrorPayload(response: Response) {
+  const clone = response.clone();
+
+  try {
+    const parsed = await clone.json() as { error?: string; message?: string };
+    return {
+      error: parsed.error,
+      message: parsed.message,
+      rawText: '',
+    };
+  } catch {
+    const rawText = await clone.text().catch(() => '');
+    return {
+      error: undefined,
+      message: undefined,
+      rawText,
+    };
+  }
+}
 
 export async function callProvider(payload: {
   providerType: ProviderType;
@@ -473,36 +529,44 @@ export async function callAIWithRetry(payload: {
       }
 
       if (response.status === 401) {
-        return Response.json(
-          {
-            error: 'invalid_key',
-            message: 'Your AI key was rejected. Check it in Settings.',
-          },
-          { status: 401 },
-        );
+        return createAIErrorResponse(401, 'invalid_key', 'Your AI key was rejected. Check it in Settings.');
       }
 
-      if (attempt < maxRetries && (response.status >= 500 || response.status === 0)) {
+      if (attempt < maxRetries && (response.status >= 500 || response.status === 0 || response.status === 408)) {
         console.warn(`${logTag} retrying after ${backoffs[attempt]}ms (server error ${response.status})...`);
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
       }
 
-      // Try to read error body for diagnostics
-      const errorBody = await response.text().catch(() => '(unreadable)');
-      console.error(`${logTag} FINAL FAILURE: HTTP ${response.status}, body: ${errorBody.slice(0, 500)}`);
+      const errorPayload = await readAIErrorPayload(response);
+      const diagnosticText = `${errorPayload.message || ''}\n${errorPayload.rawText}`.trim();
+      console.error(`${logTag} FINAL FAILURE: HTTP ${response.status}, body: ${diagnosticText.slice(0, 500)}`);
 
-      return Response.json(
-        {
-          error: 'provider_unavailable',
-          message: "Your AI provider isn't responding. Try again shortly.",
-        },
-        { status: 503 },
-      );
+      if (isRuntimeBudgetError(diagnosticText)) {
+        return createAIErrorResponse(503, 'runtime_budget_exhausted', RUNTIME_BUDGET_MESSAGE);
+      }
+
+      if (response.status === 408 || response.status === 504) {
+        return createAIErrorResponse(504, 'provider_timeout', PROVIDER_TIMEOUT_MESSAGE);
+      }
+
+      if (response.status >= 500) {
+        return createAIErrorResponse(503, 'provider_upstream_error', PROVIDER_UPSTREAM_MESSAGE);
+      }
+
+      return createAIErrorResponse(503, 'provider_unavailable', PROVIDER_UNAVAILABLE_MESSAGE);
     } catch (err) {
       clearTimeout(timeoutId);
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`${logTag} attempt ${attempt + 1} EXCEPTION: ${errMsg}`);
+
+      if (isAbortError(err)) {
+        return createAIErrorResponse(504, 'provider_timeout', PROVIDER_TIMEOUT_MESSAGE);
+      }
+
+      if (isRuntimeBudgetError(errMsg)) {
+        return createAIErrorResponse(503, 'runtime_budget_exhausted', RUNTIME_BUDGET_MESSAGE);
+      }
 
       if (attempt < maxRetries) {
         console.warn(`${logTag} retrying after ${backoffs[attempt]}ms...`);
@@ -512,25 +576,13 @@ export async function callAIWithRetry(payload: {
 
       console.error(`${logTag} ALL RETRIES EXHAUSTED. Last error: ${errMsg}`);
 
-      return Response.json(
-        {
-          error: 'provider_unavailable',
-          message: "Your AI provider isn't responding. Try again shortly.",
-        },
-        { status: 503 },
-      );
+      return createAIErrorResponse(503, 'provider_unavailable', PROVIDER_UNAVAILABLE_MESSAGE);
     }
   }
 
   console.error(`${logTag} UNREACHABLE: fell through retry loop`);
 
-  return Response.json(
-    {
-      error: 'provider_unavailable',
-      message: "Your AI provider isn't responding. Try again shortly.",
-    },
-    { status: 503 },
-  );
+  return createAIErrorResponse(503, 'provider_unavailable', PROVIDER_UNAVAILABLE_MESSAGE);
 }
 
 
@@ -540,11 +592,21 @@ function getAIErrorMessage(status: number) {
       return 'Your AI key was rejected. Check it in Settings.';
     case 429:
       return 'Your AI provider is rate limited. Wait a moment and try again.';
+    case 504:
+      return PROVIDER_TIMEOUT_MESSAGE;
     case 503:
-      return "Your AI provider isn't responding. Try again shortly.";
+      return PROVIDER_UNAVAILABLE_MESSAGE;
     default:
       return 'AI call failed.';
   }
+}
+
+export async function readAIErrorMessage(response: Response) {
+  const payload = await readAIErrorPayload(response);
+  return {
+    code: payload.error || 'provider_unavailable',
+    message: payload.message || getAIErrorMessage(response.status),
+  };
 }
 
 export async function callAIText(payload: {
@@ -561,7 +623,12 @@ export async function callAIText(payload: {
 }> {
   const response = await callAIWithRetry(payload);
   if (!response.ok) {
-    throw new Error(getAIErrorMessage(response.status));
+    const { code, message } = await readAIErrorMessage(response);
+    if (code === 'provider_timeout' || code === 'provider_upstream_error' || code === 'runtime_budget_exhausted') {
+      throw new RetryableAIError(message, code, response.status);
+    }
+
+    throw new Error(message);
   }
 
   if (!response.body) {
@@ -585,7 +652,16 @@ export async function callAIText(payload: {
       system: (payload.system || '') + '\n\nIMPORTANT: You previously only provided reasoning. Please provide the JSON output now. Do not provide extensive reasoning.',
     };
     const retryResponse = await callAIWithRetry(retryPayload);
-    if (retryResponse.ok && retryResponse.body) {
+    if (!retryResponse.ok) {
+      const { code, message } = await readAIErrorMessage(retryResponse);
+      if (code === 'provider_timeout' || code === 'provider_upstream_error' || code === 'runtime_budget_exhausted') {
+        throw new RetryableAIError(message, code, retryResponse.status);
+      }
+
+      throw new Error(message);
+    }
+
+    if (retryResponse.body) {
       const retryText = await streamProviderText(payload.providerType, retryResponse.body, {
         onReasoningDelta: payload.onReasoningDelta,
       });

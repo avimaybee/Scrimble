@@ -122,7 +122,7 @@ The most important moment in Scrimble is when you open it after being away. It i
 ### Frontend
 | Concern | Choice | Notes |
 |---|---|---|
-| Framework | Next.js 14 (App Router) | SSR, routing, TypeScript |
+| Framework | Vite + React (client SPA) | Vite-built SPA; single-page app with client routing and Hono API routes |
 | Language | TypeScript | End-to-end type safety |
 | Styling | Tailwind CSS + CSS Variables | Utility classes + design tokens |
 | Canvas | React Flow (`@xyflow/react`) | Step-based graph rendering |
@@ -131,7 +131,27 @@ The most important moment in Scrimble is when you open it after being away. It i
 | Icons | Lucide React | Consistent icon set |
 | Fonts | Fraunces + DM Sans + JetBrains Mono | See Design System |
 | UI Primitives | shadcn/ui (selective only) | Dialog, Tooltip, DropdownMenu, Sonner |
-| HTTP Client | `hono/client` or native fetch | Typed API calls to Workers |
+| HTTP Client | `hono/client` or native fetch | Typed API calls to Pages Functions / Workers |
+
+### Run & Deploy
+Use the repo's npm scripts for local dev and deployments. Key commands:
+
+```bash
+# Local dev (Vite)
+npm run dev
+
+# Build frontend (Vite) and deploy Pages
+npm run build
+npm run deploy   # runs Vite build then `wrangler pages deploy dist`
+
+# Deploy consumer/background worker
+npm run deploy:consumer  # uses wrangler and wrangler.consumer.toml
+
+# Deploy both
+npm run deploy:all
+```
+
+Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background jobs run in a separate Cloudflare Worker (see `wrangler.consumer.toml`).
 
 ### Backend
 | Concern | Choice | Notes |
@@ -165,6 +185,8 @@ Any library that genuinely improves the product may be used. Suggested candidate
 - `react-hotkeys-hook` — Keyboard shortcuts
 - `date-fns` — Date formatting
 - `hono` — Lightweight Workers router
+
+Note: the repository includes `next-themes` in package.json. This project is a Vite-built SPA; audit `next-themes` usage and remove or replace it if it's a leftover from earlier Next.js plans.
 
 ---
 
@@ -546,7 +568,7 @@ transition: { duration: 0.25, ease: [0.16, 1, 0.3, 1] }
 
 ### Page Transitions
 ```typescript
-// Between routes (Next.js App Router):
+// Between routes (client SPA transitions):
 // Outgoing: opacity 1 → 0, y 0 → -8, 200ms
 // Incoming: opacity 0 → 1, y 8 → 0, 300ms, delay 100ms
 ```
@@ -997,6 +1019,16 @@ Batch 2 also records a `research_sources` ledger (tool, source URL, one-line sum
 
 The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, the historical activity log, progress dots, ETA counter, and review gate. The `/api/projects/:id/generation-stream` route always replays missed durable events first using `Last-Event-ID`, then polls D1 for new rows every ~1 second so queue-written updates still flow even though the browser and queue worker live in separate runtimes. Provider reasoning chunks are streamed separately as transient `thinking` events: the queue consumer updates the per-project live-state relay as they arrive, and the SSE route forwards only the latest delta to the browser while continuing to replay the durable history from D1. This split lets Scrimble stream live model thinking without polluting the long-term audit trail or waiting for the entire provider response to finish.
 
+### Durable Checkpoints & Dispatch Safety
+
+Every generation run now records a `run_id` and writes the run metadata to `generation_runs` before the queue job starts. The intake route also logs a `generation_dispatches` entry (batch name, provider id, payload size, source tracking id) before pushing to Cloudflare Queue; if the enqueue fails the API rolls back the project status so no ghost `queued` state sticks around. Each queue invocation now processes exactly one batch, carries the `run_id`, and refuses to work on stale payloads whose `run_id` no longer matches the active run. This one-batch-per-job guarantee keeps the queue from tunneling through multiple batches and ensures failures surface to the queue retry instead of being masked.
+
+The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, truncated prompts, partial responses—into the Cloudflare R2 bucket named `scrimble` via the S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`. This hybrid D1+R2 strategy keeps row sizes manageable, captures the full history for any restart, and makes sure Batch 2 resumes from the same research graph without rerunning every tool.
+
+Batch 1 now checkpoints deliberately before the runtime budget edge so Batch 2 can pick up the same state, and provider pinning enforces the original BYOK entry: if that provider disappears the worker fails fast with `provider_unavailable` instead of silently switching to a different key. Batch 2 also enforces stricter prompt budgets—only the richest sources make it into the payload sent to the AI provider—so we finally avoid the “AI provider isn’t responding” symptom caused by bloated prompts.
+
+Every research tool wrapper now raises `ToolExecutionError`, emits an `activity` SSE event, and saves structured `degraded_tools`/`partial_failures` metadata with the checkpoint. The architecture review UI surfaces those fields beside the research depth badges so builders instantly know if Brave Search, Context7, or GitHub tooling degraded during collection.
+
 ### Human-in-the-Loop Workflow
 
 Certain steps are **gates** (`is_gate = 1`). At a gate:
@@ -1258,7 +1290,7 @@ Good morning.                                    [+ New project]
 │  │  → Next up    Set up your database               │   │
 │  └──────────────────────────────────────────────────┘   │
 │                                                          │
-│  Next.js · Supabase · Stripe          2 hours ago       │
+│  Vite + React · Supabase · Stripe        2 hours ago    │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -1520,6 +1552,9 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - **Privacy Purge**: Reasoning data is physically deleted from D1 on batch/pipeline completion or project deletion.
   - **Pipeline Fallthrough Prevention**: Individual `executeBatch` functions now propagate errors by throwing a `GenerationPipelineError`. This prevents the pipeline from falling through to subsequent batches and masking the root cause with "Missing output" errors.
   - **Improved Retry Flow**: Backend `/resume` resets the project status to `queued` and clears error flags, allowing the worker to re-run the failed batch. Frontend "Try again" triggers a real re-enqueue.
+  - **Dispatch Safety & R2 Checkpoints**: Every run writes a `generation_dispatches` row before enqueuing, and the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`), multiplying the durable history without hitting D1 row limits and keeping the queue state honest.
+  - **Provider Pinning & Prompt Guardrails**: The queue enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now builds a trimmed prompt payload from the richest sources so bloated payloads no longer leave AI providers stuck in “isn’t responding.”
+  - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
 - Batch 2 now relies on the Worker-side tools layer (`fetchUrl`, `analyzeGithubRepo`, `getLibraryDocs`, `getLibraryIssues`, `searchWeb`), collecting docs, releases, issues, and Brave Search chatter, while also writing the `research_sources` ledger plus `data_quality` stats (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`). These metadata power the Research depth badges, "What I read" list, and per-step footers. Batch 6 still returns the six required skill/context files that are stored in D1 and zipped through `/api/projects/:id/skill-files` for download.
 
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.

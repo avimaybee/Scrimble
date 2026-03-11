@@ -272,20 +272,7 @@ export default function ProjectGeneration() {
     setProject(projectData);
     setStatus(statusData);
 
-    const isGenerating =
-      statusData.generation_status !== 'queued' &&
-      statusData.generation_status !== 'awaiting_review' &&
-      statusData.generation_status !== 'complete' &&
-      statusData.generation_status !== 'failed' &&
-      statusData.generation_status !== 'approved';
-
-    if (isGenerating && !statusData.is_failed) {
-      // Check if we haven't had a stream update in a while
-      // The stream is managed by useEffect, but we can nudge a resume check here
-      setShowResumeBadge(true);
-    } else {
-      setShowResumeBadge(false);
-    }
+    setShowResumeBadge(statusData.can_resume && (statusData.execution_stale || statusData.is_failed));
 
     if (isGenerationBatchName(statusData.generation_status)) {
       setActiveBatch(statusData.generation_status);
@@ -635,6 +622,7 @@ export default function ProjectGeneration() {
     try {
       await dbService.resumeProjectGeneration(id);
       toast.success('Resuming generation pipeline...');
+      setShowResumeBadge(false);
       setStreamConnectionKey((prev) => prev + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to resume project generation.');
@@ -767,6 +755,25 @@ export default function ProjectGeneration() {
                       <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
                         Researched {reviewData.data_quality.technologies_researched} technologies across {reviewData.data_quality.urls_fetched} sources
                       </div>
+
+                      {reviewData.data_quality.partial_failures.length > 0 ? (
+                        <div className="rounded-[14px] border border-status-warning/20 bg-status-warning/8 px-4 py-3 font-sans text-[13px] text-status-warning">
+                          <div className="font-medium">
+                            Some research sources were partially degraded during this run.
+                          </div>
+                          <div className="mt-1 text-[12px] text-text-secondary">
+                            Impacted tools: {reviewData.data_quality.degraded_tools.join(', ')}
+                          </div>
+                          <ul className="mt-2 space-y-1 text-[12px] text-text-secondary">
+                            {reviewData.data_quality.partial_failures.slice(0, 3).map((failure, index) => (
+                              <li key={`${failure.tool}-${failure.technology || 'global'}-${index}`}>
+                                {failure.tool}
+                                {failure.technology ? ` (${failure.technology})` : ''}: {failure.message}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
 
                       {connectedResearchToolCount < 2 ? (
                         <div className="rounded-[14px] border border-status-warning/20 bg-status-warning/8 px-4 py-3 font-sans text-[13px] text-status-warning">
@@ -1132,7 +1139,7 @@ export default function ProjectGeneration() {
                     >
                       <div className="flex items-center gap-2 font-sans text-[13px] text-text-secondary">
                         <TriangleAlert className="h-4 w-4 text-accent-primary" />
-                        <span>Build stream seems interrupted.</span>
+                        <span>{status?.is_failed ? 'Build stopped before finishing.' : 'Build seems stalled.'}</span>
                       </div>
                       <button
                         onClick={handleResume}

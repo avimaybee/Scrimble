@@ -38,6 +38,9 @@ export interface Project {
   generation_error?: string;
   generation_started_at?: string;
   generation_completed_at?: string;
+  generation_run_id?: string;
+  generation_provider_id?: string;
+  generation_heartbeat_at?: string;
   progress: number;
   created_at: string;
   updated_at: string;
@@ -175,6 +178,9 @@ export interface ProjectGenerationStatusResponse {
   project_id: string;
   generation_status: GenerationStatus;
   generation_error: string | null;
+  generation_run_id: string | null;
+  generation_provider_id: string | null;
+  generation_heartbeat_at: string | null;
   completed_batches: ProjectGenerationEvent[];
   completed_batch_count: number;
   total_batches: number;
@@ -184,6 +190,8 @@ export interface ProjectGenerationStatusResponse {
   is_failed: boolean;
   is_review_required: boolean;
   is_approved: boolean;
+  execution_stale: boolean;
+  can_resume: boolean;
 }
 
 export interface ProjectIntakeMessage {
@@ -280,6 +288,12 @@ export interface ArchitectureReviewDataQuality {
   technologies_researched: number;
   urls_fetched: number;
   issues_found: number;
+  degraded_tools: string[];
+  partial_failures: Array<{
+    tool: string;
+    technology?: string;
+    message: string;
+  }>;
 }
 
 export interface GenerationPreparationState {

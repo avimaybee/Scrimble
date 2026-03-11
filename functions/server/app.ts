@@ -13,6 +13,7 @@ import {
 } from './generation-schemas';
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
+import { sendGenerationDispatch } from './generation-dispatch';
 import {
   callAIWithRetry,
   defaultModelForProvider,
@@ -33,10 +34,13 @@ import {
   upsertProjectBrief,
 } from './project-briefs';
 import {
+  clearGenerationCheckpoints,
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
+  hasApprovedArchitectureReview,
+  isGenerationExecutionStale,
   loadBatchOutput,
-  processProjectGeneration,
+  resolveResumeGenerationStatus,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 import { runProjectIntakeTurn } from './project-intake';
@@ -172,6 +176,8 @@ function getAIErrorMessage(status: number, fallback: string) {
       return 'Your AI key was rejected. Check it in Settings.';
     case 429:
       return 'Your AI provider is rate limited. Wait a moment and try again.';
+    case 504:
+      return 'Your AI provider took too long to respond. Retry to continue from the latest checkpoint.';
     case 503:
       return "Your AI provider isn't responding. Try again shortly.";
     default:
@@ -300,6 +306,9 @@ function mapProjectRow(row: any) {
     generation_error: row.generation_error || undefined,
     generation_started_at: row.generation_started_at || undefined,
     generation_completed_at: row.generation_completed_at || undefined,
+    generation_run_id: row.generation_run_id || undefined,
+    generation_provider_id: row.generation_provider_id || undefined,
+    generation_heartbeat_at: row.generation_heartbeat_at || undefined,
     progress: asNumber(row.progress, 0),
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -388,6 +397,19 @@ async function touchProject(c: AppContext, projectId: string) {
 
 async function getOwnedProject(c: AppContext, projectId: string) {
   return c.env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, c.get('uid')).first();
+}
+
+async function getCompletedGenerationBatches(c: AppContext, projectId: string) {
+  const rows = await c.env.DB.prepare(`
+    SELECT run_type, completed_at
+    FROM agent_runs
+    WHERE project_id = ? AND status = 'complete' AND run_type IN (${GENERATION_BATCHES.map(() => '?').join(', ')})
+    ORDER BY sequence_index ASC, completed_at ASC
+  `)
+    .bind(projectId, ...GENERATION_BATCHES)
+    .all();
+
+  return rows.results as Array<{ run_type: string; completed_at: string | null }>;
 }
 
 async function buildIntakeResponse(c: AppContext, projectId: string) {
@@ -970,21 +992,51 @@ app.post('/intake/:id/confirm', async (c) => {
     nextNameBase.length < (briefContext.effectiveBrief.what_it_is || '').length
       ? `${nextNameBase}...`
       : nextNameBase || asText(project.name, 'Untitled project');
+  const runId = crypto.randomUUID();
 
   await c.env.DB.prepare(`
     UPDATE projects
-    SET name = ?, generation_status = 'queued', generation_error = NULL, updated_at = datetime("now")
+    SET name = ?,
+        generation_status = 'queued',
+        generation_error = NULL,
+        generation_run_id = ?,
+        generation_provider_id = ?,
+        generation_heartbeat_at = datetime("now"),
+        generation_completed_at = NULL,
+        updated_at = datetime("now")
     WHERE id = ? AND user_id = ?
   `)
-    .bind(nextName, projectId, c.get('uid'))
+    .bind(nextName, runId, providerContext.providerId, projectId, c.get('uid'))
     .run();
 
-  await c.env.AGENT_QUEUE.send({
-    type: 'generate_project',
-    projectId,
-    userId: c.get('uid'),
-    providerId: providerContext.providerId,
-  });
+  try {
+    await sendGenerationDispatch(c.env, {
+      projectId,
+      userId: c.get('uid'),
+      providerId: providerContext.providerId,
+      runId,
+      kind: 'intake_confirm',
+      previousStatus: 'intake',
+      targetStatus: 'queued',
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET name = ?,
+          generation_status = 'intake',
+          generation_error = ?,
+          generation_run_id = NULL,
+          generation_provider_id = NULL,
+          generation_heartbeat_at = NULL,
+          generation_completed_at = NULL,
+          updated_at = datetime("now")
+      WHERE id = ? AND user_id = ?
+    `)
+      .bind(project.name, message, projectId, c.get('uid'))
+      .run();
+    return c.json({ error: 'Failed to queue project generation.' }, 503);
+  }
 
   return c.json({
     success: true,
@@ -1022,12 +1074,14 @@ app.post('/projects', async (c) => {
   const provisionalNameBase = description.split(/\s+/).slice(0, 8).join(' ');
   const provisionalName =
     provisionalNameBase.length < description.length ? `${provisionalNameBase}...` : provisionalNameBase;
+  const runId = crypto.randomUUID();
 
   await c.env.DB.prepare(`
     INSERT INTO projects (
-      id, user_id, name, description, project_type, stack, status, risk_score, generation_status, generation_error
+      id, user_id, name, description, project_type, stack, status, risk_score, generation_status, generation_error,
+      generation_run_id, generation_provider_id, generation_heartbeat_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"))
   `)
     .bind(
       id,
@@ -1040,15 +1094,35 @@ app.post('/projects', async (c) => {
       0,
       'queued',
       null,
+      runId,
+      providerRecord.id as string,
     )
     .run();
 
-  await c.env.AGENT_QUEUE.send({
-    type: 'generate_project',
-    projectId: id,
-    userId: c.get('uid'),
-    providerId: parsed.data.providerId,
-  });
+  try {
+    await sendGenerationDispatch(c.env, {
+      projectId: id,
+      userId: c.get('uid'),
+      providerId: providerRecord.id as string,
+      runId,
+      kind: 'direct_create',
+      previousStatus: null,
+      targetStatus: 'queued',
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET generation_status = 'failed',
+          generation_error = ?,
+          generation_completed_at = datetime("now"),
+          updated_at = datetime("now")
+      WHERE id = ? AND user_id = ?
+    `)
+      .bind(message, id, c.get('uid'))
+      .run();
+    return c.json({ error: 'Failed to queue project generation.', project_id: id }, 503);
+  }
 
   return c.json({ success: true, id, generation_status: 'queued' }, 202);
 });
@@ -1069,16 +1143,24 @@ app.get('/projects/:id/status', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const completedBatchRows = await c.env.DB.prepare(`
-    SELECT run_type, completed_at
-    FROM agent_runs
-    WHERE project_id = ? AND status = 'complete' AND run_type IN (${GENERATION_BATCHES.map(() => '?').join(', ')})
-    ORDER BY sequence_index ASC, completed_at ASC
-  `)
-    .bind(projectId, ...GENERATION_BATCHES)
-    .all();
+  const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
+  const completedBatchNames = completedBatchRows.map((row) => row.run_type);
+  const hasReviewApproval =
+    completedBatchNames.includes('batch_4_plan_build') ||
+    completedBatchNames.includes('batch_5_enrich_steps') ||
+    completedBatchNames.includes('batch_6_generate_files') ||
+    await hasApprovedArchitectureReview(c.env, projectId);
+  const executionStale = isGenerationExecutionStale(
+    (project.generation_status as string | null) || 'complete',
+    (project.generation_heartbeat_at as string | null) || null,
+  );
+  const resumeStatus = resolveResumeGenerationStatus(completedBatchNames, hasReviewApproval);
+  const canResume =
+    (project.generation_status || 'complete') !== 'complete' &&
+    resumeStatus !== 'awaiting_review' &&
+    ((project.generation_status || 'complete') === 'failed' || executionStale);
 
-  const completedBatches = completedBatchRows.results.map((row: any) => ({
+  const completedBatches = completedBatchRows.map((row) => ({
     batch: row.run_type,
     completed_at: row.completed_at,
     message: getBatchCompletionMessage(row.run_type as GenerationBatchName),
@@ -1088,6 +1170,9 @@ app.get('/projects/:id/status', async (c) => {
     project_id: projectId,
     generation_status: project.generation_status || 'complete',
     generation_error: project.generation_error || null,
+    generation_run_id: project.generation_run_id || null,
+    generation_provider_id: project.generation_provider_id || null,
+    generation_heartbeat_at: project.generation_heartbeat_at || null,
     completed_batches: completedBatches,
     completed_batch_count: completedBatches.length,
     total_batches: GENERATION_BATCHES.length,
@@ -1097,6 +1182,8 @@ app.get('/projects/:id/status', async (c) => {
     is_failed: (project.generation_status || 'complete') === 'failed',
     is_review_required: (project.generation_status || 'complete') === 'awaiting_review',
     is_approved: (project.generation_status || 'complete') === 'approved',
+    execution_stale: canResume && executionStale,
+    can_resume: canResume,
   });
 });
 
@@ -1139,21 +1226,65 @@ app.post('/projects/:id/architecture-review', async (c) => {
   const feedback = parsed.data.feedback?.trim() || '';
   const preferredIde = parsed.data.preferredIde as PreferredIde;
   let providerId: string | undefined;
+  const runId = crypto.randomUUID();
 
   try {
     const approval = await saveArchitectureReviewApproval(c.env, projectId, feedback, preferredIde);
-    providerId = approval.providerId;
+    providerId = approval.providerId || (project.generation_provider_id as string | null) || undefined;
+    if (!providerId) {
+      throw new Error('No AI provider is configured for this project anymore.');
+    }
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET generation_status = 'approved',
+          generation_error = NULL,
+          generation_run_id = ?,
+          generation_provider_id = ?,
+          generation_heartbeat_at = datetime("now"),
+          generation_completed_at = NULL,
+          updated_at = datetime("now")
+      WHERE id = ? AND user_id = ?
+    `)
+      .bind(runId, providerId || null, projectId, c.get('uid'))
+      .run();
+
+    await sendGenerationDispatch(c.env, {
+      projectId,
+      userId: c.get('uid'),
+      providerId,
+      runId,
+      kind: 'architecture_approval',
+      previousStatus: 'awaiting_review',
+      targetStatus: 'approved',
+    });
+
+    if (project.generation_run_id) {
+      await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to save architecture review approval.';
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET generation_status = 'awaiting_review',
+          generation_error = NULL,
+          generation_run_id = ?,
+          generation_provider_id = ?,
+          generation_heartbeat_at = ?,
+          generation_completed_at = ?,
+          updated_at = datetime("now")
+      WHERE id = ? AND user_id = ?
+    `)
+      .bind(
+        (project.generation_run_id as string | null) || null,
+        (project.generation_provider_id as string | null) || null,
+        (project.generation_heartbeat_at as string | null) || null,
+        (project.generation_completed_at as string | null) || null,
+        projectId,
+        c.get('uid'),
+      )
+      .run();
     return c.json({ error: message }, 409);
   }
-
-  await c.env.AGENT_QUEUE.send({
-    type: 'generate_project',
-    projectId,
-    userId: c.get('uid'),
-    providerId,
-  });
 
   await persistGenerationStreamEvent(c.env, {
     projectId,
@@ -1193,37 +1324,90 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'Cannot resume a project that is already complete.' }, 409);
   }
 
+  const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
+  const completedBatchNames = completedBatchRows.map((row) => row.run_type);
+  const hasReviewApproval =
+    completedBatchNames.includes('batch_4_plan_build') ||
+    completedBatchNames.includes('batch_5_enrich_steps') ||
+    completedBatchNames.includes('batch_6_generate_files') ||
+    await hasApprovedArchitectureReview(c.env, projectId);
+  const resumeStatus = resolveResumeGenerationStatus(completedBatchNames, hasReviewApproval);
+  const executionStale = isGenerationExecutionStale(
+    status,
+    (project.generation_heartbeat_at as string | null) || null,
+  );
 
-  // Find the last provider used for this project to re-enqueue
-  const lastRun = await c.env.DB.prepare(
-    'SELECT provider FROM agent_runs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1'
-  ).bind(projectId).first<{ provider: string | null }>();
-
-  // If we found a provider string (e.g. 'anthropic'), we need to find the user's provider record for it
-  let providerId: string | undefined;
-  if (lastRun?.provider) {
-    const providerRecord = await c.env.DB.prepare(
-      'SELECT id FROM ai_providers WHERE user_id = ? AND provider = ? ORDER BY is_default DESC LIMIT 1'
-    ).bind(c.get('uid'), lastRun.provider).first<{ id: string }>();
-    providerId = providerRecord?.id;
+  if (status !== 'failed' && !executionStale) {
+    return c.json({ error: 'This generation run is still active. Wait for it to finish or stall before resuming.' }, 409);
   }
 
+  if (resumeStatus === 'awaiting_review') {
+    return c.json({ error: 'Architecture review is waiting for approval, so there is nothing to resume yet.' }, 409);
+  }
+
+  const providerId = (project.generation_provider_id as string | null) || undefined;
+
+  if (!providerId) {
+    return c.json({ error: 'The original AI provider for this generation run is missing. Start a new generation instead.' }, 409);
+  }
+
+  const runId = crypto.randomUUID();
   await c.env.DB.prepare(`
     UPDATE projects 
-    SET generation_status = 'queued', generation_error = NULL, updated_at = datetime("now")
+    SET generation_status = ?,
+        generation_error = NULL,
+        generation_run_id = ?,
+        generation_provider_id = ?,
+        generation_heartbeat_at = datetime("now"),
+        generation_completed_at = NULL,
+        updated_at = datetime("now")
     WHERE id = ? AND user_id = ?
-  `).bind(projectId, c.get('uid')).run();
+  `).bind(resumeStatus, runId, providerId || null, projectId, c.get('uid')).run();
 
-  await c.env.AGENT_QUEUE.send({
-    type: 'generate_project',
-    projectId,
-    userId: c.get('uid'),
-    providerId,
-  });
+  try {
+    await sendGenerationDispatch(c.env, {
+      projectId,
+      userId: c.get('uid'),
+      providerId,
+      runId,
+      kind: 'resume',
+      previousStatus: status,
+      targetStatus: resumeStatus,
+    });
+
+    if (project.generation_run_id) {
+      await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
+    await c.env.DB.prepare(`
+      UPDATE projects 
+      SET generation_status = ?,
+          generation_error = ?,
+          generation_run_id = ?,
+          generation_provider_id = ?,
+          generation_heartbeat_at = ?,
+          generation_completed_at = ?,
+          updated_at = datetime("now")
+      WHERE id = ? AND user_id = ?
+    `)
+      .bind(
+        status,
+        (project.generation_error as string | null) || message,
+        (project.generation_run_id as string | null) || null,
+        (project.generation_provider_id as string | null) || null,
+        (project.generation_heartbeat_at as string | null) || null,
+        (project.generation_completed_at as string | null) || null,
+        projectId,
+        c.get('uid'),
+      )
+      .run();
+    return c.json({ error: 'Failed to queue project generation.' }, 503);
+  }
 
   return c.json({
     success: true,
-    generation_status: status,
+    generation_status: resumeStatus,
     resumedAt: new Date().toISOString()
   });
 });

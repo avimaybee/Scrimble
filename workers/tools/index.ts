@@ -48,6 +48,29 @@ export type GithubIssue = {
   state: string;
 };
 
+export type ToolExecutionOptions = {
+  throwOnError?: boolean;
+};
+
+export class ToolExecutionError extends Error {
+  constructor(
+    readonly tool: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ToolExecutionError';
+  }
+}
+
+export type LibraryDocsResult = {
+  content: string;
+  source: string;
+  version: string;
+  degraded?: boolean;
+  degradationCode?: 'context7_failed' | 'context7_empty';
+  degradationMessage?: string;
+};
+
 function asText(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback;
 }
@@ -277,6 +300,7 @@ export async function searchWeb(
   query: string,
   userId: string,
   env: Env,
+  options: ToolExecutionOptions = {},
 ): Promise<SearchResult[]> {
   await emitToolEvent(env, '🔍', `Searching for ${query}...`);
 
@@ -308,11 +332,15 @@ export async function searchWeb(
       description: asText(result.description || result.snippet),
     }));
   } catch (error) {
+    const message = `Brave Search could not complete "${query}" — continuing without web results.`;
     await emitWarning(
       env,
-      `Brave Search could not complete "${query}" — continuing without web results.`,
+      message,
     );
     console.warn('[workers/tools] searchWeb failed', error);
+    if (options.throwOnError) {
+      throw new ToolExecutionError('Brave Search', message);
+    }
     return [];
   }
 }
@@ -320,6 +348,7 @@ export async function searchWeb(
 export async function fetchUrl(
   url: string,
   env?: Env,
+  options: ToolExecutionOptions = {},
 ): Promise<{ content: string; title: string; url: string }> {
   await emitToolEvent(env, '🔍', `Reading ${url}...`);
 
@@ -342,15 +371,23 @@ export async function fetchUrl(
       };
     }
 
-    await emitWarning(env, `Couldn't read ${url} — continuing with partial research.`);
+    const message = `Couldn't read ${url} — continuing with partial research.`;
+    await emitWarning(env, message);
+    if (options.throwOnError) {
+      throw new ToolExecutionError('Web fetch', message);
+    }
     return {
       content: '',
       title: deriveTitleFromUrl(url),
       url,
     };
   } catch (error) {
-    await emitWarning(env, `Couldn't read ${url} — continuing with partial research.`);
+    const message = `Couldn't read ${url} — continuing with partial research.`;
+    await emitWarning(env, message);
     console.warn('[workers/tools] fetchUrl failed', error);
+    if (options.throwOnError) {
+      throw new ToolExecutionError('Web fetch', message);
+    }
     return {
       content: '',
       title: deriveTitleFromUrl(url),
@@ -364,6 +401,7 @@ export async function analyzeGithubRepo(
   repo: string,
   userId: string,
   env: Env,
+  options: ToolExecutionOptions = {},
 ): Promise<GithubRepoAnalysis> {
   await emitToolEvent(env, '📦', `Checking ${owner}/${repo} on GitHub...`);
 
@@ -378,7 +416,11 @@ export async function analyzeGithubRepo(
     });
 
     if (result.kind !== 'github_repo') {
-      await emitWarning(env, `GitHub research for ${owner}/${repo} came back empty.`);
+      const message = `GitHub research for ${owner}/${repo} came back empty.`;
+      await emitWarning(env, message);
+      if (options.throwOnError) {
+        throw new ToolExecutionError('GitHub repo', message);
+      }
       return emptyGithubRepoAnalysis(owner, repo);
     }
 
@@ -408,8 +450,12 @@ export async function analyzeGithubRepo(
       })),
     };
   } catch (error) {
-    await emitWarning(env, `GitHub research for ${owner}/${repo} failed — using partial data.`);
+    const message = `GitHub research for ${owner}/${repo} failed — using partial data.`;
+    await emitWarning(env, message);
     console.warn('[workers/tools] analyzeGithubRepo failed', error);
+    if (options.throwOnError) {
+      throw new ToolExecutionError('GitHub repo', message);
+    }
     return emptyGithubRepoAnalysis(owner, repo);
   }
 }
@@ -419,8 +465,11 @@ export async function getLibraryDocs(
   topic: string,
   userId: string,
   env: Env,
-): Promise<{ content: string; source: string; version: string }> {
+  options: ToolExecutionOptions = {},
+): Promise<LibraryDocsResult> {
   await emitToolEvent(env, '🔍', `Looking up live docs for ${library}...`);
+  let degradationCode: LibraryDocsResult['degradationCode'];
+  let degradationMessage: string | undefined;
 
   try {
     const token = await getUserMCPConfig(userId, 'context7', env);
@@ -444,22 +493,33 @@ export async function getLibraryDocs(
         return normalized;
       }
 
-      await emitWarning(env, `Context7 had no fresh docs for ${library} — falling back to the docs homepage.`);
+      degradationCode = 'context7_empty';
+      degradationMessage = `Context7 had no fresh docs for ${library} — falling back to the docs homepage.`;
+      await emitWarning(env, degradationMessage);
     } else {
       await emitToolEvent(env, '🔍', 'Context7 not connected — using the docs homepage fallback.');
     }
   } catch (error) {
-    await emitWarning(env, `Context7 lookup failed for ${library} — falling back to the docs homepage.`);
+    degradationCode = 'context7_failed';
+    degradationMessage = `Context7 lookup failed for ${library} — falling back to the docs homepage.`;
+    await emitWarning(env, degradationMessage);
     console.warn('[workers/tools] getLibraryDocs failed', error);
   }
 
   const fallbackUrl = guessDocsHomepage(library);
   const fallback = await fetchUrl(fallbackUrl, env);
 
+  if (options.throwOnError && !fallback.content && degradationCode) {
+    throw new ToolExecutionError('Context7', degradationMessage || `Context7 lookup failed for ${library}.`);
+  }
+
   return {
     content: fallback.content,
     source: fallback.url,
     version: 'unknown',
+    degraded: Boolean(degradationCode),
+    degradationCode,
+    degradationMessage,
   };
 }
 
@@ -470,6 +530,7 @@ export async function getLibraryIssues(
   daysSince: number,
   userId: string,
   env: Env,
+  options: ToolExecutionOptions = {},
 ): Promise<GithubIssue[]> {
   await emitToolEvent(env, '📦', `Searching ${owner}/${repo} issues...`);
 
@@ -516,8 +577,12 @@ export async function getLibraryIssues(
         state: asText(issue.state, 'open'),
       }));
   } catch (error) {
-    await emitWarning(env, `Issue lookup failed for ${owner}/${repo} — continuing without issue data.`);
+    const message = `Issue lookup failed for ${owner}/${repo} — continuing without issue data.`;
+    await emitWarning(env, message);
     console.warn('[workers/tools] getLibraryIssues failed', error);
+    if (options.throwOnError) {
+      throw new ToolExecutionError('GitHub issues', message);
+    }
     return [];
   }
 }
