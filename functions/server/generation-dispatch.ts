@@ -48,6 +48,9 @@ export async function sendGenerationDispatch(
     .run();
 
   try {
+    console.log('[DEBUG_QUEUE] env object keys:', Object.keys(env));
+    console.log('[DEBUG_QUEUE] AGENT_QUEUE present?', !!env.AGENT_QUEUE);
+    
     if (!env.AGENT_QUEUE) {
       throw new Error('Project generation queue is not configured.');
     }
