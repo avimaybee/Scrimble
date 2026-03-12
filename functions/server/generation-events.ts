@@ -584,6 +584,19 @@ export function createGenerationSseStream(
       const contentReset = thinkingState.content.length < latestThinkingState.content.length;
 
       if (batchChanged || sequenceReset || contentReset) {
+        if (thinkingState.content) {
+          dispatchEvent({
+            id: null,
+            projectId: payload.projectId,
+            batchName: thinkingState.batchName,
+            createdAt: new Date().toISOString(),
+            event: {
+              type: 'thinking',
+              content: thinkingState.content,
+            },
+          });
+        }
+
         latestThinkingState = thinkingState;
         return;
       }
@@ -650,16 +663,15 @@ export function createGenerationSseStream(
       pingInterval = setInterval(() => {
         enqueueChunk(': ping\n\n');
       }, 20_000);
+      void pollForNewEvents();
       pollInterval = setInterval(() => {
         void pollForNewEvents();
       }, EVENT_POLL_INTERVAL_MS);
-    } catch {
-      enqueueChunk(
-        `event: pipeline_failed\ndata: ${JSON.stringify({
-          type: 'pipeline_failed',
-          error: 'Failed to open the live generation stream.',
-        } satisfies GenerationStreamEvent)}\n\n`,
-      );
+    } catch (error) {
+      console.warn('[generation-stream-open-failed]', {
+        projectId: payload.projectId,
+        error: error instanceof Error ? error.message : 'Unknown replay error',
+      });
       cleanup();
     }
   })();

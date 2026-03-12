@@ -251,14 +251,14 @@ type ActiveStepSummary = {
   order_index: number;
 };
 
-class GenerationPipelineError extends Error {
+export class GenerationPipelineError extends Error {
   constructor(message: string, readonly alreadyPersisted = false) {
     super(message);
     this.name = 'GenerationPipelineError';
   }
 }
 
-class RetryableGenerationPipelineError extends GenerationPipelineError {
+export class RetryableGenerationPipelineError extends GenerationPipelineError {
   constructor(
     message: string,
     readonly delaySeconds = 30,
@@ -314,11 +314,15 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
 
 export const GENERATION_STALE_MS = 2 * 60 * 1000;
 export const QUEUED_GENERATION_RESUME_MS = GENERATION_STALE_MS;
-const MAX_QUEUE_RETRY_ATTEMPTS = 3;
+export const MAX_PROJECT_GENERATION_RETRY_ATTEMPTS = 3;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const BATCH1_CHECKPOINT_ITEM_INTERVAL = 20;
 const BATCH1_CHECKPOINT_SUBREQUEST_LIMIT = 30;
 const BATCH1_ESTIMATED_SUBREQUESTS_PER_TECH = 2;
+const MAX_BATCH1_TECHNOLOGIES = 8;
+const MAX_BATCH2_RESEARCH_TARGETS = 10;
+const MAX_INFERRED_BATCH2_RESEARCH_TARGETS = 6;
+const MAX_PROFILE_BATCH2_RESEARCH_TARGETS = 2;
 const lastHeartbeatTouchByProject = new Map<string, number>();
 
 const batchCompletionMessages: Record<GenerationBatchName, string> = {
@@ -566,6 +570,93 @@ function dedupeResearchTargets(targets: ResearchTechnologyTarget[]) {
   return Array.from(merged.values());
 }
 
+function targetsOverlap(left: string[], right: string[]) {
+  return left.some((leftToken) =>
+    right.some(
+      (rightToken) =>
+        leftToken === rightToken
+        || leftToken.includes(rightToken)
+        || rightToken.includes(leftToken),
+    ),
+  );
+}
+
+function limitBatch1Technologies(technologies: Batch1ResearchStack['technologies']) {
+  const uniqueTechnologies = dedupeResearchTargets(
+    technologies.map((technology) => ({
+      ...technology,
+      docs_topic: '',
+      community_search_results: [],
+      breaking_change_search_results: [],
+      source: 'inferred' as const,
+    })),
+  );
+
+  return uniqueTechnologies.slice(0, MAX_BATCH1_TECHNOLOGIES).map((technology) => ({
+    name: technology.name,
+    docs_url: technology.docs_url,
+    github_url: technology.github_url,
+    changelog_url: technology.changelog_url,
+    community_search_results: technology.community_search_results,
+    breaking_change_search_results: technology.breaking_change_search_results,
+  }));
+}
+
+function filterRelevantProfileTargets(
+  builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+  inferredTechnologies: Batch1ResearchStack['technologies'],
+) {
+  const projectTokens = [
+    ...projectBrief.confirmedStackTools.flatMap((technology) => buildMatchTokens(technology)),
+    ...inferredTechnologies.flatMap((technology) => buildMatchTokens(technology.name)),
+  ];
+
+  const relevantTargets = builderProfile.declaredTools.filter((tool) =>
+    targetsOverlap(buildMatchTokens(tool.name), projectTokens),
+  );
+
+  if (relevantTargets.length > 0) {
+    return relevantTargets.slice(0, MAX_PROFILE_BATCH2_RESEARCH_TARGETS);
+  }
+
+  if (projectTokens.length === 0) {
+    return builderProfile.declaredTools.slice(0, MAX_PROFILE_BATCH2_RESEARCH_TARGETS);
+  }
+
+  return [];
+}
+
+function limitResearchTargets(targets: ResearchTechnologyTarget[]) {
+  const selected: ResearchTechnologyTarget[] = [];
+  let inferredCount = 0;
+  let profileCount = 0;
+
+  for (const target of targets) {
+    if (selected.length >= MAX_BATCH2_RESEARCH_TARGETS) {
+      break;
+    }
+
+    if (target.source === 'inferred' && inferredCount >= MAX_INFERRED_BATCH2_RESEARCH_TARGETS) {
+      continue;
+    }
+
+    if (target.source === 'profile' && profileCount >= MAX_PROFILE_BATCH2_RESEARCH_TARGETS) {
+      continue;
+    }
+
+    selected.push(target);
+
+    if (target.source === 'inferred') {
+      inferredCount += 1;
+    } else if (target.source === 'profile') {
+      profileCount += 1;
+    }
+  }
+
+  return selected;
+}
+
 function buildResearchTargets(
   inferredTechnologies: Batch1ResearchStack['technologies'],
   builderProfile: LoadedBuilderProfileContext,
@@ -594,7 +685,11 @@ function buildResearchTargets(
     };
   });
 
-  const profileTargets: ResearchTechnologyTarget[] = builderProfile.declaredTools.map((tool) => ({
+  const profileTargets: ResearchTechnologyTarget[] = filterRelevantProfileTargets(
+    builderProfile,
+    projectBrief,
+    inferredTechnologies,
+  ).map((tool) => ({
     name: tool.name,
     docs_url: tool.docs_url,
     github_url: tool.github_url,
@@ -605,10 +700,10 @@ function buildResearchTargets(
         : tool.docs_topic,
     community_search_results: [],
     breaking_change_search_results: [],
-      source: 'profile',
+    source: 'profile',
   }));
 
-  return dedupeResearchTargets([...briefTargets, ...profileTargets, ...inferredTargets]);
+  return limitResearchTargets(dedupeResearchTargets([...briefTargets, ...inferredTargets, ...profileTargets]));
 }
 
 function emptyFetchedSource(url: string, title: string) {
@@ -1555,7 +1650,12 @@ function activityIconForKind(kind: ActivityKind) {
 }
 
 async function emitBatchStart(env: Bindings, projectId: string, batchName: GenerationBatchName) {
-  await touchGenerationHeartbeat(env, projectId);
+  await updateProjectGenerationStatus(env, projectId, batchName, {
+    generationError: null,
+    markStarted: true,
+    clearCompletedAt: true,
+    touchHeartbeat: true,
+  });
   await resetGenerationThinkingState(env, projectId, batchName);
   await persistGenerationStreamEvent(env, {
     projectId,
@@ -2430,15 +2530,25 @@ Only include technologies that matter to implementation.`;
           schema: Batch1ResearchStackSchema,
           schemaDescription: schemaDescriptions.batch_1_research_stack,
         });
+    const technologies = checkpoint?.data.technologies || limitBatch1Technologies(result.data.technologies);
+
+    if (!checkpoint && technologies.length < result.data.technologies.length) {
+      await logActivity(env, {
+        projectId: project.id,
+        batchName: 'batch_1_research_stack',
+        kind: 'system',
+        message: `Focused the stack scan on the top ${technologies.length} implementation-critical technologies so research stays fast.`,
+      });
+    }
 
     const technologiesWithSearches = checkpoint?.data.technologiesWithSearches
       ? [...checkpoint.data.technologiesWithSearches]
       : [];
     const startIndex = checkpoint?.currentIndex ?? 0;
 
-    for (let index = startIndex; index < result.data.technologies.length; index += 1) {
+    for (let index = startIndex; index < technologies.length; index += 1) {
       const processedCount = technologiesWithSearches.length;
-      const hasMoreWork = index < result.data.technologies.length;
+      const hasMoreWork = index < technologies.length;
       const estimatedSubrequestsUsed = processedCount * BATCH1_ESTIMATED_SUBREQUESTS_PER_TECH;
 
       if (
@@ -2447,42 +2557,34 @@ Only include technologies that matter to implementation.`;
           || estimatedSubrequestsUsed >= BATCH1_CHECKPOINT_SUBREQUEST_LIMIT)
       ) {
         await saveGenerationCheckpoint(env, project.id, runId, 'batch_1_research_stack', index, {
-          technologies: result.data.technologies,
+          technologies,
           technologiesWithSearches,
         });
         await logActivity(env, {
           projectId: project.id,
           batchName: 'batch_1_research_stack',
           kind: 'system',
-          message: `Saved a research checkpoint after ${processedCount} technologies. Continuing in a fresh queue run...`,
+          message: `Saved a research checkpoint after ${processedCount} technologies. Continuing from the latest checkpoint...`,
         });
         return 'checkpointed';
       }
 
-      const technology = result.data.technologies[index];
+      const technology = technologies[index];
       await logActivity(env, {
         projectId: project.id,
         batchName: 'batch_1_research_stack',
         kind: 'fetch',
-        message: `Searching for ${technology.name} community feedback...`,
+        message: `Checking ${technology.name} community feedback and breaking changes...`,
       });
-      const communitySearchResults = dedupeSearchResults(
-        await searchWeb(`${technology.name} vs alternatives ${currentYear}`, project.user_id, toolEnv),
-      );
-
-      await logActivity(env, {
-        projectId: project.id,
-        batchName: 'batch_1_research_stack',
-        kind: 'fetch',
-        message: `Searching for ${technology.name} breaking changes...`,
-      });
-      const breakingChangeSearchResults = dedupeSearchResults(
-        await searchWeb(
+      const [communitySearchResults, breakingChangeSearchResults] = await Promise.all([
+        searchWeb(`${technology.name} vs alternatives ${currentYear}`, project.user_id, toolEnv)
+          .then((results) => dedupeSearchResults(results)),
+        searchWeb(
           `${technology.name} breaking changes deprecations ${currentYear}`,
           project.user_id,
           toolEnv,
-        ),
-      );
+        ).then((results) => dedupeSearchResults(results)),
+      ]);
 
       if (communitySearchResults.length > 0) {
         await logActivity(env, {
@@ -2584,6 +2686,8 @@ async function executeBatch2(
     ? [...checkpoint.data.fetchedSources]
     : [];
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
+  const briefResearchCount = researchTargets.filter((target) => target.source === 'brief').length;
+  const profileResearchCount = researchTargets.filter((target) => target.source === 'profile').length;
   let issuesFound = checkpoint?.data.issuesFound ?? 0;
   const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
@@ -2618,10 +2722,10 @@ async function executeBatch2(
     batchName: 'batch_2_fetch_and_read',
     kind: 'fetch',
     message:
-      projectBrief.confirmedStackTools.length > 0
-        ? `Reading the docs for ${researchTargets.length} technologies, starting with ${projectBrief.confirmedStackTools.length} confirmed stack tool${projectBrief.confirmedStackTools.length === 1 ? '' : 's'} from your brief...`
-        : builderProfile.declaredTools.length > 0
-          ? `Reading the docs for ${researchTargets.length} technologies, starting with ${builderProfile.declaredTools.length} saved tool${builderProfile.declaredTools.length === 1 ? '' : 's'} from your builder profile...`
+      briefResearchCount > 0
+        ? `Reading the docs for ${researchTargets.length} technologies, starting with ${briefResearchCount} confirmed stack tool${briefResearchCount === 1 ? '' : 's'} from your brief...`
+        : profileResearchCount > 0
+          ? `Reading the docs for ${researchTargets.length} technologies, starting with ${profileResearchCount} relevant saved tool${profileResearchCount === 1 ? '' : 's'} from your builder profile...`
           : `Reading the docs for ${researchTargets.length} technolog${researchTargets.length === 1 ? 'y' : 'ies'}...`,
   });
 
@@ -2662,7 +2766,7 @@ async function executeBatch2(
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'system',
-        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing in a fresh queue run...`,
+        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
       });
       return 'checkpointed';
     }
@@ -2672,10 +2776,10 @@ async function executeBatch2(
     
     // We assume: searchWeb=1, fetchUrl=5 (github) or 1 (other), getLibraryDocs=1, analyzeGithubRepo=5, getLibraryIssues=1
     
-    const communitySearchResults =
+    const communitySearchPromise =
       technology.community_search_results.length > 0
-        ? technology.community_search_results
-        : await (async () => {
+        ? Promise.resolve(technology.community_search_results)
+        : (async () => {
             subrequestCounter += 1;
             try {
               const results = dedupeSearchResults(
@@ -2696,10 +2800,10 @@ async function executeBatch2(
             }
           })();
 
-    const breakingChangeSearchResults =
+    const breakingChangeSearchPromise =
       technology.breaking_change_search_results.length > 0
-        ? technology.breaking_change_search_results
-        : await (async () => {
+        ? Promise.resolve(technology.breaking_change_search_results)
+        : (async () => {
             subrequestCounter += 1;
             try {
               const results = dedupeSearchResults(
@@ -2719,6 +2823,11 @@ async function executeBatch2(
               return [];
             }
           })();
+
+    const [communitySearchResults, breakingChangeSearchResults] = await Promise.all([
+      communitySearchPromise,
+      breakingChangeSearchPromise,
+    ]);
 
     const searchResults = dedupeSearchResults([
       ...communitySearchResults,
@@ -3058,14 +3167,14 @@ async function executeBatch2(
         githubIssuesBroken,
         partialFailures,
       });
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_2_fetch_and_read',
-        kind: 'system',
-        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing in a fresh queue run...`,
-      });
-      return 'checkpointed';
-    }
+          await logActivity(env, {
+            projectId,
+            batchName: 'batch_2_fetch_and_read',
+            kind: 'system',
+            message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
+          });
+          return 'checkpointed';
+        }
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
@@ -3515,7 +3624,7 @@ async function executeBatch5(
         projectId,
         batchName: 'batch_5_enrich_steps',
         kind: 'system',
-        message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing in a fresh queue run...`,
+        message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing from the latest checkpoint...`,
       });
       return 'checkpointed';
     }
@@ -4108,30 +4217,7 @@ export async function processProjectGeneration(
     await processProjectGenerationTurn(env, message, continuationMode);
   } catch (error) {
     if (error instanceof RetryableGenerationPipelineError) {
-      if (continuationMode === 'queue') {
-        throw error;
-      }
-
-      const messageText =
-        error.message || 'Project generation hit a retryable provider error and stopped before it could finish.';
-
-      await updateProjectGenerationStatus(env, message.projectId, 'failed', {
-        generationError: messageText,
-        markStarted: true,
-        markCompleted: true,
-        touchHeartbeat: true,
-      });
-      await insertGenerationEvent(env, {
-        projectId: message.projectId,
-        eventType: 'generation_failed',
-        body: {
-          error: messageText,
-          generation_status: 'failed',
-          project_id: message.projectId,
-        },
-      });
-
-      throw new GenerationPipelineError(messageText, true);
+      throw error;
     }
 
     if (error instanceof GenerationPipelineError && error.alreadyPersisted) {
@@ -4182,7 +4268,7 @@ export async function handleProjectGenerationQueue(
       const fallbackMessage =
         error instanceof Error ? error.message : 'Project generation failed unexpectedly.';
 
-      if (error instanceof RetryableGenerationPipelineError && message.attempts < MAX_QUEUE_RETRY_ATTEMPTS) {
+      if (error instanceof RetryableGenerationPipelineError && message.attempts < MAX_PROJECT_GENERATION_RETRY_ATTEMPTS) {
         if (projectId) {
           await touchGenerationHeartbeat(env, projectId, message.body.runId || null);
         }

@@ -75,6 +75,7 @@ export default function ProjectCanvas() {
   
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
@@ -94,6 +95,9 @@ export default function ProjectCanvas() {
 
   const fetchProjectData = useCallback(async () => {
     if (!id) return;
+
+    setLoading(true);
+    setLoadError(null);
     try {
       const proj = await dbService.getProject(id);
       if (!proj) {
@@ -113,19 +117,23 @@ export default function ProjectCanvas() {
 
       setProject(proj);
 
-      const fetchedStages = await dbService.getStagesByProjectId(id);
-      setStages(fetchedStages);
+      const [fetchedStages, fetchedSteps, fetchedEdges] = await Promise.all([
+        dbService.getStagesByProjectId(id),
+        dbService.getStepsByProjectId(id),
+        dbService.getEdgesByProjectId(id),
+      ]);
 
-      const fetchedSteps = await dbService.getStepsByProjectId(id);
+      setStages(fetchedStages);
       setAppSteps((fetchedSteps.map(s => ({
         ...s,
         status: s.status as StepStatus
       }))) as Step[]);
-
-      const fetchedEdges = await dbService.getEdgesByProjectId(id);
       setAppEdges(fetchedEdges);
     } catch (error) {
-      console.error("Error fetching project data:", error);
+      console.error('Error fetching project data:', error);
+      setLoadError(
+        error instanceof Error ? error.message : "Couldn't reopen this project right now.",
+      );
     } finally {
       setLoading(false);
     }
@@ -483,6 +491,43 @@ export default function ProjectCanvas() {
               </div>
               <Skeleton className="h-64 w-full rounded-2xl" />
             </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="min-h-screen bg-bg-base px-6 py-16">
+        <div className="mx-auto flex max-w-[640px] flex-col items-start gap-5 rounded-[18px] border border-border-default bg-bg-surface p-8 shadow-panel">
+          <div className="flex h-12 w-12 items-center justify-center rounded-[12px] border border-status-warning/30 bg-status-warning/10 text-status-warning">
+            <RotateCcw className="h-5 w-5" />
+          </div>
+          <div>
+            <h1 className="font-serif text-3xl tracking-[-0.03em] text-text-primary">
+              I couldn&apos;t reopen this plan yet.
+            </h1>
+            <p className="mt-3 max-w-[520px] text-sm leading-relaxed text-text-secondary">
+              {loadError}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={() => void fetchProjectData()}
+              className="btn-primary flex items-center gap-2"
+            >
+              <RotateCcw className="h-4 w-4" />
+              Try again
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/dashboard')}
+              className="btn-ghost"
+            >
+              Back to dashboard
+            </button>
           </div>
         </div>
       </div>

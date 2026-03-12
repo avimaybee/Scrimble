@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -99,58 +99,110 @@ function parseStack(stackValue: string) {
   }
 }
 
+function getProjectCardDescriptor(project: Project, nextStep: Step | null, isAgentWorking: boolean) {
+  if (project.generation_status === 'intake') {
+    return {
+      statusLabel: 'Continuing your brief',
+      ctaLabel: 'Resume intake',
+      destination: `/new?intake=${project.id}`,
+      focusCopy: 'Finish the intake conversation.',
+      badgeClassName: 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
+    };
+  }
+
+  if (project.generation_status === 'awaiting_review' || nextStep?.status === 'needs_review') {
+    return {
+      statusLabel: 'Your review',
+      ctaLabel: 'Review build',
+      destination: `/project/${project.id}/generating`,
+      focusCopy: nextStep?.title ?? 'Review the architecture checkpoint.',
+      badgeClassName: 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
+    };
+  }
+
+  if (project.generation_status === 'failed') {
+    return {
+      statusLabel: 'Needs attention',
+      ctaLabel: 'Recover build',
+      destination: `/project/${project.id}/generating`,
+      focusCopy: 'Reopen the build and continue from the last safe checkpoint.',
+      badgeClassName: 'border-[rgba(248,113,113,0.22)] bg-[rgba(248,113,113,0.08)] text-status-error',
+    };
+  }
+
+  if (isAgentWorking) {
+    return {
+      statusLabel: 'Working now',
+      ctaLabel: 'Watch progress',
+      destination: `/project/${project.id}/generating`,
+      focusCopy: nextStep?.title ?? 'Scrimble is still building this plan.',
+      badgeClassName: 'border-accent-border/70 bg-accent-primary-muted/25 text-accent-soft',
+    };
+  }
+
+  return {
+    statusLabel: 'Next up',
+    ctaLabel: 'Open plan',
+    destination: `/project/${project.id}`,
+    focusCopy: nextStep?.title ?? 'Plan details are still coming together.',
+    badgeClassName: 'border-border-default bg-bg-elevated/55 text-text-secondary',
+  };
+}
+
 export default function Dashboard() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
   const [projectCards, setProjectCards] = useState<ProjectCardData[]>([]);
   const [builderProfileCount, setBuilderProfileCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [showArchived, setShowArchived] = useState(false);
   const [projectToDelete, setProjectToDelete] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
-  useEffect(() => {
+  const loadDashboard = useCallback(async () => {
     if (!user) {
       return;
     }
 
-    async function fetchProjects() {
-      setLoading(true);
+    setLoading(true);
+    setError('');
 
-      try {
-        const [projects, userTools] = await Promise.all([
-          dbService.getProjectsByUserId(user.uid),
-          dbService.getUserTools(),
-        ]);
-        const cards = await Promise.all(
-          projects.map(async (project) => {
-            const [steps, stages] = await Promise.all([
-              dbService.getStepsByProjectId(project.id),
-              dbService.getStagesByProjectId(project.id),
-            ]);
+    try {
+      const [projects, userTools] = await Promise.all([
+        dbService.getProjectsByUserId(user.uid),
+        dbService.getUserTools(),
+      ]);
+      const cards = await Promise.all(
+        projects.map(async (project) => {
+          const [steps, stages] = await Promise.all([
+            dbService.getStepsByProjectId(project.id),
+            dbService.getStagesByProjectId(project.id),
+          ]);
 
-            return {
-              project,
-              stages,
-              steps,
-              nextStep: getNextStep(steps),
-              activeStepCount: steps.filter((step) => ['active', 'agent_working', 'needs_review', 'waiting'].includes(step.status)).length,
-            };
-          }),
-        );
+          return {
+            project,
+            stages,
+            steps,
+            nextStep: getNextStep(steps),
+            activeStepCount: steps.filter((step) => ['active', 'agent_working', 'needs_review', 'waiting'].includes(step.status)).length,
+          };
+        }),
+      );
 
-        setProjectCards(cards);
-        setBuilderProfileCount(userTools.length);
-      } catch (error) {
-        console.error('Error fetching projects:', error);
-        toast.error('Could not load your projects.');
-      } finally {
-        setLoading(false);
-      }
+      setProjectCards(cards);
+      setBuilderProfileCount(userTools.length);
+    } catch (loadError) {
+      console.error('Error fetching projects:', loadError);
+      setError(loadError instanceof Error ? loadError.message : 'Could not load your projects.');
+    } finally {
+      setLoading(false);
     }
-
-    void fetchProjects();
   }, [user]);
+
+  useEffect(() => {
+    void loadDashboard();
+  }, [loadDashboard]);
 
   const handleArchiveProject = async (projectId: string) => {
     try {
@@ -304,6 +356,32 @@ export default function Dashboard() {
             </div>
           ))}
         </div>
+      ) : error ? (
+        <motion.div variants={itemVariants} className="surface-card px-8 py-10">
+          <div className="max-w-[520px]">
+            <div className="section-label">Couldn&apos;t reopen your projects</div>
+            <h2 className="mt-4 text-[32px] font-serif tracking-[-0.03em] text-text-primary">
+              I couldn&apos;t rebuild your dashboard just now.
+            </h2>
+            <p className="mt-3 text-body">
+              {error}
+            </p>
+            <div className="mt-6 flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={() => void loadDashboard()}
+                className="btn-primary"
+              >
+                <RotateCcw className="h-4 w-4" />
+                Try again
+              </button>
+              <Link to="/new" className="btn-ghost">
+                <Plus className="h-4 w-4" />
+                Start something new
+              </Link>
+            </div>
+          </div>
+        </motion.div>
       ) : visibleCards.length === 0 ? (
         <motion.div variants={itemVariants} className="surface-card px-8 py-14 text-center">
           <div className="mb-5 flex justify-center">
@@ -332,26 +410,13 @@ export default function Dashboard() {
             const stageTotal = stages.length || 1;
             const stageProgress = Math.min(Math.max(completedStageCount, 0), stageTotal);
             const isAgentWorking = ['queued', 'batch_1_research_stack', 'batch_2_fetch_and_read', 'batch_3_architect', 'batch_4_plan_build', 'batch_5_enrich_steps', 'batch_6_generate_files'].includes(project.generation_status || '') || nextStep?.status === 'agent_working';
-
-            const statusLabel = project.generation_status === 'intake'
-              ? 'Continue intake'
-              : nextStep?.status === 'needs_review'
-                ? 'Your review'
-                : isAgentWorking
-                  ? 'Working now'
-                  : 'Next up';
+            const descriptor = getProjectCardDescriptor(project, nextStep, isAgentWorking);
 
             return (
               <motion.article
                 key={project.id}
                 variants={itemVariants}
-                onClick={() =>
-                  navigate(
-                    project.generation_status === 'intake'
-                      ? `/new?intake=${project.id}`
-                      : `/project/${project.id}`,
-                  )
-                }
+                onClick={() => navigate(descriptor.destination)}
                 className="surface-card group cursor-pointer p-6 transition-transform duration-200 hover:-translate-y-1"
               >
                 <div className="mb-5 flex items-start justify-between gap-4">
@@ -367,6 +432,14 @@ export default function Dashboard() {
                   </div>
 
                   <div className="flex items-start gap-3">
+                    <span
+                      className={cn(
+                        'inline-flex items-center rounded-[8px] border px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em]',
+                        descriptor.badgeClassName,
+                      )}
+                    >
+                      {descriptor.statusLabel}
+                    </span>
                     <div className="flex items-center gap-1 pt-1">
                       {Array.from({ length: stageTotal }).map((_, index) => (
                         <span
@@ -443,7 +516,7 @@ export default function Dashboard() {
                   
                   <div className="flex items-center justify-between mb-1 relative z-10">
                     <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-accent-primary">
-                      {statusLabel}
+                      {descriptor.statusLabel}
                     </div>
                     {isAgentWorking && (
                       <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent-primary/10 border border-accent-primary/20">
@@ -465,9 +538,7 @@ export default function Dashboard() {
                       <ArrowRight className="h-4 w-4 text-accent-primary" />
                     )}
                     <span>
-                      {project.generation_status === 'intake'
-                        ? 'Finish the intake conversation.'
-                        : nextStep?.title ?? 'Plan details are still coming together.'}
+                      {descriptor.focusCopy}
                     </span>
                   </div>
                 </div>
@@ -507,8 +578,14 @@ export default function Dashboard() {
                     ))}
                   </div>
 
-                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">
-                    {activeStepCount > 0 ? `${activeStepCount} in play` : 'Quiet for now'}
+                  <div className="flex items-center gap-3">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">
+                      {activeStepCount > 0 ? `${activeStepCount} in play` : 'Quiet for now'}
+                    </div>
+                    <span className="inline-flex items-center gap-1 text-[13px] font-medium text-accent-primary transition-colors group-hover:text-accent-primary-hover">
+                      {descriptor.ctaLabel}
+                      <ArrowRight className="h-4 w-4" />
+                    </span>
                   </div>
                 </div>
               </motion.article>

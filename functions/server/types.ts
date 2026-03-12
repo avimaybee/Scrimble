@@ -51,9 +51,24 @@ export type DurableObjectNamespaceLike = {
   get(id: DurableObjectIdLike): DurableObjectStubLike;
 };
 
+export type DurableObjectStorageLike = {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put<T = unknown>(key: string, value: T): Promise<void>;
+  delete(key: string): Promise<void>;
+  getAlarm(): Promise<number | null>;
+  setAlarm(scheduledTimeMs: number): Promise<void> | void;
+  deleteAlarm(): Promise<void> | void;
+};
+
+export type DurableObjectAlarmInfoLike = {
+  retryCount?: number;
+  isRetry?: boolean;
+};
+
 export type DurableObjectStateLike = {
   waitUntil(promise: Promise<unknown>): void;
   blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
+  storage: DurableObjectStorageLike;
 };
 
 export type Bindings = {

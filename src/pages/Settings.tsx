@@ -9,6 +9,7 @@ import {
   KeyRound,
   Loader2,
   LogOut,
+  RefreshCw,
   Search,
   Server,
   ShieldCheck,
@@ -274,6 +275,8 @@ export default function Settings() {
   const [expandedMCPType, setExpandedMCPType] = useState<MCPServerType | null>(null);
   const [isLoadingProviders, setIsLoadingProviders] = useState(true);
   const [isLoadingMCPServers, setIsLoadingMCPServers] = useState(true);
+  const [providerLoadError, setProviderLoadError] = useState<string | null>(null);
+  const [mcpLoadError, setMCPLoadError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [savingMCPType, setSavingMCPType] = useState<MCPServerType | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
@@ -292,18 +295,22 @@ export default function Settings() {
   );
 
   const activeResearchToolCount = mcpServers.filter((server) => server.is_active).length;
+  const aiProviderCount = providers.length;
+  const isWorkspaceReady = aiProviderCount > 0;
 
   const loadProviders = async (silent = false) => {
     setIsLoadingProviders(true);
+    setProviderLoadError(null);
 
     try {
       const result = await getAIProviders();
       setProviders(result);
     } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : 'Could not load your AI keys right now.';
+      setProviderLoadError(message);
       if (!silent) {
-        toast.error(
-          error instanceof Error ? error.message : 'Could not load your AI keys right now.',
-        );
+        toast.error(message);
       }
     } finally {
       setIsLoadingProviders(false);
@@ -312,17 +319,19 @@ export default function Settings() {
 
   const loadMCPServers = async (silent = false) => {
     setIsLoadingMCPServers(true);
+    setMCPLoadError(null);
 
     try {
       const result = await getMCPServers();
       setMCPServers(result);
     } catch (error: unknown) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Could not load your research tools right now.';
+      setMCPLoadError(message);
       if (!silent) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : 'Could not load your research tools right now.',
-        );
+        toast.error(message);
       }
     } finally {
       setIsLoadingMCPServers(false);
@@ -548,6 +557,56 @@ export default function Settings() {
 
       <motion.section
         variants={itemVariants}
+        className="mb-8 grid gap-4 md:grid-cols-3"
+      >
+        <div className="rounded-[16px] border border-border-default bg-bg-surface p-5 shadow-panel">
+          <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
+            <Cpu className="h-4 w-4 text-accent-primary" />
+            AI coverage
+          </div>
+          <div className="text-3xl font-serif tracking-[-0.04em] text-text-primary">
+            {aiProviderCount}
+          </div>
+          <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+            {aiProviderCount > 0
+              ? 'Your generation keys are connected and ready to use.'
+              : 'Add at least one AI key so Scrimble can start building.'}
+          </p>
+        </div>
+
+        <div className="rounded-[16px] border border-border-default bg-bg-surface p-5 shadow-panel">
+          <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
+            <Search className="h-4 w-4 text-accent-primary" />
+            Research depth
+          </div>
+          <div className="text-3xl font-serif tracking-[-0.04em] text-text-primary">
+            {activeResearchToolCount}
+          </div>
+          <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+            {activeResearchToolCount > 0
+              ? 'Live research is on, so plans can use fresh documentation and comparisons.'
+              : 'Optional, but helpful when you want deeper tradeoffs and fresher references.'}
+          </p>
+        </div>
+
+        <div className="rounded-[16px] border border-border-default bg-bg-surface p-5 shadow-panel">
+          <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
+            <ShieldCheck className="h-4 w-4 text-accent-primary" />
+            Workspace readiness
+          </div>
+          <div className="text-lg font-medium tracking-[-0.03em] text-text-primary">
+            {isWorkspaceReady ? 'Ready to build' : 'Needs one quick setup'}
+          </div>
+          <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+            {isWorkspaceReady
+              ? 'You can start a new project now and Scrimble will have what it needs.'
+              : 'Once you save an AI key, new projects can run without extra setup.'}
+          </p>
+        </div>
+      </motion.section>
+
+      <motion.section
+        variants={itemVariants}
         className="mb-8 rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
       >
         <div className="mb-4 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
@@ -608,6 +667,23 @@ export default function Settings() {
             uses them to do the work on your projects.
           </p>
         </div>
+
+        {providerLoadError ? (
+          <div className="mb-5 flex flex-col gap-3 rounded-[14px] border border-status-error/25 bg-status-error/8 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium text-text-primary">I couldn&apos;t refresh your AI keys.</p>
+              <p className="mt-1 text-sm leading-relaxed text-text-secondary">{providerLoadError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadProviders()}
+              className="inline-flex items-center gap-2 rounded-[8px] border border-status-error/25 px-3 py-2 text-sm font-medium text-status-error transition-colors hover:bg-status-error/10"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Try again
+            </button>
+          </div>
+        ) : null}
 
         <div className="space-y-4">
           {isLoadingProviders ? (
@@ -823,6 +899,23 @@ export default function Settings() {
             you connect, the better your plan will be.
           </p>
         </div>
+
+        {mcpLoadError ? (
+          <div className="mb-5 flex flex-col gap-3 rounded-[14px] border border-status-error/25 bg-status-error/8 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium text-text-primary">I couldn&apos;t refresh your research tools.</p>
+              <p className="mt-1 text-sm leading-relaxed text-text-secondary">{mcpLoadError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadMCPServers()}
+              className="inline-flex items-center gap-2 rounded-[8px] border border-status-error/25 px-3 py-2 text-sm font-medium text-status-error transition-colors hover:bg-status-error/10"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Try again
+            </button>
+          </div>
+        ) : null}
 
         <div className="space-y-4">
           {isLoadingMCPServers ? (

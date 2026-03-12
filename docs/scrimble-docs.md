@@ -879,43 +879,31 @@ POST   /api/projects/:id/resume    → Resume a failed or interrupted project
 ```
 
 
-### Cloudflare Durable Object + Queue Fallback
+### Cloudflare Durable Object Primary Runtime
 
-```
-Primary runtime:
-  ProjectGeneratorDO (standalone Worker)
-  - One Durable Object instance per project
-  - Pages Functions dispatch into the DO via binding
-  - The DO schedules the pipeline in the background with waitUntil()
-  - The DO reuses D1 + R2 checkpoints between turns, so it can keep moving without queue polling gaps
+Project generation now runs inside `ProjectGeneratorDO`, a standalone Cloudflare Worker Durable Object that owns every project’s pipeline turn.
 
-Fallback runtime:
-  Queue name: scrimble
+- **One DO per project**: Each run keeps its own `run_id`, persists batch state in D1 + R2, and streams progress events through the durable `project_generation_events` table.
+- **Timeouts & retries**: The DO updates `projects.generation_status` as soon as each batch starts, retries transient provider/timeout errors via D1-stored alarms, and reschedules itself instead of failing the project.
+- **SSE-friendly**: Reasoning deltas feed `project_generation_live_state`, and the Pages `/api/projects/:id/generation-stream` route polls D1 + replays events so the SPA receives live thinking without sharing memory across runtimes.
+- **Checkpoint durability**: Every batch writes both inline JSON and R2 payloads, so the pipeline can resume instantly after any interruption without re-running prior work.
+- **Fallback safety**: Pages always records a `generation_dispatches` row before handing work to the DO; if something fails before the DO takes over, the dispatch rollbacks the project status so no “ghost queued” runs appear.
 
-Message types:
-  { type: 'generate_plan',  projectId, userId, description, providerKeyId }
-  { type: 'enrich_step',    stepId, projectId, userId, providerKeyId }
-  { type: 'update_plan',    workflowId, userId, message, providerKeyId }
-  { type: 'gate_review',    stepId, projectId, userId }
+### Queue Fallback (Legacy Rollback)
 
-Consumer Worker:
-  1. Pull message from queue
-  2. Fetch user's encrypted API key from D1
-  3. Decrypt key in Worker memory
-  4. Call AI provider API
-  5. Write results to D1
-  6. Update step status (agent_working → needs_review | complete)
-  7. Mark message consumed
+The original `scrimble` Cloudflare Queue consumer remains as a rollback. It still processes one batch per invocation, honours the same `run_id` guard, and writes checkpoints through the same worker, but it no longer drives normal generation flow. Use it only when:
 
-Retry: 3 attempts, exponential backoff
-```
+- the DO binding is missing or misconfigured
+- a previous run crashed without leaving a retriable alarm (very rare)
 
 ### Sequential Generation Pipeline
 
-Project creation dispatches a dedicated 6-batch generation run. Scrimble uses a hybrid architecture to handle these long-running tasks:
-1. **Pages (The Boss)**: Handles the UI, updates D1 state, and dispatches generation through the configured backend.
-2. **ProjectGeneratorDO (Primary)**: A Durable Object in the standalone worker that runs queue-like turns inline, preserves checkpoints, and keeps progressing without waiting for another queue delivery window.
-3. **Cloudflare Queue (Fallback)**: The `scrimble` queue remains available as the rollback path and still uses the same worker for one-batch-at-a-time execution.
+Project creation dispatches a dedicated 6-batch generation run. Scrimble now relies on `ProjectGeneratorDO` running inline turns inside the standalone worker:
+
+1. **Pages (The Boss)**: Handles the UI, updates D1 state, streams SSE, and dispatches generation through the configured backend.
+2. **ProjectGeneratorDO (Primary Runner)**: Runs the same six batches inside the Durable Object, emits batch status before it starts, writes checkpoints to D1+R2, and restarts itself via alarms when transient provider/timeouts occur.
+
+The Cloudflare Queue consumer remains only as an emergency rollback. It still exists to process a single batch when the DO binding is unavailable, but it no longer drives the default flow.
 
 Each batch executes in order with **Smart Caps** to ensure extreme thoroughness without reckless resource usage:
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
@@ -1003,16 +991,16 @@ interface AIProvider {
 
 ### Agentic Generation Pipeline
 
-Scrimble’s “start a project” flow now dispatches into `ProjectGeneratorDO` by default, with Cloudflare Queue preserved as the fallback path. The DO runs the same six sequential batches and keeps replay-safe checkpoints in D1 + R2 so it can continue immediately after each turn instead of waiting for queue polling gaps. Each batch:
+`ProjectGeneratorDO` now executes every generation run in one continuous Durable Object turn. Each of the six batches:
 
-1. Reads input from the previous batch’s `agent_runs` output (stored as JSON).
-2. Makes exactly one AI call through the BYOK proxy.
-3. Validates the JSON response with Zod and, on failure, retries once with the invalid output appended to the prompt.
-4. Persists the output to `agent_runs` with `run_type` set to the batch name.
-5. Updates `projects.generation_status` to the batch currently running.
-6. Writes a structured SSE event into `project_generation_events` so the frontend can replay and stream it immediately.
+1. Reads the previous batch output from `agent_runs`.
+2. Dispatches a single BYOK AI call (streaming reasoning tokens into `thinking` events).
+3. Validates the JSON response with Zod and retries once if validation fails.
+4. Writes results back into `agent_runs` and persists large payloads to R2 so checkpoints stay lightweight.
+5. Touches `projects.generation_status` as soon as the batch starts so status polling stays truthful.
+6. Emits a durable SSE event (`batch_start`, `activity`, `batch_complete`, etc.) so `/api/projects/:id/generation-stream` can replay history + stream real-time deltas.
 
-The background worker owns this pipeline completely. It does not hold a browser `WritableStream`, depend on an open tab, or await any frontend connection before continuing its work. If the user refreshes, disconnects, or closes the tab, the worker keeps running, persists each durable milestone to D1, and the generation screen rebuilds itself later from replay plus fresh polling. In the primary path that worker is `ProjectGeneratorDO`; in rollback mode it is the queue consumer.
+The DO keeps running even if all tabs are closed: it stores checkpoints in D1, writes reasoning deltas through the throttled emitter, uses alarms/`waitUntil()` to retry transient failures, and only marks a run as `failed` when retries are exhausted. This is the default path; the Cloudflare Queue consumer wakes only when the DO binding is missing or a manual rollback is required, and it follows the same stale-`run_id` guard and checkpoint writing strategy.
 
 Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. **Token Guardrails** (aggressive truncation of raw research data) prevent prompt-size failures. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
 

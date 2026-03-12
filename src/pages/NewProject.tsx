@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowRight, ChevronRight, Hexagon, KeyRound, Sparkles } from 'lucide-react';
@@ -114,6 +114,31 @@ export default function NewProject() {
   const intakeProjectId = searchParams.get('intake');
   const currentAgentMessage = manualPrompt || getCurrentAgentMessage(intakeSession);
   const conversationProgress = Math.min(Math.max(intakeSession?.brief.conversation_turns || 1, 1), 4);
+  const needsAiSetup = !isPreparationLoading && !generationPreparation?.has_ai_provider;
+
+  const preparationBadges = useMemo(() => {
+    if (!generationPreparation) {
+      return [];
+    }
+
+    return [
+      {
+        key: 'ai',
+        label: generationPreparation.has_ai_provider ? 'AI ready' : 'AI key missing',
+        tone: generationPreparation.has_ai_provider ? 'ready' : 'missing',
+      },
+      {
+        key: 'github',
+        label: generationPreparation.has_github_token ? 'GitHub connected' : 'GitHub public only',
+        tone: generationPreparation.has_github_token ? 'ready' : 'partial',
+      },
+      {
+        key: 'docs',
+        label: generationPreparation.has_context7 ? 'Live docs connected' : 'Live docs not connected',
+        tone: generationPreparation.has_context7 ? 'ready' : 'missing',
+      },
+    ] as const;
+  }, [generationPreparation]);
 
   const historyMessages = useMemo(() => {
     if (!intakeSession) {
@@ -162,55 +187,44 @@ export default function NewProject() {
     historyElement.scrollTop = historyElement.scrollHeight;
   }, [historyMessages.length, currentAgentMessage]);
 
-  useEffect(() => {
-    let isMounted = true;
+  const loadPreparationState = useCallback(async () => {
+    setIsPreparationLoading(true);
+    setError('');
 
-    const loadPreparationState = async () => {
-      try {
-        const [providerList, servers, userTools] = await Promise.all([
-          getAIProviders(),
-          getMCPServers(),
-          dbService.getUserTools(),
-        ]);
-        const activeServers = servers.filter((server) => server.is_active);
+    try {
+      const [providerList, servers, userTools] = await Promise.all([
+        getAIProviders(),
+        getMCPServers(),
+        dbService.getUserTools(),
+      ]);
+      const activeServers = servers.filter((server) => server.is_active);
 
-        if (!isMounted) {
-          return;
-        }
-
-        setProviders(providerList);
-        setBuilderProfileCount(userTools.length);
-        const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
-        if (defaultProvider) {
-          setSelectedProviderId(defaultProvider.id);
-        }
-
-        setGenerationPreparation({
-          has_ai_provider: providerList.length > 0,
-          has_brave_search: activeServers.some((server) => server.server_type === 'brave-search'),
-          has_github_token: activeServers.some((server) => server.server_type === 'github'),
-          has_context7: activeServers.some((server) => server.server_type === 'context7'),
-        });
-      } catch (fetchError) {
-        if (!isMounted) {
-          return;
-        }
-
-        console.error('Failed to load generation preparation state:', fetchError);
-        setError('Could not load your saved settings. Reload and try again.');
-      } finally {
-        if (isMounted) {
-          setIsPreparationLoading(false);
-        }
+      setProviders(providerList);
+      setBuilderProfileCount(userTools.length);
+      const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
+      if (defaultProvider) {
+        setSelectedProviderId(defaultProvider.id);
       }
-    };
 
-    void loadPreparationState();
-
-    return () => {
-      isMounted = false;
-    };
+      setGenerationPreparation({
+        has_ai_provider: providerList.length > 0,
+        has_brave_search: activeServers.some((server) => server.server_type === 'brave-search'),
+        has_github_token: activeServers.some((server) => server.server_type === 'github'),
+        has_context7: activeServers.some((server) => server.server_type === 'context7'),
+      });
+      setError('');
+    } catch (fetchError) {
+      console.error('Failed to load generation preparation state:', fetchError);
+      setGenerationPreparation(null);
+      setError('Could not load your saved settings. Reload and try again.');
+    } finally {
+      setIsPreparationLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void loadPreparationState();
+  }, [loadPreparationState]);
 
   useEffect(() => {
     if (!user || !intakeProjectId) {
@@ -493,6 +507,29 @@ export default function NewProject() {
                   </div>
                 ) : null}
 
+                {!isPreparationLoading && preparationBadges.length > 0 ? (
+                  <div className="mx-3 mt-4 flex flex-wrap gap-2 sm:mx-2">
+                    {preparationBadges.map((badge) => (
+                      <span
+                        key={badge.key}
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-[8px] border px-3 py-1 font-sans text-[12px]',
+                          badge.tone === 'ready'
+                            ? 'border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure'
+                            : badge.tone === 'partial'
+                              ? 'border-border-default bg-bg-elevated/50 text-text-secondary'
+                              : 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
+                        )}
+                      >
+                        <span aria-hidden="true">
+                          {badge.tone === 'ready' ? '✓' : badge.tone === 'partial' ? '•' : '!' }
+                        </span>
+                        <span>{badge.label}</span>
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+
                 <div className="flex flex-col gap-4 px-3 pb-2 pt-4 sm:flex-row sm:items-end sm:justify-between">
                   <div className="flex items-start gap-3 text-left">
                     <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-accent-primary" />
@@ -521,6 +558,16 @@ export default function NewProject() {
                       <div className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
                         Plain language works best here
                       </div>
+                      {needsAiSetup ? (
+                        <button
+                          type="button"
+                          onClick={() => navigate('/settings')}
+                          className="mt-2 inline-flex items-center gap-2 text-sm font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
+                        >
+                          Open settings
+                          <ChevronRight className="h-4 w-4" />
+                        </button>
+                      ) : null}
                     </div>
                   </div>
 
@@ -546,17 +593,20 @@ export default function NewProject() {
               transition={{ duration: 0.3, ease: EASE_OUT_EXPO }}
               className="relative rounded-[24px] border border-border-default bg-bg-surface/90 px-6 py-7 shadow-panel sm:px-8"
             >
-              <div className="mb-8 flex items-start justify-between gap-6">
-                <div>
-                  <div className="section-label">Intake conversation</div>
-                  <p className="mt-3 max-w-[420px] text-body">
-                    I am tightening the brief before the research pipeline starts.
-                  </p>
+                <div className="mb-8 flex items-start justify-between gap-6">
+                  <div>
+                    <div className="section-label">Intake conversation</div>
+                    <p className="mt-3 max-w-[420px] text-body">
+                      I am tightening the brief before the research pipeline starts.
+                    </p>
+                    <p className="mt-2 max-w-[440px] text-[13px] leading-6 text-text-tertiary">
+                      I save this as we go, so you can leave and come back without losing the thread.
+                    </p>
+                  </div>
+                  <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
+                    Building context... {conversationProgress}/4
+                  </div>
                 </div>
-                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
-                  Building context... {conversationProgress}/4
-                </div>
-              </div>
 
               {historyMessages.length > 0 ? (
                 <div
@@ -651,6 +701,9 @@ export default function NewProject() {
                 <p className="mt-4 max-w-[640px] text-[16px] leading-8 text-text-secondary">
                   {intakeSession.brief.summary}
                 </p>
+                <p className="mt-3 max-w-[620px] text-[13px] leading-6 text-text-tertiary">
+                  Once you confirm this, I&apos;ll keep the brief attached to the full planning run and take it from there.
+                </p>
               </div>
 
               <div className="rounded-[16px] border border-border-default bg-bg-elevated/55 p-4">
@@ -733,14 +786,26 @@ export default function NewProject() {
               className="mt-5 rounded-[14px] border border-[rgba(248,113,113,0.22)] bg-status-skipped px-4 py-3 text-sm leading-6 text-status-error"
             >
               <p>{error}</p>
-              {error.toLowerCase().includes('settings') ? (
-                <button
-                  onClick={() => navigate('/settings')}
-                  className="mt-2 text-sm font-medium text-accent-primary hover:text-accent-primary-hover"
-                >
-                  Open settings
-                </button>
-              ) : null}
+              <div className="mt-3 flex flex-wrap gap-3">
+                {!generationPreparation && !isPreparationLoading ? (
+                  <button
+                    type="button"
+                    onClick={() => void loadPreparationState()}
+                    className="text-sm font-medium text-accent-primary hover:text-accent-primary-hover"
+                  >
+                    Reload setup
+                  </button>
+                ) : null}
+                {(error.toLowerCase().includes('settings') || needsAiSetup) ? (
+                  <button
+                    type="button"
+                    onClick={() => navigate('/settings')}
+                    className="text-sm font-medium text-accent-primary hover:text-accent-primary-hover"
+                  >
+                    Open settings
+                  </button>
+                ) : null}
+              </div>
             </motion.div>
           ) : null}
 

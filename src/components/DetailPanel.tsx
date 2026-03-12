@@ -77,7 +77,9 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
   const [step, setStep] = useState<Step | null>(null);
   const [checklist, setChecklist] = useState<ChecklistItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [showSkipWarning, setShowSkipWarning] = useState(false);
+  const [stepAction, setStepAction] = useState<'complete' | 'skip' | null>(null);
 
   // Step Execution Hook
   const { executeStep, isExecuting, streamingOutput, error: executionError } = useStepExecution({
@@ -98,27 +100,47 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
   );
 
   useEffect(() => {
-    if (!stepId) return;
-    fetchStepData(stepId);
+    if (!stepId) {
+      setStep(null);
+      setChecklist([]);
+      setLoadError(null);
+      return;
+    }
+
+    setStep(null);
+    setChecklist([]);
+    setLoadError(null);
+    void fetchStepData(stepId);
   }, [stepId, project]);
 
   async function fetchStepData(id: string) {
     setLoading(true);
+    setLoadError(null);
     try {
-      const stepData = await dbService.getStep(id);
+      const [stepData, items] = await Promise.all([
+        dbService.getStep(id),
+        dbService.getChecklistItemsByStepId(id),
+      ]);
+
       if (stepData) {
         setStep(stepData);
         setEditedOutput(splitResearchFooter(stepData.ai_output || '').body);
-        
+
         if (stepData.is_ai_enriched === false && project && !isExecuting) {
-          enrichStep(stepData, project);
+          void enrichStep(stepData, project);
         }
+      } else {
+        setStep(null);
+        setEditedOutput('');
       }
-      
-      const items = await dbService.getChecklistItemsByStepId(id);
+
       setChecklist(items);
     } catch (error) {
-      console.error("Error fetching step details:", error);
+      console.error('Error fetching step details:', error);
+      setStep(null);
+      setChecklist([]);
+      setEditedOutput('');
+      setLoadError(error instanceof Error ? error.message : 'Could not load this step right now.');
     } finally {
       setLoading(false);
     }
@@ -152,39 +174,49 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
 
   const handleComplete = async () => {
     if (!step) return;
-    
-    // Optimistic UI: Close and trigger complete in parent immediately
-    onStepComplete(step.id);
-    onClose();
+
+    setStepAction('complete');
 
     try {
       await dbService.updateStep(step.id, {
-        status: 'complete'
+        status: 'complete',
       });
+      onStepComplete(step.id);
+      toast.success('Step marked as done.');
+      onClose();
     } catch (error) {
-      console.error("Error completing step:", error);
-      toast.error("Couldn't save step completion. Try again.");
+      console.error('Error completing step:', error);
+      toast.error(error instanceof Error ? error.message : "Couldn't save step completion.");
+    } finally {
+      setStepAction(null);
     }
   };
 
   const handleSkip = async () => {
     if (!step) return;
-    
+
+    setStepAction('skip');
+
     try {
       await dbService.updateStep(step.id, {
-        status: 'skipped'
+        status: 'skipped',
       });
       onStepComplete(step.id);
+      toast.success('Step skipped.');
       onClose();
     } catch (error) {
-      console.error("Error skipping step:", error);
+      console.error('Error skipping step:', error);
+      toast.error(error instanceof Error ? error.message : "Couldn't skip this step.");
+    } finally {
+      setStepAction(null);
     }
   };
 
   const allRequiredChecked = checklist.filter(i => i.is_required).every(i => i.is_completed);
   const suggestedTools = useMemo(() => parseJsonArray<SuggestedTool>(step?.suggested_tools), [step?.suggested_tools]);
   const promptCards = useMemo(() => parseJsonArray<PromptCard>(step?.prompts), [step?.prompts]);
-  const enrichmentLoading = isExecuting || (!!step && !step.is_ai_enriched && !executionError);
+  const enrichmentLoading = isExecuting || (!!step && !step.is_ai_enriched && !executionError && !loadError);
+  const isSavingStepDecision = stepAction !== null;
 
   const handleApprove = async () => {
     if (!step) {
@@ -320,6 +352,30 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
 
               {/* Content */}
               <div className="flex-1 overflow-y-auto p-6 space-y-8">
+                {loadError ? (
+                  <section className="rounded-[14px] border border-status-error/30 bg-status-error/8 p-4">
+                    <div className="flex items-start gap-3">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-status-error" />
+                      <div className="flex-1">
+                        <h3 className="text-sm font-medium text-text-primary">
+                          I couldn&apos;t reopen this step just now.
+                        </h3>
+                        <p className="mt-1 text-sm leading-relaxed text-text-secondary">{loadError}</p>
+                      </div>
+                      {stepId ? (
+                        <button
+                          type="button"
+                          onClick={() => void fetchStepData(stepId)}
+                          className="inline-flex items-center gap-2 rounded-[8px] border border-status-error/25 px-3 py-1.5 text-xs font-medium text-status-error transition-colors hover:bg-status-error/10"
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />
+                          Try again
+                        </button>
+                      ) : null}
+                    </div>
+                  </section>
+                ) : null}
+
                 {step.is_gate && step.status === 'needs_review' && (
                   <section className="review-prompt-container">
                     <h3 className="review-prompt-heading">Before I continue — does this look right?</h3>
@@ -612,15 +668,17 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                     <div className="flex gap-3">
                       <button 
                         onClick={() => setShowSkipWarning(false)}
+                        disabled={isSavingStepDecision}
                         className="flex-1 bg-bg-surface border border-border-default hover:bg-border-default text-sm font-medium py-2 rounded-[8px] transition-colors"
                       >
                         Cancel
                       </button>
                       <button 
                         onClick={handleSkip}
+                        disabled={isSavingStepDecision}
                         className="flex-1 bg-status-warning/20 text-status-warning hover:bg-status-warning/30 text-sm font-medium py-2 rounded-[8px] transition-colors"
                       >
-                        Skip this step
+                        {stepAction === 'skip' ? 'Skipping...' : 'Skip this step'}
                       </button>
                     </div>
                   </div>
@@ -628,24 +686,41 @@ export default function DetailPanel({ stepId, project, onClose, onStepComplete }
                   <div className="flex items-center gap-4">
                     <button 
                       onClick={() => setShowSkipWarning(true)}
+                      disabled={isSavingStepDecision}
                       className="text-sm font-medium text-text-tertiary hover:text-text-primary transition-colors px-2"
                     >
                       Skip this
                     </button>
                     <button 
                       onClick={handleComplete}
-                      disabled={!allRequiredChecked}
+                      disabled={!allRequiredChecked || isSavingStepDecision}
                       className="flex-1 btn-primary py-3"
                     >
-                      Mark as done
+                      {stepAction === 'complete' ? 'Saving...' : 'Mark as done'}
                     </button>
                   </div>
                 )}
               </div>
             </>
           ) : (
-            <div className="p-8 flex items-center justify-center h-full text-text-secondary">
-              Step not found
+            <div className="p-8 flex h-full items-center justify-center">
+              <div className="max-w-[280px] text-center">
+                <p className="text-sm text-text-secondary">
+                  {loading
+                    ? 'Opening this step...'
+                    : loadError || 'This step is no longer available.'}
+                </p>
+                {stepId && !loading ? (
+                  <button
+                    type="button"
+                    onClick={() => void fetchStepData(stepId)}
+                    className="mt-4 inline-flex items-center gap-2 rounded-[8px] border border-border-default px-3 py-2 text-sm font-medium text-text-primary transition-colors hover:border-border-strong"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                    Reload step
+                  </button>
+                ) : null}
+              </div>
             </div>
           )}
         </motion.div>

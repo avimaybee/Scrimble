@@ -8,13 +8,15 @@ import {
   Github,
   Globe,
   Hexagon,
+  LoaderCircle,
   Search,
   TriangleAlert,
 } from 'lucide-react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
-import { dbService } from '../lib/db';
+import FullscreenStatus from '../components/ui/FullscreenStatus';
+import { dbService, type GenerationStreamConnectionState } from '../lib/db';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
@@ -29,6 +31,10 @@ import type {
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 const MAX_VISIBLE_RESEARCH_SOURCES = 5;
+const DEFAULT_TOTAL_ESTIMATE_MS = 12 * 60_000;
+const DEFAULT_BATCH_ESTIMATE_MS = 2 * 60_000;
+const QUIET_CHECK_IN_THRESHOLD_MS = 90_000;
+const automaticRecoveryAttempts = new Set<string>();
 
 const generationBatches: Array<{
   id: GenerationBatchName;
@@ -101,6 +107,94 @@ function formatTimestamp(value: string) {
     second: '2-digit',
     hour12: false,
   }).format(date);
+}
+
+function toTimestampMs(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function pickLatestTimestamp(...values: Array<string | null | undefined>) {
+  let latest: string | null = null;
+  let latestMs = -Infinity;
+
+  for (const value of values) {
+    const valueMs = toTimestampMs(value);
+    if (valueMs === null || valueMs <= latestMs) {
+      continue;
+    }
+
+    latest = value;
+    latestMs = valueMs;
+  }
+
+  return latest;
+}
+
+function formatEtaLabel(remainingMs: number | null) {
+  if (remainingMs === null) {
+    return 'Estimating the time left...';
+  }
+
+  if (remainingMs <= 45_000) {
+    return 'Less than a minute left';
+  }
+
+  const minutes = Math.round(remainingMs / 60_000);
+  if (minutes < 60) {
+    return `About ${minutes} min left`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0
+    ? `About ${hours}h ${remainingMinutes}m left`
+    : `About ${hours}h left`;
+}
+
+function getConnectionMeta(
+  state: GenerationStreamConnectionState,
+  isAutoRecovering: boolean,
+) {
+  if (isAutoRecovering) {
+    return {
+      label: 'Recovering',
+      chipClass: 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
+      copy: 'Restarting from the last safe checkpoint.',
+    };
+  }
+
+  switch (state) {
+    case 'live':
+      return {
+        label: 'Live',
+        chipClass: 'border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure',
+        copy: 'Everything is still moving. You can leave this page if you want.',
+      };
+    case 'reconnecting':
+      return {
+        label: 'Reconnecting',
+        chipClass: 'border-border-default bg-bg-elevated/50 text-text-secondary',
+        copy: 'Pulling the live feed back in now.',
+      };
+    case 'closed':
+      return {
+        label: 'Closed',
+        chipClass: 'border-border-default bg-bg-elevated/50 text-text-secondary',
+        copy: 'The live feed is closed.',
+      };
+    case 'connecting':
+    default:
+      return {
+        label: 'Connecting',
+        chipClass: 'border-border-default bg-bg-elevated/50 text-text-secondary',
+        copy: 'Connecting to the live activity feed.',
+      };
+  }
 }
 
 
@@ -214,11 +308,20 @@ export default function ProjectGeneration() {
   const [hasPreparationCompleted, setHasPreparationCompleted] = useState(!initialPreparationState);
   const [generationPreparation] = useState<GenerationPreparationState | null>(initialPreparationState);
   const [streamConnectionKey, setStreamConnectionKey] = useState(0);
+  const [streamConnectionState, setStreamConnectionState] = useState<GenerationStreamConnectionState>('connecting');
+  const [lastProgressAt, setLastProgressAt] = useState<string | null>(null);
+  const [isAutoRecovering, setIsAutoRecovering] = useState(false);
+  const [autoRecoveryFailed, setAutoRecoveryFailed] = useState(false);
+  const [clockNow, setClockNow] = useState(() => Date.now());
   const hasNavigatedRef = useRef(false);
   const activityKeysRef = useRef(new Set<string>());
   const currentActivityRef = useRef<ActivityFeedItem | null>(null);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
   const feedbackRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const noteProgressTimestamp = useCallback((timestamp: string | null | undefined) => {
+    setLastProgressAt((previous) => pickLatestTimestamp(previous, timestamp));
+  }, []);
 
   const scheduleProjectNavigation = useCallback(() => {
     if (!id || hasNavigatedRef.current) {
@@ -328,6 +431,7 @@ export default function ProjectGeneration() {
 
     setProject(projectData);
     setStatus(statusData);
+    noteProgressTimestamp(statusData.generation_heartbeat_at || projectData.generation_started_at || projectData.updated_at);
 
     setShowResumeBadge(statusData.can_resume && (statusData.execution_stale || statusData.is_failed));
 
@@ -348,7 +452,7 @@ export default function ProjectGeneration() {
     if (statusData.is_complete) {
       scheduleProjectNavigation();
     }
-  }, [id, loadReviewData, reviewData, scheduleProjectNavigation]);
+  }, [id, loadReviewData, noteProgressTimestamp, reviewData, scheduleProjectNavigation]);
 
 
   const needsPreparationNudge = Boolean(
@@ -357,6 +461,18 @@ export default function ProjectGeneration() {
         !generationPreparation.has_github_token ||
         !generationPreparation.has_context7),
   );
+
+  useEffect(() => {
+    if (status?.is_complete) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setClockNow(Date.now());
+    }, 1_000);
+
+    return () => window.clearInterval(intervalId);
+  }, [status?.is_complete]);
 
   useEffect(() => {
     if (!generationPreparation) {
@@ -432,6 +548,8 @@ export default function ProjectGeneration() {
           replaceCurrentActivity(null);
           setActiveBatch(event.batch);
           setError('');
+          setAutoRecoveryFailed(false);
+          noteProgressTimestamp(new Date().toISOString());
           setStatus((previous) =>
             previous
               ? {
@@ -444,6 +562,7 @@ export default function ProjectGeneration() {
           );
         },
         onActivity: (event) => {
+          noteProgressTimestamp(event.timestamp);
           const key = `${event.timestamp}-${event.icon}-${event.message}`;
           if (activityKeysRef.current.has(key)) {
             return;
@@ -458,9 +577,11 @@ export default function ProjectGeneration() {
           });
         },
         onThinking: (event: ProjectGenerationThinking) => {
+          noteProgressTimestamp(event.timestamp);
           appendThinkingActivity(event.content, event.timestamp);
         },
         onBatchCompleted: (event) => {
+          noteProgressTimestamp(event.completed_at || new Date().toISOString());
           setStreamEvents((previous) => {
             const next = previous.filter((item) => item.batch !== event.batch);
             next.push(event);
@@ -469,6 +590,7 @@ export default function ProjectGeneration() {
         },
         onCheckpoint: () => {
           replaceCurrentActivity(null);
+          noteProgressTimestamp(new Date().toISOString());
           setStatus((previous) =>
             previous
               ? {
@@ -483,6 +605,7 @@ export default function ProjectGeneration() {
         },
         onComplete: () => {
           replaceCurrentActivity(null);
+          noteProgressTimestamp(new Date().toISOString());
           setStatus((previous) =>
             previous
               ? {
@@ -498,6 +621,7 @@ export default function ProjectGeneration() {
         },
         onFailed: (message) => {
           replaceCurrentActivity(null);
+          noteProgressTimestamp(new Date().toISOString());
           setError(message);
           setStatus((previous) =>
             previous
@@ -510,6 +634,9 @@ export default function ProjectGeneration() {
               : previous,
           );
           void syncProjectState();
+        },
+        onConnectionStateChange: (nextState) => {
+          setStreamConnectionState(nextState);
         },
       })
       .catch((err: unknown) => {
@@ -526,6 +653,7 @@ export default function ProjectGeneration() {
     hasPreparationCompleted,
     id,
     loadReviewData,
+    noteProgressTimestamp,
     replaceCurrentActivity,
     scheduleProjectNavigation,
     streamConnectionKey,
@@ -558,6 +686,49 @@ export default function ProjectGeneration() {
   const currentBatchIndex = generationBatches.findIndex((batch) => batch.id === currentBatchId);
   const resolvedCurrentBatchIndex = currentBatchIndex >= 0 ? currentBatchIndex : fallbackBatchIndex;
   const currentBatch = generationBatches[resolvedCurrentBatchIndex] || generationBatches[0];
+  const showReviewPanel = Boolean(status?.is_review_required && !status?.is_complete && !status?.is_failed);
+  const showPreparationScreen = Boolean(generationPreparation && !hasPreparationCompleted);
+  const latestProgressTimestamp = pickLatestTimestamp(
+    lastProgressAt,
+    status?.generation_heartbeat_at,
+    project?.generation_started_at,
+  );
+  const quietDurationMs = latestProgressTimestamp
+    ? Math.max(0, clockNow - (toTimestampMs(latestProgressTimestamp) || clockNow))
+    : 0;
+  const connectionMeta = getConnectionMeta(streamConnectionState, isAutoRecovering);
+  const observedDurations = completedEvents
+    .map((event) => event.duration_ms)
+    .filter((duration): duration is number => typeof duration === 'number' && Number.isFinite(duration));
+  const averageBatchDurationMs = observedDurations.length > 0
+    ? observedDurations.reduce((total, duration) => total + duration, 0) / observedDurations.length
+    : DEFAULT_BATCH_ESTIMATE_MS;
+  const startedAtMs = toTimestampMs(project?.generation_started_at);
+  const estimatedTotalMs = observedDurations.length > 0
+    ? Math.max(DEFAULT_TOTAL_ESTIMATE_MS / 2, averageBatchDurationMs * generationBatches.length)
+    : DEFAULT_TOTAL_ESTIMATE_MS;
+  const elapsedMs = startedAtMs !== null
+    ? Math.max(0, clockNow - startedAtMs)
+    : completedBatchCount * averageBatchDurationMs;
+  const remainingBatchFloorMs = status?.is_complete
+    ? 0
+    : Math.max(15_000, (generationBatches.length - completedBatchCount) * 15_000);
+  const estimatedRemainingMs = showReviewPanel
+    ? null
+    : status?.is_complete
+      ? 0
+      : Math.max(remainingBatchFloorMs, estimatedTotalMs - elapsedMs);
+  const estimatedRemainingLabel = showReviewPanel
+    ? 'Waiting for your review'
+    : formatEtaLabel(estimatedRemainingMs);
+  const showManualCheckIn =
+    quietDurationMs >= QUIET_CHECK_IN_THRESHOLD_MS &&
+    !status?.is_failed &&
+    !showReviewPanel &&
+    !status?.is_complete &&
+    !showResumeBadge &&
+    !isAutoRecovering;
+  const autoRecoveryKey = `${id ?? 'unknown'}:${status?.generation_run_id ?? status?.generation_status ?? 'pending'}:${completedBatchCount}`;
 
 
 
@@ -569,8 +740,6 @@ export default function ProjectGeneration() {
     timestamp: project?.generation_started_at ?? new Date(0).toISOString(),
   };
 
-  const showReviewPanel = Boolean(status?.is_review_required && !status?.is_complete && !status?.is_failed);
-  const showPreparationScreen = Boolean(generationPreparation && !hasPreparationCompleted);
   const preparationBadges = useMemo(() => {
     if (!generationPreparation) {
       return [];
@@ -679,28 +848,50 @@ export default function ProjectGeneration() {
     }
   }, [id, preferredIde, reviewFeedback, syncProjectState]);
 
-  const handleResume = useCallback(async () => {
+  const requestResume = useCallback(async (mode: 'automatic' | 'manual') => {
     if (!id || isResuming) {
       return;
     }
 
     setIsResuming(true);
     setError('');
+    if (mode === 'automatic') {
+      setIsAutoRecovering(true);
+      setAutoRecoveryFailed(false);
+    }
 
     try {
       await dbService.resumeProjectGeneration(id);
-      toast.success('Resuming generation pipeline...');
+      setShowResumeBadge(false);
+      noteProgressTimestamp(new Date().toISOString());
+      toast.success(
+        mode === 'automatic'
+          ? 'I hit a snag, so I restarted from the last safe checkpoint.'
+          : 'Resuming generation pipeline...',
+      );
       setShowResumeBadge(false);
       setStreamConnectionKey((prev) => prev + 1);
+      void syncProjectState();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to resume project generation.');
+      const message = err instanceof Error ? err.message : 'Failed to resume project generation.';
+      setError(message);
+      if (mode === 'automatic') {
+        setAutoRecoveryFailed(true);
+      }
     } finally {
       setIsResuming(false);
+      if (mode === 'automatic') {
+        setIsAutoRecovering(false);
+      }
     }
-  }, [id, isResuming]);
+  }, [id, isResuming, noteProgressTimestamp, syncProjectState]);
+
+  const handleResume = useCallback(() => {
+    void requestResume('manual');
+  }, [requestResume]);
 
   const [isNudging, setIsNudging] = useState(false);
-  const handleNudge = useCallback(async () => {
+  const handleCheckIn = useCallback(async () => {
     if (!id || isNudging) {
       return;
     }
@@ -709,19 +900,43 @@ export default function ProjectGeneration() {
 
     try {
       const result = await dbService.nudgeProjectGeneration(id);
-      toast.success(result.message || 'Nudged! If the pipeline is working, it will continue shortly.');
+      noteProgressTimestamp(result.nudgedAt || new Date().toISOString());
+      toast.success(result.message || 'I asked the background runner to check back in.');
       setStreamConnectionKey((prev) => prev + 1);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Failed to nudge.';
       if (errMsg.includes('still active')) {
-        toast.info('Pipeline is actively working — no need to nudge!');
+        toast.info('Everything is still moving. There was nothing to restart.');
       } else {
         toast.error(errMsg);
       }
     } finally {
       setIsNudging(false);
     }
-  }, [id, isNudging]);
+  }, [id, isNudging, noteProgressTimestamp]);
+
+  useEffect(() => {
+    if (!showResumeBadge || autoRecoveryFailed || isAutoRecovering || isResuming) {
+      return;
+    }
+
+    if (automaticRecoveryAttempts.has(autoRecoveryKey)) {
+      return;
+    }
+
+    automaticRecoveryAttempts.add(autoRecoveryKey);
+    void requestResume('automatic');
+  }, [autoRecoveryFailed, autoRecoveryKey, isAutoRecovering, isResuming, requestResume, showResumeBadge]);
+
+  if (isLoading && !status) {
+    return (
+      <FullscreenStatus
+        label="Reopening your build"
+        title="Pulling the latest progress back in"
+        description="Rebuilding the live activity feed and checking where the pipeline left off."
+      />
+    );
+  }
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg-base px-6 py-12">
@@ -1142,7 +1357,19 @@ export default function ProjectGeneration() {
                 </motion.h1>
               </AnimatePresence>
 
-              {status?.is_failed ? (
+              {status?.is_failed && showResumeBadge && !autoRecoveryFailed ? (
+                <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">
+                  <div className="flex items-start gap-3">
+                    <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
+                    <div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Getting the build back on track</div>
+                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
+                        I saw the run stop, so I&apos;m restarting it from the last safe checkpoint now.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : status?.is_failed && !isAutoRecovering ? (
                 <div className="w-full rounded-[16px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
                   <div className="flex items-start gap-3">
                     <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
@@ -1151,18 +1378,30 @@ export default function ProjectGeneration() {
                       <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
                         {error || status.generation_error || 'Project generation failed.'}
                       </p>
+                      <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
+                        I keep durable checkpoints as I go, so restarting picks up from the last safe place instead of starting over.
+                      </p>
                     </div>
                   </div>
                   <button
                     type="button"
-                    onClick={() => {
-                      void handleResume();
-                    }}
-
+                    onClick={handleResume}
                     className="btn-primary mt-5"
                   >
                     Try again
                   </button>
+                </div>
+              ) : isAutoRecovering ? (
+                <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">
+                  <div className="flex items-start gap-3">
+                    <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
+                    <div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Getting the build back on track</div>
+                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
+                        I saw the run stall, so I&apos;m restarting it from the last safe checkpoint now.
+                      </p>
+                    </div>
+                  </div>
                 </div>
               ) : (
                 <>
@@ -1199,21 +1438,47 @@ export default function ProjectGeneration() {
                       </AnimatePresence>
                     </div>
 
-                    <div className="mt-3 flex items-center gap-2 rounded-[8px] bg-bg-base/50 px-3 py-2">
-                      <svg className="h-4 w-4 shrink-0 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                      </svg>
-                      <span className="text-[12px] text-text-muted">
-                        This takes 1-5 minutes — AI analysis speed depends on your model and context size
-                      </span>
-                      <button
-                        type="button"
-                        onClick={handleNudge}
-                        disabled={isNudging}
-                        className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary disabled:opacity-50"
+                    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-[10px] bg-bg-base/50 px-3 py-2">
+                      <span
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-[7px] border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.14em]',
+                          connectionMeta.chipClass,
+                        )}
                       >
-                        {isNudging ? 'Nudging...' : 'Nudge'}
-                      </button>
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            'h-1.5 w-1.5 rounded-full',
+                            streamConnectionState === 'live' && !isAutoRecovering
+                              ? 'bg-status-secure'
+                              : streamConnectionState === 'reconnecting' || isAutoRecovering
+                                ? 'bg-status-warning'
+                                : 'bg-text-muted',
+                          )}
+                        />
+                        {connectionMeta.label}
+                      </span>
+                      <span className="text-[12px] text-text-muted">{connectionMeta.copy}</span>
+                      <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
+                      <span className="text-[12px] text-text-muted">{estimatedRemainingLabel}</span>
+                      {latestProgressTimestamp ? (
+                        <>
+                          <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
+                          <span className="text-[12px] text-text-muted">
+                            Last update {formatTimestamp(latestProgressTimestamp)}
+                          </span>
+                        </>
+                      ) : null}
+                      {showManualCheckIn ? (
+                        <button
+                          type="button"
+                          onClick={handleCheckIn}
+                          disabled={isNudging}
+                          className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary disabled:opacity-50"
+                        >
+                          {isNudging ? 'Checking in...' : 'Check in'}
+                        </button>
+                      ) : null}
                     </div>
 
                     <div ref={logContainerRef} className="mt-4 max-h-[280px] overflow-y-auto pr-2">
@@ -1291,7 +1556,7 @@ export default function ProjectGeneration() {
                     </div>
                   ) : null}
 
-                  {showResumeBadge ? (
+                  {showResumeBadge && autoRecoveryFailed ? (
                     <motion.div
                       initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
@@ -1304,9 +1569,9 @@ export default function ProjectGeneration() {
                       <button
                         onClick={handleResume}
                         disabled={isResuming}
-                        className="rounded-[10px] bg-accent-primary px-4 py-2 font-sans text-[13px] font-medium text-white transition-all hover:bg-accent-secondary hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-50"
+                        className="btn-primary px-4 py-2 text-[13px]"
                       >
-                        {isResuming ? 'Resuming...' : 'Resume Build'}
+                        {isResuming ? 'Resuming...' : 'Resume build'}
                       </button>
                     </motion.div>
                   ) : null}

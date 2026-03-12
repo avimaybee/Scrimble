@@ -245,6 +245,33 @@ function optionalText(value: unknown): string | null {
   return trimmed ? trimmed : null;
 }
 
+function sqlNullableColumnMatch(column: string) {
+  return `((${column} IS NULL AND ? IS NULL) OR ${column} = ?)`;
+}
+
+function getProjectGenerationGuardBindings(project: {
+  generation_run_id?: unknown;
+  generation_provider_id?: unknown;
+  generation_heartbeat_at?: unknown;
+  generation_completed_at?: unknown;
+}) {
+  const generationRunId = optionalText(project.generation_run_id);
+  const generationProviderId = optionalText(project.generation_provider_id);
+  const generationHeartbeatAt = optionalText(project.generation_heartbeat_at);
+  const generationCompletedAt = optionalText(project.generation_completed_at);
+
+  return [
+    generationRunId,
+    generationRunId,
+    generationProviderId,
+    generationProviderId,
+    generationHeartbeatAt,
+    generationHeartbeatAt,
+    generationCompletedAt,
+    generationCompletedAt,
+  ];
+}
+
 function serializeJson(value: unknown): string | null {
   if (value === undefined || value === null) {
     return null;
@@ -1016,8 +1043,9 @@ app.post('/intake/:id/confirm', async (c) => {
       ? `${nextNameBase}...`
       : nextNameBase || asText(project.name, 'Untitled project');
   const runId = crypto.randomUUID();
+  const generationGuardBindings = getProjectGenerationGuardBindings(project);
 
-  await c.env.DB.prepare(`
+  const confirmUpdate = await c.env.DB.prepare(`
     UPDATE projects
     SET name = ?,
         generation_status = 'queued',
@@ -1027,10 +1055,25 @@ app.post('/intake/:id/confirm', async (c) => {
         generation_heartbeat_at = datetime("now"),
         generation_completed_at = NULL,
         updated_at = datetime("now")
-    WHERE id = ? AND user_id = ?
+    WHERE id = ? AND user_id = ? AND generation_status = 'intake'
+      AND ${sqlNullableColumnMatch('generation_run_id')}
+      AND ${sqlNullableColumnMatch('generation_provider_id')}
+      AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
+      AND ${sqlNullableColumnMatch('generation_completed_at')}
   `)
-    .bind(nextName, runId, providerContext.providerId, projectId, c.get('uid'))
+    .bind(
+      nextName,
+      runId,
+      providerContext.providerId,
+      projectId,
+      c.get('uid'),
+      ...generationGuardBindings,
+    )
     .run();
+
+  if (asNumber((confirmUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
+    return c.json({ error: 'This project changed while you were confirming it. Reload and try again.' }, 409);
+  }
 
   try {
     await sendGenerationDispatch(c.env, {
@@ -1054,9 +1097,9 @@ app.post('/intake/:id/confirm', async (c) => {
           generation_heartbeat_at = NULL,
           generation_completed_at = NULL,
           updated_at = datetime("now")
-      WHERE id = ? AND user_id = ?
+      WHERE id = ? AND user_id = ? AND generation_status = 'queued' AND generation_run_id = ?
     `)
-      .bind(project.name, message, projectId, c.get('uid'))
+      .bind(project.name, message, projectId, c.get('uid'), runId)
       .run();
     return c.json({ error: 'Failed to start project generation.' }, 503);
   }
@@ -1141,9 +1184,9 @@ app.post('/projects', async (c) => {
           generation_error = ?,
           generation_completed_at = datetime("now"),
           updated_at = datetime("now")
-      WHERE id = ? AND user_id = ?
+      WHERE id = ? AND user_id = ? AND generation_status = 'queued' AND generation_run_id = ?
     `)
-      .bind(message, id, c.get('uid'))
+      .bind(message, id, c.get('uid'), runId)
       .run();
     return c.json({ error: 'Failed to start project generation.', project_id: id }, 503);
   }
@@ -1252,6 +1295,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
   const preferredIde = parsed.data.preferredIde as PreferredIde;
   let providerId: string | undefined;
   const runId = crypto.randomUUID();
+  const generationGuardBindings = getProjectGenerationGuardBindings(project);
 
   try {
     const approval = await saveArchitectureReviewApproval(c.env, projectId, feedback, preferredIde);
@@ -1259,7 +1303,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
     if (!providerId) {
       throw new Error('No AI provider is configured for this project anymore.');
     }
-    await c.env.DB.prepare(`
+    const approvalUpdate = await c.env.DB.prepare(`
       UPDATE projects
       SET generation_status = 'approved',
           generation_error = NULL,
@@ -1268,10 +1312,18 @@ app.post('/projects/:id/architecture-review', async (c) => {
           generation_heartbeat_at = datetime("now"),
           generation_completed_at = NULL,
           updated_at = datetime("now")
-      WHERE id = ? AND user_id = ?
+      WHERE id = ? AND user_id = ? AND generation_status = 'awaiting_review'
+        AND ${sqlNullableColumnMatch('generation_run_id')}
+        AND ${sqlNullableColumnMatch('generation_provider_id')}
+        AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
+        AND ${sqlNullableColumnMatch('generation_completed_at')}
     `)
-      .bind(runId, providerId || null, projectId, c.get('uid'))
+      .bind(runId, providerId || null, projectId, c.get('uid'), ...generationGuardBindings)
       .run();
+
+    if (asNumber((approvalUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
+      return c.json({ error: 'This review already changed. Reload to see the latest state.' }, 409);
+    }
 
     await sendGenerationDispatch(c.env, {
       projectId,
@@ -1297,7 +1349,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
           generation_heartbeat_at = ?,
           generation_completed_at = ?,
           updated_at = datetime("now")
-      WHERE id = ? AND user_id = ?
+      WHERE id = ? AND user_id = ? AND generation_status = 'approved' AND generation_run_id = ?
     `)
       .bind(
         (project.generation_run_id as string | null) || null,
@@ -1306,6 +1358,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
         (project.generation_completed_at as string | null) || null,
         projectId,
         c.get('uid'),
+        runId,
       )
       .run();
     return c.json({ error: message }, 409);
@@ -1382,7 +1435,8 @@ app.post('/projects/:id/resume', async (c) => {
   }
 
   const runId = crypto.randomUUID();
-  await c.env.DB.prepare(`
+  const generationGuardBindings = getProjectGenerationGuardBindings(project);
+  const resumeUpdate = await c.env.DB.prepare(`
     UPDATE projects 
     SET generation_status = ?,
         generation_error = NULL,
@@ -1391,8 +1445,26 @@ app.post('/projects/:id/resume', async (c) => {
         generation_heartbeat_at = datetime("now"),
         generation_completed_at = NULL,
         updated_at = datetime("now")
-    WHERE id = ? AND user_id = ?
-  `).bind(resumeStatus, runId, providerId || null, projectId, c.get('uid')).run();
+    WHERE id = ? AND user_id = ? AND generation_status = ?
+      AND ${sqlNullableColumnMatch('generation_run_id')}
+      AND ${sqlNullableColumnMatch('generation_provider_id')}
+      AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
+      AND ${sqlNullableColumnMatch('generation_completed_at')}
+  `)
+    .bind(
+      resumeStatus,
+      runId,
+      providerId || null,
+      projectId,
+      c.get('uid'),
+      status,
+      ...generationGuardBindings,
+    )
+    .run();
+
+  if (asNumber((resumeUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
+    return c.json({ error: 'This generation run changed while you were resuming it. Reload and try again.' }, 409);
+  }
 
   try {
     await sendGenerationDispatch(c.env, {
@@ -1419,7 +1491,7 @@ app.post('/projects/:id/resume', async (c) => {
           generation_heartbeat_at = ?,
           generation_completed_at = ?,
           updated_at = datetime("now")
-      WHERE id = ? AND user_id = ?
+      WHERE id = ? AND user_id = ? AND generation_status = ? AND generation_run_id = ?
     `)
       .bind(
         status,
@@ -1430,6 +1502,8 @@ app.post('/projects/:id/resume', async (c) => {
         (project.generation_completed_at as string | null) || null,
         projectId,
         c.get('uid'),
+        resumeStatus,
+        runId,
       )
       .run();
     return c.json({ error: 'Failed to resume project generation.' }, 503);
@@ -1459,48 +1533,57 @@ app.post('/projects/:id/nudge', async (c) => {
     return c.json({ error: 'Cannot nudge a project that is already complete.' }, 409);
   }
 
+  if (status === 'intake') {
+    return c.json({ error: 'Finish the intake first, then I can continue the build.' }, 409);
+  }
+
+  if (status === 'awaiting_review') {
+    return c.json({ error: 'Your review is still needed before generation can continue.' }, 409);
+  }
+
+  if (status === 'failed') {
+    return c.json({ error: 'This build stopped. Use resume so Scrimble can restart from the last safe checkpoint.' }, 409);
+  }
+
   const providerId = (project.generation_provider_id as string | null) || undefined;
   if (!providerId) {
     return c.json({ error: 'The original AI provider for this generation run is missing. Start a new generation instead.' }, 409);
   }
 
   const runId = project.generation_run_id || crypto.randomUUID();
-  
-  const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
-  const completedBatchNames = completedBatchRows.map((row) => row.run_type);
-  const hasReviewApproval = completedBatchNames.includes('batch_4_plan_build') || 
-    completedBatchNames.includes('batch_5_enrich_steps') ||
-    completedBatchNames.includes('batch_6_generate_files') ||
-    await hasApprovedArchitectureReview(c.env, projectId);
-  
-  let targetStatus: ProjectGenerationStatus = status;
-  console.log('[NUDGE] Current status:', status);
-  console.log('[NUDGE] Completed batches:', completedBatchNames);
-  
-  if (status === 'awaiting_review' || status === 'approved') {
-    targetStatus = 'approved';
-  } else if (completedBatchNames.includes('batch_6_generate_files')) {
-    targetStatus = 'complete';
-  } else if (completedBatchNames.includes('batch_5_enrich_steps')) {
-    targetStatus = 'batch_5_enrich_steps';
-  } else if (completedBatchNames.includes('batch_4_plan_build')) {
-    targetStatus = 'batch_4_plan_build';
-  } else if (completedBatchNames.includes('batch_3_architect')) {
-    targetStatus = 'batch_3_architect';
-  } else if (completedBatchNames.includes('batch_2_fetch_and_read')) {
-    targetStatus = 'batch_2_fetch_and_read';
-  } else if (completedBatchNames.includes('batch_1_research_stack')) {
-    targetStatus = 'batch_1_research_stack';
-  }
-
-  console.log('[NUDGE] Target status to run:', targetStatus);
-
-  await c.env.DB.prepare(`
+  const targetStatus: ProjectGenerationStatus = status === 'approved'
+    ? 'approved'
+    : (status as ProjectGenerationStatus);
+  const generationGuardBindings = getProjectGenerationGuardBindings(project);
+  const nudgeUpdate = await c.env.DB.prepare(`
     UPDATE projects 
-    SET generation_heartbeat_at = datetime("now"),
+    SET generation_status = ?,
+        generation_error = NULL,
+        generation_run_id = ?,
+        generation_provider_id = ?,
+        generation_heartbeat_at = datetime("now"),
+        generation_completed_at = NULL,
         updated_at = datetime("now")
-    WHERE id = ? AND user_id = ?
-  `).bind(projectId, c.get('uid')).run();
+    WHERE id = ? AND user_id = ? AND generation_status = ?
+      AND ${sqlNullableColumnMatch('generation_run_id')}
+      AND ${sqlNullableColumnMatch('generation_provider_id')}
+      AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
+      AND ${sqlNullableColumnMatch('generation_completed_at')}
+  `)
+    .bind(
+      targetStatus,
+      runId,
+      providerId,
+      projectId,
+      c.get('uid'),
+      status,
+      ...generationGuardBindings,
+    )
+    .run();
+
+  if (asNumber((nudgeUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
+    return c.json({ error: 'This generation run changed while you were checking in. Reload and try again.' }, 409);
+  }
 
   try {
     await sendGenerationDispatch(c.env, {
@@ -1520,6 +1603,13 @@ app.post('/projects/:id/nudge', async (c) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to nudge project generation.';
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET generation_error = ?, updated_at = datetime("now")
+      WHERE id = ? AND user_id = ? AND generation_status = ? AND generation_run_id = ?
+    `)
+      .bind(message, projectId, c.get('uid'), targetStatus, runId)
+      .run();
     return c.json({ error: message }, 503);
   }
 });
@@ -2187,7 +2277,7 @@ app.post('/workflows/:id/update', async (c) => {
           workflowId,
           project: {
             id: workflowRecord.project_id,
-            user_id: workflowRecord.user_id,
+            user_id: asText(workflowRecord.user_id),
             name: optionalText(workflowRecord.name),
             description: optionalText(workflowRecord.description),
             stack: optionalText(workflowRecord.stack),

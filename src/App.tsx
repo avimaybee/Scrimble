@@ -18,6 +18,7 @@ import AppLayout from './components/AppLayout';
 import { Toaster } from 'sonner';
 import { TooltipProvider } from './components/ui/tooltip';
 import ErrorBoundary from './components/ErrorBoundary';
+import FullscreenStatus from './components/ui/FullscreenStatus';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -45,7 +46,13 @@ function ProtectedRoute() {
   const { user, isAuthReady } = useAuthStore();
   
   if (!isAuthReady) {
-    return <div className="min-h-screen flex items-center justify-center bg-bg-base font-mono text-[11px] uppercase tracking-[0.14em] text-text-tertiary">Getting things ready</div>;
+    return (
+      <FullscreenStatus
+        label="Getting ready"
+        title="Picking up where you left off"
+        description="Checking your account and rebuilding the latest app state."
+      />
+    );
   }
   
   if (!user) {
@@ -63,7 +70,13 @@ function ProtectedFullscreenRoute() {
   const { user, isAuthReady } = useAuthStore();
 
   if (!isAuthReady) {
-    return <div className="min-h-screen flex items-center justify-center bg-bg-base font-mono text-[11px] uppercase tracking-[0.14em] text-text-tertiary">Getting things ready</div>;
+    return (
+      <FullscreenStatus
+        label="Getting ready"
+        title="Picking up where you left off"
+        description="Checking your account and reconnecting to the current build."
+      />
+    );
   }
 
   if (!user) {

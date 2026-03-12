@@ -368,6 +368,64 @@ function trimLongText(value: string, maxLength: number) {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength)}...`;
 }
 
+function findExistingDocsSource(researchItem: Batch2FetchAndRead['research'][number] | null) {
+  if (!researchItem) {
+    return null;
+  }
+
+  return researchItem.sources.find((source) => {
+    const title = source.title.toLowerCase();
+    return (
+      source.tool === 'Context7'
+      || (!source.url.toLowerCase().includes('github.com')
+        && (title.includes('docs') || title.includes('documentation') || title.includes('guide')))
+    );
+  }) || null;
+}
+
+function appendExistingResearchContext(args: {
+  library: RelevantLibrary;
+  docsLibraryName: string;
+  docs: StepResearchContext['docs'];
+  community: StepResearchContext['community'];
+  toolsUsed: Set<string>;
+}) {
+  const researchItem = args.library.research;
+  if (!researchItem) {
+    return;
+  }
+
+  const docsContent = researchItem.docs_content.trim();
+  const docsSource = findExistingDocsSource(researchItem);
+  if (docsContent) {
+    args.docs.push({
+      library: args.docsLibraryName,
+      source: docsSource?.tool === 'Context7' ? 'Context7' : 'Docs',
+      version: researchItem.latest_version || 'unknown',
+      url: docsSource?.url || args.library.docsUrl || '',
+      content: trimLongText(docsContent, 3200),
+    });
+    args.toolsUsed.add(docsSource?.tool === 'Context7' ? 'Context7' : 'Live docs');
+  }
+
+  const communitySources = researchItem.sources
+    .filter((source) => source.tool === 'Brave Search' && source.summary.trim().length > 0)
+    .slice(0, 2);
+
+  communitySources.forEach((source) => {
+    args.community.push({
+      library: args.library.packageName,
+      title: source.title,
+      url: source.url,
+      summary: trimLongText(source.summary, 280),
+    });
+  });
+
+  if (communitySources.length > 0) {
+    args.toolsUsed.add('Brave Search');
+  }
+}
+
 function filterIssuesByStepKeywords(
   issues: GithubIssue[],
   stepTitle: string,
@@ -491,7 +549,7 @@ export async function collectStepResearchContext({
   const relevantLibraries = prioritizeLibrariesForStepKind(
     stepKind,
     inferRelevantLibraries(stepTitle, stepObjective, adr, mergedResearchEntries),
-  );
+  ).slice(0, stepKind === 'general' && !stepIsGate ? 1 : 2);
   const docs: StepResearchContext['docs'] = [];
   const issues: StepResearchContext['issues'] = [];
   const community: StepResearchContext['community'] = [];
@@ -500,12 +558,25 @@ export async function collectStepResearchContext({
   const dateLabel = new Date().toISOString().slice(0, 10);
   const frameworkLabel = getFrameworkLabel(adr);
   const requirements = getStepKindRequirements(stepKind, frameworkLabel);
+  const shouldUseLiveResearch = stepKind !== 'general' || Boolean(stepIsGate);
 
   for (const library of relevantLibraries) {
     const docsLibraryName =
       stepKind === 'payment' && !library.packageName.toLowerCase().includes('stripe')
         ? 'stripe'
         : library.packageName;
+
+    if (!shouldUseLiveResearch) {
+      appendExistingResearchContext({
+        library,
+        docsLibraryName,
+        docs,
+        community,
+        toolsUsed,
+      });
+      continue;
+    }
+
     const docsTopics = new Set<string>([stepTitle]);
     if (stepKind === 'auth') {
       docsTopics.add('security best practices');
@@ -600,18 +671,12 @@ export async function collectStepResearchContext({
       toolsUsed.add('GitHub');
     }
 
-    const communityPages = await Promise.all(
-      (searchResults as SearchResult[]).slice(0, 4).map(async (result) => {
-        const page = await fetchUrl(result.url, toolEnv);
-
-        return {
-          library: library.packageName,
-          title: result.title,
-          url: result.url,
-          summary: summarizeText(page.content || result.description),
-        };
-      }),
-    );
+    const communityPages = (searchResults as SearchResult[]).slice(0, 3).map((result) => ({
+      library: library.packageName,
+      title: result.title,
+      url: result.url,
+      summary: summarizeText(result.description || result.title),
+    }));
 
     communityPages
       .filter((page) => page.summary.length > 0)

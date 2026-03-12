@@ -28,6 +28,9 @@ import type {
 } from './builder-profile';
 
 const API_BASE = '/api';
+const REQUEST_TIMEOUT_MS = 20_000;
+
+export type GenerationStreamConnectionState = 'connecting' | 'live' | 'reconnecting' | 'closed';
 
 interface ReviewResponse {
   success: boolean;
@@ -57,6 +60,13 @@ type IntakeRespondPayload = {
 
 type IntakeConfirmPayload = {
   providerId?: string;
+};
+
+export type StepEnrichmentPayload = {
+  projectId: string;
+  providerId?: string;
+  feedback?: string;
+  editedOutput?: string;
 };
 
 export class WorkflowBriefDriftError extends Error {
@@ -90,6 +100,12 @@ interface StreamProjectGenerationOptions {
   onCheckpoint?: (event: ProjectGenerationCheckpointEvent) => void;
   onComplete?: () => void;
   onFailed?: (message: string) => void;
+  onConnectionStateChange?: (state: GenerationStreamConnectionState) => void;
+}
+
+interface StreamStepEnrichmentOptions {
+  signal?: AbortSignal;
+  onOutput?: (output: string) => void;
 }
 
 const generationBatchLabels: Record<ProjectGenerationBatchStartEvent['batch'], string> = {
@@ -101,26 +117,43 @@ const generationBatchLabels: Record<ProjectGenerationBatchStartEvent['batch'], s
   batch_6_generate_files: 'Preparing your files',
 };
 
+function extractStepEnrichmentStreamText(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') {
+    return '';
+  }
+
+  const value = parsed as {
+    choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
+    content?: Array<{ text?: string }>;
+    delta?: { text?: string };
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+
+  if (value.choices?.[0]?.delta?.content) {
+    return value.choices[0].delta.content;
+  }
+
+  if (value.choices?.[0]?.message?.content) {
+    return value.choices[0].message.content;
+  }
+
+  if (value.content?.[0]?.text) {
+    return value.content[0].text;
+  }
+
+  if (value.delta?.text) {
+    return value.delta.text;
+  }
+
+  if (value.candidates?.[0]?.content?.parts?.[0]?.text) {
+    return value.candidates[0].content.parts[0].text;
+  }
+
+  return '';
+}
+
 async function fetchAPI<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error('User not authenticated');
-  }
-
-  const token = await user.getIdToken();
-  const response = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      ...options.headers,
-    },
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.json().catch(() => null) as { error?: string } | null;
-    throw new Error(errorBody?.error || `API error: ${response.statusText}`);
-  }
+  const response = await fetchWithAuth(endpoint, options);
 
   if (response.status === 204) {
     return null as T;
@@ -132,18 +165,60 @@ async function fetchAPI<T>(endpoint: string, options: RequestInit = {}): Promise
 async function fetchWithAuth(endpoint: string, options: RequestInit = {}): Promise<Response> {
   const user = auth.currentUser;
   if (!user) {
-    throw new Error('User not authenticated');
+    throw new Error('Your session expired. Sign in again to keep going.');
   }
 
   const token = await user.getIdToken();
-  return fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      ...options.headers,
-    },
-  });
+  const controller = new AbortController();
+  let didTimeout = false;
+  const timeoutId = window.setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  const abortListener = () => controller.abort();
+  options.signal?.addEventListener('abort', abortListener, { once: true });
+
+  try {
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => null) as { error?: string } | null;
+      if (response.status === 401) {
+        throw new Error('Your session expired. Sign in again to keep going.');
+      }
+
+      if (response.status >= 500) {
+        throw new Error(errorBody?.error || 'The server hit a snag. Try again in a moment.');
+      }
+
+      throw new Error(errorBody?.error || `API error: ${response.statusText}`);
+    }
+
+    return response;
+  } catch (error) {
+    if (options.signal?.aborted) {
+      throw error;
+    }
+
+    if (didTimeout) {
+      throw new Error('This is taking longer than expected. Check your connection and try again.');
+    }
+
+    throw error instanceof Error
+      ? error
+      : new Error('Something went wrong while talking to Scrimble.');
+  } finally {
+    window.clearTimeout(timeoutId);
+    options.signal?.removeEventListener('abort', abortListener);
+  }
 }
 
 export const dbService = {
@@ -151,13 +226,13 @@ export const dbService = {
     return fetchAPI<Project | null>(`/projects/${id}`);
   },
 
-  async resumeProjectGeneration(id: string): Promise<{ success: boolean; generation_status: string }> {
+  async resumeProjectGeneration(id: string): Promise<{ success: boolean; generation_status: string; resumedAt?: string }> {
     return fetchAPI(`/projects/${id}/resume`, {
       method: 'POST',
     });
   },
 
-  async nudgeProjectGeneration(id: string): Promise<{ success: boolean; message: string }> {
+  async nudgeProjectGeneration(id: string): Promise<{ success: boolean; message: string; nudgedAt?: string }> {
     return fetchAPI(`/projects/${id}/nudge`, {
       method: 'POST',
     });
@@ -268,8 +343,11 @@ export const dbService = {
     let lastEventId = 0;
     let reachedTerminalEvent = false;
     const seenEventIds = new Set<number>();
+    let hasEstablishedConnection = false;
 
     while (!options.signal?.aborted && !reachedTerminalEvent) {
+      options.onConnectionStateChange?.(hasEstablishedConnection ? 'reconnecting' : 'connecting');
+
       try {
         const response = await fetchWithAuth(`/projects/${projectId}/generation-stream`, {
           method: 'GET',
@@ -289,6 +367,9 @@ export const dbService = {
         if (!reader) {
           throw new Error('Generation stream did not return a readable body.');
         }
+
+        hasEstablishedConnection = true;
+        options.onConnectionStateChange?.('live');
 
         const decoder = new TextDecoder();
         let buffer = '';
@@ -424,6 +505,7 @@ export const dbService = {
         }
       } catch (error) {
         if (options.signal?.aborted) {
+          options.onConnectionStateChange?.('closed');
           return;
         }
 
@@ -433,12 +515,16 @@ export const dbService = {
         )) {
           throw error;
         }
+
+        options.onConnectionStateChange?.('reconnecting');
       }
 
       if (!options.signal?.aborted && !reachedTerminalEvent) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
+
+    options.onConnectionStateChange?.('closed');
   },
 
   async getPlanByProjectId(projectId: string): Promise<Plan | null> {
@@ -507,6 +593,80 @@ export const dbService = {
       method: 'POST',
       body: JSON.stringify(review),
     });
+  },
+
+  async streamStepEnrichment(
+    stepId: string,
+    payload: StepEnrichmentPayload,
+    options: StreamStepEnrichmentOptions = {},
+  ): Promise<string> {
+    const response = await fetchWithAuth(`/steps/${stepId}/enrich`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      signal: options.signal,
+      headers: {
+        Accept: 'text/event-stream',
+      },
+    });
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('Step enrichment did not return a readable stream.');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullOutput = '';
+
+    const appendOutput = (nextChunk: string) => {
+      if (!nextChunk) {
+        return;
+      }
+
+      fullOutput += nextChunk;
+      options.onOutput?.(fullOutput);
+    };
+
+    const processLine = (line: string) => {
+      const trimmedLine = line.trim();
+      if (!trimmedLine || trimmedLine.startsWith(':')) {
+        return;
+      }
+
+      const data = trimmedLine.startsWith('data:') ? trimmedLine.slice(5).trimStart() : trimmedLine;
+      if (!data || data === '[DONE]') {
+        return;
+      }
+
+      try {
+        appendOutput(extractStepEnrichmentStreamText(JSON.parse(data)));
+      } catch {
+        if (!trimmedLine.startsWith('data:')) {
+          appendOutput(data);
+        }
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const rawLine of lines) {
+        processLine(rawLine.replace(/\r$/, ''));
+      }
+    }
+
+    if (buffer.trim()) {
+      processLine(buffer.replace(/\r$/, ''));
+    }
+
+    return fullOutput;
   },
 
   async getEdgesByProjectId(projectId: string): Promise<AppEdge[]> {
