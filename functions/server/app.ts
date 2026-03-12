@@ -575,7 +575,7 @@ async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
 
 async function getOwnedStep(c: AppContext, stepId: string) {
   return c.env.DB.prepare(`
-    SELECT s.*
+    SELECT s.*, w.project_id
     FROM steps s
     INNER JOIN workflows w ON w.id = s.workflow_id
     INNER JOIN projects p ON p.id = w.project_id
@@ -671,14 +671,6 @@ async function insertAgentRun(
 
   return id;
 }
-
-app.get('/debug-env', (c) => {
-  return c.json({
-    envKeys: Object.keys(c.env || {}),
-    hasQueue: !!c.env.AGENT_QUEUE,
-    environment: c.env.ENVIRONMENT,
-  });
-});
 
 app.use('*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
@@ -1629,6 +1621,70 @@ app.post('/projects/:id/nudge', async (c) => {
   }
 });
 
+app.post('/projects/:id/cancel', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const status = project.generation_status || 'queued';
+  if (status === 'complete' || status === 'cancelled') {
+    return c.json({ error: `Cannot cancel a project that is already ${status}.` }, 409);
+  }
+
+  if (status === 'intake') {
+    return c.json({ error: 'This project is still in intake and has not started generating yet.' }, 409);
+  }
+
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+
+  // If using DO, tell it to cancel (clears alarms and resets pipeline chain)
+  if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
+    try {
+      const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
+      const stub = c.env.PROJECT_GENERATOR.get(objectId);
+      await stub.fetch('https://project-generator/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId }),
+      });
+    } catch (error) {
+      console.warn('[CANCEL] DO cancel call failed, falling back to D1-only cancel.', {
+        projectId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Always update D1 directly as the source of truth
+  await c.env.DB.prepare(`
+    UPDATE projects
+    SET generation_status = 'cancelled',
+        generation_error = 'Generation cancelled by user.',
+        generation_completed_at = datetime("now"),
+        generation_heartbeat_at = datetime("now"),
+        updated_at = datetime("now")
+    WHERE id = ? AND user_id = ?
+  `)
+    .bind(projectId, c.get('uid'))
+    .run();
+
+  await persistGenerationStreamEvent(c.env, {
+    projectId,
+    event: {
+      type: 'pipeline_failed',
+      error: 'Generation cancelled by user.',
+    },
+  });
+
+  return c.json({
+    success: true,
+    generation_status: 'cancelled',
+    cancelledAt: new Date().toISOString(),
+  });
+});
+
 app.get('/projects/:id/generation-stream', async (c) => {
   const projectId = c.req.param('id');
   const project = await getOwnedProject(c, projectId);
@@ -1736,7 +1792,6 @@ app.delete('/projects/:id', async (c) => {
   // Using CASCADE would be ideal, but we'll do explicit deletes for safety.
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM project_generation_events WHERE project_id = ?').bind(projectId),
-    c.env.DB.prepare('DELETE FROM project_generation_live_state WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM project_intake_messages WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM project_briefs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
@@ -2028,7 +2083,11 @@ app.post('/steps/:id/review', async (c) => {
 
   if (review.decision === 'approve') {
     const unlockedStepIds = (
-      await c.env.DB.prepare('SELECT target_step_id FROM edges WHERE project_id = ? AND source_step_id = ?')
+      await c.env.DB.prepare(`
+          SELECT e.target_step_id FROM edges e
+          INNER JOIN workflows w ON w.id = e.workflow_id
+          WHERE w.project_id = ? AND e.source_step_id = ?
+        `)
         .bind(stepRecord.project_id, stepId)
         .all()
     ).results
@@ -2108,7 +2167,11 @@ app.post('/edges', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const stepCount = await c.env.DB.prepare('SELECT COUNT(*) AS count FROM steps WHERE project_id = ? AND id IN (?, ?)')
+  const stepCount = await c.env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM steps s
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    WHERE w.project_id = ? AND s.id IN (?, ?)
+  `)
     .bind(projectId, sourceStepId, targetStepId)
     .first();
 
@@ -2117,11 +2180,15 @@ app.post('/edges', async (c) => {
   }
 
   const id = crypto.randomUUID();
+  const workflowRow = await c.env.DB.prepare('SELECT id FROM workflows WHERE project_id = ? ORDER BY version DESC LIMIT 1')
+    .bind(projectId).first();
+  const edgeWorkflowId = workflowRow?.id as string || '';
+
   await c.env.DB.prepare(`
-    INSERT INTO edges (id, project_id, source_step_id, target_step_id, edge_type, condition)
+    INSERT INTO edges (id, workflow_id, source_step_id, target_step_id, edge_type, condition)
     VALUES (?, ?, ?, ?, ?, ?)
   `)
-    .bind(id, projectId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
+    .bind(id, edgeWorkflowId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
     .run();
 
   await touchProject(c, projectId);
@@ -2363,7 +2430,11 @@ app.post('/steps/:id/enrich', async (c) => {
   }
 
   const { providerId, projectId, feedback, editedOutput } = parsed.data;
-  const stepRecord = await c.env.DB.prepare('SELECT * FROM steps WHERE id = ? AND project_id = ?')
+  const stepRecord = await c.env.DB.prepare(`
+    SELECT s.*, w.project_id FROM steps s
+    INNER JOIN workflows w ON w.id = s.workflow_id
+    WHERE s.id = ? AND w.project_id = ?
+  `)
     .bind(stepId, projectId)
     .first();
 

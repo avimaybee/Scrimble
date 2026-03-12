@@ -22,18 +22,9 @@ type PersistedGenerationEvent = LiveGenerationEventEnvelope & {
   id: number;
 };
 
-type LiveGenerationListener = (event: LiveGenerationEventEnvelope) => void;
-type GenerationThinkingState = {
-  batchName: GenerationBatchName | null;
-  content: string;
-  sequence: number;
-};
-
 const encoder = new TextEncoder();
 const TERMINAL_EVENT_TYPES = new Set<GenerationStreamEvent['type']>(['pipeline_complete', 'pipeline_failed']);
-const liveGenerationListeners = new Map<string, Set<LiveGenerationListener>>();
-const EVENT_POLL_INTERVAL_MS = 750;
-let ensureThinkingTablePromise: Promise<void> | null = null;
+const EVENT_POLL_INTERVAL_MS = 2_000;
 
 const batchLabels: Record<GenerationBatchName, string> = {
   batch_1_research_stack: 'Identifying your stack',
@@ -182,32 +173,9 @@ function parseStoredGenerationEvent(row: Record<string, unknown>): PersistedGene
   }
 }
 
-function subscribeToLiveGenerationEvents(projectId: string, listener: LiveGenerationListener) {
-  const listeners = liveGenerationListeners.get(projectId) || new Set<LiveGenerationListener>();
-  listeners.add(listener);
-  liveGenerationListeners.set(projectId, listeners);
-
-  return () => {
-    const currentListeners = liveGenerationListeners.get(projectId);
-    if (!currentListeners) {
-      return;
-    }
-
-    currentListeners.delete(listener);
-    if (currentListeners.size === 0) {
-      liveGenerationListeners.delete(projectId);
-    }
-  };
-}
-
-function publishLiveGenerationEvent(projectId: string, event: LiveGenerationEventEnvelope) {
-  const listeners = liveGenerationListeners.get(projectId);
-  if (!listeners || listeners.size === 0) {
-    return;
-  }
-
-  listeners.forEach((listener) => listener(event));
-}
+// In-memory live listeners removed: the pipeline runs in a separate Worker
+// (scrimble-consumer / Durable Object) so in-memory pub/sub never reaches
+// the Pages SSE endpoint.  All event delivery now goes through D1 polling.
 
 function formatSseEvent(event: LiveGenerationEventEnvelope) {
   const idLine = event.id === null ? '' : `id: ${event.id}\n`;
@@ -222,87 +190,28 @@ export function getBatchStartLabel(batchName: GenerationBatchName) {
   return batchLabels[batchName];
 }
 
-async function ensureGenerationThinkingTable(env: Bindings) {
-  if (!ensureThinkingTablePromise) {
-    ensureThinkingTablePromise = env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS project_generation_live_state (
-        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-        batch_name TEXT,
-        content TEXT NOT NULL DEFAULT '',
-        sequence INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT DEFAULT (datetime('now'))
-      )
-    `)
-      .run()
-      .then(() => undefined)
-      .catch((error: unknown) => {
-        ensureThinkingTablePromise = null;
-        throw error;
-      });
-  }
-
-  return ensureThinkingTablePromise;
-}
-
-async function loadGenerationThinkingState(env: Bindings, projectId: string) {
-  await ensureGenerationThinkingTable(env);
-  const row = await env.DB.prepare(`
-    SELECT batch_name, content, sequence
-    FROM project_generation_live_state
-    WHERE project_id = ?
-  `)
-    .bind(projectId)
-    .first();
-
-  if (!row) {
-    return null;
-  }
-
-  return {
-    batchName: (asText(row.batch_name) || null) as GenerationBatchName | null,
-    content: asText(row.content),
-    sequence: asNumber(row.sequence),
-  } satisfies GenerationThinkingState;
-}
+// D1-based thinking state removed — thinking deltas are transient and should
+// not be written to the database.  The frontend receives them as activity
+// events instead (see createThrottledThinkingEmitter below).
 
 export async function resetGenerationThinkingState(
-  env: Bindings,
-  projectId: string,
-  batchName: GenerationBatchName | null,
+  _env: Bindings,
+  _projectId: string,
+  _batchName: GenerationBatchName | null,
 ) {
-  await ensureGenerationThinkingTable(env);
-  await env.DB.prepare('DELETE FROM project_generation_live_state WHERE project_id = ?').bind(projectId).run();
+  // No-op: thinking state is no longer persisted to D1.
 }
 
 
 export async function appendGenerationThinkingDelta(
-  env: Bindings,
-  payload: {
+  _env: Bindings,
+  _payload: {
     projectId: string;
     batchName: GenerationBatchName;
     content: string;
   },
 ) {
-  await ensureGenerationThinkingTable(env);
-  await env.DB.prepare(`
-    INSERT INTO project_generation_live_state (project_id, batch_name, content, sequence, updated_at)
-    VALUES (?, ?, ?, 1, datetime('now'))
-    ON CONFLICT(project_id) DO UPDATE SET
-      batch_name = excluded.batch_name,
-      content = CASE
-        WHEN project_generation_live_state.batch_name = excluded.batch_name
-          THEN project_generation_live_state.content || excluded.content
-        ELSE excluded.content
-      END,
-      sequence = CASE
-        WHEN project_generation_live_state.batch_name = excluded.batch_name
-          THEN project_generation_live_state.sequence + 1
-        ELSE 1
-      END,
-      updated_at = datetime('now')
-  `)
-    .bind(payload.projectId, payload.batchName, payload.content)
-    .run();
+  // No-op: thinking deltas are no longer persisted to D1.
 }
 
 export async function persistGenerationStreamEvent(
@@ -325,104 +234,40 @@ export async function persistGenerationStreamEvent(
     )
     .run();
 
-  const persistedEvent: PersistedGenerationEvent = {
+  return {
     id: asNumber(result.meta?.last_row_id),
     projectId: payload.projectId,
     batchName: payload.batchName || null,
     createdAt: new Date().toISOString(),
     event: payload.event,
-  };
-
-  publishLiveGenerationEvent(payload.projectId, persistedEvent);
-  return persistedEvent;
+  } satisfies PersistedGenerationEvent;
 }
 
-export function emitTransientGenerationStreamEvent(payload: {
+export function emitTransientGenerationStreamEvent(_payload: {
   projectId: string;
   batchName?: GenerationBatchName;
   event: Extract<GenerationStreamEvent, { type: 'thinking' }>;
 }) {
-  const transientEvent: LiveGenerationEventEnvelope = {
-    id: null,
-    projectId: payload.projectId,
-    batchName: payload.batchName || null,
-    createdAt: new Date().toISOString(),
-    event: payload.event,
-  };
-
-  publishLiveGenerationEvent(payload.projectId, transientEvent);
-  return transientEvent;
+  // No-op: transient events cannot cross the Worker/Pages process boundary.
+  // Thinking state is conveyed via periodic persisted activity events instead.
 }
 
 export function createThrottledThinkingEmitter(
-  env: Bindings,
-  projectId: string,
-  batchName: GenerationBatchName,
-  flushIntervalMs = 1000,
+  _env: Bindings,
+  _projectId: string,
+  _batchName: GenerationBatchName,
+  _flushIntervalMs = 1000,
 ) {
-  let buffer = '';
-  let flushTimeout: ReturnType<typeof setTimeout> | null = null;
-  let activeFlushPromise: Promise<void> | null = null;
-
-  const flushBuffer = async () => {
-    if (flushTimeout !== null) {
-      clearTimeout(flushTimeout);
-      flushTimeout = null;
-    }
-
-    const currentBuffer = buffer;
-    if (!currentBuffer) {
-      return;
-    }
-
-    // Capture the flush promise so we can safely await it at the end
-    activeFlushPromise = (async () => {
-      try {
-        await appendGenerationThinkingDelta(env, {
-          projectId,
-          batchName,
-          content: currentBuffer,
-        });
-        // Only clear from the buffer what we successfully wrote,
-        // in case the buffer grew while we were writing (though we re-slice below)
-      } catch (error) {
-        console.warn('[createThrottledThinkingEmitter] Failed to flush thinking delta to D1:', error);
-      }
-    })();
-
-    await activeFlushPromise;
-    // Remove the executed portion from the buffer
-    buffer = buffer.slice(currentBuffer.length);
-    activeFlushPromise = null;
-  };
-
+  // Thinking deltas are no longer persisted to D1 or relayed via in-memory
+  // pub/sub. The emitter is kept as a lightweight sink so pipeline call sites
+  // don't need to change.
   return {
-    onReasoningDelta: (delta: string) => {
-      // 1. Immediately emit a transient event for connected frontend clients
-      emitTransientGenerationStreamEvent({
-        projectId,
-        batchName,
-        event: { type: 'thinking', content: delta },
-      });
-
-      // 2. Buffer for D1 writing
-      buffer += delta;
-
-      // 3. Schedule flush
-      if (flushTimeout === null && !activeFlushPromise) {
-        flushTimeout = setTimeout(() => {
-          void flushBuffer();
-        }, flushIntervalMs);
-      }
+    onReasoningDelta: (_delta: string) => {
+      // Intentionally empty — reasoning is consumed by callAIText internally
+      // but not forwarded to the frontend.
     },
     flush: async () => {
-      // Wait for any ongoing flush, then do one last flush
-      if (activeFlushPromise) {
-        await activeFlushPromise;
-      }
-      if (buffer) {
-        await flushBuffer();
-      }
+      // Nothing to flush.
     },
   };
 }
@@ -453,17 +298,10 @@ export function createGenerationSseStream(
   const stream = new TransformStream<Uint8Array, Uint8Array>();
   const writer = stream.writable.getWriter();
   let isClosed = false;
-  let replayComplete = false;
   let latestEventId = payload.lastEventId;
   let pingInterval: ReturnType<typeof setInterval> | null = null;
   let pollInterval: ReturnType<typeof setInterval> | null = null;
-  const bufferedEvents: LiveGenerationEventEnvelope[] = [];
   let writeChain = Promise.resolve();
-  let latestThinkingState: GenerationThinkingState = {
-    batchName: null,
-    content: '',
-    sequence: 0,
-  };
   let pollInFlight = false;
 
   const cleanup = () => {
@@ -472,7 +310,6 @@ export function createGenerationSseStream(
     }
 
     isClosed = true;
-    unsubscribe();
     if (pingInterval !== null) {
       clearInterval(pingInterval);
     }
@@ -501,48 +338,12 @@ export function createGenerationSseStream(
       });
   };
 
-  const dispatchEvent = (event: LiveGenerationEventEnvelope) => {
-    if (event.id !== null && event.id <= latestEventId) {
+  const dispatchEvent = (event: PersistedGenerationEvent) => {
+    if (event.id <= latestEventId) {
       return;
     }
 
-    if (!replayComplete) {
-      bufferedEvents.push(event);
-      return;
-    }
-
-    if (event.id !== null) {
-      latestEventId = event.id;
-    }
-
-    if (event.event.type === 'batch_start') {
-      latestThinkingState = {
-        batchName: event.event.batch,
-        content: '',
-        sequence: 0,
-      };
-    } else if (event.event.type === 'thinking') {
-      if (latestThinkingState.batchName !== event.batchName) {
-        latestThinkingState = {
-          batchName: event.batchName,
-          content: '',
-          sequence: 0,
-        };
-      }
-
-      latestThinkingState = {
-        ...latestThinkingState,
-        content: `${latestThinkingState.content}${event.event.content}`,
-        sequence: latestThinkingState.sequence + 1,
-      };
-    } else if (event.event.type === 'batch_complete' || isTerminalGenerationEvent(event.event)) {
-      latestThinkingState = {
-        batchName: event.batchName,
-        content: '',
-        sequence: 0,
-      };
-    }
-
+    latestEventId = event.id;
     enqueueChunk(formatSseEvent(event));
 
     if (isTerminalGenerationEvent(event.event)) {
@@ -550,7 +351,6 @@ export function createGenerationSseStream(
     }
   };
 
-  const unsubscribe = subscribeToLiveGenerationEvents(payload.projectId, dispatchEvent);
   payload.signal.addEventListener('abort', cleanup, { once: true });
 
   const pollForNewEvents = async () => {
@@ -561,65 +361,14 @@ export function createGenerationSseStream(
     pollInFlight = true;
 
     try {
-      const [persistedEvents, thinkingState] = await Promise.all([
-        listPersistedGenerationEventsSince(env, payload.projectId, latestEventId),
-        loadGenerationThinkingState(env, payload.projectId),
-      ]);
+      const persistedEvents = await listPersistedGenerationEventsSince(
+        env,
+        payload.projectId,
+        latestEventId,
+      );
 
       for (const event of persistedEvents) {
         dispatchEvent(event);
-      }
-
-      if (!thinkingState) {
-        latestThinkingState = {
-          batchName: null,
-          content: '',
-          sequence: 0,
-        };
-        return;
-      }
-
-      const batchChanged = thinkingState.batchName !== latestThinkingState.batchName;
-      const sequenceReset = thinkingState.sequence < latestThinkingState.sequence;
-      const contentReset = thinkingState.content.length < latestThinkingState.content.length;
-
-      if (batchChanged || sequenceReset || contentReset) {
-        if (thinkingState.content) {
-          dispatchEvent({
-            id: null,
-            projectId: payload.projectId,
-            batchName: thinkingState.batchName,
-            createdAt: new Date().toISOString(),
-            event: {
-              type: 'thinking',
-              content: thinkingState.content,
-            },
-          });
-        }
-
-        latestThinkingState = thinkingState;
-        return;
-      }
-
-      if (
-        thinkingState.sequence > latestThinkingState.sequence &&
-        thinkingState.content.length > latestThinkingState.content.length
-      ) {
-        const delta = thinkingState.content.slice(latestThinkingState.content.length);
-        latestThinkingState = thinkingState;
-
-        if (delta) {
-          dispatchEvent({
-            id: null,
-            projectId: payload.projectId,
-            batchName: thinkingState.batchName,
-            createdAt: new Date().toISOString(),
-            event: {
-              type: 'thinking',
-              content: delta,
-            },
-          });
-        }
       }
     } catch (error) {
       console.warn('[generation-stream-poll-failed]', {
@@ -631,38 +380,35 @@ export function createGenerationSseStream(
     }
   };
 
+  // Bootstrap: replay persisted events, then start polling
   void (async () => {
     try {
-      const replayEvents = await listPersistedGenerationEventsSince(env, payload.projectId, payload.lastEventId);
-      const initialThinkingState = await loadGenerationThinkingState(env, payload.projectId);
-      if (initialThinkingState) {
-        latestThinkingState = initialThinkingState;
-      }
+      const replayEvents = await listPersistedGenerationEventsSince(
+        env,
+        payload.projectId,
+        payload.lastEventId,
+      );
 
       for (const event of replayEvents) {
         latestEventId = Math.max(latestEventId, event.id);
         enqueueChunk(formatSseEvent(event));
 
         if (isTerminalGenerationEvent(event.event)) {
-          replayComplete = true;
           cleanup();
           return;
         }
       }
 
-      replayComplete = true;
-
-      bufferedEvents.forEach((event) => {
-        dispatchEvent(event);
-      });
-
       if (isClosed) {
         return;
       }
 
+      // Keep-alive pings every 20s
       pingInterval = setInterval(() => {
         enqueueChunk(': ping\n\n');
       }, 20_000);
+
+      // Poll for new D1 events at a steady interval
       void pollForNewEvents();
       pollInterval = setInterval(() => {
         void pollForNewEvents();

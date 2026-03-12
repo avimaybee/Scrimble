@@ -16,7 +16,8 @@ export type GenerationStatus =
   | 'awaiting_review'
   | 'approved'
   | 'complete'
-  | 'failed';
+  | 'failed'
+  | 'cancelled';
 
 export interface Profile {
   id: string;

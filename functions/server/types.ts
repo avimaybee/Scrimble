@@ -34,7 +34,8 @@ export type ProjectGenerationStatus =
   | 'awaiting_review'
   | 'approved'
   | 'complete'
-  | 'failed';
+  | 'failed'
+  | 'cancelled';
 
 export type ProjectGenerationBackend = 'queue' | 'durable_object';
 

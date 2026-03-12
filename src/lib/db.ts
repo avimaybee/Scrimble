@@ -267,6 +267,12 @@ export const dbService = {
     });
   },
 
+  async cancelProjectGeneration(id: string): Promise<{ success: boolean; generation_status: string; cancelledAt?: string }> {
+    return fetchAPI(`/projects/${id}/cancel`, {
+      method: 'POST',
+    });
+  },
+
   async getProjectsByUserId(_userId: string): Promise<Project[]> {
     return fetchAPI<Project[]>('/projects');
   },
@@ -373,6 +379,10 @@ export const dbService = {
     let reachedTerminalEvent = false;
     const seenEventIds = new Set<number>();
     let hasEstablishedConnection = false;
+    let reconnectDelay = 2000;
+    const MAX_RECONNECT_DELAY = 30_000;
+    const MAX_RECONNECT_DURATION = 5 * 60_000;
+    let firstReconnectAt: number | null = null;
 
     while (!options.signal?.aborted && !reachedTerminalEvent) {
       options.onConnectionStateChange?.(hasEstablishedConnection ? 'reconnecting' : 'connecting');
@@ -398,6 +408,8 @@ export const dbService = {
         }
 
         hasEstablishedConnection = true;
+        reconnectDelay = 2000;
+        firstReconnectAt = null;
         options.onConnectionStateChange?.('live');
 
         const decoder = new TextDecoder();
@@ -549,7 +561,18 @@ export const dbService = {
       }
 
       if (!options.signal?.aborted && !reachedTerminalEvent) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
+        // Exponential backoff with max duration cap
+        if (firstReconnectAt === null) {
+          firstReconnectAt = Date.now();
+        }
+
+        if (Date.now() - firstReconnectAt > MAX_RECONNECT_DURATION) {
+          options.onConnectionStateChange?.('closed');
+          return;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+        reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
       }
     }
 

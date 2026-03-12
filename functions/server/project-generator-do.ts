@@ -63,6 +63,15 @@ export class ProjectGeneratorDO {
       return Response.json({ error: 'Method not allowed.' }, { status: 405 });
     }
 
+    if (url.pathname === '/cancel') {
+      const body = await request.json().catch(() => null) as { projectId?: string } | null;
+      if (!body?.projectId) {
+        return Response.json({ error: 'Missing projectId.' }, { status: 400 });
+      }
+      await this.cancelPipeline(body.projectId);
+      return Response.json({ success: true, cancelled: true });
+    }
+
     if (!['/start', '/resume', '/approve', '/nudge'].includes(url.pathname)) {
       return Response.json({ error: 'Not found.' }, { status: 404 });
     }
@@ -253,5 +262,32 @@ export class ProjectGeneratorDO {
   private async clearScheduledRetry() {
     await this.state.storage.delete(RETRY_STORAGE_KEY);
     await this.state.storage.deleteAlarm();
+  }
+
+  private async cancelPipeline(projectId: string) {
+    await this.clearScheduledRetry();
+
+    // Reset the pipeline chain so any queued-but-not-yet-started run is dropped
+    this.pipelineChain = Promise.resolve();
+
+    await this.env.DB.prepare(`
+      UPDATE projects
+      SET generation_status = 'cancelled',
+          generation_error = 'Generation cancelled by user.',
+          generation_completed_at = datetime("now"),
+          generation_heartbeat_at = datetime("now"),
+          updated_at = datetime("now")
+      WHERE id = ?
+    `)
+      .bind(projectId)
+      .run();
+
+    await persistGenerationStreamEvent(this.env, {
+      projectId,
+      event: {
+        type: 'pipeline_failed',
+        error: 'Generation cancelled by user.',
+      },
+    });
   }
 }

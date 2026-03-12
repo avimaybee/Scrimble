@@ -42,6 +42,7 @@ import {
   containsStreamTransportMarkers,
   defaultModelForProvider,
   extractJSON,
+  PipelineQuotaExceededError,
   RetryableAIError,
   trimToLimit,
 } from './ai';
@@ -2442,7 +2443,6 @@ async function callValidatedBatch<T>(
 
       const validated = options.schema.safeParse(parsed);
       if (validated.success) {
-        console.log(`[GENERATION_DEBUG] ${options.runType} validation successful on attempt ${attempt}`);
         return {
           data: validated.data,
           rawResponse: JSON.stringify(validated.data),
@@ -2874,7 +2874,9 @@ Identify the stack implied by the idea. For each technology, provide:
 }
 
 // Leave headroom for D1 writes, queue continuation dispatches, and stream events in the same invocation.
-const MAX_SUBREQUEST_BUDGET = 20;
+// Queue consumers have tight subrequest budgets; DOs do not.
+const MAX_SUBREQUEST_BUDGET_QUEUE = 20;
+const MAX_SUBREQUEST_BUDGET_DO = 500;
 const SUBREQUEST_RESERVE = 3;
 
 async function executeBatch2(
@@ -2884,9 +2886,13 @@ async function executeBatch2(
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
+  continuationMode: GenerationContinuationMode = 'queue',
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const projectId = project.id;
+  const maxSubrequestBudget = continuationMode === 'inline'
+    ? MAX_SUBREQUEST_BUDGET_DO
+    : MAX_SUBREQUEST_BUDGET_QUEUE;
   const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
   const checkpoint = await loadGenerationCheckpoint<Batch2CheckpointData>(
     env,
@@ -2967,7 +2973,7 @@ async function executeBatch2(
     });
 
     // Check budget before starting research for this technology
-    if (subrequestCounter >= MAX_SUBREQUEST_BUDGET - SUBREQUEST_RESERVE) {
+    if (subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index, {
         researchTargets,
         fetchedSources,
@@ -3099,7 +3105,6 @@ async function executeBatch2(
             const message = err instanceof ToolExecutionError
               ? err.message
               : `Context7 failed for ${technology.name}.`;
-            console.warn(`[BATCH2_CIRCUIT] Context7 failed for ${technology.name}: ${err instanceof Error ? err.message : err}. Disabling for remaining technologies.`);
             contextSevenBroken = true;
             await recordPartialFailure('Context7', technology.name, message);
             return { content: '', source: 'Context7', version: 'unknown' } as LibraryDocsResult;
@@ -3143,7 +3148,6 @@ async function executeBatch2(
             toolEnv,
             { throwOnError: true },
           ).catch((err) => {
-            console.warn(`[BATCH2_CIRCUIT] GitHub Issues failed for ${technology.name}: ${err instanceof Error ? err.message : err}. Disabling for remaining technologies.`);
             githubIssuesBroken = true;
             const message = err instanceof ToolExecutionError
               ? err.message
@@ -3157,7 +3161,7 @@ async function executeBatch2(
     if (changelogUrl && !isChangelogSameAsMainRepo) subrequestCounter += (changelogRepo ? 5 : 1);
     if (attemptedGithubIssues) subrequestCounter += 1;
 
-    console.log(`[BATCH2_SUBREQUEST] ${technology.name} research complete. Global counter: ${subrequestCounter}`);
+
 
     // Skip community page fetching to conserve subrequests.
     // Use search result text summaries instead of fetching each page.
@@ -3371,7 +3375,7 @@ async function executeBatch2(
     if (
       hasMoreWork &&
       (processedCount % GENERATION_CHECKPOINT_ITEM_INTERVAL === 0
-        || subrequestCounter >= MAX_SUBREQUEST_BUDGET - SUBREQUEST_RESERVE)
+        || subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE)
     ) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
         researchTargets,
@@ -3441,17 +3445,6 @@ For each technology, return:
 - sources (copy the important sources you used as { technology, url, tool, title, summary })
 
 Preserve specific version and compatibility details.`;
-
-  console.log('[BATCH2_DEBUG] starting research analyst AI call', {
-    projectId,
-    technologies: researchTargets.map(t => t.name),
-    fetchedSourcesCount: fetchedSources.length,
-    firstSourceSample: fetchedSources[0] ? { 
-      tech: fetchedSources[0].technology, 
-      docsLen: fetchedSources[0].docs_content.length,
-      readmeLen: fetchedSources[0].github_readme.length 
-    } : null
-  });
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -4207,17 +4200,10 @@ async function enqueueProjectGeneration(
     delaySeconds?: number;
   },
 ) {
-  console.log('[ENQUEUE_PROJECT] Starting. env keys:', Object.keys(env));
-  console.log('[ENQUEUE_PROJECT] AGENT_QUEUE exists:', !!env.AGENT_QUEUE);
-  console.log('[ENQUEUE_PROJECT] AGENT_QUEUE type:', typeof env.AGENT_QUEUE);
-  
   if (!env.AGENT_QUEUE) {
-    console.error('[ENQUEUE_PROJECT] ERROR: AGENT_QUEUE is undefined!');
     throw new GenerationPipelineError('Project generation queue is not configured.');
   }
 
-  console.log('[ENQUEUE_PROJECT] Calling sendGenerationDispatch...');
-  
   await sendGenerationDispatch(env, {
     projectId: payload.projectId,
     userId: payload.userId,
@@ -4228,8 +4214,6 @@ async function enqueueProjectGeneration(
     targetStatus: payload.targetStatus,
     delaySeconds: payload.delaySeconds,
   });
-  
-  console.log('[ENQUEUE_PROJECT] Successfully enqueued continuation');
 }
 
 const PIPELINE_VERSION = '1.2.0-heartbeat-safe';
@@ -4252,17 +4236,12 @@ async function processProjectGenerationTurn(
     throw new GenerationPipelineError('The queued project no longer exists.');
   }
 
-  console.log(`[PIPELINE_DEBUG] Project status: ${project.generation_status}, runId: ${project.generation_run_id}`);
-
   if (message.runId && project.generation_run_id && message.runId !== project.generation_run_id) {
-    console.warn(`[PIPELINE_DEBUG] ignoring stale queue message for project ${message.projectId}`);
     return false;
   }
 
   const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
-  console.log(`[PIPELINE_DEBUG] currentStatus: ${currentStatus}`);
   if (currentStatus === 'complete' || currentStatus === 'failed' || currentStatus === 'awaiting_review') {
-    console.log(`[PIPELINE_DEBUG] returning early due to status: ${currentStatus}`);
     return false;
   }
 
@@ -4339,7 +4318,7 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_1_research_stack':
       if (!completed.includes('batch_2_fetch_and_read')) {
-        await executeBatch2(env, project, provider, activeRunId, builderProfile, projectBrief);
+        await executeBatch2(env, project, provider, activeRunId, builderProfile, projectBrief, continuationMode);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
@@ -4410,7 +4389,6 @@ export async function processProjectGeneration(
   message: QueueMessageBody,
   options: ProcessProjectGenerationOptions = {},
 ) {
-  console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}, runId: ${message.runId}`);
   const continuationMode = options.continuationMode || 'queue';
   const maxInlineTurns = options.maxInlineTurns || INLINE_GENERATION_TURN_LIMIT;
 
@@ -4438,6 +4416,12 @@ export async function processProjectGeneration(
 
     if (error instanceof GenerationPipelineError && error.alreadyPersisted) {
       throw error;
+    }
+
+    // Convert quota/runtime-limit errors into retryable errors so the DO
+    // can checkpoint and resume instead of killing the whole pipeline.
+    if (error instanceof PipelineQuotaExceededError) {
+      throw new RetryableGenerationPipelineError(error.message, 30);
     }
 
     const messageText =
@@ -4489,7 +4473,7 @@ export async function handleProjectGenerationQueue(
           await touchGenerationHeartbeat(env, projectId, message.body.runId || null);
         }
 
-        console.warn(`[PIPELINE_DEBUG] retrying project ${projectId} after transient failure: ${fallbackMessage}`);
+        console.warn(`Retrying project ${projectId} after transient failure: ${fallbackMessage}`);
         message.retry({ delaySeconds: error.delaySeconds });
         continue;
       }

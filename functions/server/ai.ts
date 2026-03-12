@@ -52,7 +52,6 @@ export async function streamToText(
     leftover = lines.pop() ?? '';
 
     for (const line of lines) {
-      console.log('[STREAM_DEBUG] raw line:', line);
       const trimmed = line.trim();
       if (!trimmed) continue;
 
@@ -101,12 +100,8 @@ export async function streamToText(
     }
   }
 
-  console.log('[STREAM_DEBUG] final contentBuffer:', contentBuffer.slice(0, 200));
-
   if (!contentBuffer && leftover.trim()) {
-    // If we have reasoning but no content yet, and the stream suddenly ends,
-    // it might be a silent cut-off or a thought-loop exit.
-    console.warn('[STREAM_DEBUG] Stream ended with no content but leftover reasoning/chunks.');
+    console.warn('Stream ended with no content but leftover reasoning/chunks.');
   }
 
   return contentBuffer;

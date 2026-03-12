@@ -11,6 +11,7 @@ import {
   LoaderCircle,
   Search,
   TriangleAlert,
+  XCircle,
 } from 'lucide-react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -357,11 +358,17 @@ export default function ProjectGeneration() {
       return;
     }
 
+    const MAX_THINKING_LENGTH = 50_000;
+
     const previousEntry = currentActivityRef.current;
     if (previousEntry?.kind === 'thinking') {
+      let combined = `${previousEntry.message}${delta}`;
+      if (combined.length > MAX_THINKING_LENGTH) {
+        combined = combined.slice(-MAX_THINKING_LENGTH);
+      }
       const updatedEntry = {
         ...previousEntry,
-        message: normalizeFeedMessage(`${previousEntry.message}${delta}`),
+        message: normalizeFeedMessage(combined),
         timestamp,
       };
       currentActivityRef.current = updatedEntry;
@@ -513,7 +520,12 @@ export default function ProjectGeneration() {
         }
       });
 
+    // Only poll when the SSE stream is NOT live — avoids state regression from stale poll data
     const intervalId = window.setInterval(() => {
+      if (streamConnectionState === 'live') {
+        return;
+      }
+
       void syncProjectState().catch((err: unknown) => {
         if (!isMounted) {
           return;
@@ -527,7 +539,7 @@ export default function ProjectGeneration() {
       isMounted = false;
       window.clearInterval(intervalId);
     };
-  }, [id, navigate, syncProjectState]);
+  }, [id, navigate, streamConnectionState, syncProjectState]);
 
   useEffect(() => {
     if (!id || !hasPreparationCompleted) {
@@ -706,6 +718,13 @@ export default function ProjectGeneration() {
     !showReviewPanel &&
     !status?.is_complete &&
     !isAutoRecovering;
+  const canCancelGeneration = Boolean(
+    status &&
+      !status.is_complete &&
+      !status.is_failed &&
+      status.generation_status !== ('cancelled' as string) &&
+      status.generation_status !== ('intake' as string),
+  );
   const autoRecoveryKey = `${id ?? 'unknown'}:${status?.generation_run_id ?? status?.generation_status ?? 'pending'}:${completedBatchCount}`;
 
 
@@ -907,6 +926,7 @@ export default function ProjectGeneration() {
   }, [requestResume]);
 
   const [isNudging, setIsNudging] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const handleCheckIn = useCallback(async () => {
     if (!id || isNudging) {
       return;
@@ -931,6 +951,22 @@ export default function ProjectGeneration() {
       setIsNudging(false);
     }
   }, [id, isNudging, noteProgressTimestamp, reconnectLiveFeed]);
+
+  const handleCancel = useCallback(async () => {
+    if (!id || isCancelling) return;
+    setIsCancelling(true);
+    try {
+      const result = await dbService.cancelProjectGeneration(id);
+      if (result.success) {
+        toast.success('Generation cancelled.');
+        setStatus((prev) => prev ? { ...prev, generation_status: 'cancelled', is_failed: true } : prev);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to cancel generation.');
+    } finally {
+      setIsCancelling(false);
+    }
+  }, [id, isCancelling]);
 
   useEffect(() => {
     if (!showResumeBadge || autoRecoveryFailed || isAutoRecovering || isResuming) {
@@ -1116,18 +1152,37 @@ export default function ProjectGeneration() {
 
                           <section className="py-7">
                             <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Core data</div>
-                            <div className="mt-5 space-y-3">
+                            <div className="mt-5 space-y-4">
                               {reviewData.data_model.slice(0, 8).map((table) => (
                                 <div
                                   key={table.table}
-                                  className="grid gap-2 md:grid-cols-[168px,1fr]"
+                                  className="rounded-[14px] border border-border-subtle/60 bg-bg-base/40 px-4 py-3"
                                 >
-                                  <div className="font-mono text-[12px] uppercase tracking-[0.12em] text-text-primary">
-                                    {table.table}
+                                  <div className="flex items-baseline gap-3">
+                                    <div className="font-mono text-[13px] font-medium text-text-primary">
+                                      {table.table}
+                                    </div>
+                                    <div className="font-sans text-[12px] leading-5 text-text-tertiary">
+                                      {table.description}
+                                    </div>
                                   </div>
-                                  <div className="font-sans text-[13px] leading-6 text-text-tertiary">
-                                    {table.description}
-                                  </div>
+                                  {table.columns.length > 0 && (
+                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                      {table.columns.slice(0, 12).map((col) => (
+                                        <span
+                                          key={`${table.table}-${col}`}
+                                          className="inline-flex items-center rounded-[6px] border border-border-subtle/50 bg-bg-surface/50 px-2 py-0.5 font-mono text-[10px] text-text-muted"
+                                        >
+                                          {col}
+                                        </span>
+                                      ))}
+                                      {table.columns.length > 12 && (
+                                        <span className="inline-flex items-center px-1 py-0.5 font-mono text-[10px] text-text-muted">
+                                          +{table.columns.length - 12} more
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
                               ))}
                             </div>
@@ -1144,9 +1199,9 @@ export default function ProjectGeneration() {
                                     <TooltipTrigger asChild>
                                       <button
                                         type="button"
-                                        className="flex w-full items-center gap-3 rounded-[12px] border border-status-warning/20 bg-status-warning/8 px-3 py-2.5 text-left font-sans text-[13px] text-status-warning"
+                                        className="flex w-full items-center gap-3 overflow-hidden rounded-[12px] border border-status-warning/20 bg-status-warning/8 px-3 py-2.5 text-left font-sans text-[13px] text-status-warning"
                                       >
-                                        <span aria-hidden="true">⚠</span>
+                                        <span aria-hidden="true" className="shrink-0">⚠</span>
                                         <span className="min-w-0 flex-1 truncate">{gotcha.issue}</span>
                                       </button>
                                     </TooltipTrigger>
@@ -1425,7 +1480,36 @@ export default function ProjectGeneration() {
                 </div>
               </div>
 
-              {status?.is_failed && showResumeBadge && !autoRecoveryFailed ? (
+              {status?.generation_status === ('cancelled' as string) ? (
+                <div className="w-full rounded-[16px] border border-border-default/70 bg-bg-surface/60 p-6 text-left shadow-panel backdrop-blur-sm">
+                  <div className="flex items-start gap-3">
+                    <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-text-muted" />
+                    <div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Generation stopped</div>
+                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
+                        You cancelled this generation run. Checkpoints from completed stages are preserved.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-5 flex gap-3">
+                    <button
+                      type="button"
+                      onClick={handleResume}
+                      disabled={isResuming}
+                      className="btn-primary"
+                    >
+                      {isResuming ? 'Resuming…' : 'Resume from checkpoint'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => navigate('/dashboard')}
+                      className="btn-ghost"
+                    >
+                      Back to dashboard
+                    </button>
+                  </div>
+                </div>
+              ) : status?.is_failed && showResumeBadge && !autoRecoveryFailed ? (
                 <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">
                   <div className="flex items-start gap-3">
                     <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
@@ -1556,6 +1640,26 @@ export default function ProjectGeneration() {
                           className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary"
                         >
                           Reconnect feed
+                        </button>
+                      ) : null}
+                      {canCancelGeneration ? (
+                        <button
+                          type="button"
+                          onClick={() => void handleCancel()}
+                          disabled={isCancelling}
+                          className="shrink-0 rounded-[6px] bg-red-500/10 px-2 py-1 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20 hover:text-red-300 disabled:opacity-50"
+                        >
+                          {isCancelling ? (
+                            <span className="flex items-center gap-1">
+                              <LoaderCircle className="h-3 w-3 animate-spin" />
+                              Stopping…
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1">
+                              <XCircle className="h-3 w-3" />
+                              Stop generation
+                            </span>
+                          )}
                         </button>
                       ) : null}
                     </div>
