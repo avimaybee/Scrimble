@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ExternalLink, Hexagon, TriangleAlert } from 'lucide-react';
+import {
+  BookOpenText,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  Github,
+  Globe,
+  Hexagon,
+  Search,
+  TriangleAlert,
+} from 'lucide-react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
@@ -18,6 +28,7 @@ import type {
 } from '../types';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
+const MAX_VISIBLE_RESEARCH_SOURCES = 5;
 
 const generationBatches: Array<{
   id: GenerationBatchName;
@@ -129,6 +140,50 @@ function getPlaceholderMessage(status: ProjectGenerationStatusResponse | null, c
   }
 }
 
+function formatReviewSourceUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const compactPath = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '');
+    return `${parsed.hostname.replace(/^www\./, '')}${compactPath}`;
+  } catch {
+    return url;
+  }
+}
+
+function getReviewSourceToolMeta(tool: string) {
+  const normalized = tool.trim().toLowerCase();
+
+  if (normalized.includes('github')) {
+    return {
+      label: 'GitHub',
+      icon: Github,
+      toneClass: 'text-text-primary',
+    };
+  }
+
+  if (normalized.includes('context7')) {
+    return {
+      label: 'Context7',
+      icon: BookOpenText,
+      toneClass: 'text-accent-soft',
+    };
+  }
+
+  if (normalized.includes('brave') || normalized.includes('web search')) {
+    return {
+      label: normalized.includes('brave') ? 'Brave Search' : 'Web search',
+      icon: Search,
+      toneClass: 'text-accent-primary',
+    };
+  }
+
+  return {
+    label: 'Fetch',
+    icon: Globe,
+    toneClass: 'text-text-tertiary',
+  };
+}
+
 export default function ProjectGeneration() {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
@@ -154,6 +209,8 @@ export default function ProjectGeneration() {
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
   const [hasEditedReview, setHasEditedReview] = useState(false);
   const [hasEditedPreferredIde, setHasEditedPreferredIde] = useState(false);
+  const [isResearchDisclosureOpen, setIsResearchDisclosureOpen] = useState(false);
+  const [showAllResearchSources, setShowAllResearchSources] = useState(false);
   const [hasPreparationCompleted, setHasPreparationCompleted] = useState(!initialPreparationState);
   const [generationPreparation] = useState<GenerationPreparationState | null>(initialPreparationState);
   const [streamConnectionKey, setStreamConnectionKey] = useState(0);
@@ -315,6 +372,11 @@ export default function ProjectGeneration() {
 
     return () => window.clearTimeout(timeoutId);
   }, [generationPreparation, needsPreparationNudge]);
+
+  useEffect(() => {
+    setIsResearchDisclosureOpen(false);
+    setShowAllResearchSources(false);
+  }, [reviewData?.project_id]);
 
   useEffect(() => {
     if (!id) {
@@ -543,25 +605,29 @@ export default function ProjectGeneration() {
       ['Brave Search', 'Web search'].includes(source.tool),
     );
     const githubUsed = reviewData.research_sources.some((source) => source.tool === 'GitHub');
-    const liveDocsUsed = reviewData.research_sources.some((source) =>
-      ['Context7', 'Live docs', 'Docs', 'Web fetch'].includes(source.tool),
+    const context7Used = reviewData.research_sources.some((source) =>
+      ['Context7', 'Live docs'].includes(source.tool),
     );
 
     return [
       {
         key: 'web-search',
-        label: 'Web search',
+        label: communityUsed ? 'Web search' : 'Web search — not connected',
         active: communityUsed,
       },
       {
         key: 'github',
-        label: reviewData.data_quality.has_github_token || githubUsed ? 'GitHub' : 'GitHub — not connected',
+        label: reviewData.data_quality.has_github_token
+          ? 'GitHub — authenticated'
+          : githubUsed
+            ? 'GitHub — public only'
+            : 'GitHub — not connected',
         active: reviewData.data_quality.has_github_token || githubUsed,
       },
       {
-        key: 'live-docs',
-        label: reviewData.data_quality.has_context7 || liveDocsUsed ? 'Live docs' : 'Live docs — not connected',
-        active: reviewData.data_quality.has_context7 || liveDocsUsed,
+        key: 'context7',
+        label: reviewData.data_quality.has_context7 || context7Used ? 'Context7' : 'Context7 — not connected',
+        active: reviewData.data_quality.has_context7 || context7Used,
       },
       {
         key: 'brave-search',
@@ -570,17 +636,19 @@ export default function ProjectGeneration() {
       },
     ];
   }, [reviewData]);
-  const connectedResearchToolCount = useMemo(() => {
+  const visibleResearchSources = useMemo(() => {
     if (!reviewData) {
-      return 0;
+      return [];
     }
 
-    return [
-      reviewData.data_quality.has_brave_search,
-      reviewData.data_quality.has_github_token,
-      reviewData.data_quality.has_context7,
-    ].filter(Boolean).length;
-  }, [reviewData]);
+    return showAllResearchSources
+      ? reviewData.research_sources
+      : reviewData.research_sources.slice(0, MAX_VISIBLE_RESEARCH_SOURCES);
+  }, [reviewData, showAllResearchSources]);
+  const hasHiddenResearchSources = useMemo(
+    () => Boolean(reviewData && reviewData.research_sources.length > MAX_VISIBLE_RESEARCH_SOURCES),
+    [reviewData],
+  );
 
   const handleApproveReview = useCallback(async () => {
     if (!id) {
@@ -667,7 +735,7 @@ export default function ProjectGeneration() {
         }}
       />
 
-      <section className="relative z-10 flex w-full max-w-[720px] flex-col items-center text-center">
+      <section className="relative z-10 flex w-full max-w-[960px] flex-col items-center text-center">
         <motion.div
           animate={{ opacity: [0.4, 1, 0.4] }}
           transition={{ duration: 2, ease: 'easeInOut', repeat: Infinity }}
@@ -728,278 +796,329 @@ export default function ProjectGeneration() {
               animate={{ y: 0, opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
-              className="w-full max-w-[720px] text-left"
+              className="w-full max-w-[920px] text-left"
             >
-              <div className="mb-8">
-                <div className="section-label">Your review</div>
-                <h1 className="mt-4 font-serif text-[32px] leading-[1.02] tracking-[-0.03em] text-text-primary">
-                  Before I build the rest, does this look right?
-                </h1>
-                <p className="mt-3 max-w-[560px] font-sans text-[15px] leading-7 text-text-secondary">
-                  I&apos;ve drafted the setup. Change anything you want before the full plan is written out.
-                </p>
-              </div>
+              <TooltipProvider>
+                <div className="overflow-hidden rounded-[28px] border border-border-default/80 bg-[linear-gradient(180deg,rgba(30,29,27,0.98),rgba(18,17,16,0.98))] shadow-panel backdrop-blur-sm">
+                  <div className="relative px-6 py-7 sm:px-8 md:px-10 md:py-10">
+                    <div className="pointer-events-none absolute inset-x-0 top-0 h-24 bg-[radial-gradient(circle_at_top,rgba(235,94,40,0.12),transparent_72%)]" />
+                    <div className="relative">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Your review</div>
+                      <h1 className="mt-4 max-w-[720px] font-serif text-[clamp(28px,4vw,40px)] leading-[1.02] tracking-[-0.03em] text-text-primary">
+                        Before I build the rest, does this look right?
+                      </h1>
+                      <p className="mt-4 max-w-[620px] font-sans text-[15px] leading-[1.7] text-text-secondary">
+                        I&apos;ve mapped out exactly what we&apos;re building. Read through it, then tell me anything you want changed.
+                      </p>
 
-              {error ? (
-                <div className="mb-5 flex items-center gap-2 rounded-[14px] border border-status-warning/30 bg-status-warning/10 px-3 py-3 text-[13px] text-status-warning">
-                  <TriangleAlert className="h-4 w-4 shrink-0" />
-                  <span>{error}</span>
-                </div>
-              ) : null}
-
-              <div className="space-y-5">
-                <section className="surface-panel rounded-[16px] p-5">
-                  <div className="mb-4">
-                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">Research depth</h2>
-                    <p className="mt-1 font-sans text-[13px] text-text-tertiary">
-                      A quick look at how much live research informed this planning pass.
-                    </p>
-                  </div>
-
-                  {reviewData ? (
-                    <div className="space-y-4">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-sans text-[13px] text-text-secondary">Research used:</span>
-                        {researchBadges.map((badge) => (
-                          <span
-                            key={badge.key}
-                              className={cn(
-                                'inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1 font-sans text-[12px]',
-                                badge.active
-                                ? 'border border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure'
-                                : 'border border-[rgba(204,197,185,0.1)] bg-[rgba(204,197,185,0.05)] text-text-muted',
-                              )}
-                          >
-                            <span aria-hidden="true">{badge.active ? '✓' : '✗'}</span>
-                            <span>{badge.label}</span>
-                          </span>
-                        ))}
-                      </div>
-
-                      <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
-                        Researched {reviewData.data_quality.technologies_researched} technologies across {reviewData.data_quality.urls_fetched} sources
-                      </div>
-
-                      {reviewData.data_quality.partial_failures.length > 0 ? (
-                        <div className="rounded-[14px] border border-status-warning/20 bg-status-warning/8 px-4 py-3 font-sans text-[13px] text-status-warning">
-                          <div className="font-medium">
-                            Some research sources were partially degraded during this run.
-                          </div>
-                          <div className="mt-1 text-[12px] text-text-secondary">
-                            Impacted tools: {reviewData.data_quality.degraded_tools.join(', ')}
-                          </div>
-                          <ul className="mt-2 space-y-1 text-[12px] text-text-secondary">
-                            {reviewData.data_quality.partial_failures.slice(0, 3).map((failure, index) => (
-                              <li key={`${failure.tool}-${failure.technology || 'global'}-${index}`}>
-                                {failure.tool}
-                                {failure.technology ? ` (${failure.technology})` : ''}: {failure.message}
-                              </li>
-                            ))}
-                          </ul>
+                      {error ? (
+                        <div className="mt-6 flex items-center gap-2 rounded-[14px] border border-status-warning/30 bg-status-warning/10 px-3 py-3 text-[13px] text-status-warning">
+                          <TriangleAlert className="h-4 w-4 shrink-0" />
+                          <span>{error}</span>
                         </div>
                       ) : null}
 
-                      {connectedResearchToolCount < 2 ? (
-                        <div className="rounded-[14px] border border-status-warning/20 bg-status-warning/8 px-4 py-3 font-sans text-[13px] text-status-warning">
-                          Connect more research tools in{' '}
-                          <a href="/settings#mcp-servers" className="underline underline-offset-4">
-                            Settings
-                          </a>{' '}
-                          for deeper analysis next time.
+                      {isReviewLoading && !reviewData ? (
+                        <div className="mt-8 rounded-[18px] border border-border-default/70 bg-bg-base/74 px-5 py-6 font-sans text-[14px] text-text-secondary">
+                          Loading your project brief...
                         </div>
-                      ) : null}
+                      ) : reviewData ? (
+                        <div className="mt-8">
+                          <div className="border-t border-border-subtle" />
 
-                      <details className="rounded-[14px] border border-border-default/70 bg-bg-base/76 px-4 py-3">
-                        <summary className="cursor-pointer list-none font-sans text-[14px] font-medium text-text-primary">
-                          What I read
-                        </summary>
-                        <div className="mt-4 space-y-3">
-                          {reviewData.research_sources.map((source) => (
-                            <div key={`${source.tool}-${source.url}`} className="rounded-[14px] border border-border-default/60 bg-bg-surface/72 px-3 py-3">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
-                                  {source.tool}
-                                </span>
-                                {source.technology ? (
-                                  <span className="font-sans text-[12px] text-text-tertiary">{source.technology}</span>
-                                ) : null}
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">What we&apos;re building</div>
+                            <h2 className="mt-4 font-serif text-[32px] leading-[1.05] tracking-[-0.03em] text-text-primary">
+                              {reviewData.project_name}
+                            </h2>
+                            <p className="mt-4 max-w-[760px] font-sans text-[15px] leading-[1.7] text-text-secondary">
+                              {reviewData.project_summary}
+                            </p>
+                          </section>
+
+                          <div className="border-t border-border-subtle" />
+
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">How it&apos;s put together</div>
+                            <div className="mt-5 space-y-4">
+                              {reviewData.stack_sections.map((section) => (
+                                <div
+                                  key={section.id}
+                                  className="grid gap-3 border-b border-border-subtle/70 pb-4 last:border-b-0 last:pb-0 md:grid-cols-[132px,1fr]"
+                                >
+                                  <div className="font-sans text-[13px] font-medium text-text-primary">{section.label}</div>
+                                  <div>
+                                    {section.chips.length > 0 ? (
+                                      <div className="flex flex-wrap gap-2">
+                                        {section.chips.map((chip) => (
+                                          <span
+                                            key={`${section.id}-${chip}`}
+                                            className="inline-flex items-center rounded-full border border-accent-border/70 bg-accent-primary/8 px-2.5 py-1 font-mono text-[11px] text-accent-soft"
+                                          >
+                                            {chip}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <div className="font-mono text-[11px] text-text-muted">—</div>
+                                    )}
+                                    <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
+                                      {section.description}
+                                    </p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </section>
+
+                          <div className="border-t border-border-subtle" />
+
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">How the pieces connect</div>
+                            <p className="mt-4 max-w-[760px] font-sans text-[15px] leading-[1.7] text-text-secondary">
+                              {reviewData.how_it_connects}
+                            </p>
+                          </section>
+
+                          <div className="border-t border-border-subtle" />
+
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Core data</div>
+                            <div className="mt-5 space-y-3">
+                              {reviewData.data_model.slice(0, 8).map((table) => (
+                                <div
+                                  key={table.table}
+                                  className="grid gap-2 md:grid-cols-[168px,1fr]"
+                                >
+                                  <div className="font-mono text-[12px] uppercase tracking-[0.12em] text-text-primary">
+                                    {table.table}
+                                  </div>
+                                  <div className="font-sans text-[13px] leading-6 text-text-tertiary">
+                                    {table.description}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </section>
+
+                          <div className="border-t border-border-subtle" />
+
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Things to watch out for</div>
+                            {reviewData.gotchas.length > 0 ? (
+                              <div className="mt-5 space-y-2">
+                                {reviewData.gotchas.slice(0, 6).map((gotcha) => (
+                                  <Tooltip key={`${gotcha.technology}-${gotcha.issue}`}>
+                                    <TooltipTrigger asChild>
+                                      <button
+                                        type="button"
+                                        className="flex w-full items-center gap-3 rounded-[12px] border border-status-warning/20 bg-status-warning/8 px-3 py-2.5 text-left font-sans text-[13px] text-status-warning"
+                                      >
+                                        <span aria-hidden="true">⚠</span>
+                                        <span className="min-w-0 flex-1 truncate">{gotcha.issue}</span>
+                                      </button>
+                                    </TooltipTrigger>
+                                    <TooltipContent className="max-w-[320px] whitespace-normal px-3 py-2 text-[12px] leading-5">
+                                      <div className="font-medium text-text-primary">{gotcha.technology}</div>
+                                      <div className="mt-1 text-text-secondary">{gotcha.issue}</div>
+                                      <div className="mt-2 text-text-secondary">Mitigation: {gotcha.mitigation}</div>
+                                    </TooltipContent>
+                                  </Tooltip>
+                                ))}
                               </div>
-                              <a
-                                href={source.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="mt-2 block font-sans text-[13px] font-medium text-text-primary underline-offset-4 hover:underline"
+                            ) : (
+                              <p className="mt-4 font-sans text-[13px] leading-6 text-text-tertiary">
+                                Nothing risky jumped out from the current research pass.
+                              </p>
+                            )}
+                          </section>
+
+                          <div className="border-t border-border-subtle" />
+
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Research depth</div>
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              {researchBadges.map((badge) => (
+                                <span
+                                  key={badge.key}
+                                  className={cn(
+                                    'inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1 font-sans text-[12px]',
+                                    badge.active
+                                      ? 'border border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure'
+                                      : 'border border-[rgba(204,197,185,0.1)] bg-[rgba(204,197,185,0.05)] text-text-muted',
+                                  )}
+                                >
+                                  <span aria-hidden="true">{badge.active ? '✓' : '✗'}</span>
+                                  <span>{badge.label}</span>
+                                </span>
+                              ))}
+                            </div>
+
+                            <div className="mt-4 font-sans text-[13px] text-text-tertiary">
+                              Researched {reviewData.data_quality.technologies_researched} technologies · {reviewData.research_sources.length} sources
+                            </div>
+
+                            {reviewData.data_quality.partial_failures.length > 0 ? (
+                              <div className="mt-3 font-sans text-[12px] leading-5 text-status-warning">
+                                Some sources were partially degraded during this pass: {reviewData.data_quality.degraded_tools.join(', ')}.
+                              </div>
+                            ) : null}
+
+                            <div className="mt-5 rounded-[16px] border border-border-default/70 bg-bg-base/64 px-4 py-4">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsResearchDisclosureOpen((previous) => !previous);
+                                  if (isResearchDisclosureOpen) {
+                                    setShowAllResearchSources(false);
+                                  }
+                                }}
+                                className="flex w-full items-center justify-between gap-4 text-left"
+                                aria-expanded={isResearchDisclosureOpen}
                               >
-                                {source.title || source.url}
-                              </a>
-                              {source.summary ? (
-                                <p className="mt-2 font-sans text-[13px] leading-6 text-text-secondary">{source.summary}</p>
+                                <span className="font-sans text-[14px] font-medium text-text-primary">
+                                  What I read ({reviewData.research_sources.length} sources)
+                                </span>
+                                {isResearchDisclosureOpen ? (
+                                  <ChevronUp className="h-4 w-4 text-text-tertiary" />
+                                ) : (
+                                  <ChevronDown className="h-4 w-4 text-text-tertiary" />
+                                )}
+                              </button>
+
+                              {isResearchDisclosureOpen ? (
+                                <div className="mt-4 space-y-2">
+                                  {visibleResearchSources.map((source) => {
+                                    const toolMeta = getReviewSourceToolMeta(source.tool);
+                                    const ToolIcon = toolMeta.icon;
+
+                                    return (
+                                      <a
+                                        key={`${source.tool}-${source.url}`}
+                                        href={source.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="group grid gap-2 rounded-[14px] border border-border-default/60 bg-bg-surface/74 px-3 py-3 transition-colors hover:border-accent-border/70"
+                                      >
+                                        <div className="flex min-w-0 items-center gap-3">
+                                          <span className={cn('shrink-0', toolMeta.toneClass)}>
+                                            <ToolIcon className="h-4 w-4" />
+                                          </span>
+                                          <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
+                                            {toolMeta.label}
+                                          </span>
+                                          {source.technology ? (
+                                            <span className="truncate font-sans text-[12px] text-text-tertiary">
+                                              {source.technology}
+                                            </span>
+                                          ) : null}
+                                        </div>
+                                        <div className="min-w-0 font-sans text-[13px] font-medium text-text-primary group-hover:text-accent-soft">
+                                          <span title={source.url} className="block truncate">
+                                            {formatReviewSourceUrl(source.url)}
+                                          </span>
+                                        </div>
+                                        <div className="min-w-0 font-sans text-[12px] text-text-tertiary">
+                                          <span
+                                            title={source.summary || source.title || source.url}
+                                            className="block truncate"
+                                          >
+                                            {source.summary || source.title || 'Source opened for architecture validation.'}
+                                          </span>
+                                        </div>
+                                      </a>
+                                    );
+                                  })}
+
+                                  {hasHiddenResearchSources ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => setShowAllResearchSources((previous) => !previous)}
+                                      className="pt-1 font-sans text-[13px] font-medium text-accent-soft transition-colors hover:text-accent-primary"
+                                    >
+                                      {showAllResearchSources ? 'Show less' : `Show all ${reviewData.research_sources.length} sources`}
+                                    </button>
+                                  ) : null}
+                                </div>
                               ) : null}
                             </div>
-                          ))}
-                        </div>
-                      </details>
-                    </div>
-                  ) : (
-                    <div className="rounded-[14px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
-                      Loading the research depth summary...
-                    </div>
-                  )}
-                </section>
+                          </section>
 
-                <section className="surface-panel rounded-[16px] p-5">
-                  <div className="mb-4">
-                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">Your stack</h2>
-                    <p className="mt-1 font-sans text-[13px] text-text-tertiary">
-                      The recommended packages and services this plan will be built around.
-                    </p>
-                  </div>
+                          <div className="border-t border-border-subtle" />
 
-                  {isReviewLoading && !reviewData ? (
-                    <div className="rounded-[14px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
-                      Loading your review...
-                    </div>
-                  ) : (
-                    reviewData && reviewData.stack_cards.length > 0 ? (
-                      <div className="grid gap-4 md:grid-cols-2">
-                        {reviewData.stack_cards.map((card) => (
-                          <div
-                            key={`${card.technology}-${card.package_name}-${card.version}`}
-                            className="rounded-[14px] border border-border-default/70 bg-bg-base/76 p-4"
-                          >
-                            <div className="font-sans text-[15px] font-semibold text-text-primary">{card.technology}</div>
-                            <div className="mt-1 font-mono text-[12px] text-text-muted">
-                              {card.package_name} @ {card.version}
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Anything to change?</div>
+                            <textarea
+                              ref={feedbackRef}
+                              value={reviewFeedback}
+                              onChange={(event) => {
+                                setHasEditedReview(true);
+                                setReviewFeedback(event.target.value);
+                              }}
+                              placeholder="e.g. use Drizzle instead of Prisma, remove payments for now, add Resend for email..."
+                              className="mt-4 min-h-[148px] w-full resize-y rounded-[16px] border border-border-default bg-bg-base/82 px-4 py-4 font-sans text-[15px] leading-[1.7] text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
+                            />
+
+                            <div className="mt-6">
+                              <div className="font-sans text-[14px] font-medium text-text-primary">
+                                Which IDE should the MCP file target?
+                              </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {reviewIdeOptions.map((option) => {
+                                  const isSelected = preferredIde === option.id;
+
+                                  return (
+                                    <button
+                                      key={option.id}
+                                      type="button"
+                                      onClick={() => {
+                                        setHasEditedPreferredIde(true);
+                                        setPreferredIde(option.id);
+                                      }}
+                                      className={cn(
+                                        'inline-flex min-h-[40px] items-center rounded-full border px-4 py-2 font-sans text-[13px] transition-all',
+                                        isSelected
+                                          ? 'border-accent-primary bg-accent-primary text-text-primary shadow-[0_0_0_1px_rgba(235,94,40,0.16)]'
+                                          : 'border-border-default bg-bg-base/76 text-text-secondary hover:border-accent-primary/35 hover:text-text-primary',
+                                      )}
+                                    >
+                                      {option.label}
+                                    </button>
+                                  );
+                                })}
+                              </div>
                             </div>
-                            <p className="mt-3 font-sans text-[13px] leading-6 text-text-secondary">{card.reason}</p>
-
-                            {card.gotcha_issue ? (
-                              <TooltipProvider>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <div className="mt-3 flex cursor-help items-center gap-2 rounded-[10px] border border-status-warning/20 bg-status-warning/8 px-3 py-2 text-[12px] text-status-warning">
-                                      <span aria-hidden="true">⚠️</span>
-                                      <span className="min-w-0 truncate">{card.gotcha_issue}</span>
-                                    </div>
-                                  </TooltipTrigger>
-                                   <TooltipContent className="max-w-[260px] whitespace-normal px-3 py-2 text-[12px] leading-5">
-                                     {card.gotcha_mitigation}
-                                   </TooltipContent>
-                                 </Tooltip>
-                               </TooltipProvider>
-                             ) : null}
-                           </div>
-                         ))}
-                       </div>
-                     ) : (
-                      <div className="rounded-[14px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
-                        The setup is ready, but the stack summary isn&apos;t loaded yet.
-                      </div>
-                    )
-                  )}
-                </section>
-
-                <section className="surface-panel rounded-[16px] p-5">
-                  <div className="mb-4">
-                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">How it&apos;s built</h2>
-                    <p className="mt-1 font-sans text-[13px] text-text-tertiary">
-                      A quick sanity check of the core data model before the plan is expanded.
-                    </p>
-                  </div>
-
-                  {reviewData && reviewData.data_model.length > 0 ? (
-                    <div className="grid gap-3">
-                      {reviewData.data_model.map((table) => (
-                        <div
-                          key={table.table}
-                          className="rounded-[14px] border border-border-default/70 bg-bg-base/76 px-4 py-3"
-                        >
-                          <div className="font-mono text-[12px] uppercase tracking-[0.14em] text-text-muted">
-                            {table.table}
-                          </div>
-                          <div className="mt-2 font-sans text-[13px] leading-6 text-text-secondary">
-                            {table.columns.join(', ')}
-                          </div>
+                          </section>
                         </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="rounded-[16px] border border-border-default/70 bg-bg-base/70 px-4 py-5 font-sans text-[14px] text-text-secondary">
-                      Loading the proposed data model...
-                    </div>
-                  )}
-                </section>
-
-                <section className="surface-panel rounded-[16px] p-5">
-                  <div className="mb-4">
-                    <h2 className="font-serif text-[22px] tracking-[-0.02em] text-text-primary">Anything to change?</h2>
-                    <p className="mt-1 font-sans text-[13px] text-text-tertiary">
-                      I&apos;ll fold any changes you add here directly into the plan builder.
-                    </p>
-                  </div>
-
-                  <div className="mb-5">
-                    <div className="font-sans text-[13px] font-medium text-text-primary">Which IDE should the MCP file target?</div>
-                    <p className="mt-1 font-sans text-[12px] text-text-tertiary">
-                      I&apos;ll tailor <span className="font-mono">scrimble-mcp.json</span> to the setup you&apos;ll paste into.
-                    </p>
-                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                      {reviewIdeOptions.map((option) => {
-                        const isSelected = preferredIde === option.id;
-
-                        return (
-                          <button
-                            key={option.id}
-                            type="button"
-                            onClick={() => {
-                              setHasEditedPreferredIde(true);
-                              setPreferredIde(option.id);
-                            }}
-                            className={cn(
-                              'rounded-[14px] border px-4 py-3 text-left transition-all',
-                              isSelected
-                                ? 'border-accent-primary bg-accent-primary/10 shadow-[0_0_0_1px_rgba(235,94,40,0.18)]'
-                                : 'border-border-default bg-bg-base/76 hover:border-accent-primary/35',
-                            )}
-                          >
-                            <div className="font-sans text-[14px] font-medium text-text-primary">{option.label}</div>
-                            <div className="mt-1 font-sans text-[12px] leading-5 text-text-tertiary">{option.hint}</div>
-                          </button>
-                        );
-                      })}
+                      ) : (
+                        <div className="mt-8 rounded-[18px] border border-border-default/70 bg-bg-base/74 px-5 py-6 font-sans text-[14px] text-text-secondary">
+                          The review brief is ready, but the document details haven&apos;t loaded yet.
+                        </div>
+                      )}
                     </div>
                   </div>
 
-                  <textarea
-                    ref={feedbackRef}
-                    value={reviewFeedback}
-                    onChange={(event) => {
-                      setHasEditedReview(true);
-                      setReviewFeedback(event.target.value);
-                    }}
-                    placeholder="e.g. use Drizzle instead of Prisma, add Resend for email, keep it simpler..."
-                    className="min-h-[124px] w-full resize-y rounded-[14px] border border-border-default bg-bg-base/82 px-4 py-3 font-sans text-[14px] leading-6 text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
-                  />
-                </section>
-              </div>
-
-              <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
-                <button
-                  type="button"
-                  onClick={() => feedbackRef.current?.focus()}
-                  className="btn-ghost"
-                >
-                  Let me adjust
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleApproveReview()}
-                  disabled={isSubmittingReview || isReviewLoading || !reviewData}
-                  className="btn-primary px-5"
-                >
-                  {isSubmittingReview ? 'Building your plan...' : 'Looks right, build my plan →'}
-                </button>
-              </div>
+                  <div className="border-t border-border-subtle bg-bg-base/50 px-6 py-4 sm:px-8 md:px-10">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+                      <button
+                        type="button"
+                        onClick={() => feedbackRef.current?.focus()}
+                        className="btn-ghost"
+                      >
+                        Let me adjust
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleApproveReview()}
+                        disabled={isSubmittingReview || isReviewLoading || !reviewData}
+                        className="btn-primary px-5"
+                      >
+                        {isSubmittingReview ? 'Building your plan...' : 'Looks right, build my plan →'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </TooltipProvider>
             </motion.div>
           ) : (
             <motion.div

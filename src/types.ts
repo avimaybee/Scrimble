@@ -111,6 +111,8 @@ export interface ChecklistItem {
 export interface ArchitectureDecisionRecord {
   project_name: string;
   project_type: string;
+  project_summary: string;
+  how_it_connects: string;
   recommended_stack: {
     frontend: string;
     backend: string;
@@ -270,7 +272,21 @@ export interface ArchitectureReviewCard {
 
 export interface ArchitectureReviewDataModelTable {
   table: string;
+  description: string;
   columns: string[];
+}
+
+export interface ArchitectureReviewStackSection {
+  id: 'frontend' | 'backend' | 'database' | 'auth' | 'ai' | 'storage' | 'payments' | 'email' | 'deploy';
+  label: string;
+  chips: string[];
+  description: string;
+}
+
+export interface ArchitectureReviewGotcha {
+  technology: string;
+  issue: string;
+  mitigation: string;
 }
 
 export interface ArchitectureReviewResearchSource {
@@ -318,6 +334,8 @@ export interface ArchitectureReviewResponse {
   project_id: string;
   project_name: string;
   project_type: string;
+  project_summary: string;
+  how_it_connects: string;
   recommended_stack: {
     frontend: string;
     backend: string;
@@ -328,7 +346,9 @@ export interface ArchitectureReviewResponse {
     deploy: string;
   };
   stack_cards: ArchitectureReviewCard[];
+  stack_sections: ArchitectureReviewStackSection[];
   data_model: ArchitectureReviewDataModelTable[];
+  gotchas: ArchitectureReviewGotcha[];
   research_sources: ArchitectureReviewResearchSource[];
   data_quality: ArchitectureReviewDataQuality;
   preferred_ide: PreferredIde;

@@ -1,4 +1,9 @@
-import type { Bindings, ProjectGenerationStatus } from './types';
+import type {
+  Bindings,
+  ProjectGenerationBackend,
+  ProjectGenerationStatus,
+  QueueMessageBody,
+} from './types';
 
 export type GenerationDispatchKind =
   | 'intake_confirm'
@@ -18,21 +23,77 @@ type DispatchPayload = {
   delaySeconds?: number;
 };
 
+function durableObjectDispatchPathForKind(kind: GenerationDispatchKind) {
+  switch (kind) {
+    case 'direct_create':
+    case 'intake_confirm':
+      return '/start';
+    case 'architecture_approval':
+      return '/approve';
+    case 'resume':
+      return '/resume';
+    case 'continuation':
+      return '/nudge';
+  }
+}
+
+export function normalizeProjectGenerationBackend(value: unknown): ProjectGenerationBackend {
+  if (typeof value !== 'string') {
+    return 'queue';
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'durable_object' || normalized === 'durable-object' || normalized === 'do') {
+    return 'durable_object';
+  }
+
+  return 'queue';
+}
+
+export function resolveProjectGenerationBackend(request: Request, env: Pick<Bindings, 'PROJECT_GENERATION_RUNTIME'>) {
+  const override = new URL(request.url).searchParams.get('useDO');
+  if (override === '1' || override === 'true') {
+    return 'durable_object' as const;
+  }
+
+  if (override === '0' || override === 'false') {
+    return 'queue' as const;
+  }
+
+  return normalizeProjectGenerationBackend(env.PROJECT_GENERATION_RUNTIME);
+}
+
+export function hasProjectGenerationBackendBinding(
+  env: Pick<Bindings, 'AGENT_QUEUE' | 'PROJECT_GENERATOR'>,
+  backend: ProjectGenerationBackend,
+) {
+  return backend === 'durable_object' ? !!env.PROJECT_GENERATOR : !!env.AGENT_QUEUE;
+}
+
+async function readDurableObjectDispatchError(response: Response) {
+  try {
+    const payload = await response.json() as { error?: unknown };
+    if (typeof payload.error === 'string' && payload.error.trim()) {
+      return payload.error.trim();
+    }
+  } catch {
+    // Fall through to the generic message.
+  }
+
+  return 'Failed to start project generation.';
+}
+
 export async function sendGenerationDispatch(
   env: Bindings,
   payload: DispatchPayload,
+  options?: {
+    backend?: ProjectGenerationBackend;
+  },
 ) {
-  console.log("[DEBUG] sendGenerationDispatch - Start");
-  console.log("[DEBUG] env exists:", !!env);
-  console.log("[DEBUG] env keys:", Object.keys(env || {}));
-  console.log("[DEBUG] AGENT_QUEUE exists:", !!env?.AGENT_QUEUE);
-  
-  if (!env.AGENT_QUEUE) {
-    console.error("[ERROR] AGENT_QUEUE is undefined in Bindings");
-  }
+  const backend = options?.backend || 'queue';
 
   const dispatchId = crypto.randomUUID();
-  const queueBody = {
+  const queueBody: QueueMessageBody = {
     type: 'generate_project' as const,
     projectId: payload.projectId,
     userId: payload.userId,
@@ -57,25 +118,38 @@ export async function sendGenerationDispatch(
     .run();
 
   try {
-    console.log('[DEBUG_QUEUE] env object keys:', Object.keys(env));
-    console.log('[DEBUG_QUEUE] AGENT_QUEUE present?', !!env.AGENT_QUEUE);
-    console.log('[DEBUG_QUEUE] AGENT_QUEUE type:', typeof env.AGENT_QUEUE);
-    
-    if (!env.AGENT_QUEUE) {
-      throw new Error('Project generation queue is not configured.');
-    }
+    if (backend === 'durable_object') {
+      if (!env.PROJECT_GENERATOR) {
+        throw new Error('Project generation durable object is not configured.');
+      }
 
-    console.log('[DEBUG_QUEUE] About to send to queue. Payload:', JSON.stringify(queueBody));
-    
-    try {
+      const objectId = env.PROJECT_GENERATOR.idFromName(payload.projectId);
+      const stub = env.PROJECT_GENERATOR.get(objectId);
+      const response = await stub.fetch(`https://project-generator${durableObjectDispatchPathForKind(payload.kind)}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...queueBody,
+          kind: payload.kind,
+          previousStatus: payload.previousStatus || null,
+          targetStatus: payload.targetStatus,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readDurableObjectDispatchError(response));
+      }
+    } else {
+      if (!env.AGENT_QUEUE) {
+        throw new Error('Project generation queue is not configured.');
+      }
+
       await env.AGENT_QUEUE.send(
         queueBody,
         payload.delaySeconds ? { delaySeconds: payload.delaySeconds } : undefined,
       );
-      console.log('[DEBUG_QUEUE] Successfully sent to queue');
-    } catch (sendError) {
-      console.error('[DEBUG_QUEUE] Error sending to queue:', sendError);
-      throw sendError;
     }
 
     await env.DB.prepare(`

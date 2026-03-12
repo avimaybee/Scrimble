@@ -13,7 +13,11 @@ import {
 } from './generation-schemas';
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
-import { sendGenerationDispatch } from './generation-dispatch';
+import {
+  hasProjectGenerationBackendBinding,
+  resolveProjectGenerationBackend,
+  sendGenerationDispatch,
+} from './generation-dispatch';
 import {
   callAIWithRetry,
   defaultModelForProvider,
@@ -56,6 +60,8 @@ import {
   type AppEnv,
   type Bindings,
   type GenerationBatchName,
+  type ProjectGenerationBackend,
+  type ProjectGenerationStatus,
   type PreferredIde,
   type ProviderType,
 } from './types';
@@ -171,9 +177,13 @@ function jsonError(message: string, status: number, details?: unknown) {
   return Response.json(details ? { error: message, details } : { error: message }, { status });
 }
 
-function queueConfigurationError(c: AppContext) {
+function generationBackendConfigurationError(c: AppContext, backend: ProjectGenerationBackend) {
   return c.json({
-    error: 'Project generation queue is not configured.',
+    error:
+      backend === 'durable_object'
+        ? 'Project generation durable object is not configured.'
+        : 'Project generation queue is not configured.',
+    backend,
     envKeys: Object.keys(c.env || {}),
   }, 500);
 }
@@ -840,10 +850,6 @@ app.post('/intake/start', async (c) => {
     return c.json({ error: 'A project description is required.', details: parsed.error.format() }, 400);
   }
 
-  if (!c.env.AGENT_QUEUE) {
-    return queueConfigurationError(c);
-  }
-
   let providerContext;
   try {
     providerContext = await resolveProviderContext(c, parsed.data.providerId);
@@ -976,8 +982,9 @@ app.post('/intake/:id/confirm', async (c) => {
     return c.json({ error: 'This project has already moved past intake.' }, 409);
   }
 
-  if (!c.env.AGENT_QUEUE) {
-    return queueConfigurationError(c);
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
+    return generationBackendConfigurationError(c, generationBackend);
   }
 
   const parsed = intakeConfirmSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1034,7 +1041,7 @@ app.post('/intake/:id/confirm', async (c) => {
       kind: 'intake_confirm',
       previousStatus: 'intake',
       targetStatus: 'queued',
-    });
+    }, { backend: generationBackend });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
     await c.env.DB.prepare(`
@@ -1051,7 +1058,7 @@ app.post('/intake/:id/confirm', async (c) => {
     `)
       .bind(project.name, message, projectId, c.get('uid'))
       .run();
-    return c.json({ error: 'Failed to queue project generation.' }, 503);
+    return c.json({ error: 'Failed to start project generation.' }, 503);
   }
 
   return c.json({
@@ -1076,8 +1083,9 @@ app.post('/projects', async (c) => {
     return c.json({ error: 'A project description is required.', details: parsed.error.format() }, 400);
   }
 
-  if (!c.env.AGENT_QUEUE) {
-    return queueConfigurationError(c);
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
+    return generationBackendConfigurationError(c, generationBackend);
   }
 
   const providerRecord = await resolveProvider(c, parsed.data.providerId);
@@ -1124,7 +1132,7 @@ app.post('/projects', async (c) => {
       kind: 'direct_create',
       previousStatus: null,
       targetStatus: 'queued',
-    });
+    }, { backend: generationBackend });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
     await c.env.DB.prepare(`
@@ -1137,7 +1145,7 @@ app.post('/projects', async (c) => {
     `)
       .bind(message, id, c.get('uid'))
       .run();
-    return c.json({ error: 'Failed to queue project generation.', project_id: id }, 503);
+    return c.json({ error: 'Failed to start project generation.', project_id: id }, 503);
   }
 
   return c.json({ success: true, id, generation_status: 'queued' }, 202);
@@ -1226,8 +1234,9 @@ app.post('/projects/:id/architecture-review', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  if (!c.env.AGENT_QUEUE) {
-    return queueConfigurationError(c);
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
+    return generationBackendConfigurationError(c, generationBackend);
   }
 
   const parsed = architectureReviewApprovalSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1272,7 +1281,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
       kind: 'architecture_approval',
       previousStatus: 'awaiting_review',
       targetStatus: 'approved',
-    });
+    }, { backend: generationBackend });
 
     if (project.generation_run_id) {
       await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
@@ -1331,8 +1340,9 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  if (!c.env.AGENT_QUEUE) {
-    return queueConfigurationError(c);
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
+    return generationBackendConfigurationError(c, generationBackend);
   }
 
   const status = project.generation_status || 'queued';
@@ -1393,7 +1403,7 @@ app.post('/projects/:id/resume', async (c) => {
       kind: 'resume',
       previousStatus: status,
       targetStatus: resumeStatus,
-    });
+    }, { backend: generationBackend });
 
     if (project.generation_run_id) {
       await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
@@ -1422,7 +1432,7 @@ app.post('/projects/:id/resume', async (c) => {
         c.get('uid'),
       )
       .run();
-    return c.json({ error: 'Failed to queue project generation.' }, 503);
+    return c.json({ error: 'Failed to resume project generation.' }, 503);
   }
 
   return c.json({
@@ -1439,8 +1449,9 @@ app.post('/projects/:id/nudge', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  if (!c.env.AGENT_QUEUE) {
-    return queueConfigurationError(c);
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
+    return generationBackendConfigurationError(c, generationBackend);
   }
 
   const status = project.generation_status || 'queued';
@@ -1500,11 +1511,11 @@ app.post('/projects/:id/nudge', async (c) => {
       kind: 'continuation',
       previousStatus: status,
       targetStatus,
-    });
+    }, { backend: generationBackend });
 
     return c.json({
       success: true,
-      message: 'Generation nudged - a new queue message has been sent.',
+      message: 'Generation nudged - a new background run has been scheduled.',
       nudgedAt: new Date().toISOString()
     });
   } catch (error) {

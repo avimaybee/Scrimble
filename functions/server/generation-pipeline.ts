@@ -126,19 +126,43 @@ export type ArchitectureReviewStackCard = {
 
 export type ArchitectureReviewDataModelTable = {
   table: string;
+  description: string;
   columns: string[];
 };
 
 export type ArchitectureReviewResearchSource = Batch2FetchAndRead['sources'][number];
 export type ArchitectureReviewDataQuality = Batch2FetchAndRead['data_quality'];
+export type ArchitectureReviewGotcha = Batch3Architect['gotchas'][number];
+
+type ArchitectureReviewStackSectionId =
+  | 'frontend'
+  | 'backend'
+  | 'database'
+  | 'auth'
+  | 'ai'
+  | 'storage'
+  | 'payments'
+  | 'email'
+  | 'deploy';
+
+export type ArchitectureReviewStackSection = {
+  id: ArchitectureReviewStackSectionId;
+  label: string;
+  chips: string[];
+  description: string;
+};
 
 export type ArchitectureReviewPayload = {
   project_id: string;
   project_name: string;
   project_type: string;
+  project_summary: string;
+  how_it_connects: string;
   recommended_stack: Batch3Architect['recommended_stack'];
   stack_cards: ArchitectureReviewStackCard[];
+  stack_sections: ArchitectureReviewStackSection[];
   data_model: ArchitectureReviewDataModelTable[];
+  gotchas: ArchitectureReviewGotcha[];
   research_sources: ArchitectureReviewResearchSource[];
   data_quality: ArchitectureReviewDataQuality;
   preferred_ide: PreferredIde;
@@ -194,6 +218,14 @@ type FetchedTechnologyResearch = {
   bug_report_digest: string;
   source_ledger: Batch2FetchAndRead['sources'];
   community_pages: FetchedCommunitySource[];
+};
+
+type ArchitectureReviewStackSectionConfig = {
+  id: ArchitectureReviewStackSectionId;
+  label: string;
+  recommendedKey?: keyof Batch3Architect['recommended_stack'];
+  keywords: string[];
+  alwaysInclude?: boolean;
 };
 
 type LoadedBuilderProfileContext = Awaited<ReturnType<typeof loadBuilderProfileContext>>;
@@ -775,6 +807,279 @@ function fallbackStackCardsFromRecommendedStack(adr: Batch3Architect): Architect
   });
 }
 
+const architectureReviewStackSectionConfigs: ArchitectureReviewStackSectionConfig[] = [
+  {
+    id: 'frontend',
+    label: 'Frontend',
+    recommendedKey: 'frontend',
+    keywords: ['frontend', 'client', 'browser', 'ui', 'react', 'next', 'vite', 'tailwind'],
+  },
+  {
+    id: 'backend',
+    label: 'Backend',
+    recommendedKey: 'backend',
+    keywords: ['backend', 'server', 'api', 'worker', 'hono', 'express', 'fastify', 'lambda'],
+  },
+  {
+    id: 'database',
+    label: 'Database',
+    recommendedKey: 'database',
+    keywords: ['database', 'db', 'sql', 'postgres', 'mysql', 'sqlite', 'd1', 'prisma', 'drizzle', 'orm'],
+  },
+  {
+    id: 'auth',
+    label: 'Auth',
+    recommendedKey: 'auth',
+    keywords: ['auth', 'authentication', 'authorization', 'session', 'oauth', 'jwt', 'clerk', 'firebase'],
+  },
+  {
+    id: 'ai',
+    label: 'AI',
+    keywords: ['ai', 'llm', 'openai', 'anthropic', 'gemini', 'model', 'inference', 'embeddings', 'vector'],
+  },
+  {
+    id: 'storage',
+    label: 'Storage',
+    keywords: ['storage', 'bucket', 'upload', 'uploads', 'file', 'files', 'asset', 'assets', 'blob', 'r2', 's3'],
+  },
+  {
+    id: 'payments',
+    label: 'Payments',
+    recommendedKey: 'payments',
+    keywords: ['payment', 'payments', 'billing', 'checkout', 'invoice', 'subscription', 'stripe', 'paypal', 'paddle'],
+    alwaysInclude: true,
+  },
+  {
+    id: 'email',
+    label: 'Email',
+    recommendedKey: 'email',
+    keywords: ['email', 'mail', 'smtp', 'resend', 'postmark', 'sendgrid'],
+  },
+  {
+    id: 'deploy',
+    label: 'Deploy',
+    recommendedKey: 'deploy',
+    keywords: ['deploy', 'deployment', 'hosting', 'host', 'vercel', 'netlify', 'cloudflare pages', 'docker'],
+  },
+];
+
+function hasTokenOverlap(left: string[], right: string[]) {
+  return left.some((leftToken) =>
+    right.some(
+      (rightToken) => leftToken.includes(rightToken) || rightToken.includes(leftToken),
+    ),
+  );
+}
+
+function isMeaningfulArchitectureSelection(value: string | null | undefined) {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === '-' || normalized === '—') {
+    return false;
+  }
+
+  return !(
+    normalized === 'none'
+    || normalized === 'n/a'
+    || normalized === 'na'
+    || normalized.startsWith('none ')
+    || normalized.includes('not needed')
+    || normalized.includes('not in scope')
+    || normalized.includes('not required')
+  );
+}
+
+function ensureSentence(value: string, fallback: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  const normalized = trimmed[0].toUpperCase() + trimmed.slice(1);
+  return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
+}
+
+function buildIntegrationChip(integration: Batch3Architect['integrations'][number]) {
+  const service = integration.service.trim() || integration.package_name.trim();
+  const version = integration.version.trim();
+  if (!version || version === 'Unknown' || service.toLowerCase().includes(version.toLowerCase())) {
+    return service;
+  }
+
+  return `${service} ${version}`;
+}
+
+function defaultStackSectionDescription(
+  config: ArchitectureReviewStackSectionConfig,
+  adr: Batch3Architect,
+) {
+  switch (config.id) {
+    case 'frontend':
+      return 'Handles the interface people use and the flows they move through.';
+    case 'backend':
+      return 'Runs the application logic, APIs, and the work happening behind the scenes.';
+    case 'database':
+      return adr.data_model.length > 0
+        ? `Stores the core product records across ${adr.data_model.length} main table${adr.data_model.length === 1 ? '' : 's'}.`
+        : 'Stores the core product records and supporting history.';
+    case 'auth':
+      return 'Signs people in and controls access to private data.';
+    case 'ai':
+      return 'Powers the model-driven parts of the product and any AI-assisted workflows.';
+    case 'storage':
+      return 'Holds uploads, generated assets, and large payloads outside the main database.';
+    case 'payments':
+      return 'Not part of the current scope.';
+    case 'email':
+      return 'Sends transactional updates and product emails when the flow needs them.';
+    case 'deploy':
+      return 'Hosts the product in production and delivers it to end users.';
+  }
+
+  return 'Supports this part of the architecture.';
+}
+
+function buildStackSectionDescription(
+  config: ArchitectureReviewStackSectionConfig,
+  adr: Batch3Architect,
+  matchingIntegrations: Batch3Architect['integrations'],
+) {
+  const fallback = defaultStackSectionDescription(config, adr);
+  const purpose = matchingIntegrations
+    .map((integration) => integration.purpose.trim())
+    .find(Boolean);
+
+  if (!purpose) {
+    return fallback;
+  }
+
+  const baseSentence = ensureSentence(purpose, fallback);
+  if (config.id === 'database' && adr.data_model.length > 0 && !baseSentence.toLowerCase().includes('table')) {
+    return `${baseSentence} ${adr.data_model.length} core table${adr.data_model.length === 1 ? '' : 's'} support the product data.`;
+  }
+
+  return baseSentence;
+}
+
+function buildArchitectureStackSections(adr: Batch3Architect): ArchitectureReviewStackSection[] {
+  return architectureReviewStackSectionConfigs.flatMap((config) => {
+    const selection = config.recommendedKey ? adr.recommended_stack[config.recommendedKey] : '';
+    const selectionTokens = isMeaningfulArchitectureSelection(selection) ? buildMatchTokens(selection) : [];
+    const matchingIntegrations = adr.integrations.filter((integration) => {
+      const integrationTokens = buildMatchTokens(
+        integration.service,
+        integration.package_name,
+        integration.purpose,
+      );
+
+      return (
+        (selectionTokens.length > 0 && hasTokenOverlap(selectionTokens, integrationTokens))
+        || hasTokenOverlap(config.keywords, integrationTokens)
+      );
+    });
+
+    const chips = Array.from(
+      new Set(
+        [
+          ...matchingIntegrations.map(buildIntegrationChip),
+          ...(isMeaningfulArchitectureSelection(selection) ? [selection.trim()] : []),
+        ]
+          .map((chip) => chip.trim())
+          .filter(Boolean),
+      ),
+    ).slice(0, 4);
+
+    if (chips.length === 0 && !config.alwaysInclude) {
+      return [];
+    }
+
+    return [{
+      id: config.id,
+      label: config.label,
+      chips,
+      description: chips.length > 0
+        ? buildStackSectionDescription(config, adr, matchingIntegrations)
+        : defaultStackSectionDescription(config, adr),
+    }];
+  });
+}
+
+function humanizeIdentifier(value: string) {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function singularizeIdentifier(value: string) {
+  if (value.endsWith('ies') && value.length > 3) {
+    return `${value.slice(0, -3)}y`;
+  }
+
+  if (value.endsWith('ses') || value.endsWith('ss')) {
+    return value;
+  }
+
+  if (value.endsWith('s') && value.length > 3) {
+    return value.slice(0, -1);
+  }
+
+  return value;
+}
+
+function describeArchitectureDataTable(table: Batch3Architect['data_model'][number]) {
+  const tableName = table.table.toLowerCase();
+  const columnTokens = buildMatchTokens(
+    table.table,
+    ...table.columns.map((column) => `${column.name} ${column.notes || ''}`),
+    ...table.relationships,
+  );
+  const foreignKeyCount = table.columns.filter((column) => column.name.toLowerCase().endsWith('_id')).length;
+
+  if (/user|profile|account|member|customer/.test(tableName) || hasTokenOverlap(columnTokens, ['user', 'profile', 'account'])) {
+    return 'Stores the people using the product and the details tied to their account.';
+  }
+
+  if (/project|workspace|team|organization|company|board/.test(tableName)) {
+    return 'Stores the top-level spaces or projects the rest of the product data belongs to.';
+  }
+
+  if (/session|token|invite|permission|role|access|auth/.test(tableName)) {
+    return 'Stores sign-in state, permissions, and the records that control access.';
+  }
+
+  if (/payment|invoice|billing|subscription|checkout/.test(tableName)) {
+    return 'Stores billing state, subscriptions, and payment history.';
+  }
+
+  if (/message|conversation|chat|thread|comment|notification|activity|event|log|history|audit/.test(tableName)) {
+    return 'Stores conversations, updates, and the activity trail inside the product.';
+  }
+
+  if (/file|asset|media|document|upload|attachment/.test(tableName)) {
+    return 'Stores uploaded files and the metadata needed to retrieve them later.';
+  }
+
+  if (/task|step|todo|ticket|issue|item/.test(tableName)) {
+    return 'Stores the main work items users create, track, and complete in the product.';
+  }
+
+  if (foreignKeyCount >= 2 && table.columns.length <= 5) {
+    return 'Stores the link records that connect the main objects together.';
+  }
+
+  const singularName = humanizeIdentifier(singularizeIdentifier(table.table));
+  if (table.relationships.length > 0) {
+    return `Stores the core ${singularName} records and their links to the rest of the product.`;
+  }
+
+  return `Stores the core ${singularName} records used by this product.`;
+}
+
 function buildArchitectureReviewPayload(
   projectId: string,
   adr: Batch3Architect,
@@ -810,12 +1115,21 @@ function buildArchitectureReviewPayload(
     project_id: projectId,
     project_name: adr.project_name,
     project_type: adr.project_type,
+    project_summary:
+      optionalText(adr.project_summary)
+      || `${adr.project_name} is being built around the selected stack and the research-backed architecture recommendations.`,
+    how_it_connects:
+      optionalText(adr.how_it_connects)
+      || 'The interface talks to the application backend, the backend writes to the core database, and the supporting services handle the surrounding workflows.',
     recommended_stack: adr.recommended_stack,
     stack_cards: stackCards.length > 0 ? stackCards : fallbackStackCardsFromRecommendedStack(adr),
+    stack_sections: buildArchitectureStackSections(adr),
     data_model: adr.data_model.map((table) => ({
       table: table.table,
+      description: describeArchitectureDataTable(table),
       columns: table.columns.map((column) => `${column.name} (${column.type})`),
     })),
+    gotchas: adr.gotchas,
     research_sources: research.sources,
     data_quality: research.data_quality,
     preferred_ide: preferredIde,
@@ -2937,6 +3251,8 @@ ${JSON.stringify(batch2.research, null, 2)}
 Produce:
 - project_name (string)
 - project_type (string)
+- project_summary (2-3 sentence plain-language prose summary of what the product does, who it's for, and what problem it solves)
+- how_it_connects (4-6 sentence plain-language prose explanation of how the main pieces connect and how data moves through the system)
 - recommended_stack (each field should be a plain string like "Next.js", not an object)
 - data_model
 - integrations with package_name and version
@@ -3592,51 +3908,70 @@ async function enqueueProjectGeneration(
 }
 
 const PIPELINE_VERSION = '1.2.0-heartbeat-safe';
+const INLINE_GENERATION_TURN_LIMIT = 256;
 
-export async function processProjectGeneration(env: Bindings, message: QueueMessageBody) {
-  console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}, runId: ${message.runId}`);
+type GenerationContinuationMode = 'queue' | 'inline';
 
-  try {
-    const project = await getProjectById(env, message.projectId);
-    if (!project) {
-      throw new GenerationPipelineError('The queued project no longer exists.');
-    }
+type ProcessProjectGenerationOptions = {
+  continuationMode?: GenerationContinuationMode;
+  maxInlineTurns?: number;
+};
 
-    console.log(`[PIPELINE_DEBUG] Project status: ${project.generation_status}, runId: ${project.generation_run_id}`);
+async function processProjectGenerationTurn(
+  env: Bindings,
+  message: QueueMessageBody,
+  continuationMode: GenerationContinuationMode,
+) {
+  const project = await getProjectById(env, message.projectId);
+  if (!project) {
+    throw new GenerationPipelineError('The queued project no longer exists.');
+  }
 
-    if (message.runId && project.generation_run_id && message.runId !== project.generation_run_id) {
-      console.warn(`[PIPELINE_DEBUG] ignoring stale queue message for project ${message.projectId}`);
-      return;
-    }
+  console.log(`[PIPELINE_DEBUG] Project status: ${project.generation_status}, runId: ${project.generation_run_id}`);
 
-    const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
-    console.log(`[PIPELINE_DEBUG] currentStatus: ${currentStatus}`);
-    if (currentStatus === 'complete' || currentStatus === 'failed' || currentStatus === 'awaiting_review') {
-      console.log(`[PIPELINE_DEBUG] returning early due to status: ${currentStatus}`);
-      return;
-    }
+  if (message.runId && project.generation_run_id && message.runId !== project.generation_run_id) {
+    console.warn(`[PIPELINE_DEBUG] ignoring stale queue message for project ${message.projectId}`);
+    return false;
+  }
 
-    const completed = await getCompletedBatches(message.projectId, env);
-    if (message.providerId && project.generation_provider_id && message.providerId !== project.generation_provider_id) {
-      throw new GenerationPipelineError('Queued generation provider does not match the project’s pinned provider.');
-    }
+  const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
+  console.log(`[PIPELINE_DEBUG] currentStatus: ${currentStatus}`);
+  if (currentStatus === 'complete' || currentStatus === 'failed' || currentStatus === 'awaiting_review') {
+    console.log(`[PIPELINE_DEBUG] returning early due to status: ${currentStatus}`);
+    return false;
+  }
 
-    const pinnedProviderId = message.providerId || project.generation_provider_id;
-    if (!pinnedProviderId) {
-      throw new GenerationPipelineError(
-        'The original AI provider for this generation run is missing. Start a new generation with an explicit provider.',
-      );
-    }
+  const completed = await getCompletedBatches(message.projectId, env);
+  if (message.providerId && project.generation_provider_id && message.providerId !== project.generation_provider_id) {
+    throw new GenerationPipelineError('Queued generation provider does not match the project’s pinned provider.');
+  }
 
-    const provider = await resolveProviderConfiguration(
-      env,
-      message.userId,
-      pinnedProviderId,
+  const pinnedProviderId = message.providerId || project.generation_provider_id;
+  if (!pinnedProviderId) {
+    throw new GenerationPipelineError(
+      'The original AI provider for this generation run is missing. Start a new generation with an explicit provider.',
     );
-    const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
-    const statusToRun = resolvePipelineStatusToRun(currentStatus, completed);
+  }
 
-    await updateProjectGenerationStatus(env, project.id, currentStatus, {
+  const provider = await resolveProviderConfiguration(
+    env,
+    message.userId,
+    pinnedProviderId,
+  );
+  const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
+  const statusToRun = resolvePipelineStatusToRun(currentStatus, completed);
+
+  await updateProjectGenerationStatus(env, project.id, currentStatus, {
+    generationError: null,
+    markStarted: true,
+    clearCompletedAt: true,
+    touchHeartbeat: true,
+    generationRunId: activeRunId,
+    generationProviderId: provider.providerId,
+  });
+
+  if (statusToRun === 'queued' && !completed.includes('batch_1_research_stack')) {
+    await updateProjectGenerationStatus(env, project.id, 'queued', {
       generationError: null,
       markStarted: true,
       clearCompletedAt: true,
@@ -3644,37 +3979,28 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
       generationRunId: activeRunId,
       generationProviderId: provider.providerId,
     });
-
-    if (statusToRun === 'queued' && !completed.includes('batch_1_research_stack')) {
-      await updateProjectGenerationStatus(env, project.id, 'queued', {
-        generationError: null,
-        markStarted: true,
-        clearCompletedAt: true,
-        touchHeartbeat: true,
-        generationRunId: activeRunId,
-        generationProviderId: provider.providerId,
-      });
-      await logActivity(env, {
-        projectId: project.id,
-        batchName: 'batch_1_research_stack',
-        kind: 'system',
-        message: 'Agent picked up your brief and is starting the research sequence.',
-      });
-    }
-
-    const builderProfile = await loadBuilderProfileContext(message.userId, env);
-    const projectBrief = await loadProjectBriefContext(env, message.projectId, message.userId, {
-      rawDescription: project.description || '',
-      projectStack: project.stack,
-      existingTools: builderProfile.declaredTools.map((tool) => tool.name),
+    await logActivity(env, {
+      projectId: project.id,
+      batchName: 'batch_1_research_stack',
+      kind: 'system',
+      message: 'Agent picked up your brief and is starting the research sequence.',
     });
+  }
 
-    switch (statusToRun) {
-      case 'intake':
-        return;
-      case 'queued':
-        if (!completed.includes('batch_1_research_stack')) {
-          await executeBatch1(env, project, provider, activeRunId, builderProfile, projectBrief);
+  const builderProfile = await loadBuilderProfileContext(message.userId, env);
+  const projectBrief = await loadProjectBriefContext(env, message.projectId, message.userId, {
+    rawDescription: project.description || '',
+    projectStack: project.stack,
+    existingTools: builderProfile.declaredTools.map((tool) => tool.name),
+  });
+
+  switch (statusToRun) {
+    case 'intake':
+      return false;
+    case 'queued':
+      if (!completed.includes('batch_1_research_stack')) {
+        await executeBatch1(env, project, provider, activeRunId, builderProfile, projectBrief);
+        if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
@@ -3683,10 +4009,13 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
             targetStatus: 'queued',
           });
         }
-        return;
-      case 'batch_1_research_stack':
-        if (!completed.includes('batch_2_fetch_and_read')) {
-          await executeBatch2(env, project, provider, activeRunId, builderProfile, projectBrief);
+        return true;
+      }
+      return false;
+    case 'batch_1_research_stack':
+      if (!completed.includes('batch_2_fetch_and_read')) {
+        await executeBatch2(env, project, provider, activeRunId, builderProfile, projectBrief);
+        if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
@@ -3695,19 +4024,22 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
             targetStatus: 'batch_1_research_stack',
           });
         }
-        return;
-      case 'batch_2_fetch_and_read':
-        if (!completed.includes('batch_3_architect')) {
-          await executeBatch3(env, project.id, provider, project, builderProfile, projectBrief);
-        }
-        await pauseForArchitectureReview(env, project.id);
-        return;
-      case 'batch_3_architect':
-        await pauseForArchitectureReview(env, project.id);
-        return;
-      case 'approved':
-        if (!completed.includes('batch_4_plan_build')) {
-          await executeBatch4(env, project.id, provider, builderProfile, projectBrief);
+        return true;
+      }
+      return false;
+    case 'batch_2_fetch_and_read':
+      if (!completed.includes('batch_3_architect')) {
+        await executeBatch3(env, project.id, provider, project, builderProfile, projectBrief);
+      }
+      await pauseForArchitectureReview(env, project.id);
+      return false;
+    case 'batch_3_architect':
+      await pauseForArchitectureReview(env, project.id);
+      return false;
+    case 'approved':
+      if (!completed.includes('batch_4_plan_build')) {
+        await executeBatch4(env, project.id, provider, builderProfile, projectBrief);
+        if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
@@ -3716,10 +4048,13 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
             targetStatus: 'approved',
           });
         }
-        return;
-      case 'batch_4_plan_build':
-        if (!completed.includes('batch_5_enrich_steps')) {
-          await executeBatch5(env, project.id, provider, activeRunId, builderProfile, projectBrief);
+        return true;
+      }
+      return false;
+    case 'batch_4_plan_build':
+      if (!completed.includes('batch_5_enrich_steps')) {
+        await executeBatch5(env, project.id, provider, activeRunId, builderProfile, projectBrief);
+        if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
@@ -3728,22 +4063,75 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
             targetStatus: 'batch_4_plan_build',
           });
         }
-        return;
-      case 'batch_5_enrich_steps':
-        if (!completed.includes('batch_6_generate_files')) {
-          await executeBatch6(env, project.id, provider, builderProfile, projectBrief);
+        return true;
+      }
+      return false;
+    case 'batch_5_enrich_steps':
+      if (!completed.includes('batch_6_generate_files')) {
+        await executeBatch6(env, project.id, provider, builderProfile, projectBrief);
+      }
+      await finalizeProjectGeneration(env, project.id);
+      return false;
+    case 'batch_6_generate_files':
+      await finalizeProjectGeneration(env, project.id);
+      return false;
+    default:
+      return false;
+  }
+}
+
+export async function processProjectGeneration(
+  env: Bindings,
+  message: QueueMessageBody,
+  options: ProcessProjectGenerationOptions = {},
+) {
+  console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}, runId: ${message.runId}`);
+  const continuationMode = options.continuationMode || 'queue';
+  const maxInlineTurns = options.maxInlineTurns || INLINE_GENERATION_TURN_LIMIT;
+
+  try {
+    if (continuationMode === 'inline') {
+      let turnCount = 0;
+      while (turnCount < maxInlineTurns) {
+        turnCount += 1;
+        const shouldContinue = await processProjectGenerationTurn(env, message, continuationMode);
+        if (!shouldContinue) {
+          return;
         }
-        await finalizeProjectGeneration(env, project.id);
-        return;
-      case 'batch_6_generate_files':
-        await finalizeProjectGeneration(env, project.id);
-        return;
-      default:
-        return;
+      }
+
+      throw new GenerationPipelineError(
+        'Project generation exceeded the Durable Object turn limit. Resume to continue from the latest checkpoint.',
+      );
     }
+
+    await processProjectGenerationTurn(env, message, continuationMode);
   } catch (error) {
     if (error instanceof RetryableGenerationPipelineError) {
-      throw error;
+      if (continuationMode === 'queue') {
+        throw error;
+      }
+
+      const messageText =
+        error.message || 'Project generation hit a retryable provider error and stopped before it could finish.';
+
+      await updateProjectGenerationStatus(env, message.projectId, 'failed', {
+        generationError: messageText,
+        markStarted: true,
+        markCompleted: true,
+        touchHeartbeat: true,
+      });
+      await insertGenerationEvent(env, {
+        projectId: message.projectId,
+        eventType: 'generation_failed',
+        body: {
+          error: messageText,
+          generation_status: 'failed',
+          project_id: message.projectId,
+        },
+      });
+
+      throw new GenerationPipelineError(messageText, true);
     }
 
     if (error instanceof GenerationPipelineError && error.alreadyPersisted) {

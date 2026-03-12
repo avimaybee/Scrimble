@@ -36,14 +36,36 @@ export type ProjectGenerationStatus =
   | 'complete'
   | 'failed';
 
+export type ProjectGenerationBackend = 'queue' | 'durable_object';
+
+export type DurableObjectIdLike = {
+  toString(): string;
+};
+
+export type DurableObjectStubLike = {
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+};
+
+export type DurableObjectNamespaceLike = {
+  idFromName(name: string): DurableObjectIdLike;
+  get(id: DurableObjectIdLike): DurableObjectStubLike;
+};
+
+export type DurableObjectStateLike = {
+  waitUntil(promise: Promise<unknown>): void;
+  blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
+};
+
 export type Bindings = {
   DB: any;
   ENVIRONMENT: string;
   FIREBASE_PROJECT_ID: string;
   ENCRYPTION_KEY: string;
-  AGENT_QUEUE: {
+  PROJECT_GENERATION_RUNTIME?: string;
+  AGENT_QUEUE?: {
     send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
   };
+  PROJECT_GENERATOR?: DurableObjectNamespaceLike;
   CHECKPOINT_BUCKET: {
     put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
     get(key: string): Promise<R2Object | null>;

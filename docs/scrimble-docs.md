@@ -151,13 +151,13 @@ npm run deploy:consumer  # uses wrangler and wrangler.consumer.toml
 npm run deploy:all
 ```
 
-Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background jobs run in a separate Cloudflare Worker (see `wrangler.consumer.toml`).
+Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that now hosts the primary `ProjectGeneratorDO` runtime plus the legacy queue consumer fallback.
 
 ### Backend
 | Concern | Choice | Notes |
 |---|---|---|
-| Runtime | Cloudflare Pages Functions | Edge serverless — Produces queue messages |
-| Background Jobs | Cloudflare Workers (Standalone) | Consumes "scrimble" queue — Handles AI pipeline |
+| Runtime | Cloudflare Pages Functions | Edge serverless — owns the API, chooses DO vs queue fallback, and streams generation state |
+| Background Jobs | Cloudflare Workers (Standalone) | Hosts `ProjectGeneratorDO` for the primary pipeline and keeps the `scrimble` queue consumer as fallback |
 | Database | Cloudflare D1 (SQLite) | Relational, edge-native, shared between environments |
 | Auth | Firebase Auth (auth only) | Google OAuth + email/password — JWT verification in Functions |
 | AI Routing | Function-side proxy | All AI calls proxied through Functions or Background Worker |
@@ -869,7 +869,7 @@ PATCH  /api/settings/mcp-servers/:id → Toggle research tool active/inactive
 DELETE /api/settings/mcp-servers/:id → Remove research tool connection
 
 POST   /api/ai/proxy               → Proxied AI call (uses user's stored key)
-POST   /api/projects/:id/resume    → Re-enqueue a failed or interrupted project
+POST   /api/projects/:id/resume    → Resume a failed or interrupted project
 
 > [!IMPORTANT]
 > **Routing Gotcha**: Hono is configured with `.basePath('/api')`. When defining new routes, **do not** start the route string with `/api/`. 
@@ -879,10 +879,18 @@ POST   /api/projects/:id/resume    → Re-enqueue a failed or interrupted projec
 ```
 
 
-### Cloudflare Queue — Async Agent Jobs
+### Cloudflare Durable Object + Queue Fallback
 
 ```
-Queue name: scrimble-agent-jobs
+Primary runtime:
+  ProjectGeneratorDO (standalone Worker)
+  - One Durable Object instance per project
+  - Pages Functions dispatch into the DO via binding
+  - The DO schedules the pipeline in the background with waitUntil()
+  - The DO reuses D1 + R2 checkpoints between turns, so it can keep moving without queue polling gaps
+
+Fallback runtime:
+  Queue name: scrimble
 
 Message types:
   { type: 'generate_plan',  projectId, userId, description, providerKeyId }
@@ -904,10 +912,10 @@ Retry: 3 attempts, exponential backoff
 
 ### Sequential Generation Pipeline
 
-Project creation enqueues a dedicated 6-batch agent job. Scrimble uses a professional hybrid architecture to handle these long-running tasks:
-1. **Pages (The Boss)**: Handles the UI and enqueues tasks via `AGENT_QUEUE.send()`.
-2. **Cloudflare Queue (Magic Mailbox)**: A queue named `scrimble` that ensures task reliability.
-3. **Worker (The Helper)**: A standalone Cloudflare Worker (`worker-consumer.ts`) dedicated to consuming messages and running the AI pipeline.
+Project creation dispatches a dedicated 6-batch generation run. Scrimble uses a hybrid architecture to handle these long-running tasks:
+1. **Pages (The Boss)**: Handles the UI, updates D1 state, and dispatches generation through the configured backend.
+2. **ProjectGeneratorDO (Primary)**: A Durable Object in the standalone worker that runs queue-like turns inline, preserves checkpoints, and keeps progressing without waiting for another queue delivery window.
+3. **Cloudflare Queue (Fallback)**: The `scrimble` queue remains available as the rollback path and still uses the same worker for one-batch-at-a-time execution.
 
 Each batch executes in order with **Smart Caps** to ensure extreme thoroughness without reckless resource usage:
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
@@ -921,8 +929,8 @@ Batch 3 pauses before continuing—Scrimble saves the architecture decision reco
 
 ### Resume & Retry Flow
 The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or budget limit), it enters a `failed` state.
-1. **Backend Support**: The `/api/projects/:id/resume` endpoint allows re-enqueuing even `failed` projects, picking up from the last incomplete batch.
-2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend re-enqueue, reconnecting the SSE stream only after the task is back in the queue.
+1. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches even `failed` projects, picking up from the last incomplete batch through the active backend.
+2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend resume request, reconnecting the SSE stream only after the run is scheduled again.
 
 
 ### Professional Icon System
@@ -934,7 +942,7 @@ Scrimble strictly uses technical, engineering-focused icons (Lucide React) to ma
 - *Prohibited: Any whimsical, magic, sparkle, or glitter-themed icons.*
 
 The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. 
-That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate queue consumer worker. 
+That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate background worker runtime. 
 
 To handle the high-frequency nature of AI reasoning deltas from distributed global isolates, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`). This utility buffers incoming reasoning tokens in memory and performs a single `ON CONFLICT DO UPDATE` write to the `project_generation_live_state` table every 1000ms. This prevents D1 row-locking congestion while maintaining a fluid user experience.
 
@@ -995,7 +1003,7 @@ interface AIProvider {
 
 ### Agentic Generation Pipeline
 
-Scrimble’s “start a project” flow now enqueues a Cloudflare Queue job that runs six sequential batches inside the queue consumer worker. Each batch:
+Scrimble’s “start a project” flow now dispatches into `ProjectGeneratorDO` by default, with Cloudflare Queue preserved as the fallback path. The DO runs the same six sequential batches and keeps replay-safe checkpoints in D1 + R2 so it can continue immediately after each turn instead of waiting for queue polling gaps. Each batch:
 
 1. Reads input from the previous batch’s `agent_runs` output (stored as JSON).
 2. Makes exactly one AI call through the BYOK proxy.
@@ -1004,7 +1012,7 @@ Scrimble’s “start a project” flow now enqueues a Cloudflare Queue job that
 5. Updates `projects.generation_status` to the batch currently running.
 6. Writes a structured SSE event into `project_generation_events` so the frontend can replay and stream it immediately.
 
-The queue consumer owns this pipeline completely. It does not hold a browser `WritableStream`, depend on an open tab, or await any frontend connection before continuing its work. If the user refreshes, disconnects, or closes the tab, the worker keeps running, persists each durable milestone to D1, and the generation screen rebuilds itself later from replay plus fresh polling.
+The background worker owns this pipeline completely. It does not hold a browser `WritableStream`, depend on an open tab, or await any frontend connection before continuing its work. If the user refreshes, disconnects, or closes the tab, the worker keeps running, persists each durable milestone to D1, and the generation screen rebuilds itself later from replay plus fresh polling. In the primary path that worker is `ProjectGeneratorDO`; in rollback mode it is the queue consumer.
 
 Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. **Token Guardrails** (aggressive truncation of raw research data) prevent prompt-size failures. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
 
@@ -1017,11 +1025,11 @@ Step enrichment is now deeper too: auth steps fetch security/session docs plus r
 
 Batch 2 also records a `research_sources` ledger (tool, source URL, one-line summary) and a `data_quality` object (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`) so the architecture checkpoint can explain which tools were consulted, how deep the research went, and which sources the agent actually read.
 
-The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, the historical activity log, progress dots, ETA counter, and review gate. The `/api/projects/:id/generation-stream` route always replays missed durable events first using `Last-Event-ID`, then polls D1 for new rows every ~1 second so queue-written updates still flow even though the browser and queue worker live in separate runtimes. Provider reasoning chunks are streamed separately as transient `thinking` events: the queue consumer updates the per-project live-state relay as they arrive, and the SSE route forwards only the latest delta to the browser while continuing to replay the durable history from D1. This split lets Scrimble stream live model thinking without polluting the long-term audit trail or waiting for the entire provider response to finish.
+The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, the historical activity log, progress dots, ETA counter, and review gate. The `/api/projects/:id/generation-stream` route always replays missed durable events first using `Last-Event-ID`, then polls D1 for new rows every ~1 second so background-written updates still flow even though the browser and background runner live in separate runtimes. Provider reasoning chunks are streamed separately as transient `thinking` events: the active background runner updates the per-project live-state relay as they arrive, and the SSE route forwards only the latest delta to the browser while continuing to replay the durable history from D1. This split lets Scrimble stream live model thinking without polluting the long-term audit trail or waiting for the entire provider response to finish.
 
 ### Durable Checkpoints & Dispatch Safety
 
-Every generation run now records a `run_id` and writes the run metadata to `generation_runs` before the queue job starts. The intake route also logs a `generation_dispatches` entry (batch name, provider id, payload size, source tracking id) before pushing to Cloudflare Queue; if the enqueue fails the API rolls back the project status so no ghost `queued` state sticks around. Each queue invocation now processes exactly one batch, carries the `run_id`, and refuses to work on stale payloads whose `run_id` no longer matches the active run. This one-batch-per-job guarantee keeps the queue from tunneling through multiple batches and ensures failures surface to the queue retry instead of being masked.
+Every generation run now records a `run_id` on the project before work starts. The API also logs a `generation_dispatches` entry before dispatching either to `ProjectGeneratorDO` or the queue fallback; if the dispatch fails the API rolls back the project status so no ghost `queued` state sticks around. The queue fallback still processes exactly one batch per invocation and refuses to work on stale payloads whose `run_id` no longer matches the active run. The Durable Object path preserves the same stale-run guard while looping through the next turn immediately.
 
 The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, truncated prompts, partial responses—into the Cloudflare R2 bucket named `scrimble` via the S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`. This hybrid D1+R2 strategy keeps row sizes manageable, captures the full history for any restart, and makes sure Batch 2 resumes from the same research graph without rerunning every tool.
 
@@ -1042,7 +1050,7 @@ Certain steps are **gates** (`is_gate = 1`). At a gate:
 7. User can: **Approve** (agent continues) / **Edit** (modify AI output, then approve) / **Reject** (agent retries with feedback)
 8. On approval: step status → `complete`, downstream steps unlock, agent continues
 
-After `batch_3_architect` finishes, the pipeline halts automatically. The project’s `generation_status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The queue consumer re-enqueues the job for `batch_4_plan_build` only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
+After `batch_3_architect` finishes, the pipeline halts automatically. The project’s `generation_status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The next leg (`batch_4_plan_build`) is dispatched only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
 
 **Gate review API:**
 ```typescript

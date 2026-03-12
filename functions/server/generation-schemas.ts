@@ -75,6 +75,8 @@ export const Batch2FetchAndReadSchema = z.object({
 export const Batch3ArchitectSchema = z.object({
   project_name: z.string().min(1),
   project_type: z.string().min(1),
+  project_summary: z.string().min(1),
+  how_it_connects: z.string().min(1),
   recommended_stack: z.object({
     frontend: z.string().min(1),
     backend: z.string().min(1),
@@ -230,7 +232,7 @@ export const schemaDescriptions = {
   batch_2_fetch_and_read:
     '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary? }] }], sources?: [{ technology?, url, tool, title?, summary? }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
   batch_3_architect:
-    '{ project_name: string, project_type: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
+    '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:
     '{ project_name?: string, project_type?: string, stack?: string | Record<string, unknown>, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
   batch_5_enrich_steps:
