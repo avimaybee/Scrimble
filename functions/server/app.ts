@@ -1432,6 +1432,87 @@ app.post('/projects/:id/resume', async (c) => {
   });
 });
 
+app.post('/projects/:id/nudge', async (c) => {
+  const projectId = c.req.param('id');
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  if (!c.env.AGENT_QUEUE) {
+    return queueConfigurationError(c);
+  }
+
+  const status = project.generation_status || 'queued';
+  if (status === 'complete') {
+    return c.json({ error: 'Cannot nudge a project that is already complete.' }, 409);
+  }
+
+  const providerId = (project.generation_provider_id as string | null) || undefined;
+  if (!providerId) {
+    return c.json({ error: 'The original AI provider for this generation run is missing. Start a new generation instead.' }, 409);
+  }
+
+  const runId = project.generation_run_id || crypto.randomUUID();
+  
+  const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
+  const completedBatchNames = completedBatchRows.map((row) => row.run_type);
+  const hasReviewApproval = completedBatchNames.includes('batch_4_plan_build') || 
+    completedBatchNames.includes('batch_5_enrich_steps') ||
+    completedBatchNames.includes('batch_6_generate_files') ||
+    await hasApprovedArchitectureReview(c.env, projectId);
+  
+  let targetStatus: ProjectGenerationStatus = status;
+  console.log('[NUDGE] Current status:', status);
+  console.log('[NUDGE] Completed batches:', completedBatchNames);
+  
+  if (status === 'awaiting_review' || status === 'approved') {
+    targetStatus = 'approved';
+  } else if (completedBatchNames.includes('batch_6_generate_files')) {
+    targetStatus = 'complete';
+  } else if (completedBatchNames.includes('batch_5_enrich_steps')) {
+    targetStatus = 'batch_5_enrich_steps';
+  } else if (completedBatchNames.includes('batch_4_plan_build')) {
+    targetStatus = 'batch_4_plan_build';
+  } else if (completedBatchNames.includes('batch_3_architect')) {
+    targetStatus = 'batch_3_architect';
+  } else if (completedBatchNames.includes('batch_2_fetch_and_read')) {
+    targetStatus = 'batch_2_fetch_and_read';
+  } else if (completedBatchNames.includes('batch_1_research_stack')) {
+    targetStatus = 'batch_1_research_stack';
+  }
+
+  console.log('[NUDGE] Target status to run:', targetStatus);
+
+  await c.env.DB.prepare(`
+    UPDATE projects 
+    SET generation_heartbeat_at = datetime("now"),
+        updated_at = datetime("now")
+    WHERE id = ? AND user_id = ?
+  `).bind(projectId, c.get('uid')).run();
+
+  try {
+    await sendGenerationDispatch(c.env, {
+      projectId,
+      userId: c.get('uid'),
+      providerId,
+      runId,
+      kind: 'continuation',
+      previousStatus: status,
+      targetStatus,
+    });
+
+    return c.json({
+      success: true,
+      message: 'Generation nudged - a new queue message has been sent.',
+      nudgedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to nudge project generation.';
+    return c.json({ error: message }, 503);
+  }
+});
+
 app.get('/projects/:id/generation-stream', async (c) => {
   const projectId = c.req.param('id');
   const project = await getOwnedProject(c, projectId);
@@ -1543,7 +1624,7 @@ app.delete('/projects/:id', async (c) => {
     c.env.DB.prepare('DELETE FROM project_intake_messages WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM project_briefs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
-    c.env.DB.prepare('DELETE FROM edges WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM edges WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),
     c.env.DB.prepare('DELETE FROM checklist_items WHERE step_id IN (SELECT id FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?))').bind(projectId),
     c.env.DB.prepare('DELETE FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),
     c.env.DB.prepare('DELETE FROM stages WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),

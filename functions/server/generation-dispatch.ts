@@ -59,15 +59,24 @@ export async function sendGenerationDispatch(
   try {
     console.log('[DEBUG_QUEUE] env object keys:', Object.keys(env));
     console.log('[DEBUG_QUEUE] AGENT_QUEUE present?', !!env.AGENT_QUEUE);
+    console.log('[DEBUG_QUEUE] AGENT_QUEUE type:', typeof env.AGENT_QUEUE);
     
     if (!env.AGENT_QUEUE) {
       throw new Error('Project generation queue is not configured.');
     }
 
-    await env.AGENT_QUEUE.send(
-      queueBody,
-      payload.delaySeconds ? { delaySeconds: payload.delaySeconds } : undefined,
-    );
+    console.log('[DEBUG_QUEUE] About to send to queue. Payload:', JSON.stringify(queueBody));
+    
+    try {
+      await env.AGENT_QUEUE.send(
+        queueBody,
+        payload.delaySeconds ? { delaySeconds: payload.delaySeconds } : undefined,
+      );
+      console.log('[DEBUG_QUEUE] Successfully sent to queue');
+    } catch (sendError) {
+      console.error('[DEBUG_QUEUE] Error sending to queue:', sendError);
+      throw sendError;
+    }
 
     await env.DB.prepare(`
       UPDATE generation_dispatches

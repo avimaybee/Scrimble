@@ -584,6 +584,16 @@ export async function callAIWithRetry(payload: {
 
       console.error(`${logTag} ALL RETRIES EXHAUSTED. Last error: ${errMsg}`);
 
+      const isNetworkError = 
+        errMsg.includes('Network connection lost') ||
+        errMsg.includes('fetch failed') ||
+        errMsg.includes('ECONNREFUSED') ||
+        errMsg.includes('ENOTFOUND');
+      
+      if (isNetworkError) {
+        return createAIErrorResponse(503, 'provider_network_error', 'Network connection lost. Please try again.');
+      }
+
       return createAIErrorResponse(503, 'provider_unavailable', PROVIDER_UNAVAILABLE_MESSAGE);
     }
   }
@@ -636,7 +646,7 @@ export async function callAIText(payload: {
       throw new PipelineQuotaExceededError(message);
     }
 
-    if (code === 'provider_timeout' || code === 'provider_upstream_error') {
+    if (code === 'provider_timeout' || code === 'provider_upstream_error' || code === 'provider_network_error') {
       throw new RetryableAIError(message, code, response.status);
     }
 

@@ -2219,8 +2219,16 @@ Only include technologies that matter to implementation.`;
     });
     return 'complete';
   } catch (error) {
-    if (error instanceof RetryableAIError) {
-      throw new RetryableGenerationPipelineError(error.message, 30);
+    const errorMessage = error instanceof Error ? error.message : 'Batch 4 failed.';
+    const isRetryable = 
+      error instanceof RetryableAIError ||
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('fetch failed') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED');
+    
+    if (isRetryable) {
+      throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
     await failBatch(
@@ -2236,8 +2244,8 @@ Only include technologies that matter to implementation.`;
 }
 
 // Leave headroom for D1 writes, queue continuation dispatches, and stream events in the same invocation.
-const MAX_SUBREQUEST_BUDGET = 35;
-const SUBREQUEST_RESERVE = 10;
+const MAX_SUBREQUEST_BUDGET = 20;
+const SUBREQUEST_RESERVE = 3;
 
 async function executeBatch2(
   env: Bindings,
@@ -2865,8 +2873,16 @@ Preserve specific version and compatibility details.`;
     });
     return 'complete';
   } catch (error) {
-    if (error instanceof RetryableAIError) {
-      throw new RetryableGenerationPipelineError(error.message, 45);
+    const errorMessage = error instanceof Error ? error.message : 'Batch 2 failed.';
+    const isRetryable = 
+      error instanceof RetryableAIError ||
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('fetch failed') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED');
+    
+    if (isRetryable) {
+      throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
     await failBatch(
@@ -2919,15 +2935,17 @@ Research corpus:
 ${JSON.stringify(batch2.research, null, 2)}
 
 Produce:
-- project_name
-- project_type
-- recommended_stack
+- project_name (string)
+- project_type (string)
+- recommended_stack (each field should be a plain string like "Next.js", not an object)
 - data_model
 - integrations with package_name and version
 - security_surface
 - gotchas with mitigations
 
-Base every recommendation on the provided research corpus.`;
+Base every recommendation on the provided research corpus.
+
+IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "PostgreSQL", NOT objects like { label: "Next.js", value: "nextjs" }. Each field (frontend, backend, auth, database, payments, email, deploy) must be a single technology name as a string.`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -2967,8 +2985,16 @@ Base every recommendation on the provided research corpus.`;
       message: `Architecture locked in — ${result.data.data_model.length} tables, ${result.data.integrations.length} integrations.`,
     });
   } catch (error) {
-    if (error instanceof RetryableAIError) {
-      throw new RetryableGenerationPipelineError(error.message, 45);
+    const errorMessage = error instanceof Error ? error.message : 'Batch 3 failed.';
+    const isRetryable = 
+      error instanceof RetryableAIError ||
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('fetch failed') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED');
+    
+    if (isRetryable) {
+      throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
     await failBatch(
@@ -3057,8 +3083,16 @@ Rules:
       message: `Plan ready — ${result.data.stages.length} stages, ${countPlanSteps(result.data)} steps.`,
     });
   } catch (error) {
-    if (error instanceof RetryableAIError) {
-      throw new RetryableGenerationPipelineError(error.message, 45);
+    const errorMessage = error instanceof Error ? error.message : 'Batch 4 failed.';
+    const isRetryable = 
+      error instanceof RetryableAIError ||
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('fetch failed') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED');
+    
+    if (isRetryable) {
+      throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
     await failBatch(
@@ -3067,7 +3101,7 @@ Rules:
       provider,
       'batch_4_plan_build',
       input,
-      error instanceof Error ? error.message : 'Batch 4 failed.',
+      errorMessage,
       2,
     );
   }
@@ -3251,8 +3285,16 @@ For each step, obey any requirements array included in the live step research co
     });
     return 'complete';
   } catch (error) {
-    if (error instanceof RetryableAIError) {
-      throw new RetryableGenerationPipelineError(error.message, 45);
+    const errorMessage = error instanceof Error ? error.message : 'Batch 5 failed.';
+    const isRetryable = 
+      error instanceof RetryableAIError ||
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('fetch failed') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED');
+    
+    if (isRetryable) {
+      throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
     await failBatch(
@@ -3400,8 +3442,16 @@ ${skillFileProfileInstructions}`;
       message: `Files prepared — ${result.data.files.length} downloadable artifact${result.data.files.length === 1 ? '' : 's'} ready.`,
     });
   } catch (error) {
-    if (error instanceof RetryableAIError) {
-      throw new RetryableGenerationPipelineError(error.message, 45);
+    const errorMessage = error instanceof Error ? error.message : 'Batch 6 failed.';
+    const isRetryable = 
+      error instanceof RetryableAIError ||
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('fetch failed') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED');
+    
+    if (isRetryable) {
+      throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
     await failBatch(
@@ -3516,10 +3566,17 @@ async function enqueueProjectGeneration(
     delaySeconds?: number;
   },
 ) {
+  console.log('[ENQUEUE_PROJECT] Starting. env keys:', Object.keys(env));
+  console.log('[ENQUEUE_PROJECT] AGENT_QUEUE exists:', !!env.AGENT_QUEUE);
+  console.log('[ENQUEUE_PROJECT] AGENT_QUEUE type:', typeof env.AGENT_QUEUE);
+  
   if (!env.AGENT_QUEUE) {
+    console.error('[ENQUEUE_PROJECT] ERROR: AGENT_QUEUE is undefined!');
     throw new GenerationPipelineError('Project generation queue is not configured.');
   }
 
+  console.log('[ENQUEUE_PROJECT] Calling sendGenerationDispatch...');
+  
   await sendGenerationDispatch(env, {
     projectId: payload.projectId,
     userId: payload.userId,
@@ -3530,12 +3587,14 @@ async function enqueueProjectGeneration(
     targetStatus: payload.targetStatus,
     delaySeconds: payload.delaySeconds,
   });
+  
+  console.log('[ENQUEUE_PROJECT] Successfully enqueued continuation');
 }
 
 const PIPELINE_VERSION = '1.2.0-heartbeat-safe';
 
 export async function processProjectGeneration(env: Bindings, message: QueueMessageBody) {
-  console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}`);
+  console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}, runId: ${message.runId}`);
 
   try {
     const project = await getProjectById(env, message.projectId);
@@ -3543,13 +3602,17 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
       throw new GenerationPipelineError('The queued project no longer exists.');
     }
 
+    console.log(`[PIPELINE_DEBUG] Project status: ${project.generation_status}, runId: ${project.generation_run_id}`);
+
     if (message.runId && project.generation_run_id && message.runId !== project.generation_run_id) {
       console.warn(`[PIPELINE_DEBUG] ignoring stale queue message for project ${message.projectId}`);
       return;
     }
 
     const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
+    console.log(`[PIPELINE_DEBUG] currentStatus: ${currentStatus}`);
     if (currentStatus === 'complete' || currentStatus === 'failed' || currentStatus === 'awaiting_review') {
+      console.log(`[PIPELINE_DEBUG] returning early due to status: ${currentStatus}`);
       return;
     }
 

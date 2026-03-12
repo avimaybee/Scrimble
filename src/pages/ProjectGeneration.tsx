@@ -631,6 +631,30 @@ export default function ProjectGeneration() {
     }
   }, [id, isResuming]);
 
+  const [isNudging, setIsNudging] = useState(false);
+  const handleNudge = useCallback(async () => {
+    if (!id || isNudging) {
+      return;
+    }
+
+    setIsNudging(true);
+
+    try {
+      const result = await dbService.nudgeProjectGeneration(id);
+      toast.success(result.message || 'Nudged! If the pipeline is working, it will continue shortly.');
+      setStreamConnectionKey((prev) => prev + 1);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Failed to nudge.';
+      if (errMsg.includes('still active')) {
+        toast.info('Pipeline is actively working — no need to nudge!');
+      } else {
+        toast.error(errMsg);
+      }
+    } finally {
+      setIsNudging(false);
+    }
+  }, [id, isNudging]);
+
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg-base px-6 py-12">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(235,94,40,0.12),transparent_38%)]" />
@@ -1054,6 +1078,23 @@ export default function ProjectGeneration() {
                           </span>
                         </motion.div>
                       </AnimatePresence>
+                    </div>
+
+                    <div className="mt-3 flex items-center gap-2 rounded-[8px] bg-bg-base/50 px-3 py-2">
+                      <svg className="h-4 w-4 shrink-0 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <span className="text-[12px] text-text-muted">
+                        This takes 1-5 minutes — AI analysis speed depends on your model and context size
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleNudge}
+                        disabled={isNudging}
+                        className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary disabled:opacity-50"
+                      >
+                        {isNudging ? 'Nudging...' : 'Nudge'}
+                      </button>
                     </div>
 
                     <div ref={logContainerRef} className="mt-4 max-h-[280px] overflow-y-auto pr-2">

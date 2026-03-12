@@ -157,6 +157,12 @@ export const dbService = {
     });
   },
 
+  async nudgeProjectGeneration(id: string): Promise<{ success: boolean; message: string }> {
+    return fetchAPI(`/projects/${id}/nudge`, {
+      method: 'POST',
+    });
+  },
+
   async getProjectsByUserId(_userId: string): Promise<Project[]> {
     return fetchAPI<Project[]>('/projects');
   },
