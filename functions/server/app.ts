@@ -9,7 +9,7 @@ import {
   Batch2FetchAndReadSchema,
   Batch3ArchitectSchema,
   Batch6GenerateFilesSchema,
-  SKILL_FILE_NAMES,
+  getSkillFileSortIndex,
 } from './generation-schemas';
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
@@ -506,7 +506,10 @@ async function loadStoredSkillFiles(c: AppContext, projectId: string) {
         updated_at: row.updated_at,
       }))
       .sort(
-        (left, right) => SKILL_FILE_NAMES.indexOf(left.filename) - SKILL_FILE_NAMES.indexOf(right.filename),
+        (
+          left: { filename: string },
+          right: { filename: string },
+        ) => getSkillFileSortIndex(left.filename) - getSkillFileSortIndex(right.filename),
       );
   }
 
@@ -542,7 +545,10 @@ async function loadStoredSkillFiles(c: AppContext, projectId: string) {
         updated_at: '',
       }))
       .sort(
-        (left, right) => SKILL_FILE_NAMES.indexOf(left.filename) - SKILL_FILE_NAMES.indexOf(right.filename),
+        (
+          left: { filename: string },
+          right: { filename: string },
+        ) => getSkillFileSortIndex(left.filename) - getSkillFileSortIndex(right.filename),
       );
   } catch {
     return [];
@@ -1542,12 +1548,21 @@ app.post('/projects/:id/nudge', async (c) => {
   }
 
   if (status === 'failed') {
-    return c.json({ error: 'This build stopped. Use resume so Scrimble can restart from the last safe checkpoint.' }, 409);
+    return c.json({ error: 'This build stopped. Use resume so Scrimble can continue from the latest completed checkpoint.' }, 409);
   }
 
   const providerId = (project.generation_provider_id as string | null) || undefined;
   if (!providerId) {
     return c.json({ error: 'The original AI provider for this generation run is missing. Start a new generation instead.' }, 409);
+  }
+
+  const generationHeartbeat = (project.generation_heartbeat_at as string | null) || null;
+  const executionStale = isGenerationExecutionStale(status, generationHeartbeat);
+  const queuedResumeReady = isQueuedGenerationResumeReady(status, generationHeartbeat);
+  if (!executionStale && !queuedResumeReady) {
+    return c.json({
+      error: 'This generation run is still active. I only schedule another runner pass after the current one has actually gone quiet.',
+    }, 409);
   }
 
   const runId = project.generation_run_id || crypto.randomUUID();
@@ -1598,7 +1613,7 @@ app.post('/projects/:id/nudge', async (c) => {
 
     return c.json({
       success: true,
-      message: 'Generation nudged - a new background run has been scheduled.',
+      message: 'The runner was quiet, so I scheduled a fresh background pass from the latest durable checkpoint.',
       nudgedAt: new Date().toISOString()
     });
   } catch (error) {
@@ -1660,7 +1675,7 @@ app.get('/projects/:id/skill-files', async (c) => {
   }
 
   const zip = new JSZip();
-  files.forEach((file) => {
+  files.forEach((file: { filename: string; content: string }) => {
     zip.file(file.filename, file.content);
   });
 

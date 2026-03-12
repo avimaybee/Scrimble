@@ -28,7 +28,8 @@ import type {
 } from './builder-profile';
 
 const API_BASE = '/api';
-const REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_REQUEST_TIMEOUT_MESSAGE = 'This is taking longer than expected. Check your connection and try again.';
 
 export type GenerationStreamConnectionState = 'connecting' | 'live' | 'reconnecting' | 'closed';
 
@@ -108,6 +109,11 @@ interface StreamStepEnrichmentOptions {
   onOutput?: (output: string) => void;
 }
 
+interface APIRequestOptions extends RequestInit {
+  timeoutMs?: number | null;
+  timeoutMessage?: string;
+}
+
 const generationBatchLabels: Record<ProjectGenerationBatchStartEvent['batch'], string> = {
   batch_1_research_stack: 'Identifying your stack',
   batch_2_fetch_and_read: 'Reading the docs',
@@ -152,7 +158,14 @@ function extractStepEnrichmentStreamText(parsed: unknown): string {
   return '';
 }
 
-async function fetchAPI<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+function withoutClientTimeout(options: APIRequestOptions = {}): APIRequestOptions {
+  return {
+    timeoutMs: null,
+    ...options,
+  };
+}
+
+async function fetchAPI<T>(endpoint: string, options: APIRequestOptions = {}): Promise<T> {
   const response = await fetchWithAuth(endpoint, options);
 
   if (response.status === 204) {
@@ -162,30 +175,44 @@ async function fetchAPI<T>(endpoint: string, options: RequestInit = {}): Promise
   return response.json() as Promise<T>;
 }
 
-async function fetchWithAuth(endpoint: string, options: RequestInit = {}): Promise<Response> {
+async function fetchWithAuth(endpoint: string, options: APIRequestOptions = {}): Promise<Response> {
   const user = auth.currentUser;
   if (!user) {
     throw new Error('Your session expired. Sign in again to keep going.');
   }
 
+  const {
+    headers,
+    signal,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    timeoutMessage = DEFAULT_REQUEST_TIMEOUT_MESSAGE,
+    ...requestInit
+  } = options;
   const token = await user.getIdToken();
   const controller = new AbortController();
   let didTimeout = false;
-  const timeoutId = window.setTimeout(() => {
-    didTimeout = true;
-    controller.abort();
-  }, REQUEST_TIMEOUT_MS);
+  let timeoutId: number | null = null;
+  if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+    timeoutId = window.setTimeout(() => {
+      didTimeout = true;
+      controller.abort();
+    }, timeoutMs);
+  }
   const abortListener = () => controller.abort();
-  options.signal?.addEventListener('abort', abortListener, { once: true });
+  if (signal?.aborted) {
+    controller.abort();
+  } else {
+    signal?.addEventListener('abort', abortListener, { once: true });
+  }
 
   try {
     const response = await fetch(`${API_BASE}${endpoint}`, {
-      ...options,
+      ...requestInit,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
-        ...options.headers,
+        ...headers,
       },
     });
 
@@ -204,20 +231,22 @@ async function fetchWithAuth(endpoint: string, options: RequestInit = {}): Promi
 
     return response;
   } catch (error) {
-    if (options.signal?.aborted) {
+    if (signal?.aborted && !didTimeout) {
       throw error;
     }
 
     if (didTimeout) {
-      throw new Error('This is taking longer than expected. Check your connection and try again.');
+      throw new Error(timeoutMessage);
     }
 
     throw error instanceof Error
       ? error
       : new Error('Something went wrong while talking to Scrimble.');
   } finally {
-    window.clearTimeout(timeoutId);
-    options.signal?.removeEventListener('abort', abortListener);
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+    signal?.removeEventListener('abort', abortListener);
   }
 }
 
@@ -261,17 +290,17 @@ export const dbService = {
   },
 
   async startProjectIntake(payload: IntakeStartPayload): Promise<ProjectIntakeSession> {
-    return fetchAPI<ProjectIntakeSession>('/intake/start', {
+    return fetchAPI<ProjectIntakeSession>('/intake/start', withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }));
   },
 
   async respondToProjectIntake(projectId: string, payload: IntakeRespondPayload): Promise<ProjectIntakeSession> {
-    return fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/respond`, {
+    return fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/respond`, withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }));
   },
 
   async confirmProjectIntake(projectId: string, payload: IntakeConfirmPayload = {}): Promise<{
@@ -349,14 +378,14 @@ export const dbService = {
       options.onConnectionStateChange?.(hasEstablishedConnection ? 'reconnecting' : 'connecting');
 
       try {
-        const response = await fetchWithAuth(`/projects/${projectId}/generation-stream`, {
+        const response = await fetchWithAuth(`/projects/${projectId}/generation-stream`, withoutClientTimeout({
           method: 'GET',
           headers: {
             Accept: 'text/event-stream',
             ...(lastEventId > 0 ? { 'Last-Event-ID': `${lastEventId}` } : {}),
           },
           signal: options.signal,
-        });
+        }));
 
         if (!response.ok) {
           const errorBody = await response.json().catch(() => null) as { error?: string } | null;
@@ -600,14 +629,14 @@ export const dbService = {
     payload: StepEnrichmentPayload,
     options: StreamStepEnrichmentOptions = {},
   ): Promise<string> {
-    const response = await fetchWithAuth(`/steps/${stepId}/enrich`, {
+    const response = await fetchWithAuth(`/steps/${stepId}/enrich`, withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify(payload),
       signal: options.signal,
       headers: {
         Accept: 'text/event-stream',
       },
-    });
+    }));
 
     const reader = response.body?.getReader();
     if (!reader) {
@@ -715,13 +744,13 @@ export const dbService = {
     payload: { message: string; providerId?: string; driftResolution?: 'apply_now' | 'save_for_later' },
     options: UpdateWorkflowOptions = {},
   ): Promise<WorkflowUpdateResult> {
-    const response = await fetchWithAuth(`/workflows/${workflowId}/update`, {
+    const response = await fetchWithAuth(`/workflows/${workflowId}/update`, withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify(payload),
       headers: {
         Accept: 'text/event-stream',
       },
-    });
+    }));
 
     if (!response.ok) {
       const errorBody = (await response.json().catch(() => null)) as {

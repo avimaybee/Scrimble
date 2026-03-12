@@ -156,6 +156,9 @@ export class ProjectGeneratorDO {
   ) {
     const delaySeconds = Math.max(1, error.delaySeconds || 1);
     const retryMessage = error.message || 'Temporary provider issue. Retrying automatically.';
+    const retryNotice =
+      `${retryMessage} Retrying automatically in ${delaySeconds} second${delaySeconds === 1 ? '' : 's'} `
+      + `(${attempts}/${MAX_PROJECT_GENERATION_RETRY_ATTEMPTS}).`;
 
     await this.state.storage.put<ScheduledRetry>(RETRY_STORAGE_KEY, {
       action,
@@ -164,26 +167,45 @@ export class ProjectGeneratorDO {
     });
     await this.state.storage.setAlarm(Date.now() + (delaySeconds * 1000));
 
-    await this.env.DB.prepare(`
-      UPDATE projects
-      SET generation_error = NULL,
-          generation_completed_at = NULL,
-          generation_heartbeat_at = datetime("now"),
-          updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(message.projectId)
-      .run();
+    const persistenceResults = await Promise.allSettled([
+      this.env.DB.prepare(`
+        UPDATE projects
+        SET generation_error = NULL,
+            generation_completed_at = NULL,
+            generation_heartbeat_at = datetime("now"),
+            updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(message.projectId)
+        .run(),
+      persistGenerationStreamEvent(this.env, {
+        projectId: message.projectId,
+        event: {
+          type: 'activity',
+          icon: '⚠️',
+          message: retryNotice,
+          timestamp: new Date().toISOString(),
+        },
+      }),
+    ]);
 
-    await persistGenerationStreamEvent(this.env, {
-      projectId: message.projectId,
-      event: {
-        type: 'activity',
-        icon: '⚠️',
-        message: `${retryMessage} Retrying automatically in ${delaySeconds} second${delaySeconds === 1 ? '' : 's'} (${attempts}/${MAX_PROJECT_GENERATION_RETRY_ATTEMPTS}).`,
-        timestamp: new Date().toISOString(),
-      },
-    });
+    const failedPersistence = persistenceResults
+      .map((result, index) => ({ index, result }))
+      .filter((entry): entry is { index: number; result: PromiseRejectedResult } => entry.result.status === 'rejected');
+
+    if (failedPersistence.length > 0) {
+      console.warn('[PROJECT_GENERATOR_DO] Scheduled retry but failed to persist all retry metadata.', {
+        action,
+        attempts,
+        delaySeconds,
+        projectId: message.projectId,
+        runId: message.runId,
+        failures: failedPersistence.map((entry) => ({
+          target: entry.index === 0 ? 'project-heartbeat' : 'generation-event',
+          error: entry.result.reason instanceof Error ? entry.result.reason.message : String(entry.result.reason),
+        })),
+      });
+    }
 
     console.warn('[PROJECT_GENERATOR_DO] Scheduled retryable pipeline rerun.', {
       action,

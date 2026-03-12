@@ -31,9 +31,8 @@ import type {
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 const MAX_VISIBLE_RESEARCH_SOURCES = 5;
-const DEFAULT_TOTAL_ESTIMATE_MS = 12 * 60_000;
-const DEFAULT_BATCH_ESTIMATE_MS = 2 * 60_000;
-const QUIET_CHECK_IN_THRESHOLD_MS = 90_000;
+const RUNNER_WAITING_LABEL_THRESHOLD_MS = 60_000;
+const MANUAL_RUNNER_CHECK_THRESHOLD_MS = 10 * 60_000;
 const automaticRecoveryAttempts = new Set<string>();
 
 const generationBatches: Array<{
@@ -135,25 +134,21 @@ function pickLatestTimestamp(...values: Array<string | null | undefined>) {
   return latest;
 }
 
-function formatEtaLabel(remainingMs: number | null) {
-  if (remainingMs === null) {
-    return 'Estimating the time left...';
+function formatDurationShort(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
   }
 
-  if (remainingMs <= 45_000) {
-    return 'Less than a minute left';
+  if (minutes > 0) {
+    return minutes < 10 && seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
   }
 
-  const minutes = Math.round(remainingMs / 60_000);
-  if (minutes < 60) {
-    return `About ${minutes} min left`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return remainingMinutes > 0
-    ? `About ${hours}h ${remainingMinutes}m left`
-    : `About ${hours}h left`;
+  return `${seconds}s`;
 }
 
 function getConnectionMeta(
@@ -164,28 +159,28 @@ function getConnectionMeta(
     return {
       label: 'Recovering',
       chipClass: 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
-      copy: 'Restarting from the last safe checkpoint.',
+      copy: 'Requesting a resume from the latest completed checkpoint.',
     };
   }
 
   switch (state) {
     case 'live':
       return {
-        label: 'Live',
+        label: 'Live feed',
         chipClass: 'border-[rgba(52,211,153,0.2)] bg-[rgba(52,211,153,0.1)] text-status-secure',
-        copy: 'Everything is still moving. You can leave this page if you want.',
+        copy: 'Streaming runner events as they happen.',
       };
     case 'reconnecting':
       return {
         label: 'Reconnecting',
         chipClass: 'border-border-default bg-bg-elevated/50 text-text-secondary',
-        copy: 'Pulling the live feed back in now.',
+        copy: 'Pulling the live runner feed back in now.',
       };
     case 'closed':
       return {
         label: 'Closed',
         chipClass: 'border-border-default bg-bg-elevated/50 text-text-secondary',
-        copy: 'The live feed is closed.',
+        copy: 'The live runner feed is closed.',
       };
     case 'connecting':
     default:
@@ -697,36 +692,19 @@ export default function ProjectGeneration() {
     ? Math.max(0, clockNow - (toTimestampMs(latestProgressTimestamp) || clockNow))
     : 0;
   const connectionMeta = getConnectionMeta(streamConnectionState, isAutoRecovering);
-  const observedDurations = completedEvents
-    .map((event) => event.duration_ms)
-    .filter((duration): duration is number => typeof duration === 'number' && Number.isFinite(duration));
-  const averageBatchDurationMs = observedDurations.length > 0
-    ? observedDurations.reduce((total, duration) => total + duration, 0) / observedDurations.length
-    : DEFAULT_BATCH_ESTIMATE_MS;
-  const startedAtMs = toTimestampMs(project?.generation_started_at);
-  const estimatedTotalMs = observedDurations.length > 0
-    ? Math.max(DEFAULT_TOTAL_ESTIMATE_MS / 2, averageBatchDurationMs * generationBatches.length)
-    : DEFAULT_TOTAL_ESTIMATE_MS;
-  const elapsedMs = startedAtMs !== null
-    ? Math.max(0, clockNow - startedAtMs)
-    : completedBatchCount * averageBatchDurationMs;
-  const remainingBatchFloorMs = status?.is_complete
-    ? 0
-    : Math.max(15_000, (generationBatches.length - completedBatchCount) * 15_000);
-  const estimatedRemainingMs = showReviewPanel
-    ? null
-    : status?.is_complete
-      ? 0
-      : Math.max(remainingBatchFloorMs, estimatedTotalMs - elapsedMs);
-  const estimatedRemainingLabel = showReviewPanel
-    ? 'Waiting for your review'
-    : formatEtaLabel(estimatedRemainingMs);
   const showManualCheckIn =
-    quietDurationMs >= QUIET_CHECK_IN_THRESHOLD_MS &&
+    quietDurationMs >= MANUAL_RUNNER_CHECK_THRESHOLD_MS &&
     !status?.is_failed &&
     !showReviewPanel &&
     !status?.is_complete &&
+    streamConnectionState === 'live' &&
     !showResumeBadge &&
+    !isAutoRecovering;
+  const showReconnectFeed =
+    streamConnectionState !== 'live' &&
+    !status?.is_failed &&
+    !showReviewPanel &&
+    !status?.is_complete &&
     !isAutoRecovering;
   const autoRecoveryKey = `${id ?? 'unknown'}:${status?.generation_run_id ?? status?.generation_status ?? 'pending'}:${completedBatchCount}`;
 
@@ -739,6 +717,38 @@ export default function ProjectGeneration() {
     message: getPlaceholderMessage(status, currentBatch.id),
     timestamp: project?.generation_started_at ?? new Date(0).toISOString(),
   };
+  const quietDurationLabel = quietDurationMs > 0 ? formatDurationShort(quietDurationMs) : null;
+  const stageCounterLabel = status?.is_complete
+    ? `${generationBatches.length} of ${generationBatches.length} stages complete`
+    : `${completedBatchCount} of ${generationBatches.length} stages complete`;
+  const runnerStatusHeadline = showReviewPanel
+    ? 'Waiting for your review'
+    : status?.is_complete
+      ? 'Generation finished'
+      : status?.is_failed
+        ? 'Runner needs attention'
+        : isAutoRecovering
+          ? 'Requesting a checkpoint resume'
+          : streamConnectionState === 'reconnecting'
+            ? 'Reconnecting to live runner events'
+            : streamConnectionState === 'connecting'
+              ? 'Connecting to live runner events'
+              : streamConnectionState === 'closed'
+                ? 'Live runner feed paused'
+                : liveActivity.kind === 'thinking'
+                  ? 'Receiving model reasoning'
+                  : quietDurationMs >= RUNNER_WAITING_LABEL_THRESHOLD_MS
+                    ? 'Waiting on the current model or tool call'
+                    : `Stage ${Math.min(resolvedCurrentBatchIndex + 1, generationBatches.length)} is actively running`;
+  const runnerStatusDetail = showReviewPanel
+    ? 'Approve the architecture when it looks right, then Scrimble will continue immediately.'
+    : status?.is_complete
+      ? 'All generation stages are done and the final project handoff is ready.'
+      : quietDurationMs >= RUNNER_WAITING_LABEL_THRESHOLD_MS && streamConnectionState === 'live'
+        ? `No fixed ETA while this call is in flight${quietDurationLabel ? ` · last runner signal ${quietDurationLabel} ago` : ''}.`
+        : quietDurationLabel
+          ? `Last runner signal ${quietDurationLabel} ago.`
+          : 'Fresh runner updates will appear here as soon as they are emitted.';
 
   const preparationBadges = useMemo(() => {
     if (!generationPreparation) {
@@ -848,6 +858,12 @@ export default function ProjectGeneration() {
     }
   }, [id, preferredIde, reviewFeedback, syncProjectState]);
 
+  const reconnectLiveFeed = useCallback(() => {
+    setError('');
+    setStreamConnectionState('connecting');
+    setStreamConnectionKey((previous) => previous + 1);
+  }, []);
+
   const requestResume = useCallback(async (mode: 'automatic' | 'manual') => {
     if (!id || isResuming) {
       return;
@@ -866,7 +882,7 @@ export default function ProjectGeneration() {
       noteProgressTimestamp(new Date().toISOString());
       toast.success(
         mode === 'automatic'
-          ? 'I hit a snag, so I restarted from the last safe checkpoint.'
+          ? 'The runner stayed quiet for too long, so I asked Scrimble to resume from the last completed checkpoint.'
           : 'Resuming generation pipeline...',
       );
       setShowResumeBadge(false);
@@ -906,14 +922,15 @@ export default function ProjectGeneration() {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Failed to nudge.';
       if (errMsg.includes('still active')) {
-        toast.info('Everything is still moving. There was nothing to restart.');
+        reconnectLiveFeed();
+        toast.info('The runner is still active. I refreshed the live feed instead of restarting anything.');
       } else {
         toast.error(errMsg);
       }
     } finally {
       setIsNudging(false);
     }
-  }, [id, isNudging, noteProgressTimestamp]);
+  }, [id, isNudging, noteProgressTimestamp, reconnectLiveFeed]);
 
   useEffect(() => {
     if (!showResumeBadge || autoRecoveryFailed || isAutoRecovering || isResuming) {
@@ -1357,14 +1374,65 @@ export default function ProjectGeneration() {
                 </motion.h1>
               </AnimatePresence>
 
+              <div className="mb-6 w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                      Stage progress
+                    </div>
+                    <div className="mt-2 font-serif text-[24px] tracking-[-0.02em] text-text-primary">
+                      {stageCounterLabel}
+                    </div>
+                    <div className="mt-2 font-sans text-[13px] leading-6 text-text-secondary">
+                      {runnerStatusHeadline}
+                    </div>
+                    <div className="font-sans text-[12px] leading-5 text-text-tertiary">
+                      {runnerStatusDetail}
+                    </div>
+                  </div>
+                  <div className="rounded-[12px] border border-border-subtle bg-bg-base/60 px-3 py-2 text-right">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Current stage</div>
+                    <div className="mt-1 font-sans text-[13px] font-medium text-text-primary">
+                      {status?.is_complete ? 'Complete' : `${Math.min(resolvedCurrentBatchIndex + 1, generationBatches.length)} / ${generationBatches.length}`}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid grid-cols-6 gap-2">
+                  {generationBatches.map((batch, index) => {
+                    const isComplete = index < completedBatchCount || status?.is_complete;
+                    const isCurrent = !isComplete && index === resolvedCurrentBatchIndex && !status?.is_failed;
+
+                    return (
+                      <div key={`progress-${batch.id}`} className="space-y-2">
+                        <div className="relative h-2 overflow-hidden rounded-full bg-bg-base">
+                          {isComplete ? (
+                            <div className="h-full w-full rounded-full bg-status-secure" />
+                          ) : isCurrent ? (
+                            <motion.div
+                              className="absolute inset-y-0 left-[-30%] w-1/2 rounded-full bg-[linear-gradient(90deg,rgba(235,94,40,0),rgba(235,94,40,0.95),rgba(235,94,40,0))]"
+                              animate={{ x: ['0%', '190%'] }}
+                              transition={{ duration: 1.6, ease: 'easeInOut', repeat: Infinity }}
+                            />
+                          ) : null}
+                        </div>
+                        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-tertiary">
+                          {batch.shortLabel}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               {status?.is_failed && showResumeBadge && !autoRecoveryFailed ? (
                 <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">
                   <div className="flex items-start gap-3">
                     <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Getting the build back on track</div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Rechecking the runner</div>
                       <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        I saw the run stop, so I&apos;m restarting it from the last safe checkpoint now.
+                        The last runner heartbeat went quiet, so I&apos;m asking Scrimble to resume from the last completed checkpoint.
                       </p>
                     </div>
                   </div>
@@ -1374,12 +1442,12 @@ export default function ProjectGeneration() {
                   <div className="flex items-start gap-3">
                     <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The plan builder hit a snag</div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The generation runner needs attention</div>
                       <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
                         {error || status.generation_error || 'Project generation failed.'}
                       </p>
                       <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
-                        I keep durable checkpoints as I go, so restarting picks up from the last safe place instead of starting over.
+                        Durable checkpoints are preserved as each stage completes, so resuming picks up from the latest finished checkpoint instead of starting over.
                       </p>
                     </div>
                   </div>
@@ -1396,9 +1464,9 @@ export default function ProjectGeneration() {
                   <div className="flex items-start gap-3">
                     <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Getting the build back on track</div>
+                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Rechecking the runner</div>
                       <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        I saw the run stall, so I&apos;m restarting it from the last safe checkpoint now.
+                        The runner stayed quiet for longer than expected, so I&apos;m requesting a checkpoint resume now.
                       </p>
                     </div>
                   </div>
@@ -1408,7 +1476,7 @@ export default function ProjectGeneration() {
                   <div className="w-full rounded-[16px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
                     <div className="border-b border-border-subtle pb-4">
                       <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                        Currently working
+                        Live transcript
                       </div>
                       <AnimatePresence mode="wait" initial={false}>
                         <motion.div
@@ -1428,8 +1496,10 @@ export default function ProjectGeneration() {
                           <span
                             title={formatFeedMessage(liveActivity, { prefixThinking: false })}
                             className={cn(
-                              'block min-w-0 flex-1 truncate text-[14px] leading-6 text-text-primary',
-                              liveActivity.kind === 'thinking' ? 'font-mono' : 'font-sans font-medium tracking-[-0.01em]',
+                              'block min-w-0 flex-1 whitespace-pre-wrap break-words text-[14px] leading-6 text-text-primary',
+                              liveActivity.kind === 'thinking'
+                                ? 'max-h-[168px] overflow-y-auto rounded-[12px] bg-bg-base/52 px-3 py-3 font-mono text-[13px] text-text-primary/92'
+                                : 'font-sans font-medium tracking-[-0.01em]',
                             )}
                           >
                             {formatFeedMessage(liveActivity, { prefixThinking: false })}
@@ -1460,7 +1530,7 @@ export default function ProjectGeneration() {
                       </span>
                       <span className="text-[12px] text-text-muted">{connectionMeta.copy}</span>
                       <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
-                      <span className="text-[12px] text-text-muted">{estimatedRemainingLabel}</span>
+                      <span className="text-[12px] text-text-muted">{runnerStatusHeadline}</span>
                       {latestProgressTimestamp ? (
                         <>
                           <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
@@ -1476,7 +1546,16 @@ export default function ProjectGeneration() {
                           disabled={isNudging}
                           className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary disabled:opacity-50"
                         >
-                          {isNudging ? 'Checking in...' : 'Check in'}
+                          {isNudging ? 'Checking runner...' : 'Check runner'}
+                        </button>
+                      ) : null}
+                      {showReconnectFeed ? (
+                        <button
+                          type="button"
+                          onClick={reconnectLiveFeed}
+                          className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary"
+                        >
+                          Reconnect feed
                         </button>
                       ) : null}
                     </div>
@@ -1520,35 +1599,6 @@ export default function ProjectGeneration() {
                     </div>
                   </div>
 
-                  <div className="mt-8 w-full px-1">
-                    <div className="relative mx-auto flex w-full items-start justify-between">
-                      <div className="absolute left-[8%] right-[8%] top-[11px] h-px bg-border-default" />
-                      {generationBatches.map((batch, index) => {
-                        const isComplete = index < completedBatchCount || status?.is_complete;
-                        const isCurrent = !isComplete && index === resolvedCurrentBatchIndex && !status?.is_failed;
-
-                        return (
-                          <div key={batch.id} className="relative z-10 flex flex-1 flex-col items-center gap-3">
-                            <div
-                              className={cn(
-                                'h-[22px] w-[22px] rounded-full border transition-all duration-300',
-                                isComplete
-                                  ? 'border-status-secure bg-status-secure shadow-[0_0_0_4px_rgba(16,185,129,0.12)]'
-                                  : isCurrent
-                                    ? 'border-accent-primary bg-accent-primary shadow-[0_0_18px_rgba(235,94,40,0.45)]'
-                                    : 'border-border-default bg-bg-base',
-                              )}
-                            />
-                            <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-tertiary">
-                              {batch.shortLabel}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-
                   {error && !showResumeBadge ? (
                     <div className="mt-4 flex items-center gap-2 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-status-warning">
                       <TriangleAlert className="h-4 w-4" />
@@ -1564,7 +1614,7 @@ export default function ProjectGeneration() {
                     >
                       <div className="flex items-center gap-2 font-sans text-[13px] text-text-secondary">
                         <TriangleAlert className="h-4 w-4 text-accent-primary" />
-                        <span>{status?.is_failed ? 'Build stopped before finishing.' : 'Build seems stalled.'}</span>
+                        <span>{status?.is_failed ? 'The runner stopped before finishing.' : 'The runner stayed quiet for too long.'}</span>
                       </div>
                       <button
                         onClick={handleResume}

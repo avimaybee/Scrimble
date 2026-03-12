@@ -6,6 +6,7 @@ import {
   Batch4PlanBuildSchema,
   Batch5EnrichStepsSchema,
   Batch6GenerateFilesSchema,
+  getSkillFileSortIndex,
   SKILL_FILE_NAMES,
   type Batch1ResearchStack,
   type Batch2FetchAndRead,
@@ -13,6 +14,7 @@ import {
   type Batch4PlanBuild,
   type Batch5EnrichSteps,
   type Batch6GenerateFiles,
+  type SkillFileName,
   schemaDescriptions,
 } from './generation-schemas';
 import {
@@ -270,11 +272,6 @@ export class RetryableGenerationPipelineError extends GenerationPipelineError {
 
 type BatchExecutionResult = 'complete' | 'checkpointed';
 
-type Batch1CheckpointData = {
-  technologies: Batch1ResearchStack['technologies'];
-  technologiesWithSearches: Batch1ResearchStack['technologies'];
-};
-
 type Batch2CheckpointData = {
   researchTargets: ResearchTechnologyTarget[];
   fetchedSources: FetchedTechnologyResearch[];
@@ -312,13 +309,11 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
   'batch_6_generate_files',
 ]);
 
-export const GENERATION_STALE_MS = 2 * 60 * 1000;
-export const QUEUED_GENERATION_RESUME_MS = GENERATION_STALE_MS;
+export const GENERATION_STALE_MS = 15 * 60 * 1000;
+export const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
 export const MAX_PROJECT_GENERATION_RETRY_ATTEMPTS = 3;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
-const BATCH1_CHECKPOINT_ITEM_INTERVAL = 20;
-const BATCH1_CHECKPOINT_SUBREQUEST_LIMIT = 30;
-const BATCH1_ESTIMATED_SUBREQUESTS_PER_TECH = 2;
+const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
 const MAX_BATCH2_RESEARCH_TARGETS = 10;
 const MAX_INFERRED_BATCH2_RESEARCH_TARGETS = 6;
@@ -340,6 +335,25 @@ const batchSequenceIndexes = Object.fromEntries(
 
 export function getBatchCompletionMessage(batchName: GenerationBatchName) {
   return batchCompletionMessages[batchName];
+}
+
+function getBatchWorkDescription(batchName: GenerationBatchName) {
+  switch (batchName) {
+    case 'batch_1_research_stack':
+      return 'infer the implementation stack from your brief';
+    case 'batch_2_fetch_and_read':
+      return 'read the most relevant docs, repositories, and release notes';
+    case 'batch_3_architect':
+      return 'turn the research into an architecture decision record';
+    case 'batch_4_plan_build':
+      return 'turn the approved architecture into a staged implementation plan';
+    case 'batch_5_enrich_steps':
+      return 'write concrete implementation details for each step';
+    case 'batch_6_generate_files':
+      return 'prepare the downloadable AI companion files';
+    default:
+      return 'finish the current generation pass';
+  }
 }
 
 function asText(value: unknown, fallback = ''): string {
@@ -524,6 +538,18 @@ function dedupeSearchResults(results: SearchResult[]) {
   });
 }
 
+function normalizeStoredSearchResults(results: Array<Partial<SearchResult>> | undefined) {
+  return dedupeSearchResults(
+    (results || [])
+      .map((result) => ({
+        title: result.title || 'Untitled source',
+        url: result.url || '',
+        description: result.description || '',
+      }))
+      .filter((result) => Boolean(result.url)),
+  );
+}
+
 function dedupeResearchSources(sources: Batch2FetchAndRead['sources']) {
   const seen = new Set<string>();
 
@@ -581,15 +607,26 @@ function targetsOverlap(left: string[], right: string[]) {
   );
 }
 
+function toResearchTechnologyTarget(
+  technology: Partial<Batch1ResearchStack['technologies'][number]>,
+  source: ResearchTechnologyTarget['source'],
+  docsTopic: string,
+): ResearchTechnologyTarget {
+  return {
+    name: technology.name || 'Unknown technology',
+    docs_url: technology.docs_url || '',
+    github_url: technology.github_url || '',
+    changelog_url: technology.changelog_url || '',
+    docs_topic: docsTopic,
+    community_search_results: normalizeStoredSearchResults(technology.community_search_results),
+    breaking_change_search_results: normalizeStoredSearchResults(technology.breaking_change_search_results),
+    source,
+  };
+}
+
 function limitBatch1Technologies(technologies: Batch1ResearchStack['technologies']) {
   const uniqueTechnologies = dedupeResearchTargets(
-    technologies.map((technology) => ({
-      ...technology,
-      docs_topic: '',
-      community_search_results: [],
-      breaking_change_search_results: [],
-      source: 'inferred' as const,
-    })),
+    technologies.map((technology) => toResearchTechnologyTarget(technology, 'inferred', '')),
   );
 
   return uniqueTechnologies.slice(0, MAX_BATCH1_TECHNOLOGIES).map((technology) => ({
@@ -662,11 +699,13 @@ function buildResearchTargets(
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
 ) {
-  const inferredTargets: ResearchTechnologyTarget[] = inferredTechnologies.map((technology) => ({
-    ...technology,
-    docs_topic: 'installation, migration, compatibility, breaking changes, best practices',
-    source: 'inferred',
-  }));
+  const inferredTargets: ResearchTechnologyTarget[] = inferredTechnologies.map((technology) =>
+    toResearchTechnologyTarget(
+      technology,
+      'inferred',
+      'installation, migration, compatibility, breaking changes, best practices',
+    ),
+  );
 
   const briefTargets: ResearchTechnologyTarget[] = projectBrief.confirmedStackTools.map((technology) => {
     const researchUrls = getBuilderProfileResearchUrls(technology);
@@ -1271,6 +1310,241 @@ function mergePlanWithEnrichments(plan: Batch4PlanBuild, enrichments: Batch5Enri
   };
 }
 
+function makeUniquePlanId(value: string, fallbackPrefix: string, index: number, seen: Set<string>) {
+  const base = normalizeBuilderProfileName(value) || `${fallbackPrefix}-${index + 1}`;
+  let candidate = base;
+  let suffix = 2;
+
+  while (seen.has(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+
+  seen.add(candidate);
+  return candidate;
+}
+
+function normalizePlanStructure(plan: Batch4PlanBuild): Batch4PlanBuild {
+  const seenStageIds = new Set<string>();
+  const seenStepIds = new Set<string>();
+  const seenChecklistIds = new Set<string>();
+  const seenEdgeIds = new Set<string>();
+  const stepIdMap = new Map<string, string>();
+  let globalStepIndex = 0;
+
+  const stages = plan.stages.map((stage, stageIndex) => {
+    const stageId = makeUniquePlanId(stage.id, 'stage', stageIndex, seenStageIds);
+    const steps = stage.steps.map((step, stepIndex) => {
+      const normalizedStepId = makeUniquePlanId(
+        step.id || `${stageId}-step-${stepIndex + 1}`,
+        'step',
+        globalStepIndex,
+        seenStepIds,
+      );
+      if (step.id) {
+        stepIdMap.set(step.id, normalizedStepId);
+      }
+
+      const checklist = step.checklist.map((item, checklistIndex) => ({
+        ...item,
+        id: makeUniquePlanId(
+          item.id || `${normalizedStepId}-check-${checklistIndex + 1}`,
+          'check',
+          checklistIndex,
+          seenChecklistIds,
+        ),
+        label: item.label || `Check ${checklistIndex + 1}`,
+      }));
+
+      globalStepIndex += 1;
+
+      return {
+        ...step,
+        id: normalizedStepId,
+        checklist,
+      };
+    });
+
+    return {
+      ...stage,
+      id: stageId,
+      order_index: Number.isFinite(stage.order_index) ? stage.order_index : stageIndex,
+      steps,
+    };
+  });
+
+  const validStepIds = new Set(stages.flatMap((stage) => stage.steps.map((step) => step.id)));
+  const edges: Batch4PlanBuild['edges'] = [];
+  for (const [index, edge] of plan.edges.entries()) {
+    const sourceStepId = stepIdMap.get(edge.source_step_id) || edge.source_step_id;
+    const targetStepId = stepIdMap.get(edge.target_step_id) || edge.target_step_id;
+
+    if (!sourceStepId || !targetStepId || sourceStepId === targetStepId) {
+      continue;
+    }
+
+    if (!validStepIds.has(sourceStepId) || !validStepIds.has(targetStepId)) {
+      continue;
+    }
+
+    edges.push({
+      ...edge,
+      id: makeUniquePlanId(
+        edge.id || `${sourceStepId}-to-${targetStepId}`,
+        'edge',
+        index,
+        seenEdgeIds,
+      ),
+      source_step_id: sourceStepId,
+      target_step_id: targetStepId,
+      edge_type: edge.edge_type || 'default',
+    });
+  }
+
+  return {
+    ...plan,
+    stages,
+    edges,
+  };
+}
+
+function buildFallbackStepEnrichmentBody(step: Batch5ResearchStep) {
+  return [
+    `${step.title} still needs a final AI write-up, so Scrimble preserved the core execution guidance instead of blocking the workflow.`,
+    step.objective ? `Goal: ${step.objective}` : 'Goal: Complete this part of the build using the approved architecture and current plan.',
+    step.why_it_matters ? `Why it matters: ${step.why_it_matters}` : '',
+    step.done_when ? `Done when: ${step.done_when}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function normalizePromptCards(prompts: Batch5EnrichSteps['enrichments'][number]['prompts']) {
+  return prompts.filter((prompt) => prompt.label.trim() && prompt.content.trim());
+}
+
+function ensureCompleteStepEnrichments(
+  steps: Batch5ResearchStep[],
+  stepResearchById: Map<string, StepResearchContext>,
+  enrichments: Batch5EnrichSteps['enrichments'],
+): Batch5EnrichSteps['enrichments'] {
+  const enrichmentById = new Map<string, Batch5EnrichSteps['enrichments'][number]>();
+
+  for (const enrichment of enrichments) {
+    if (!enrichment.step_id || enrichmentById.has(enrichment.step_id)) {
+      continue;
+    }
+
+    enrichmentById.set(enrichment.step_id, {
+      step_id: enrichment.step_id,
+      ai_output: enrichment.ai_output.trim(),
+      prompts: normalizePromptCards(enrichment.prompts),
+    });
+  }
+
+  return steps.map((step) => {
+    const footer =
+      stepResearchById.get(step.id)?.footer
+      || `Researched ${new Date().toISOString().slice(0, 10)} — connect more tools in Settings for deeper results.`;
+    const existing = enrichmentById.get(step.id);
+    const body = existing?.ai_output || buildFallbackStepEnrichmentBody(step);
+
+    return {
+      step_id: step.id,
+      ai_output: appendResearchFooter(body, footer),
+      prompts: existing?.prompts || [],
+    };
+  });
+}
+
+function normalizeGeneratedFileName(value: string): SkillFileName | null {
+  return SKILL_FILE_NAMES.includes(value as SkillFileName) ? (value as SkillFileName) : null;
+}
+
+function buildFallbackGeneratedFileContent(filename: SkillFileName) {
+  switch (filename) {
+    case '.cursor/rules/scrimble-project.mdc':
+      return [
+        '---',
+        'description: Scrimble fallback project rules',
+        'globs:',
+        'alwaysApply: false',
+        '---',
+        '',
+        'Scrimble could not fully regenerate this file in the last pass.',
+        'Use the approved architecture, plan, and generated context files as the source of truth, then rerun generation when you want a refreshed rules file.',
+      ].join('\n');
+    case 'scrimble-mcp.json':
+      return JSON.stringify({ mcpServers: {} }, null, 2);
+    case '.windsurfrules':
+      return [
+        'Scrimble fallback rules',
+        '',
+        'The latest generation run could not fully rewrite this file.',
+        'Use the approved architecture, the enriched plan, and the downloaded context files as the current source of truth.',
+      ].join('\n');
+    case 'CLAUDE.md':
+    case '.github/copilot-instructions.md':
+    case 'scrimble-context.md':
+    default:
+      return [
+        `# ${filename}`,
+        '',
+        'Scrimble could not fully regenerate this file in the last pass.',
+        'Use the approved architecture, the enriched plan, and the rest of the generated files as the current source of truth, then rerun generation when you want a refreshed version.',
+      ].join('\n');
+  }
+}
+
+async function loadExistingGeneratedFileMap(env: Bindings, projectId: string) {
+  const rows = await env.DB.prepare(`
+    SELECT filename, content
+    FROM project_files
+    WHERE project_id = ?
+  `)
+    .bind(projectId)
+    .all();
+
+  const fileMap = new Map<SkillFileName, string>();
+
+  for (const row of rows.results as Array<{ filename?: unknown; content?: unknown }>) {
+    const filename = normalizeGeneratedFileName(typeof row.filename === 'string' ? row.filename : '');
+    const content = typeof row.content === 'string' ? row.content.trim() : '';
+    if (!filename || !content) {
+      continue;
+    }
+
+    fileMap.set(filename, content);
+  }
+
+  return fileMap;
+}
+
+async function ensureCompleteGeneratedFiles(
+  env: Bindings,
+  projectId: string,
+  files: Batch6GenerateFiles['files'],
+): Promise<Array<{ filename: SkillFileName; content: string }>> {
+  const existingFiles = await loadExistingGeneratedFileMap(env, projectId);
+  const nextFiles = new Map<SkillFileName, string>();
+
+  for (const file of files) {
+    const filename = normalizeGeneratedFileName(file.filename);
+    const content = file.content.trim();
+
+    if (!filename || !content || nextFiles.has(filename)) {
+      continue;
+    }
+
+    nextFiles.set(filename, content);
+  }
+
+  return SKILL_FILE_NAMES.map((filename) => ({
+    filename,
+    content: nextFiles.get(filename) || existingFiles.get(filename) || buildFallbackGeneratedFileContent(filename),
+  }));
+}
+
 function flattenPlanSteps(plan: Batch4PlanBuild): Batch5ResearchStep[] {
   return plan.stages.flatMap((stage) =>
     stage.steps.map((step) => ({
@@ -1494,7 +1768,16 @@ async function loadGenerationCheckpoint<T>(
 
   const data = await loadJsonPayload<T>(env, typedRecord.payload_inline, typedRecord.payload_r2_key);
   if (!data) {
-    throw new GenerationPipelineError(`Checkpoint payload for ${batchName} is missing.`);
+    console.error('[GENERATION_CHECKPOINT] Missing or unreadable checkpoint payload.', {
+      projectId,
+      runId,
+      batchName,
+      hasInlinePayload: Boolean(typedRecord.payload_inline),
+      payloadR2Key: typedRecord.payload_r2_key,
+    });
+    throw new GenerationPipelineError(
+      `Checkpoint data for ${batchName} is unavailable. Resume again to restart from the last safe point.`,
+    );
   }
 
   return {
@@ -1794,7 +2077,10 @@ async function callAITextWithHeartbeat(
   }, HEARTBEAT_TOUCH_INTERVAL_MS);
 
   try {
-    return await callAIText(payload);
+    await touchGenerationHeartbeat(env, projectId);
+    const response = await callAIText(payload);
+    await touchGenerationHeartbeat(env, projectId);
+    return response;
   } finally {
     clearInterval(intervalId);
   }
@@ -2102,6 +2388,15 @@ async function callValidatedBatch<T>(
   const emitter = createThrottledThinkingEmitter(options.env, options.projectId, options.runType);
   try {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
+      await logActivity(options.env, {
+        projectId: options.projectId,
+        batchName: options.runType,
+        kind: 'system',
+        message:
+          attempt === 1
+            ? `Waiting for ${provider.model} to ${getBatchWorkDescription(options.runType)}...`
+            : `Retrying ${getBatchStartLabel(options.runType).toLowerCase()} with a stricter JSON correction pass...`,
+      });
       const { text } = await callAITextWithHeartbeat(options.env, options.projectId, {
         providerType: provider.providerType,
         apiKey: provider.apiKey,
@@ -2110,6 +2405,12 @@ async function callValidatedBatch<T>(
         system: options.systemPrompt,
         prompt,
         onReasoningDelta: emitter.onReasoningDelta,
+      });
+      await logActivity(options.env, {
+        projectId: options.projectId,
+        batchName: options.runType,
+        kind: 'system',
+        message: `Model response received for ${getBatchStartLabel(options.runType).toLowerCase()}. Validating and applying it now...`,
       });
 
       let parsed: unknown;
@@ -2124,6 +2425,12 @@ async function callValidatedBatch<T>(
         );
         lastError = `The AI response for ${options.runType} was not valid JSON.`;
         if (attempt === 1) {
+          await logActivity(options.env, {
+            projectId: options.projectId,
+            batchName: options.runType,
+            kind: 'warning',
+            message: 'The first model reply was not valid JSON, so I asked for a corrected response before continuing.',
+          });
           prompt = containsStreamTransportMarkers(text)
             ? formatTransportRetryPrompt(options.prompt, options.schemaDescription)
             : formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
@@ -2146,6 +2453,12 @@ async function callValidatedBatch<T>(
       lastError = `Validation failed for ${options.runType}: ${validated.error.message}`;
       logBatchResponseFailure(options.runType, 'schema', cleanedText);
       if (attempt === 1) {
+          await logActivity(options.env, {
+            projectId: options.projectId,
+            batchName: options.runType,
+            kind: 'warning',
+            message: 'The first model reply did not match Scrimble’s expected shape, so I requested a corrected version.',
+          });
           prompt = formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
           continue;
       }
@@ -2167,7 +2480,7 @@ async function failBatch(
   input: unknown,
   message: string,
   attemptCount: number,
-) {
+): Promise<never> {
   await insertAgentRun(env, {
     projectId,
     runType,
@@ -2356,11 +2669,15 @@ async function applyStepEnrichments(env: Bindings, projectId: string, enrichment
   await runStatementsInChunks(env.DB, statements);
 }
 
-async function persistGeneratedFiles(env: Bindings, projectId: string, files: Batch6GenerateFiles['files']) {
+async function persistGeneratedFiles(
+  env: Bindings,
+  projectId: string,
+  files: Array<{ filename: SkillFileName; content: string }>,
+) {
   const statements: Array<any> = [env.DB.prepare('DELETE FROM project_files WHERE project_id = ?').bind(projectId)];
 
   const orderedFiles = [...files].sort(
-    (left, right) => SKILL_FILE_NAMES.indexOf(left.filename) - SKILL_FILE_NAMES.indexOf(right.filename),
+    (left, right) => getSkillFileSortIndex(left.filename) - getSkillFileSortIndex(right.filename),
   );
 
   for (const file of orderedFiles) {
@@ -2456,21 +2773,13 @@ async function executeBatch1(
   env: Bindings,
   project: ProjectRecord,
   provider: ProviderConfig,
-  runId: string,
+  _runId: string,
   _builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const input = {
     description: projectBrief.summary || project.description || '',
-  };
-  const currentYear = new Date().getFullYear();
-  const toolEnv: ToolEnv = {
-    ...env,
-    TOOL_CONTEXT: {
-      projectId: project.id,
-      batchName: 'batch_1_research_stack',
-    },
   };
 
   await emitBatchStart(env, project.id, 'batch_1_research_stack');
@@ -2494,45 +2803,21 @@ Identify the stack implied by the idea. For each technology, provide:
 - GitHub repository URL
 - changelog or releases URL
 
-Only include technologies that matter to implementation.`;
+  Only include technologies that matter to implementation.`;
 
   try {
-    const checkpoint = await loadGenerationCheckpoint<Batch1CheckpointData>(
+    const result = await callValidatedBatch(provider, {
       env,
-      project.id,
-      runId,
-      'batch_1_research_stack',
-    );
+      projectId: project.id,
+      runType: 'batch_1_research_stack',
+      systemPrompt,
+      prompt,
+      schema: Batch1ResearchStackSchema,
+      schemaDescription: schemaDescriptions.batch_1_research_stack,
+    });
+    const technologies = limitBatch1Technologies(result.data.technologies);
 
-    if (checkpoint) {
-      await logActivity(env, {
-        projectId: project.id,
-        batchName: 'batch_1_research_stack',
-        kind: 'system',
-        message: `Resuming stack research from technology ${checkpoint.currentIndex + 1}.`,
-      });
-    }
-
-    const result = checkpoint
-      ? {
-          data: {
-            technologies: checkpoint.data.technologies,
-          },
-          rawResponse: JSON.stringify(checkpoint.data.technologies),
-          attemptCount: 1,
-        }
-      : await callValidatedBatch(provider, {
-          env,
-          projectId: project.id,
-          runType: 'batch_1_research_stack',
-          systemPrompt,
-          prompt,
-          schema: Batch1ResearchStackSchema,
-          schemaDescription: schemaDescriptions.batch_1_research_stack,
-        });
-    const technologies = checkpoint?.data.technologies || limitBatch1Technologies(result.data.technologies);
-
-    if (!checkpoint && technologies.length < result.data.technologies.length) {
+    if (technologies.length < result.data.technologies.length) {
       await logActivity(env, {
         projectId: project.id,
         batchName: 'batch_1_research_stack',
@@ -2541,81 +2826,10 @@ Only include technologies that matter to implementation.`;
       });
     }
 
-    const technologiesWithSearches = checkpoint?.data.technologiesWithSearches
-      ? [...checkpoint.data.technologiesWithSearches]
-      : [];
-    const startIndex = checkpoint?.currentIndex ?? 0;
-
-    for (let index = startIndex; index < technologies.length; index += 1) {
-      const processedCount = technologiesWithSearches.length;
-      const hasMoreWork = index < technologies.length;
-      const estimatedSubrequestsUsed = processedCount * BATCH1_ESTIMATED_SUBREQUESTS_PER_TECH;
-
-      if (
-        hasMoreWork
-        && (processedCount > 0 && processedCount % BATCH1_CHECKPOINT_ITEM_INTERVAL === 0
-          || estimatedSubrequestsUsed >= BATCH1_CHECKPOINT_SUBREQUEST_LIMIT)
-      ) {
-        await saveGenerationCheckpoint(env, project.id, runId, 'batch_1_research_stack', index, {
-          technologies,
-          technologiesWithSearches,
-        });
-        await logActivity(env, {
-          projectId: project.id,
-          batchName: 'batch_1_research_stack',
-          kind: 'system',
-          message: `Saved a research checkpoint after ${processedCount} technologies. Continuing from the latest checkpoint...`,
-        });
-        return 'checkpointed';
-      }
-
-      const technology = technologies[index];
-      await logActivity(env, {
-        projectId: project.id,
-        batchName: 'batch_1_research_stack',
-        kind: 'fetch',
-        message: `Checking ${technology.name} community feedback and breaking changes...`,
-      });
-      const [communitySearchResults, breakingChangeSearchResults] = await Promise.all([
-        searchWeb(`${technology.name} vs alternatives ${currentYear}`, project.user_id, toolEnv)
-          .then((results) => dedupeSearchResults(results)),
-        searchWeb(
-          `${technology.name} breaking changes deprecations ${currentYear}`,
-          project.user_id,
-          toolEnv,
-        ).then((results) => dedupeSearchResults(results)),
-      ]);
-
-      if (communitySearchResults.length > 0) {
-        await logActivity(env, {
-          projectId: project.id,
-          batchName: 'batch_1_research_stack',
-          kind: 'fetch',
-          message: `${technology.name} community feedback surfaced ${communitySearchResults.length} comparison source${communitySearchResults.length === 1 ? '' : 's'}.`,
-        });
-      }
-
-      if (breakingChangeSearchResults.length > 0) {
-        await logActivity(env, {
-          projectId: project.id,
-          batchName: 'batch_1_research_stack',
-          kind: 'warning',
-          message: `${technology.name} surfaced ${breakingChangeSearchResults.length} breaking-change or deprecation source${breakingChangeSearchResults.length === 1 ? '' : 's'}.`,
-        });
-      }
-
-      technologiesWithSearches.push({
-        ...technology,
-        community_search_results: communitySearchResults,
-        breaking_change_search_results: breakingChangeSearchResults,
-      });
-    }
-
     const enrichedBatch1 = {
-      technologies: technologiesWithSearches,
+      technologies,
     };
 
-    await clearGenerationCheckpoint(env, project.id, runId, 'batch_1_research_stack');
     await completeBatch(
       env,
       project.id,
@@ -2631,11 +2845,11 @@ Only include technologies that matter to implementation.`;
       projectId: project.id,
       batchName: 'batch_1_research_stack',
       kind: 'complete',
-      message: `Stack candidates identified — ${enrichedBatch1.technologies.length} technologies queued for research.`,
+      message: `Stack candidates identified — ${enrichedBatch1.technologies.length} technologies queued for deeper research next.`,
     });
     return 'complete';
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 4 failed.';
+    const errorMessage = error instanceof Error ? error.message : 'Batch 1 failed.';
     const isRetryable = 
       error instanceof RetryableAIError ||
       errorMessage.includes('Network connection lost') ||
@@ -3156,7 +3370,7 @@ async function executeBatch2(
     const processedCount = index + 1;
     if (
       hasMoreWork &&
-      (processedCount % BATCH1_CHECKPOINT_ITEM_INTERVAL === 0
+      (processedCount % GENERATION_CHECKPOINT_ITEM_INTERVAL === 0
         || subrequestCounter >= MAX_SUBREQUEST_BUDGET - SUBREQUEST_RESERVE)
     ) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
@@ -3488,6 +3702,7 @@ Rules:
       schema: Batch4PlanBuildSchema,
       schemaDescription: schemaDescriptions.batch_4_plan_build,
     });
+    const normalizedPlan = normalizePlanStructure(result.data);
 
     await completeBatch(
       env,
@@ -3495,17 +3710,17 @@ Rules:
       provider,
       'batch_4_plan_build',
       input,
-      result.data,
+      normalizedPlan,
       result.attemptCount,
-      result.data,
+      normalizedPlan,
       Date.now() - startedAt,
     );
-    await materializePlanStructure(env, projectId, result.data);
+    await materializePlanStructure(env, projectId, normalizedPlan);
     await logActivity(env, {
       projectId,
       batchName: 'batch_4_plan_build',
       kind: 'complete',
-      message: `Plan ready — ${result.data.stages.length} stages, ${countPlanSteps(result.data)} steps.`,
+      message: `Plan ready — ${normalizedPlan.stages.length} stages, ${countPlanSteps(normalizedPlan)} steps.`,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Batch 4 failed.';
@@ -3677,14 +3892,11 @@ For each step, obey any requirements array included in the live step research co
       schemaDescription: schemaDescriptions.batch_5_enrich_steps,
     });
     const stepResearchById = new Map(stepResearchContexts.map((context) => [context.stepId, context] as const));
-    const finalEnrichments: Batch5EnrichSteps['enrichments'] = result.data.enrichments.map((enrichment) => ({
-      ...enrichment,
-      ai_output: appendResearchFooter(
-        enrichment.ai_output,
-        stepResearchById.get(enrichment.step_id)?.footer ||
-          `Researched ${new Date().toISOString().slice(0, 10)} — connect more tools in Settings for deeper results.`,
-      ),
-    }));
+    const finalEnrichments = ensureCompleteStepEnrichments(
+      planSteps,
+      stepResearchById,
+      result.data.enrichments,
+    );
     const finalResult: Batch5EnrichSteps = {
       enrichments: finalEnrichments,
     };
@@ -3847,6 +4059,10 @@ ${skillFileProfileInstructions}`;
       schema: Batch6GenerateFilesSchema,
       schemaDescription: schemaDescriptions.batch_6_generate_files,
     });
+    const finalFiles = await ensureCompleteGeneratedFiles(env, projectId, result.data.files);
+    const finalResult: Batch6GenerateFiles = {
+      files: finalFiles,
+    };
 
     await completeBatch(
       env,
@@ -3854,17 +4070,17 @@ ${skillFileProfileInstructions}`;
       provider,
       'batch_6_generate_files',
       input,
-      result.data,
+      finalResult,
       result.attemptCount,
-      result.data.files,
+      finalFiles,
       Date.now() - startedAt,
     );
-    await persistGeneratedFiles(env, projectId, result.data.files);
+    await persistGeneratedFiles(env, projectId, finalFiles);
     await logActivity(env, {
       projectId,
       batchName: 'batch_6_generate_files',
       kind: 'complete',
-      message: `Files prepared — ${result.data.files.length} downloadable artifact${result.data.files.length === 1 ? '' : 's'} ready.`,
+      message: `Files prepared — ${finalFiles.length} downloadable artifact${finalFiles.length === 1 ? '' : 's'} ready.`,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Batch 6 failed.';

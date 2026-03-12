@@ -3,46 +3,112 @@ import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
 import { buildToolsContext } from './user-tools';
 import type { Bindings } from './types';
 
-export const projectBriefV1ScopeSchema = z.object({
-  in: z.array(z.string().trim().min(1)).default([]),
-  out: z.array(z.string().trim().min(1)).default([]),
-});
+function createEmptyProjectBriefV1Scope() {
+  return {
+    in: [],
+    out: [],
+  };
+}
 
-export const projectBriefStackContextSchema = z.object({
-  confirmed: z.array(z.string().trim().min(1)).default([]),
-  existing_tools: z.array(z.string().trim().min(1)).default([]),
-  open_to: z.array(z.string().trim().min(1)).default([]),
-  notes: z.string().trim().default(''),
-});
-
-export const projectBriefConstraintsSchema = z.object({
-  budget: z.string().trim().default(''),
-  timeline: z.string().trim().default(''),
-  existing_codebase: z.string().trim().default(''),
-  dependencies: z.array(z.string().trim().min(1)).default([]),
-  other: z.array(z.string().trim().min(1)).default([]),
-});
-
-export const projectBriefStructuredSchema = z.object({
-  what_it_is: z.string().trim().default(''),
-  who_its_for: z.string().trim().default(''),
-  problem_solved: z.string().trim().default(''),
-  v1_scope: projectBriefV1ScopeSchema.default({ in: [], out: [] }),
-  stack_context: projectBriefStackContextSchema.default({
+function createEmptyProjectBriefStackContext() {
+  return {
     confirmed: [],
     existing_tools: [],
     open_to: [],
     notes: '',
-  }),
-  definition_done: z.string().trim().default(''),
-  constraints: projectBriefConstraintsSchema.default({
+  };
+}
+
+function createEmptyProjectBriefConstraints() {
+  return {
     budget: '',
     timeline: '',
     existing_codebase: '',
     dependencies: [],
     other: [],
+  };
+}
+
+function createEmptyProjectBriefStructured() {
+  return {
+    what_it_is: '',
+    who_its_for: '',
+    problem_solved: '',
+    v1_scope: createEmptyProjectBriefV1Scope(),
+    stack_context: createEmptyProjectBriefStackContext(),
+    definition_done: '',
+    constraints: createEmptyProjectBriefConstraints(),
+  };
+}
+
+function normalizeProjectBriefText(value: unknown) {
+  return typeof value === 'string' ? value : '';
+}
+
+function normalizeProjectBriefStringList(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .flatMap((entry) => (typeof entry === 'string' ? [entry.trim()] : []))
+    .filter(Boolean);
+}
+
+function normalizeProjectBriefObject<T extends Record<string, unknown>>(
+  value: unknown,
+  fallbackFactory: () => T,
+) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : fallbackFactory();
+}
+
+const projectBriefTextSchema = z.preprocess(normalizeProjectBriefText, z.string().trim());
+const projectBriefStringListSchema = z.preprocess(
+  normalizeProjectBriefStringList,
+  z.array(z.string().trim().min(1)),
+);
+
+export const projectBriefV1ScopeSchema = z.preprocess(
+  (value) => normalizeProjectBriefObject(value, createEmptyProjectBriefV1Scope),
+  z.object({
+    in: projectBriefStringListSchema,
+    out: projectBriefStringListSchema,
   }),
-});
+);
+
+export const projectBriefStackContextSchema = z.preprocess(
+  (value) => normalizeProjectBriefObject(value, createEmptyProjectBriefStackContext),
+  z.object({
+    confirmed: projectBriefStringListSchema,
+    existing_tools: projectBriefStringListSchema,
+    open_to: projectBriefStringListSchema,
+    notes: projectBriefTextSchema,
+  }),
+);
+
+export const projectBriefConstraintsSchema = z.preprocess(
+  (value) => normalizeProjectBriefObject(value, createEmptyProjectBriefConstraints),
+  z.object({
+    budget: projectBriefTextSchema,
+    timeline: projectBriefTextSchema,
+    existing_codebase: projectBriefTextSchema,
+    dependencies: projectBriefStringListSchema,
+    other: projectBriefStringListSchema,
+  }),
+);
+
+export const projectBriefStructuredSchema = z.preprocess(
+  (value) => normalizeProjectBriefObject(value, createEmptyProjectBriefStructured),
+  z.object({
+    what_it_is: projectBriefTextSchema,
+    who_its_for: projectBriefTextSchema,
+    problem_solved: projectBriefTextSchema,
+    v1_scope: projectBriefV1ScopeSchema,
+    stack_context: projectBriefStackContextSchema,
+    definition_done: projectBriefTextSchema,
+    constraints: projectBriefConstraintsSchema,
+  }),
+);
 
 export type ProjectBriefStructured = z.infer<typeof projectBriefStructuredSchema>;
 export type ProjectBriefV1Scope = z.infer<typeof projectBriefV1ScopeSchema>;

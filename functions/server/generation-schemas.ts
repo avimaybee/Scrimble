@@ -1,185 +1,390 @@
 import { z } from 'zod';
 
-const urlSchema = z.string().url();
-const searchResultSchema = z.object({
-  title: z.string().min(1),
-  url: urlSchema,
-  description: z.string().optional().default(''),
-});
+function normalizeText(value: unknown, fallback = '') {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
 
-const researchSourceSchema = z.object({
-  technology: z.string().nullish().transform((v) => v || ''),
-  url: z.string().nullish().transform((v) => v || ''),
-  tool: z.string().nullish().transform((v) => v || 'Web fetch'),
-  title: z.string().nullish().transform((v) => v || ''),
-  summary: z.string().nullish().transform((v) => v || ''),
-});
+  const trimmed = value.trim();
+  return trimmed || fallback;
+}
 
-const partialFailureSchema = z.object({
-  tool: z.string().min(1),
-  technology: z.string().nullish().transform((v) => v || ''),
-  message: z.string().min(1),
-});
+function normalizeBoolean(value: unknown, fallback = false) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
 
-export const Batch1ResearchStackSchema = z.object({
-  technologies: z.array(
-    z.object({
-      name: z.string().min(1),
-      docs_url: z.string().nullish().transform((v) => v || ''),
-      github_url: z.string().nullish().transform((v) => v || ''),
-      changelog_url: z.string().nullish().transform((v) => v || ''),
-      community_search_results: z.array(searchResultSchema).optional().default([]),
-      breaking_change_search_results: z.array(searchResultSchema).optional().default([]),
-    }),
-  ),
-});
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
 
-export const Batch2FetchAndReadSchema = z.object({
-  research: z.array(
-    z.object({
-      technology: z.string().min(1),
-      docs_content: z.string().nullish().transform((v) => v || ''),
-      github_readme: z.string().nullish().transform((v) => v || ''),
-      latest_version: z.string().nullish().transform((v) => v || 'Unknown'),
-      last_commit_date: z.string().nullish().transform((v) => v || 'Unknown'),
-      open_issues_count: z.number().nullish().transform((v) => v || 0),
-      recent_breaking_changes: z.string().nullish().transform((v) => v || ''),
-      repo_health_summary: z.string().nullish().transform((v) => v || ''),
-      community_sentiment: z.string().nullish().transform((v) => v || ''),
-      bug_report_digest: z.string().nullish().transform((v) => v || ''),
-      sources: z.array(researchSourceSchema).optional().default([]),
-    }),
-  ),
-  sources: z.array(researchSourceSchema).optional().default([]),
-  data_quality: z.object({
-    has_brave_search: z.boolean().default(false),
-    has_github_token: z.boolean().default(false),
-    has_context7: z.boolean().default(false),
-    technologies_researched: z.number().int().nonnegative().default(0),
-    urls_fetched: z.number().int().nonnegative().default(0),
-    issues_found: z.number().int().nonnegative().default(0),
-    degraded_tools: z.array(z.string()).default([]),
-    partial_failures: z.array(partialFailureSchema).default([]),
-  }).optional().default({
-    has_brave_search: false,
-    has_github_token: false,
-    has_context7: false,
-    technologies_researched: 0,
-    urls_fetched: 0,
-    issues_found: 0,
-    degraded_tools: [],
-    partial_failures: [],
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1') {
+      return true;
+    }
+
+    if (normalized === 'false' || normalized === '0') {
+      return false;
+    }
+  }
+
+  return fallback;
+}
+
+function normalizeNumber(value: unknown, fallback = 0) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return fallback;
+}
+
+function normalizeStringArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .flatMap((entry) => (typeof entry === 'string' ? [entry.trim()] : []))
+    .filter(Boolean);
+}
+
+function normalizeObjectArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter(
+    (entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry),
+  );
+}
+
+function normalizeObject<T extends Record<string, unknown>>(
+  value: unknown,
+  fallbackFactory: () => T,
+) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : fallbackFactory();
+}
+
+function createOptionalTextSchema(fallback = '') {
+  return z.preprocess((value) => normalizeText(value, fallback), z.string());
+}
+
+function createRequiredTextSchema(fallback = 'Not specified') {
+  return z.preprocess((value) => normalizeText(value, fallback), z.string().min(1));
+}
+
+function createStringArraySchema() {
+  return z.preprocess(normalizeStringArray, z.array(z.string().min(1)));
+}
+
+function createBooleanSchema(fallback = false) {
+  return z.preprocess((value) => normalizeBoolean(value, fallback), z.boolean());
+}
+
+function createNumberSchema(fallback = 0) {
+  return z.preprocess((value) => normalizeNumber(value, fallback), z.number());
+}
+
+function createNonNegativeIntSchema(fallback = 0) {
+  return z.preprocess((value) => {
+    const normalized = normalizeNumber(value, fallback);
+    return normalized < 0 ? fallback : Math.trunc(normalized);
+  }, z.number().int().nonnegative());
+}
+
+const searchResultSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    title: createRequiredTextSchema('Search result'),
+    url: createOptionalTextSchema(''),
+    description: createOptionalTextSchema(''),
   }),
-});
+);
 
-export const Batch3ArchitectSchema = z.object({
-  project_name: z.string().min(1),
-  project_type: z.string().min(1),
-  project_summary: z.string().min(1),
-  how_it_connects: z.string().min(1),
-  recommended_stack: z.object({
-    frontend: z.string().min(1),
-    backend: z.string().min(1),
-    auth: z.string().min(1),
-    database: z.string().min(1),
-    payments: z.string().min(1),
-    email: z.string().min(1),
-    deploy: z.string().min(1),
+const researchSourceSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    technology: createOptionalTextSchema(''),
+    url: createOptionalTextSchema(''),
+    tool: createOptionalTextSchema('Web fetch'),
+    title: createOptionalTextSchema(''),
+    summary: createOptionalTextSchema(''),
   }),
-  data_model: z.array(
-    z.object({
-      table: z.string().min(1),
-      columns: z.array(
-        z.object({
-          name: z.string().min(1),
-          type: z.string().min(1),
-          nullable: z.boolean().optional().default(false),
-          notes: z.string().optional().default(''),
-        }),
+);
+
+const partialFailureSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    tool: createRequiredTextSchema('Unknown tool'),
+    technology: createOptionalTextSchema(''),
+    message: createRequiredTextSchema('The fetch failed.'),
+  }),
+);
+
+export const Batch1ResearchStackSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    technologies: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            name: createRequiredTextSchema('Unknown technology'),
+            docs_url: createOptionalTextSchema(''),
+            github_url: createOptionalTextSchema(''),
+            changelog_url: createOptionalTextSchema(''),
+            community_search_results: z.preprocess(normalizeObjectArray, z.array(searchResultSchema)),
+            breaking_change_search_results: z.preprocess(normalizeObjectArray, z.array(searchResultSchema)),
+          }),
+        ),
+      ).min(1),
+    ),
+  }),
+);
+
+export const Batch2FetchAndReadSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    research: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            technology: createRequiredTextSchema('Unknown technology'),
+            docs_content: createOptionalTextSchema(''),
+            github_readme: createOptionalTextSchema(''),
+            latest_version: createOptionalTextSchema('Unknown'),
+            last_commit_date: createOptionalTextSchema('Unknown'),
+            open_issues_count: createNonNegativeIntSchema(0),
+            recent_breaking_changes: createOptionalTextSchema(''),
+            repo_health_summary: createOptionalTextSchema(''),
+            community_sentiment: createOptionalTextSchema(''),
+            bug_report_digest: createOptionalTextSchema(''),
+            sources: z.preprocess(normalizeObjectArray, z.array(researchSourceSchema)),
+          }),
+        ),
+      ).min(1),
+    ),
+    sources: z.preprocess(normalizeObjectArray, z.array(researchSourceSchema)),
+    data_quality: z.preprocess(
+      (entry) => normalizeObject(entry, () => ({})),
+      z.object({
+        has_brave_search: createBooleanSchema(false),
+        has_github_token: createBooleanSchema(false),
+        has_context7: createBooleanSchema(false),
+        technologies_researched: createNonNegativeIntSchema(0),
+        urls_fetched: createNonNegativeIntSchema(0),
+        issues_found: createNonNegativeIntSchema(0),
+        degraded_tools: createStringArraySchema(),
+        partial_failures: z.preprocess(normalizeObjectArray, z.array(partialFailureSchema)),
+      }),
+    ),
+  }),
+);
+
+export const Batch3ArchitectSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    project_name: createRequiredTextSchema('Untitled Project'),
+    project_type: createRequiredTextSchema('other'),
+    project_summary: createRequiredTextSchema('Project summary not available yet.'),
+    how_it_connects: createRequiredTextSchema(
+      'The interface talks to the backend, the backend writes to storage, and the supporting services handle the rest.',
+    ),
+    recommended_stack: z.preprocess(
+      (entry) => normalizeObject(entry, () => ({})),
+      z.object({
+        frontend: createRequiredTextSchema('Not specified'),
+        backend: createRequiredTextSchema('Not specified'),
+        auth: createRequiredTextSchema('Not specified'),
+        database: createRequiredTextSchema('Not specified'),
+        payments: createRequiredTextSchema('Not specified'),
+        email: createRequiredTextSchema('Not specified'),
+        deploy: createRequiredTextSchema('Not specified'),
+      }),
+    ),
+    data_model: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            table: createRequiredTextSchema('unnamed_table'),
+            columns: z.preprocess(
+              normalizeObjectArray,
+              z.array(
+                z.preprocess(
+                  (column) => normalizeObject(column, () => ({})),
+                  z.object({
+                    name: createRequiredTextSchema('column'),
+                    type: createRequiredTextSchema('text'),
+                    nullable: createBooleanSchema(false),
+                    notes: createOptionalTextSchema(''),
+                  }),
+                ),
+              ),
+            ),
+            relationships: createStringArraySchema(),
+          }),
+        ),
       ),
-      relationships: z.array(z.string()).optional().default([]),
-    }),
-  ),
-  integrations: z.array(
-    z.object({
-      service: z.string().min(1),
-      purpose: z.string().min(1),
-      package_name: z.string().min(1),
-      version: z.string().min(1),
-    }),
-  ),
-  security_surface: z.array(
-    z.object({
-      concern: z.string().min(1),
-      approach: z.string().min(1),
-    }),
-  ),
-  gotchas: z.array(
-    z.object({
-      technology: z.string().min(1),
-      issue: z.string().min(1),
-      mitigation: z.string().min(1),
-    }),
-  ),
-});
-
-const checklistItemSchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  is_required: z.boolean().optional().default(false),
-});
-
-const planStepSchema = z.object({
-  id: z.string(),
-  title: z.string(),
-  type: z.string(),
-  category: z.string().optional().default(''),
-  objective: z.string().optional().default(''),
-  why_it_matters: z.string().optional().default(''),
-  risk_level: z.string().optional().default('low'),
-  is_gate: z.boolean().optional().default(false),
-  done_when: z.string().optional().default(''),
-  suggested_tools: z.array(z.string()).optional().default([]),
-  checklist: z.array(checklistItemSchema).optional().default([]),
-});
-
-export const Batch4PlanBuildSchema = z.object({
-  project_name: z.string().optional().default('Untitled Project'),
-  project_type: z.string().optional().default('other'),
-  stack: z.union([z.string(), z.record(z.string(), z.unknown())]).optional().default(''),
-  stages: z.array(
-    z.object({
-      id: z.string(),
-      title: z.string(),
-      type: z.string(),
-      order_index: z.number().default(0),
-      steps: z.array(planStepSchema),
-    }),
-  ),
-  edges: z.array(
-    z.object({
-      id: z.string(),
-      source_step_id: z.string(),
-      target_step_id: z.string(),
-      edge_type: z.string().optional().default('default'),
-    }),
-  ).optional().default([]),
-});
-
-export const Batch5EnrichStepsSchema = z.object({
-  enrichments: z.array(
-    z.object({
-      step_id: z.string(),
-      ai_output: z.string(),
-      prompts: z.array(
-        z.object({
-          label: z.string(),
-          content: z.string(),
-        }),
+    ),
+    integrations: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            service: createRequiredTextSchema('Unknown service'),
+            purpose: createRequiredTextSchema('Purpose not specified'),
+            package_name: createRequiredTextSchema('unknown-package'),
+            version: createRequiredTextSchema('latest'),
+          }),
+        ),
       ),
-    }),
-  ),
-});
+    ),
+    security_surface: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            concern: createRequiredTextSchema('Security concern'),
+            approach: createRequiredTextSchema('Mitigation not specified'),
+          }),
+        ),
+      ),
+    ),
+    gotchas: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            technology: createRequiredTextSchema('Unknown technology'),
+            issue: createRequiredTextSchema('Issue not specified'),
+            mitigation: createRequiredTextSchema('Mitigation not specified'),
+          }),
+        ),
+      ),
+    ),
+  }),
+);
+
+const checklistItemSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    id: createOptionalTextSchema(''),
+    label: createRequiredTextSchema('Checklist item'),
+    is_required: createBooleanSchema(false),
+  }),
+);
+
+const planStepSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    id: createOptionalTextSchema(''),
+    title: createRequiredTextSchema('Untitled step'),
+    type: createRequiredTextSchema('task'),
+    category: createOptionalTextSchema(''),
+    objective: createOptionalTextSchema(''),
+    why_it_matters: createOptionalTextSchema(''),
+    risk_level: createOptionalTextSchema('low'),
+    is_gate: createBooleanSchema(false),
+    done_when: createOptionalTextSchema(''),
+    suggested_tools: createStringArraySchema(),
+    checklist: z.preprocess(normalizeObjectArray, z.array(checklistItemSchema)),
+  }),
+);
+
+export const Batch4PlanBuildSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    project_name: createRequiredTextSchema('Untitled Project'),
+    project_type: createRequiredTextSchema('other'),
+    stack: z.preprocess((value) => {
+      if (typeof value === 'string') {
+        return value.trim();
+      }
+
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return value;
+      }
+
+      return '';
+    }, z.union([z.string(), z.record(z.string(), z.unknown())])),
+    stages: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            id: createOptionalTextSchema(''),
+            title: createRequiredTextSchema('Untitled stage'),
+            type: createRequiredTextSchema('stage'),
+            order_index: createNumberSchema(0),
+            steps: z.preprocess(normalizeObjectArray, z.array(planStepSchema).min(1)),
+          }),
+        ),
+      ).min(1),
+    ),
+    edges: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            id: createOptionalTextSchema(''),
+            source_step_id: createOptionalTextSchema(''),
+            target_step_id: createOptionalTextSchema(''),
+            edge_type: createOptionalTextSchema('default'),
+          }),
+        ),
+      ),
+    ),
+  }),
+);
+
+export const Batch5EnrichStepsSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    enrichments: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            step_id: createOptionalTextSchema(''),
+            ai_output: createOptionalTextSchema(''),
+            prompts: z.preprocess(
+              normalizeObjectArray,
+              z.array(
+                z.preprocess(
+                  (prompt) => normalizeObject(prompt, () => ({})),
+                  z.object({
+                    label: createOptionalTextSchema(''),
+                    content: createOptionalTextSchema(''),
+                  }),
+                ),
+              ),
+            ),
+          }),
+        ),
+      ),
+    ),
+  }),
+);
 
 export const SKILL_FILE_NAMES = [
   '.cursor/rules/scrimble-project.mdc',
@@ -190,41 +395,27 @@ export const SKILL_FILE_NAMES = [
   'scrimble-mcp.json',
 ] as const;
 
-const skillFileSchema = z.object({
-  filename: z.enum(SKILL_FILE_NAMES),
-  content: z.string().min(1),
-});
+export type SkillFileName = (typeof SKILL_FILE_NAMES)[number];
 
-export const Batch6GenerateFilesSchema = z.object({
-  files: z
-    .array(skillFileSchema)
-    .length(SKILL_FILE_NAMES.length)
-    .superRefine((files, ctx) => {
-      const seen = new Set<string>();
+export function getSkillFileSortIndex(filename: string) {
+  const index = SKILL_FILE_NAMES.findIndex((name) => name === filename);
+  return index === -1 ? SKILL_FILE_NAMES.length : index;
+}
 
-      files.forEach((file, index) => {
-        if (seen.has(file.filename)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `Duplicate generated file: ${file.filename}`,
-            path: [index, 'filename'],
-          });
-          return;
-        }
+const skillFileSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    filename: createOptionalTextSchema(''),
+    content: createOptionalTextSchema(''),
+  }),
+);
 
-        seen.add(file.filename);
-      });
-
-      SKILL_FILE_NAMES.forEach((filename) => {
-        if (!seen.has(filename)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `Missing required generated file: ${filename}`,
-          });
-        }
-      });
-    }),
-});
+export const Batch6GenerateFilesSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    files: z.preprocess(normalizeObjectArray, z.array(skillFileSchema)),
+  }),
+);
 
 export const schemaDescriptions = {
   batch_1_research_stack:
@@ -247,4 +438,3 @@ export type Batch3Architect = z.infer<typeof Batch3ArchitectSchema>;
 export type Batch4PlanBuild = z.infer<typeof Batch4PlanBuildSchema>;
 export type Batch5EnrichSteps = z.infer<typeof Batch5EnrichStepsSchema>;
 export type Batch6GenerateFiles = z.infer<typeof Batch6GenerateFilesSchema>;
-export type SkillFileName = (typeof SKILL_FILE_NAMES)[number];

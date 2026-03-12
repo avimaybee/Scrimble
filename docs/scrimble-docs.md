@@ -919,6 +919,7 @@ Batch 3 pauses before continuing—Scrimble saves the architecture decision reco
 The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or budget limit), it enters a `failed` state.
 1. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches even `failed` projects, picking up from the last incomplete batch through the active backend.
 2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend resume request, reconnecting the SSE stream only after the run is scheduled again.
+3. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints now rebuild their updates as compare-and-set statements against the four `generation_*` columns (run id, provider, heartbeat, completed). If another agent already flipped the status, the request returns `409` so the UI can refresh instead of scheduling another overlapping run.
 
 
 ### Professional Icon System
@@ -1369,7 +1370,9 @@ Width 176px. Status-driven appearance:
 6. **Things to check** — interactive checklist with optimistic local toggle
 7. **Done when...** — exit criteria in emerald border container
 
-Every enriched step now ends with a JetBrains Mono 11px footer that reads `Researched {date} using {tools used}` (Context7, GitHub, Brave, or fallback fetch). The footer explicitly calls out any missing tools and invites the builder to connect them in Settings so future enrichments can go deeper. It anchors the Research depth story from the architecture review, proving the agent actually read the Supabase changelog, Stripe webhook guide, or deployment docs before writing the guidance.
+ Every enriched step now ends with a JetBrains Mono 11px footer that reads `Researched {date} using {tools used}` (Context7, GitHub, Brave, or fallback fetch). The footer explicitly calls out any missing tools and invites the builder to connect them in Settings so future enrichments can go deeper. It anchors the Research depth story from the architecture review, proving the agent actually read the Supabase changelog, Stripe webhook guide, or deployment docs before writing the guidance.
+
+Behind the scenes the panel now routes every enrichment request through `dbService.streamStepEnrichment` and the shared `useStepExecution` hook so AI output arrives as an SSE stream and the toaster-enabled UX stays responsive. While the agent is working the drawer keeps the skeletons active, disables Skip/Mark as done until the network call completes, and instantly surfaces any fetch or enrichment errors with a subtle banner plus a “Try again” button that refreshes that step without closing the drawer. Toast guidance confirms both successes and failures, which keeps the flow feeling steady even when external services pause or hiccup.
 
 **Human-in-the-loop review panel** (when `is_gate = 1` and `status = needs_review`):
 ```
@@ -1390,6 +1393,8 @@ Amber border. Fraunces heading. Warm, conversational tone.
 ---
 
 ### 15.7 Settings — AI Keys (`/settings`)
+
+Before the key list there is a row of three readiness cards (AI coverage, Research depth, Workspace readiness) that mirror the live icons and copy the UI shows when you open `/settings`. Each card totals the connected providers/tools, signals whether the workspace is “Ready to build” or still “Needs one quick setup,” and tells the builder exactly what to do before starting `/new`.
 
 ```
 Your AI Keys
@@ -1420,6 +1425,8 @@ to do the work at each step of your plan.
 Your keys are encrypted and never shared. Scrimble uses
 them only to do work on your projects.
 ```
+
+If the provider refresh fails, a subtle error banner with the message and `Try again` button appears over the list so the builder can reload the saved AI keys without leaving the page. The Research Tools section mirrors that behavior by showing the same inline retry card whenever its load fails, keeping both surfaces deterministic even during network hiccups.
 
 ### 15.8 Settings — Research Tools (`/settings`)
 

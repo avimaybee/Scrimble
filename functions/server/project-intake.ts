@@ -9,11 +9,24 @@ import {
 import { loadBuilderProfileContext } from './user-tools';
 import type { Bindings, ProviderType } from './types';
 
+function normalizeIntakeStringList(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .flatMap((entry) => (typeof entry === 'string' ? [entry.trim()] : []))
+    .filter(Boolean);
+}
+
 const intakeAgentResponseSchema = z.object({
-  ready: z.boolean().default(false),
+  ready: z.boolean().catch(false),
   agent_reply: z.string().trim().min(1),
   brief: projectBriefStructuredSchema,
-  missing_context: z.array(z.string().trim().min(1)).default([]),
+  missing_context: z.preprocess(
+    normalizeIntakeStringList,
+    z.array(z.string().trim().min(1)),
+  ),
 });
 
 type IntakeProviderContext = {
