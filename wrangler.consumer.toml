@@ -15,6 +15,10 @@ bucket_name = "scrimble"
 ENVIRONMENT = "production"
 FIREBASE_PROJECT_ID = "scrimble-auth"
 
+[[queues.producers]]
+binding = "AGENT_QUEUE"
+queue = "scrimble"
+
 [[queues.consumers]]
 queue = "scrimble"
 max_batch_size = 1

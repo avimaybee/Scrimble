@@ -355,6 +355,7 @@ const PROVIDER_TIMEOUT_MESSAGE = 'Your AI provider took too long to respond. Ret
 const PROVIDER_UPSTREAM_MESSAGE = 'Your AI provider had a temporary upstream error. Try again shortly.';
 const RUNTIME_BUDGET_MESSAGE =
   'Scrimble hit a Cloudflare runtime limit while researching your project. Resume generation to continue from the latest checkpoint.';
+export const PIPELINE_QUOTA_EXCEEDED = 'PIPELINE_QUOTA_EXCEEDED';
 
 export class RetryableAIError extends Error {
   constructor(
@@ -364,6 +365,13 @@ export class RetryableAIError extends Error {
   ) {
     super(message);
     this.name = 'RetryableAIError';
+  }
+}
+
+export class PipelineQuotaExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PipelineQuotaExceededError';
   }
 }
 
@@ -532,18 +540,18 @@ export async function callAIWithRetry(payload: {
         return createAIErrorResponse(401, 'invalid_key', 'Your AI key was rejected. Check it in Settings.');
       }
 
+      const errorPayload = await readAIErrorPayload(response);
+      const diagnosticText = `${errorPayload.message || ''}\n${errorPayload.rawText}`.trim();
+      console.error(`${logTag} attempt ${attempt + 1} failure detail: HTTP ${response.status}, body: ${diagnosticText.slice(0, 500)}`);
+
+      if (isRuntimeBudgetError(diagnosticText)) {
+        return createAIErrorResponse(503, PIPELINE_QUOTA_EXCEEDED, RUNTIME_BUDGET_MESSAGE);
+      }
+
       if (attempt < maxRetries && (response.status >= 500 || response.status === 0 || response.status === 408)) {
         console.warn(`${logTag} retrying after ${backoffs[attempt]}ms (server error ${response.status})...`);
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
-      }
-
-      const errorPayload = await readAIErrorPayload(response);
-      const diagnosticText = `${errorPayload.message || ''}\n${errorPayload.rawText}`.trim();
-      console.error(`${logTag} FINAL FAILURE: HTTP ${response.status}, body: ${diagnosticText.slice(0, 500)}`);
-
-      if (isRuntimeBudgetError(diagnosticText)) {
-        return createAIErrorResponse(503, 'runtime_budget_exhausted', RUNTIME_BUDGET_MESSAGE);
       }
 
       if (response.status === 408 || response.status === 504) {
@@ -565,7 +573,7 @@ export async function callAIWithRetry(payload: {
       }
 
       if (isRuntimeBudgetError(errMsg)) {
-        return createAIErrorResponse(503, 'runtime_budget_exhausted', RUNTIME_BUDGET_MESSAGE);
+        return createAIErrorResponse(503, PIPELINE_QUOTA_EXCEEDED, RUNTIME_BUDGET_MESSAGE);
       }
 
       if (attempt < maxRetries) {
@@ -624,7 +632,11 @@ export async function callAIText(payload: {
   const response = await callAIWithRetry(payload);
   if (!response.ok) {
     const { code, message } = await readAIErrorMessage(response);
-    if (code === 'provider_timeout' || code === 'provider_upstream_error' || code === 'runtime_budget_exhausted') {
+    if (code === PIPELINE_QUOTA_EXCEEDED) {
+      throw new PipelineQuotaExceededError(message);
+    }
+
+    if (code === 'provider_timeout' || code === 'provider_upstream_error') {
       throw new RetryableAIError(message, code, response.status);
     }
 
@@ -654,7 +666,11 @@ export async function callAIText(payload: {
     const retryResponse = await callAIWithRetry(retryPayload);
     if (!retryResponse.ok) {
       const { code, message } = await readAIErrorMessage(retryResponse);
-      if (code === 'provider_timeout' || code === 'provider_upstream_error' || code === 'runtime_budget_exhausted') {
+      if (code === PIPELINE_QUOTA_EXCEEDED) {
+        throw new PipelineQuotaExceededError(message);
+      }
+
+      if (code === 'provider_timeout' || code === 'provider_upstream_error') {
         throw new RetryableAIError(message, code, retryResponse.status);
       }
 

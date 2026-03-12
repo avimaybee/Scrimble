@@ -252,6 +252,16 @@ type Batch2CheckpointData = {
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
 };
 
+type Batch5ResearchStep = Pick<
+  Batch4PlanBuild['stages'][number]['steps'][number],
+  'id' | 'title' | 'objective' | 'why_it_matters' | 'category' | 'done_when' | 'is_gate'
+>;
+
+type Batch5CheckpointData = {
+  steps: Batch5ResearchStep[];
+  stepResearchContexts: StepResearchContext[];
+};
+
 type GenerationCheckpointRecord = {
   id: string;
   payload_inline: string | null;
@@ -270,11 +280,14 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
   'batch_6_generate_files',
 ]);
 
-export const GENERATION_STALE_MS = 15 * 60 * 1000;
+export const GENERATION_STALE_MS = 2 * 60 * 1000;
+export const QUEUED_GENERATION_RESUME_MS = GENERATION_STALE_MS;
 const MAX_QUEUE_RETRY_ATTEMPTS = 3;
+const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const BATCH1_CHECKPOINT_ITEM_INTERVAL = 20;
 const BATCH1_CHECKPOINT_SUBREQUEST_LIMIT = 30;
 const BATCH1_ESTIMATED_SUBREQUESTS_PER_TECH = 2;
+const lastHeartbeatTouchByProject = new Map<string, number>();
 
 const batchCompletionMessages: Record<GenerationBatchName, string> = {
   batch_1_research_stack: 'Mapped the implied stack and source URLs.',
@@ -849,6 +862,20 @@ function mergePlanWithEnrichments(plan: Batch4PlanBuild, enrichments: Batch5Enri
   };
 }
 
+function flattenPlanSteps(plan: Batch4PlanBuild): Batch5ResearchStep[] {
+  return plan.stages.flatMap((stage) =>
+    stage.steps.map((step) => ({
+      id: step.id,
+      title: step.title,
+      objective: step.objective,
+      why_it_matters: step.why_it_matters,
+      category: step.category,
+      done_when: step.done_when,
+      is_gate: step.is_gate,
+    })),
+  );
+}
+
 function inferGateFlag(source: {
   title?: string | null;
   objective?: string | null;
@@ -962,6 +989,7 @@ async function touchGenerationHeartbeat(
     `)
       .bind(runId, projectId)
       .run();
+    lastHeartbeatTouchByProject.set(projectId, Date.now());
     return;
   }
 
@@ -973,6 +1001,20 @@ async function touchGenerationHeartbeat(
   `)
     .bind(projectId)
     .run();
+  lastHeartbeatTouchByProject.set(projectId, Date.now());
+}
+
+async function maybeTouchGenerationHeartbeat(
+  env: Bindings,
+  projectId: string,
+  runId?: string | null,
+) {
+  const lastTouchedAt = lastHeartbeatTouchByProject.get(projectId) || 0;
+  if (Date.now() - lastTouchedAt < HEARTBEAT_TOUCH_INTERVAL_MS) {
+    return;
+  }
+
+  await touchGenerationHeartbeat(env, projectId, runId);
 }
 
 async function insertAgentRun(
@@ -1312,6 +1354,7 @@ async function logActivity(
     message: string;
   },
 ) {
+  await maybeTouchGenerationHeartbeat(env, payload.projectId);
   await insertGenerationEvent(env, {
     projectId: payload.projectId,
     eventType: 'activity',
@@ -1323,6 +1366,24 @@ async function logActivity(
       timestamp: new Date().toISOString(),
     },
   });
+}
+
+async function callAITextWithHeartbeat(
+  env: Bindings,
+  projectId: string,
+  payload: Parameters<typeof callAIText>[0],
+) {
+  const intervalId = setInterval(() => {
+    void touchGenerationHeartbeat(env, projectId).catch((error) => {
+      console.warn('[generation-heartbeat] Failed to refresh heartbeat during AI call:', error);
+    });
+  }, HEARTBEAT_TOUCH_INTERVAL_MS);
+
+  try {
+    return await callAIText(payload);
+  } finally {
+    clearInterval(intervalId);
+  }
 }
 
 function emitThinking(env: Bindings, projectId: string, batchName: GenerationBatchName, content: string) {
@@ -1481,6 +1542,22 @@ export function isGenerationExecutionStale(
     return false;
   }
 
+  return isHeartbeatOlderThan(heartbeatAt, GENERATION_STALE_MS, now);
+}
+
+export function isQueuedGenerationResumeReady(
+  generationStatus: string | null | undefined,
+  heartbeatAt: string | null | undefined,
+  now = Date.now(),
+) {
+  return generationStatus === 'queued' && isHeartbeatOlderThan(heartbeatAt, QUEUED_GENERATION_RESUME_MS, now);
+}
+
+function isHeartbeatOlderThan(
+  heartbeatAt: string | null | undefined,
+  maxAgeMs: number,
+  now = Date.now(),
+) {
   if (!heartbeatAt) {
     return true;
   }
@@ -1490,7 +1567,7 @@ export function isGenerationExecutionStale(
     return true;
   }
 
-  return now - heartbeatTimestamp > GENERATION_STALE_MS;
+  return now - heartbeatTimestamp > maxAgeMs;
 }
 
 export function resolveResumeGenerationStatus(
@@ -1611,7 +1688,7 @@ async function callValidatedBatch<T>(
   const emitter = createThrottledThinkingEmitter(options.env, options.projectId, options.runType);
   try {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const { text } = await callAIText({
+      const { text } = await callAITextWithHeartbeat(options.env, options.projectId, {
         providerType: provider.providerType,
         apiKey: provider.apiKey,
         model: provider.model,
@@ -2158,7 +2235,8 @@ Only include technologies that matter to implementation.`;
   }
 }
 
-const MAX_SUBREQUEST_BUDGET = 40;
+// Leave headroom for D1 writes, queue continuation dispatches, and stream events in the same invocation.
+const MAX_SUBREQUEST_BUDGET = 35;
 const SUBREQUEST_RESERVE = 10;
 
 async function executeBatch2(
@@ -2999,9 +3077,10 @@ async function executeBatch5(
   env: Bindings,
   projectId: string,
   provider: ProviderConfig,
+  runId: string,
   _builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
-) {
+): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const project = await getProjectById(env, projectId);
   if (!project) {
@@ -3011,8 +3090,18 @@ async function executeBatch5(
   const adr = await loadBatchOutput(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
   const research = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const checkpoint = await loadGenerationCheckpoint<Batch5CheckpointData>(
+    env,
+    projectId,
+    runId,
+    'batch_5_enrich_steps',
+  );
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
-  const stepResearchContexts: StepResearchContext[] = [];
+  const planSteps = checkpoint?.data.steps || flattenPlanSteps(plan);
+  const stepResearchContexts: StepResearchContext[] = checkpoint?.data.stepResearchContexts
+    ? [...checkpoint.data.stepResearchContexts]
+    : [];
+  const startIndex = checkpoint?.currentIndex ?? 0;
 
   await emitBatchStart(env, projectId, 'batch_5_enrich_steps');
   await logActivity(env, {
@@ -3022,40 +3111,63 @@ async function executeBatch5(
     message: 'Refreshing every step with live docs, issues, and current implementation notes...',
   });
 
-  for (const stage of plan.stages) {
-    for (const step of stage.steps) {
+  if (checkpoint) {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_5_enrich_steps',
+      kind: 'system',
+      message: `Resuming step research at step ${Math.min(startIndex + 1, planSteps.length)} of ${planSteps.length}.`,
+    });
+  }
+
+  for (let index = startIndex; index < planSteps.length; index += 1) {
+    const step = planSteps[index];
+
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_5_enrich_steps',
+      kind: 'fetch',
+      message: `Refreshing ${step.title} with live docs and current implementation notes...`,
+    });
+
+    const stepResearch = await collectStepResearchContext({
+      env,
+      userId: project.user_id,
+      stepId: step.id,
+      stepTitle: step.title,
+      stepObjective: step.objective,
+      stepWhyItMatters: step.why_it_matters,
+      stepCategory: step.category,
+      stepDoneWhen: step.done_when,
+      stepIsGate: step.is_gate,
+      adr,
+      research,
+      batchName: 'batch_5_enrich_steps',
+      projectId,
+      connectedTools,
+    });
+
+    stepResearchContexts.push(stepResearch);
+
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_5_enrich_steps',
+      kind: 'fetch',
+      message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
+    });
+
+    if (index + 1 < planSteps.length) {
+      await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
+        steps: planSteps,
+        stepResearchContexts,
+      });
       await logActivity(env, {
         projectId,
         batchName: 'batch_5_enrich_steps',
-        kind: 'fetch',
-        message: `Refreshing ${step.title} with live docs and current implementation notes...`,
+        kind: 'system',
+        message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing in a fresh queue run...`,
       });
-
-      const stepResearch = await collectStepResearchContext({
-        env,
-        userId: project.user_id,
-        stepId: step.id,
-        stepTitle: step.title,
-        stepObjective: step.objective,
-        stepWhyItMatters: step.why_it_matters,
-        stepCategory: step.category,
-        stepDoneWhen: step.done_when,
-        stepIsGate: step.is_gate,
-        adr,
-        research,
-        batchName: 'batch_5_enrich_steps',
-        projectId,
-        connectedTools,
-      });
-
-      stepResearchContexts.push(stepResearch);
-
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_5_enrich_steps',
-        kind: 'fetch',
-        message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
-      });
+      return 'checkpointed';
     }
   }
   const input = {
@@ -3118,6 +3230,7 @@ For each step, obey any requirements array included in the live step research co
       enrichments: finalEnrichments,
     };
 
+    await clearGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps');
     await completeBatch(
       env,
       projectId,
@@ -3136,6 +3249,7 @@ For each step, obey any requirements array included in the live step research co
       kind: 'complete',
       message: `Step details complete — ${finalResult.enrichments.length} steps enriched.`,
     });
+    return 'complete';
   } catch (error) {
     if (error instanceof RetryableAIError) {
       throw new RetryableGenerationPipelineError(error.message, 45);
@@ -3418,7 +3532,7 @@ async function enqueueProjectGeneration(
   });
 }
 
-const PIPELINE_VERSION = '1.1.0-checkpointed';
+const PIPELINE_VERSION = '1.2.0-heartbeat-safe';
 
 export async function processProjectGeneration(env: Bindings, message: QueueMessageBody) {
   console.log(`[PIPELINE_DEBUG] processProjectGeneration starting (v${PIPELINE_VERSION}) for project: ${message.projectId}`);
@@ -3542,7 +3656,7 @@ export async function processProjectGeneration(env: Bindings, message: QueueMess
         return;
       case 'batch_4_plan_build':
         if (!completed.includes('batch_5_enrich_steps')) {
-          await executeBatch5(env, project.id, provider, builderProfile, projectBrief);
+          await executeBatch5(env, project.id, provider, activeRunId, builderProfile, projectBrief);
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,

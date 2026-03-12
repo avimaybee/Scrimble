@@ -39,6 +39,7 @@ import {
   getBatchCompletionMessage,
   hasApprovedArchitectureReview,
   isGenerationExecutionStale,
+  isQueuedGenerationResumeReady,
   loadBatchOutput,
   resolveResumeGenerationStatus,
   saveArchitectureReviewApproval,
@@ -168,6 +169,13 @@ const reviewSchema = z
 
 function jsonError(message: string, status: number, details?: unknown) {
   return Response.json(details ? { error: message, details } : { error: message }, { status });
+}
+
+function queueConfigurationError(c: AppContext) {
+  return c.json({
+    error: 'Project generation queue is not configured.',
+    envKeys: Object.keys(c.env || {}),
+  }, 500);
 }
 
 function getAIErrorMessage(status: number, fallback: string) {
@@ -621,6 +629,14 @@ async function insertAgentRun(
   return id;
 }
 
+app.get('/debug-env', (c) => {
+  return c.json({
+    envKeys: Object.keys(c.env || {}),
+    hasQueue: !!c.env.AGENT_QUEUE,
+    environment: c.env.ENVIRONMENT,
+  });
+});
+
 app.use('*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -825,7 +841,7 @@ app.post('/intake/start', async (c) => {
   }
 
   if (!c.env.AGENT_QUEUE) {
-    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+    return queueConfigurationError(c);
   }
 
   let providerContext;
@@ -961,7 +977,7 @@ app.post('/intake/:id/confirm', async (c) => {
   }
 
   if (!c.env.AGENT_QUEUE) {
-    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+    return queueConfigurationError(c);
   }
 
   const parsed = intakeConfirmSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1054,14 +1070,6 @@ app.get('/intake/:id/brief', async (c) => {
   return c.json(await buildIntakeResponse(c, c.req.param('id')));
 });
 
-app.get('/debug-env', (c) => {
-  return c.json({
-    envKeys: Object.keys(c.env || {}),
-    hasQueue: !!c.env.AGENT_QUEUE,
-    environment: c.env.ENVIRONMENT,
-  });
-});
-
 app.post('/projects', async (c) => {
   const parsed = createProjectSchema.safeParse(await c.req.json());
   if (!parsed.success) {
@@ -1069,10 +1077,7 @@ app.post('/projects', async (c) => {
   }
 
   if (!c.env.AGENT_QUEUE) {
-    return c.json({ 
-      error: 'Project generation queue is not configured.',
-      envKeys: Object.keys(c.env || {})
-    }, 500);
+    return queueConfigurationError(c);
   }
 
   const providerRecord = await resolveProvider(c, parsed.data.providerId);
@@ -1161,15 +1166,15 @@ app.get('/projects/:id/status', async (c) => {
     completedBatchNames.includes('batch_5_enrich_steps') ||
     completedBatchNames.includes('batch_6_generate_files') ||
     await hasApprovedArchitectureReview(c.env, projectId);
-  const executionStale = isGenerationExecutionStale(
-    (project.generation_status as string | null) || 'complete',
-    (project.generation_heartbeat_at as string | null) || null,
-  );
+  const generationStatus = (project.generation_status as string | null) || 'complete';
+  const generationHeartbeat = (project.generation_heartbeat_at as string | null) || null;
+  const executionStale = isGenerationExecutionStale(generationStatus, generationHeartbeat);
+  const queuedResumeReady = isQueuedGenerationResumeReady(generationStatus, generationHeartbeat);
   const resumeStatus = resolveResumeGenerationStatus(completedBatchNames, hasReviewApproval);
   const canResume =
-    (project.generation_status || 'complete') !== 'complete' &&
+    generationStatus !== 'complete' &&
     resumeStatus !== 'awaiting_review' &&
-    ((project.generation_status || 'complete') === 'failed' || executionStale);
+    (generationStatus === 'failed' || executionStale || queuedResumeReady);
 
   const completedBatches = completedBatchRows.map((row) => ({
     batch: row.run_type,
@@ -1179,21 +1184,21 @@ app.get('/projects/:id/status', async (c) => {
 
   return c.json({
     project_id: projectId,
-    generation_status: project.generation_status || 'complete',
+    generation_status: generationStatus,
     generation_error: project.generation_error || null,
     generation_run_id: project.generation_run_id || null,
     generation_provider_id: project.generation_provider_id || null,
-    generation_heartbeat_at: project.generation_heartbeat_at || null,
+    generation_heartbeat_at: generationHeartbeat,
     completed_batches: completedBatches,
     completed_batch_count: completedBatches.length,
     total_batches: GENERATION_BATCHES.length,
     progress_percent: Math.round((completedBatches.length / GENERATION_BATCHES.length) * 100),
-    is_intake: (project.generation_status || 'complete') === 'intake',
-    is_complete: (project.generation_status || 'complete') === 'complete',
-    is_failed: (project.generation_status || 'complete') === 'failed',
-    is_review_required: (project.generation_status || 'complete') === 'awaiting_review',
-    is_approved: (project.generation_status || 'complete') === 'approved',
-    execution_stale: canResume && executionStale,
+    is_intake: generationStatus === 'intake',
+    is_complete: generationStatus === 'complete',
+    is_failed: generationStatus === 'failed',
+    is_review_required: generationStatus === 'awaiting_review',
+    is_approved: generationStatus === 'approved',
+    execution_stale: canResume && (executionStale || queuedResumeReady),
     can_resume: canResume,
   });
 });
@@ -1222,7 +1227,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
   }
 
   if (!c.env.AGENT_QUEUE) {
-    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+    return queueConfigurationError(c);
   }
 
   const parsed = architectureReviewApprovalSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1327,7 +1332,7 @@ app.post('/projects/:id/resume', async (c) => {
   }
 
   if (!c.env.AGENT_QUEUE) {
-    return c.json({ error: 'Project generation queue is not configured.' }, 500);
+    return queueConfigurationError(c);
   }
 
   const status = project.generation_status || 'queued';
@@ -1347,8 +1352,12 @@ app.post('/projects/:id/resume', async (c) => {
     status,
     (project.generation_heartbeat_at as string | null) || null,
   );
+  const queuedResumeReady = isQueuedGenerationResumeReady(
+    status,
+    (project.generation_heartbeat_at as string | null) || null,
+  );
 
-  if (status !== 'failed' && !executionStale) {
+  if (status !== 'failed' && !executionStale && !queuedResumeReady) {
     return c.json({ error: 'This generation run is still active. Wait for it to finish or stall before resuming.' }, 409);
   }
 
@@ -1536,7 +1545,7 @@ app.delete('/projects/:id', async (c) => {
     c.env.DB.prepare('DELETE FROM agent_runs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM edges WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM checklist_items WHERE step_id IN (SELECT id FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?))').bind(projectId),
-    c.env.DB.prepare('DELETE FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?1) OR id IN (SELECT id FROM steps WHERE project_id = ?1)').bind(projectId),
+    c.env.DB.prepare('DELETE FROM steps WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),
     c.env.DB.prepare('DELETE FROM stages WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)').bind(projectId),
     c.env.DB.prepare('DELETE FROM workflows WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(projectId),
