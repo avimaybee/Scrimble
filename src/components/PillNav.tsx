@@ -3,7 +3,6 @@ import { Link, matchPath, useLocation } from 'react-router-dom';
 import { LayoutPanelTop, LayoutGrid, Settings } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { cn } from '../lib/utils';
-import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
 
 type NavTab = 'plan' | 'projects' | 'settings';
 
@@ -119,14 +118,9 @@ function NavItem({
 
   if (!to || disabled) {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span aria-disabled="true" className={classes}>
-            {content}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent>Open a project to access Plan.</TooltipContent>
-      </Tooltip>
+      <span aria-disabled="true" className={classes}>
+        {content}
+      </span>
     );
   }
 

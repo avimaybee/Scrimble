@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Hexagon, ArrowRight } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { useCountUp } from '../hooks/useCountUp';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 const HERO_SOCIAL_PROOF_TARGET = 2000;

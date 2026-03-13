@@ -306,17 +306,3 @@ export const updatePlan = async (planSummary: any[], techStack: string, updateMe
     throw new Error('Something went wrong preparing your plan update. Try again.');
   }
 };
-
-export async function testAIProvider(providerId: string): Promise<boolean> {
-  try {
-    const result = await callAIProxy({
-      providerId,
-      system: 'You are a connection tester.',
-      prompt: 'Respond with exactly "OK" and nothing else.'
-    });
-    return result.trim().toUpperCase().includes('OK');
-  } catch (error) {
-    console.error('Connection test failed:', error);
-    return false;
-  }
-}

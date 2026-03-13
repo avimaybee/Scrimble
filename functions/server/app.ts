@@ -65,12 +65,6 @@ import {
   type PreferredIde,
   type ProviderType,
 } from './types';
-import {
-  ensureUserProfile,
-  getUserProfile,
-  getUserUsageStats,
-  updateUserProfile,
-} from './user-profile';
 
 export const app = new Hono<AppEnv>().basePath('/api');
 
@@ -144,11 +138,6 @@ const userToolSchema = z.object({
   name: z.string().trim().min(1).max(80),
   proficiency: z.enum(TOOL_PROFICIENCIES).default('comfortable'),
   notes: z.string().trim().max(200).optional(),
-});
-
-const accountUpdateSchema = z.object({
-  displayName: z.string().trim().min(1).max(50).optional(),
-  email: z.string().trim().email().optional(),
 });
 
 const userToolUpdateSchema = z
@@ -898,26 +887,6 @@ app.delete('/settings/user-tools/:id', async (c) => {
   }
 
   return c.json({ success: true });
-});
-
-app.get('/settings/account', async (c) => {
-  const profile = await ensureUserProfile(c.env, c.get('uid'));
-  return c.json(profile);
-});
-
-app.patch('/settings/account', async (c) => {
-  const parsed = accountUpdateSchema.safeParse(await c.req.json().catch(() => ({})));
-  if (!parsed.success) {
-    return c.json({ error: 'Invalid profile update payload', details: parsed.error.format() }, 400);
-  }
-
-  const profile = await updateUserProfile(c.env, c.get('uid'), parsed.data);
-  return c.json(profile);
-});
-
-app.get('/settings/usage', async (c) => {
-  const stats = await getUserUsageStats(c.env, c.get('uid'));
-  return c.json(stats);
 });
 
 app.get('/projects', async (c) => {

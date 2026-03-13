@@ -7,7 +7,6 @@ import {
   ExternalLink,
   Github,
   KeyRound,
-  LayoutDashboard,
   Loader2,
   LogOut,
   RefreshCw,
@@ -38,16 +37,6 @@ import {
   toggleMCPServer,
 } from '../lib/mcp';
 import { BuilderProfileSection } from '../components/settings/builder-profile-section';
-import { useCountUp } from '../hooks/useCountUp';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '../components/ui/dialog';
-import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -71,16 +60,6 @@ const itemVariants = {
     },
   },
 };
-
-type SectionId = 'overview' | 'account' | 'profile' | 'ai' | 'research';
-
-const settingsSections: Array<{ id: SectionId; label: string; icon: LucideIcon }> = [
-  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
-  { id: 'account', label: 'Account', icon: UserIcon },
-  { id: 'profile', label: 'Builder Profile', icon: Cpu },
-  { id: 'ai', label: 'AI Keys', icon: KeyRound },
-  { id: 'research', label: 'Research Tools', icon: Search },
-];
 
 const providerOptions: Array<{
   value: AIProviderType;
@@ -107,18 +86,6 @@ const providerOptions: Array<{
     placeholder: 'AIza...',
   },
   {
-    value: 'groq',
-    label: 'Groq',
-    helper: 'Use Groq for ultra-fast plan generation with open-source models.',
-    placeholder: 'gsk_...',
-  },
-  {
-    value: 'openrouter',
-    label: 'OpenRouter',
-    helper: 'Use OpenRouter to access a broad model catalog behind one key.',
-    placeholder: 'sk-or-v1-...',
-  },
-  {
     value: 'custom',
     label: 'Custom',
     helper: 'Use any OpenAI-compatible service by adding its API URL.',
@@ -130,8 +97,6 @@ const providerLabels: Record<AIProviderType, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   gemini: 'Gemini',
-  groq: 'Groq',
-  openrouter: 'OpenRouter',
   custom: 'Custom',
   openrouter: 'OpenRouter',
   groq: 'Groq',
@@ -304,8 +269,6 @@ function getToolStatusClasses(server: MCPServer) {
 export default function Settings() {
   const { user } = useAuthStore();
   const mcpSectionRef = useRef<HTMLElement | null>(null);
-  const connectIntentTimeoutRef = useRef<number | null>(null);
-  const disconnectIntentTimeoutRef = useRef<number | null>(null);
 
   const [providers, setProviders] = useState<AIProvider[]>([]);
   const [mcpServers, setMCPServers] = useState<MCPServer[]>([]);
@@ -321,18 +284,9 @@ export default function Settings() {
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [removingMCPId, setRemovingMCPId] = useState<string | null>(null);
   const [togglingMCPId, setTogglingMCPId] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<SectionId>('overview');
-  const [visibleSection, setVisibleSection] = useState<SectionId>('overview');
-  const [isSectionSwitching, setIsSectionSwitching] = useState(false);
-  const [openingMCPType, setOpeningMCPType] = useState<MCPServerType | null>(null);
-  const [pendingMCPDisconnectId, setPendingMCPDisconnectId] = useState<string | null>(null);
-  const [providerToRemove, setProviderToRemove] = useState<AIProvider | null>(null);
-  const [isSignOutDialogOpen, setIsSignOutDialogOpen] = useState(false);
-  const [isSigningOut, setIsSigningOut] = useState(false);
 
   const selectedProvider =
     providerOptions.find((option) => option.value === form.provider) ?? providerOptions[0];
-  const accountInitial = (user?.displayName || user?.email || 'U').trim().charAt(0).toUpperCase();
 
   const mcpServersByType = mcpServers.reduce<Partial<Record<MCPServerType, MCPServer>>>(
     (lookup, server) => {
@@ -345,28 +299,6 @@ export default function Settings() {
   const activeResearchToolCount = mcpServers.filter((server) => server.is_active).length;
   const aiProviderCount = providers.length;
   const isWorkspaceReady = aiProviderCount > 0;
-  const animatedAIProviderCount = useCountUp({
-    target: aiProviderCount,
-    durationMs: 1200,
-    enabled: !isLoadingProviders && aiProviderCount > 0,
-  });
-  const animatedResearchToolCount = useCountUp({
-    target: activeResearchToolCount,
-    durationMs: 1200,
-    enabled: !isLoadingMCPServers && activeResearchToolCount > 0,
-  });
-
-  useEffect(() => {
-    const titleBySection: Record<SectionId, string> = {
-      overview: 'Settings — Scrimble',
-      account: 'Account — Scrimble',
-      profile: 'Builder Profile — Scrimble',
-      ai: 'AI Keys — Scrimble',
-      research: 'Research Tools — Scrimble',
-    };
-
-    document.title = titleBySection[activeSection];
-  }, [activeSection]);
 
   const loadProviders = async (silent = false) => {
     setIsLoadingProviders(true);
@@ -410,31 +342,6 @@ export default function Settings() {
 
   useEffect(() => {
     void Promise.all([loadProviders(), loadMCPServers()]);
-  }, []);
-
-  useEffect(() => {
-    if (activeSection === visibleSection) {
-      return;
-    }
-
-    setIsSectionSwitching(true);
-    const timeoutId = window.setTimeout(() => {
-      setVisibleSection(activeSection);
-      setIsSectionSwitching(false);
-    }, 100);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [activeSection, visibleSection]);
-
-  useEffect(() => {
-    return () => {
-      if (connectIntentTimeoutRef.current !== null) {
-        window.clearTimeout(connectIntentTimeoutRef.current);
-      }
-      if (disconnectIntentTimeoutRef.current !== null) {
-        window.clearTimeout(disconnectIntentTimeoutRef.current);
-      }
-    };
   }, []);
 
   const handleSaveProvider = async (event: FormEvent<HTMLFormElement>) => {
@@ -491,56 +398,6 @@ export default function Settings() {
     } finally {
       setRemovingId(null);
     }
-  };
-
-  const requestProviderRemoval = (provider: AIProvider) => {
-    setProviderToRemove(provider);
-  };
-
-  const handleConfirmProviderRemoval = async () => {
-    if (!providerToRemove) {
-      return;
-    }
-
-    await handleRemoveProvider(providerToRemove.id);
-    setProviderToRemove(null);
-  };
-
-  const handleConfirmSignOut = async () => {
-    setIsSigningOut(true);
-    try {
-      await logout();
-      setIsSignOutDialogOpen(false);
-    } finally {
-      setIsSigningOut(false);
-    }
-  };
-
-  const clearPendingMCPDisconnect = () => {
-    if (disconnectIntentTimeoutRef.current !== null) {
-      window.clearTimeout(disconnectIntentTimeoutRef.current);
-      disconnectIntentTimeoutRef.current = null;
-    }
-
-    setPendingMCPDisconnectId(null);
-  };
-
-  const requestMCPDisconnect = (server: MCPServer) => {
-    if (pendingMCPDisconnectId === server.id) {
-      clearPendingMCPDisconnect();
-      void handleRemoveMCPServer(server);
-      return;
-    }
-
-    if (disconnectIntentTimeoutRef.current !== null) {
-      window.clearTimeout(disconnectIntentTimeoutRef.current);
-    }
-
-    setPendingMCPDisconnectId(server.id);
-    disconnectIntentTimeoutRef.current = window.setTimeout(() => {
-      setPendingMCPDisconnectId(null);
-      disconnectIntentTimeoutRef.current = null;
-    }, 4000);
   };
 
   const handleMCPFieldChange = (
@@ -635,11 +492,6 @@ export default function Settings() {
       return;
     }
 
-    if (connectIntentTimeoutRef.current !== null) {
-      window.clearTimeout(connectIntentTimeoutRef.current);
-      connectIntentTimeoutRef.current = null;
-    }
-    setOpeningMCPType(null);
     setSavingMCPType(serverType);
 
     try {
@@ -670,9 +522,6 @@ export default function Settings() {
   };
 
   const handleRemoveMCPServer = async (server: MCPServer) => {
-    if (pendingMCPDisconnectId === server.id) {
-      clearPendingMCPDisconnect();
-    }
     setRemovingMCPId(server.id);
 
     try {
@@ -689,42 +538,8 @@ export default function Settings() {
     }
   };
 
-  const handleSectionChange = (section: SectionId) => {
-    if (section === activeSection) {
-      return;
-    }
-
-    setActiveSection(section);
-  };
-
-  const handleConnectIntent = (serverType: MCPServerType) => {
-    if (expandedMCPType === serverType) {
-      if (connectIntentTimeoutRef.current !== null) {
-        window.clearTimeout(connectIntentTimeoutRef.current);
-        connectIntentTimeoutRef.current = null;
-      }
-      setOpeningMCPType(null);
-      setExpandedMCPType(null);
-      return;
-    }
-
-    if (connectIntentTimeoutRef.current !== null) {
-      window.clearTimeout(connectIntentTimeoutRef.current);
-    }
-
-    setOpeningMCPType(serverType);
-    connectIntentTimeoutRef.current = window.setTimeout(() => {
-      setExpandedMCPType(serverType);
-      setOpeningMCPType(null);
-      connectIntentTimeoutRef.current = null;
-    }, 220);
-  };
-
   const scrollToResearchTools = () => {
-    setActiveSection('research');
-    window.setTimeout(() => {
-      mcpSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }, 140);
+    mcpSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
   return (
@@ -742,41 +557,6 @@ export default function Settings() {
         </p>
       </motion.div>
 
-      <motion.div variants={itemVariants} className="mb-8">
-        <div className="-mx-1 overflow-x-auto pb-1">
-          <div className="flex min-w-max gap-2 px-1">
-            {settingsSections.map((section) => {
-              const isActive = activeSection === section.id;
-
-              return (
-                <button
-                  key={section.id}
-                  type="button"
-                  onClick={() => handleSectionChange(section.id)}
-                  className={cn(
-                    'inline-flex h-9 items-center gap-2 rounded-full border px-3 text-[12px] font-medium transition-colors',
-                    isActive
-                      ? 'border-accent-border bg-accent-primary-muted text-accent-primary'
-                      : 'border-border-default bg-bg-surface text-text-secondary hover:border-border-strong hover:text-text-primary',
-                  )}
-                >
-                  <section.icon className="h-3.5 w-3.5" />
-                  {section.label}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </motion.div>
-
-      <div
-        className={cn(
-          'transition-opacity ease-out',
-          isSectionSwitching ? 'opacity-0 duration-100' : 'opacity-100 duration-150',
-        )}
-      >
-
-      {visibleSection === 'overview' ? (
       <motion.section
         variants={itemVariants}
         className="mb-8 grid gap-4 md:grid-cols-3"
@@ -786,11 +566,8 @@ export default function Settings() {
             <Cpu className="h-4 w-4 text-accent-primary" />
             AI coverage
           </div>
-          <div className={cn(
-            "text-3xl font-serif tracking-[-0.04em] text-text-primary",
-            isLoadingProviders && "skeleton-shimmer rounded-md"
-          )}>
-            {isLoadingProviders ? '──' : animatedAIProviderCount}
+          <div className="text-3xl font-serif tracking-[-0.04em] text-text-primary">
+            {aiProviderCount}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
             {aiProviderCount > 0
@@ -804,11 +581,8 @@ export default function Settings() {
             <Search className="h-4 w-4 text-accent-primary" />
             Research depth
           </div>
-          <div className={cn(
-            "text-3xl font-serif tracking-[-0.04em] text-text-primary",
-            isLoadingMCPServers && "skeleton-shimmer rounded-md"
-          )}>
-            {isLoadingMCPServers ? '──' : animatedResearchToolCount}
+          <div className="text-3xl font-serif tracking-[-0.04em] text-text-primary">
+            {activeResearchToolCount}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
             {activeResearchToolCount > 0
@@ -822,11 +596,8 @@ export default function Settings() {
             <ShieldCheck className="h-4 w-4 text-accent-primary" />
             Workspace readiness
           </div>
-          <div className={cn(
-            "text-lg font-medium tracking-[-0.03em] text-text-primary",
-            isLoadingProviders && "skeleton-shimmer rounded-md w-40"
-          )}>
-            {isLoadingProviders ? '──' : isWorkspaceReady ? 'Ready to build' : 'Needs one quick setup'}
+          <div className="text-lg font-medium tracking-[-0.03em] text-text-primary">
+            {isWorkspaceReady ? 'Ready to build' : 'Needs one quick setup'}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
             {isWorkspaceReady
@@ -835,9 +606,7 @@ export default function Settings() {
           </p>
         </div>
       </motion.section>
-      ) : null}
 
-      {visibleSection === 'account' ? (
       <motion.section
         variants={itemVariants}
         className="mb-8 rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
@@ -857,9 +626,7 @@ export default function Settings() {
                   className="h-full w-full object-cover"
                 />
               ) : (
-                <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[linear-gradient(135deg,#E8581A_0%,#c44a14_100%)] text-[13px] font-semibold tracking-[0.02em] text-white">
-                  {accountInitial}
-                </span>
+                <UserIcon className="h-8 w-8 text-text-secondary" />
               )}
             </div>
 
@@ -872,23 +639,19 @@ export default function Settings() {
           </div>
 
           <button
-            onClick={() => setIsSignOutDialogOpen(true)}
-            className="btn-danger"
+            onClick={() => logout()}
+            className="inline-flex h-11 items-center justify-center gap-2 rounded-[8px] border border-border-default bg-bg-surface px-4 text-sm font-medium text-text-secondary transition-colors hover:border-border-strong hover:text-text-primary"
           >
             <LogOut className="h-4 w-4" />
             Sign out
           </button>
         </div>
       </motion.section>
-      ) : null}
 
-      {visibleSection === 'profile' ? (
       <motion.div variants={itemVariants} className="mb-8">
         <BuilderProfileSection />
       </motion.div>
-      ) : null}
 
-      {visibleSection === 'ai' ? (
       <motion.section
         variants={itemVariants}
         className="mb-8 rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
@@ -933,25 +696,16 @@ export default function Settings() {
             providers.map((provider) => (
               <div
                 key={provider.id}
-                className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4 transition-[border-color,background-color] duration-150 hover:border-white/[0.12] hover:bg-white/[0.02]"
+                className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4"
               >
                 <div className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
                   <div>
                     <div className="mb-2 flex flex-wrap items-center gap-2">
-                      <div className="flex items-center gap-2">
-                        <div className="flex h-8 w-8 items-center justify-center rounded-md bg-white/5 border border-white/10">
-                          <Cpu className="h-4 w-4 text-text-secondary" />
-                        </div>
-                        <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
-                          {providerLabels[provider.provider]}
-                        </h3>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className={`h-2 w-2 rounded-full ${provider.is_default ? 'bg-status-secure' : 'bg-text-muted'}`} />
-                        <span className="text-xs text-text-muted">{provider.is_default ? 'Default' : 'Connected'}</span>
-                      </div>
+                      <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
+                        {providerLabels[provider.provider]}
+                      </h3>
                       {provider.is_default ? (
-                        <span className="badge-accent">
+                        <span className="rounded-[6px] border border-accent-border bg-accent-primary-muted px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-accent-primary">
                           Default
                         </span>
                       ) : null}
@@ -962,50 +716,17 @@ export default function Settings() {
                       <label className="block text-[10px] font-mono uppercase tracking-[0.16em] text-text-tertiary">
                         Saved key
                       </label>
-                      <div className="flex items-center gap-2">
-                        <input
-                          readOnly
-                          value={provider.masked_key || '••••••••••••••••'}
-                          className={cn(inputClassName, 'bg-bg-base/60 opacity-85 flex-1')}
-                        />
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <button
-                              type="button"
-                              disabled
-                              className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-text-muted transition-colors hover:border-white/20 hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                              </svg>
-                            </button>
-                          </TooltipTrigger>
-                          <TooltipContent>Copy is disabled for security.</TooltipContent>
-                        </Tooltip>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <button
-                              type="button"
-                              onClick={() => requestProviderRemoval(provider)}
-                              disabled={removingId === provider.id}
-                              className="flex h-10 w-10 items-center justify-center rounded-lg border border-status-error/20 bg-status-error/5 text-status-error transition-colors hover:bg-status-error/10 disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                              {removingId === provider.id ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                <Trash2 className="h-4 w-4" />
-                              )}
-                            </button>
-                          </TooltipTrigger>
-                          <TooltipContent>Remove key</TooltipContent>
-                        </Tooltip>
-                      </div>
+                      <input
+                        readOnly
+                        value="••••••••••••••••"
+                        className={cn(inputClassName, 'cursor-default bg-bg-base/60 opacity-85')}
+                      />
                     </div>
                   </div>
 
                   <button
                     type="button"
-                    onClick={() => requestProviderRemoval(provider)}
+                    onClick={() => handleRemoveProvider(provider.id)}
                     disabled={removingId === provider.id}
                     className="btn-danger"
                   >
@@ -1020,45 +741,13 @@ export default function Settings() {
               </div>
             ))
           ) : (
-            <div className="grid gap-4 sm:grid-cols-2">
-              {providerOptions.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => {
-                    setForm((current) => ({
-                      ...current,
-                      provider: option.value,
-                      apiKey: '',
-                      model: '',
-                      baseUrl: '',
-                    }));
-                    document.getElementById('ai-keys-form')?.scrollIntoView({ behavior: 'smooth' });
-                  }}
-                  className="flex flex-col items-start rounded-xl border border-white/10 bg-white/[0.02] p-5 transition-all duration-200 hover:border-white/20 hover:bg-white/[0.04] text-left"
-                >
-                  <div className="flex items-center gap-3 mb-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-white/5 border border-white/10">
-                      <Cpu className="h-5 w-5 text-text-secondary" />
-                    </div>
-                    <div>
-                      <span className="text-[15px] font-medium text-text-primary">{option.label}</span>
-                      <span className="block text-[11px] text-text-muted">
-                        {option.value === 'openai' && 'GPT-4o'}
-                        {option.value === 'anthropic' && 'Claude 3.5'}
-                        {option.value === 'gemini' && '2.0 Flash'}
-                        {option.value === 'custom' && 'Custom API'}
-                      </span>
-                    </div>
-                  </div>
-                  <span className="text-sm font-medium text-accent-primary">+ Add key</span>
-                </button>
-              ))}
+            <div className="rounded-[14px] border border-dashed border-border-strong bg-bg-elevated/40 p-4 text-sm text-text-secondary">
+              No AI keys saved yet. Add one below so Scrimble can work on your projects.
             </div>
           )}
         </div>
 
-        <div id="ai-keys-form" className="mt-6 rounded-[14px] border border-border-default bg-bg-elevated/40 p-5">
+        <div className="mt-6 rounded-[14px] border border-border-default bg-bg-elevated/40 p-5">
           <div className="mb-4 flex items-center gap-2 text-[15px] font-medium text-text-primary">
             <Cpu className="h-4 w-4 text-accent-primary" />
             Add another AI
@@ -1165,24 +854,18 @@ export default function Settings() {
           </form>
         </div>
 
-        <div className="mt-6 card-level-2">
+        <div className="mt-6 rounded-[14px] border border-accent-border bg-accent-primary-muted p-4">
           <div className="flex items-start gap-3">
-            <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-status-secure" />
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <p className="text-sm font-medium text-text-primary">Your keys are encrypted</p>
-                <span className="text-[10px] font-mono text-status-secure bg-status-secure/10 px-1.5 py-0.5 rounded">AES-256-GCM</span>
-              </div>
-              <p className="text-sm leading-relaxed text-text-secondary">
-                Keys are encrypted before storage in Cloudflare D1. Scrimble never keeps them in plain text and only uses them to run work on your projects.
-              </p>
-            </div>
+            <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-accent-primary" />
+            <p className="text-sm leading-relaxed text-text-primary">
+              Your keys are encrypted before they are stored in Cloudflare D1. Scrimble never
+              keeps them in plain text and only uses them to run work on your projects.
+            </p>
           </div>
         </div>
       </motion.section>
-      ) : null}
 
-      {visibleSection === 'research' && activeResearchToolCount === 0 ? (
+      {activeResearchToolCount === 0 ? (
         <motion.div
           variants={itemVariants}
           className="mb-8 rounded-[14px] border border-accent-border bg-accent-primary-muted px-4 py-3"
@@ -1202,7 +885,6 @@ export default function Settings() {
         </motion.div>
       ) : null}
 
-      {visibleSection === 'research' ? (
       <motion.section
         ref={mcpSectionRef}
         id="research-tools"
@@ -1239,31 +921,20 @@ export default function Settings() {
 
         <div className="space-y-4">
           {isLoadingMCPServers ? (
-            <div className="space-y-4">
-              {[1, 2, 3, 4].map((i) => (
-                <div
-                  key={i}
-                  className="h-24 w-full skeleton-shimmer rounded-xl"
-                  style={{ animationDelay: `${i * 100}ms` }}
-                />
-              ))}
+            <div className="rounded-[14px] border border-border-default bg-bg-elevated/50 p-4 text-sm text-text-secondary">
+              Loading your research tools...
             </div>
           ) : (
-            mcpCardDefinitions.map((card, index) => {
+            mcpCardDefinitions.map((card) => {
               const connectedServer = mcpServersByType[card.type];
               const isConnected = Boolean(connectedServer);
               const isExpanded = expandedMCPType === card.type;
               const isSavingCard = savingMCPType === card.type;
-              const isOpeningCard = openingMCPType === card.type;
 
               return (
                 <div
                   key={card.type}
-                  className={cn(
-                    "rounded-[14px] border border-border-default p-4 transition-[border-color,background-color] duration-150 hover:border-white/[0.12] hover:bg-white/[0.02]",
-                    isConnected ? "bg-status-secure/[0.03] border-status-secure/20" : "bg-bg-elevated/70"
-                  )}
-                  style={card.recommended && !isConnected ? { borderLeft: '3px solid rgba(235, 94, 40, 0.5)' } : undefined}
+                  className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4"
                 >
                   <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
                     <div className="flex gap-4">
@@ -1277,7 +948,7 @@ export default function Settings() {
                             {card.label}
                           </h3>
                           {card.recommended ? (
-                            <span className="badge-warning">
+                            <span className="rounded-[6px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-status-warning">
                               Recommended
                             </span>
                           ) : null}
@@ -1289,8 +960,19 @@ export default function Settings() {
 
                         {isConnected && connectedServer ? (
                           <div className="mt-4 flex flex-wrap items-center gap-3">
-                            <span className="badge-success">
-                              Connected
+                            <span
+                              className={cn(
+                                'inline-flex items-center gap-2 rounded-[8px] border px-3 py-1 text-[12px] font-medium',
+                                getToolStatusClasses(connectedServer),
+                              )}
+                            >
+                              <span
+                                className={cn(
+                                  'h-2 w-2 rounded-full',
+                                  connectedServer.is_active ? 'bg-status-secure' : 'bg-status-warning',
+                                )}
+                              />
+                              {getToolStatusText(connectedServer)}
                             </span>
                             <p className="text-sm text-text-secondary">
                               {connectedServer.masked_config}
@@ -1314,53 +996,27 @@ export default function Settings() {
                             ) : null}
                             {connectedServer.is_active ? 'Pause' : 'Turn on'}
                           </button>
-                          {pendingMCPDisconnectId === connectedServer.id ? (
-                            <>
-                              <button
-                                type="button"
-                                onClick={clearPendingMCPDisconnect}
-                                disabled={removingMCPId === connectedServer.id}
-                                className="inline-flex h-9 items-center justify-center rounded-[8px] border border-border-default px-3 text-sm font-medium text-text-secondary transition-colors hover:border-border-strong hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
-                              >
-                                Cancel
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => void handleRemoveMCPServer(connectedServer)}
-                                disabled={removingMCPId === connectedServer.id}
-                                className="inline-flex h-9 items-center justify-center gap-2 rounded-[8px] border border-status-error/35 px-3 text-sm font-semibold text-status-error transition-colors hover:bg-status-error/10 disabled:cursor-not-allowed disabled:opacity-60"
-                              >
-                                {removingMCPId === connectedServer.id ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : null}
-                                Are you sure?
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => requestMCPDisconnect(connectedServer)}
-                              disabled={removingMCPId === connectedServer.id}
-                              className="inline-flex items-center gap-2 text-sm font-medium text-status-error transition-colors hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                              Disconnect
-                            </button>
-                          )}
+                          <button
+                            type="button"
+                            onClick={() => void handleRemoveMCPServer(connectedServer)}
+                            disabled={removingMCPId === connectedServer.id}
+                            className="inline-flex items-center gap-2 text-sm font-medium text-status-error transition-colors hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {removingMCPId === connectedServer.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : null}
+                            Disconnect
+                          </button>
                         </>
                       ) : (
                         <button
                           type="button"
-                          onClick={() => handleConnectIntent(card.type)}
-                          disabled={isOpeningCard}
-                          className={cn(
-                            index === 0 
-                              ? "btn-primary"
-                              : "btn-secondary",
-                            isOpeningCard && 'opacity-50',
-                          )}
+                          onClick={() =>
+                            setExpandedMCPType((current) => (current === card.type ? null : card.type))
+                          }
+                          className="inline-flex h-11 items-center justify-center rounded-[8px] border border-accent-border px-4 text-sm font-medium text-accent-primary transition-colors hover:bg-accent-primary-muted"
                         >
-                          {isOpeningCard ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                          {isOpeningCard ? 'Connecting...' : isExpanded ? 'Close' : card.type === 'custom' ? 'Configure' : 'Connect'}
+                          {isExpanded ? 'Close' : 'Connect'}
                         </button>
                       )}
                     </div>
@@ -1436,7 +1092,7 @@ export default function Settings() {
                           <button
                             type="submit"
                             disabled={isSavingCard}
-                            className="btn-primary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-50"
+                            className="btn-primary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {isSavingCard ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                             {isSavingCard ? 'Connecting...' : 'Save connection'}
@@ -1456,88 +1112,6 @@ export default function Settings() {
           never shared.
         </div>
       </motion.section>
-      ) : null}
-      </div>
-
-      <Dialog open={isSignOutDialogOpen} onOpenChange={(open) => !isSigningOut && setIsSignOutDialogOpen(open)}>
-        <DialogContent className="max-w-[400px]">
-          <DialogHeader>
-            <DialogTitle>Sign out of Scrimble?</DialogTitle>
-            <DialogDescription>
-              You&apos;ll need to sign back in to access your projects and plans.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="mt-4 flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={() => setIsSignOutDialogOpen(false)}
-              disabled={isSigningOut}
-              className="btn-secondary px-6"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleConfirmSignOut()}
-              disabled={isSigningOut}
-              className="btn-danger px-6"
-            >
-              {isSigningOut ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Signing out...
-                </>
-              ) : (
-                'Sign out'
-              )}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={providerToRemove !== null}
-        onOpenChange={(open) => {
-          if (!open && !removingId) {
-            setProviderToRemove(null);
-          }
-        }}
-      >
-        <DialogContent className="max-w-[400px]">
-          <DialogHeader>
-            <DialogTitle>Remove AI key?</DialogTitle>
-            <DialogDescription>
-              This removes {providerToRemove ? providerLabels[providerToRemove.provider] : 'this provider'} from your
-              workspace. You can add it again any time.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="mt-4 flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={() => setProviderToRemove(null)}
-              disabled={Boolean(removingId)}
-              className="btn-secondary px-6"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleConfirmProviderRemoval()}
-              disabled={Boolean(removingId)}
-              className="btn-danger px-6"
-            >
-              {removingId ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Removing...
-                </>
-              ) : (
-                'Remove key'
-              )}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </motion.main>
   );
 }
