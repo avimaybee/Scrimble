@@ -133,6 +133,8 @@ const providerLabels: Record<AIProviderType, string> = {
   groq: 'Groq',
   openrouter: 'OpenRouter',
   custom: 'Custom',
+  openrouter: 'OpenRouter',
+  groq: 'Groq',
 };
 
 const inputClassName = 'field-input';
