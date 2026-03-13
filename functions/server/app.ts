@@ -81,7 +81,7 @@ app.onError((error, c) => {
 
 app.use('*', async (c, next) => {
   await next();
-  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://openrouter.ai https://identitytoolkit.googleapis.com https://firebaseinstallations.googleapis.com https://securetoken.googleapis.com; img-src 'self' data: https://lh3.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
+  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://openrouter.ai https://api.groq.com https://identitytoolkit.googleapis.com https://firebaseinstallations.googleapis.com https://securetoken.googleapis.com; img-src 'self' data: https://lh3.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('X-Frame-Options', 'DENY');
@@ -90,7 +90,7 @@ app.use('*', async (c, next) => {
 
 const providerSchema = z.object({
   name: z.string().trim().min(1),
-  provider: z.enum(['anthropic', 'gemini', 'openai', 'custom', 'openrouter']),
+  provider: z.enum(['anthropic', 'gemini', 'openai', 'custom', 'openrouter', 'groq']),
   apiKey: z.string().trim().min(1),
   baseUrl: z.string().trim().optional(),
   model: z.string().trim().optional(),

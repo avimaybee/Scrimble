@@ -38,6 +38,8 @@ export function defaultModelForProvider(provider: ProviderType): string {
       return 'gemini-2.0-flash';
     case 'openrouter':
       return 'anthropic/claude-3.5-sonnet';
+    case 'groq':
+      return 'llama-3.3-70b-versatile';
     case 'custom':
       return 'gpt-4o-mini';
     case 'openai':
@@ -655,6 +657,10 @@ export async function callProvider(payload: {
 
   let url = payload.baseUrl?.trim() || 'https://api.openai.com/v1/chat/completions';
 
+  if (payload.providerType === 'groq') {
+    url = 'https://api.groq.com/openai/v1/chat/completions';
+  }
+
   if (payload.providerType === 'custom' && payload.baseUrl) {
     const urlObj = new URL(url);
     if (urlObj.pathname.endsWith('/v1')) {
@@ -665,7 +671,7 @@ export async function callProvider(payload: {
     url = urlObj.toString();
   }
 
-  const max_tokens = (payload.providerType === 'openai' || payload.providerType === 'custom') ? 16384 : 8192;
+  const max_tokens = (payload.providerType === 'openai' || payload.providerType === 'custom' || payload.providerType === 'groq' || payload.providerType === 'openrouter') ? 16384 : 8192;
 
 
 
