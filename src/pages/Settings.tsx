@@ -26,6 +26,7 @@ import {
   deleteAIProvider,
   getAIProviders,
   saveAIProvider,
+  testAIProvider,
 } from '../lib/ai';
 import {
   deleteMCPServer,
@@ -282,6 +283,7 @@ export default function Settings() {
   const [isSaving, setIsSaving] = useState(false);
   const [savingMCPType, setSavingMCPType] = useState<MCPServerType | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
   const [removingMCPId, setRemovingMCPId] = useState<string | null>(null);
   const [togglingMCPId, setTogglingMCPId] = useState<string | null>(null);
 
@@ -397,6 +399,22 @@ export default function Settings() {
       toast.error(error instanceof Error ? error.message : 'Could not remove that AI key.');
     } finally {
       setRemovingId(null);
+    }
+  };
+
+  const handleTestProvider = async (providerId: string) => {
+    setTestingId(providerId);
+    try {
+      const success = await testAIProvider(providerId);
+      if (success) {
+        toast.success('Connection successful! The AI key is working.');
+      } else {
+        toast.error('Connection failed. Please check your API key.');
+      }
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not test the connection.');
+    } finally {
+      setTestingId(null);
     }
   };
 
@@ -724,19 +742,34 @@ export default function Settings() {
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveProvider(provider.id)}
-                    disabled={removingId === provider.id}
-                    className="btn-danger"
-                  >
-                    {removingId === provider.id ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-4 w-4" />
-                    )}
-                    Remove
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleTestProvider(provider.id)}
+                      disabled={testingId === provider.id}
+                      className="btn-secondary"
+                    >
+                      {testingId === provider.id ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ShieldCheck className="h-4 w-4" />
+                      )}
+                      Test
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveProvider(provider.id)}
+                      disabled={removingId === provider.id}
+                      className="btn-danger"
+                    >
+                      {removingId === provider.id ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-4 w-4" />
+                      )}
+                      Remove
+                    </button>
+                  </div>
                 </div>
               </div>
             ))
