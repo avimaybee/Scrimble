@@ -13,7 +13,6 @@ import Dashboard from './pages/Dashboard';
 import NewProject from './pages/NewProject';
 import ProjectGeneration from './pages/ProjectGeneration';
 import ProjectCanvas from './pages/ProjectCanvas';
-import PlanRoute from './pages/PlanRoute';
 import Settings from './pages/Settings';
 import AppLayout from './components/AppLayout';
 import { Toaster } from 'sonner';
@@ -122,7 +121,6 @@ function AnimatedRoutes() {
         <Route path="/new" element={<ErrorBoundary name="New Project"><NewProject /></ErrorBoundary>} />
         <Route path="/settings" element={<ErrorBoundary name="Settings"><Settings /></ErrorBoundary>} />
         <Route path="/project/:id" element={<ErrorBoundary name="Canvas"><ProjectCanvas /></ErrorBoundary>} />
-        <Route path="/plan" element={<ErrorBoundary name="Plan"><PlanRoute /></ErrorBoundary>} />
         <Route path="/project" element={<Navigate to="/dashboard" replace />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Route>

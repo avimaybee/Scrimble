@@ -428,11 +428,7 @@ export default function LandingPage() {
   const { ref: planSectionRef, hasRevealed: hasPlanRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
   const { ref: aiSectionRef, hasRevealed: hasAiRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
   const { ref: morningSectionRef, hasRevealed: hasMorningRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
-  const heroBuilderCount = useCountUp({
-    target: HERO_SOCIAL_PROOF_TARGET,
-    durationMs: 1200,
-    enabled: true,
-  });
+  const heroBuilderCount = HERO_SOCIAL_PROOF_TARGET;
   const [typedPrompt, setTypedPrompt] = useState('');
 
   useEffect(() => {
