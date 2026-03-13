@@ -88,6 +88,18 @@ const providerOptions: Array<{
     placeholder: 'AIza...',
   },
   {
+    value: 'openrouter',
+    label: 'OpenRouter',
+    helper: 'Access multiple AI models through OpenRouter at competitive prices.',
+    placeholder: 'sk-or-...',
+  },
+  {
+    value: 'groq',
+    label: 'Groq',
+    helper: 'Ultra-fast inference with Groq. Great for quick iterations.',
+    placeholder: 'gsk_...',
+  },
+  {
     value: 'custom',
     label: 'Custom',
     helper: 'Use any OpenAI-compatible service by adding its API URL.',
