@@ -4,8 +4,8 @@
  */
 
 import React from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { BrowserRouter, Routes, Route, Navigate, useLocation, Outlet } from 'react-router-dom';
+import { motion } from 'framer-motion';
+import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { useAuthStore } from './store/authStore';
 import LandingPage from './pages/LandingPage';
 import AuthPage from './pages/AuthPage';
@@ -13,14 +13,13 @@ import Dashboard from './pages/Dashboard';
 import NewProject from './pages/NewProject';
 import ProjectGeneration from './pages/ProjectGeneration';
 import ProjectCanvas from './pages/ProjectCanvas';
+import PlanRoute from './pages/PlanRoute';
 import Settings from './pages/Settings';
 import AppLayout from './components/AppLayout';
 import { Toaster } from 'sonner';
 import { TooltipProvider } from './components/ui/tooltip';
 import ErrorBoundary from './components/ErrorBoundary';
 import FullscreenStatus from './components/ui/FullscreenStatus';
-
-const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
 function RouteTransition({
   children,
@@ -33,8 +32,8 @@ function RouteTransition({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -8 }}
-      transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
+      exit={{ opacity: 0, y: 8 }}
+      transition={{ duration: 0.2, ease: 'easeOut' }}
       className={className}
     >
       {children || <Outlet />}
@@ -61,7 +60,7 @@ function ProtectedRoute() {
   
   return (
     <AppLayout>
-      <RouteTransition className="flex flex-1 flex-col" />
+      <Outlet />
     </AppLayout>
   );
 }
@@ -87,51 +86,49 @@ function ProtectedFullscreenRoute() {
 }
 
 function AnimatedRoutes() {
-  const location = useLocation();
-
   return (
-    <AnimatePresence mode="wait">
-      <Routes location={location}>
-        <Route
-          path="/"
-          element={
-            <RouteTransition>
-              <LandingPage />
-            </RouteTransition>
-          }
-        />
-        <Route
-          path="/login"
-          element={
-            <RouteTransition>
-              <AuthPage mode="login" />
-            </RouteTransition>
-          }
-        />
-        <Route
-          path="/signup"
-          element={
-            <RouteTransition>
-              <AuthPage mode="signup" />
-            </RouteTransition>
-          }
-        />
-        
-        <Route element={<ProtectedFullscreenRoute />}>
-          <Route path="/project/:id/generating" element={<ErrorBoundary name="Generation"><ProjectGeneration /></ErrorBoundary>} />
-        </Route>
+    <Routes>
+      <Route
+        path="/"
+        element={
+          <RouteTransition>
+            <LandingPage />
+          </RouteTransition>
+        }
+      />
+      <Route
+        path="/login"
+        element={
+          <RouteTransition>
+            <AuthPage mode="login" />
+          </RouteTransition>
+        }
+      />
+      <Route
+        path="/signup"
+        element={
+          <RouteTransition>
+            <AuthPage mode="signup" />
+          </RouteTransition>
+        }
+      />
 
-        <Route element={<ProtectedRoute />}>
-          <Route path="/dashboard" element={<ErrorBoundary name="Dashboard"><Dashboard /></ErrorBoundary>} />
-          <Route path="/new" element={<ErrorBoundary name="New Project"><NewProject /></ErrorBoundary>} />
-          <Route path="/settings" element={<ErrorBoundary name="Settings"><Settings /></ErrorBoundary>} />
-          <Route path="/project/:id" element={<ErrorBoundary name="Canvas"><ProjectCanvas /></ErrorBoundary>} />
-        </Route>
+      <Route element={<ProtectedFullscreenRoute />}>
+        <Route path="/project/:id/generating" element={<ErrorBoundary name="Generation"><ProjectGeneration /></ErrorBoundary>} />
+      </Route>
 
+      <Route element={<ProtectedRoute />}>
+        <Route path="/dashboard" element={<ErrorBoundary name="Dashboard"><Dashboard /></ErrorBoundary>} />
+        <Route path="/new" element={<ErrorBoundary name="New Project"><NewProject /></ErrorBoundary>} />
+        <Route path="/settings" element={<ErrorBoundary name="Settings"><Settings /></ErrorBoundary>} />
+        <Route path="/project/:id" element={<ErrorBoundary name="Canvas"><ProjectCanvas /></ErrorBoundary>} />
+        <Route path="/plan" element={<ErrorBoundary name="Plan"><PlanRoute /></ErrorBoundary>} />
         <Route path="/project" element={<Navigate to="/dashboard" replace />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </AnimatePresence>
+        <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      </Route>
+
+      <Route path="*" element={<Navigate to="/login" replace />} />
+    </Routes>
   );
 }
 
@@ -146,8 +143,9 @@ export default function App() {
         position="bottom-right"
         expand={false}
         toastOptions={{
+          duration: 4000,
           classNames: {
-            toast: '!rounded-[14px] !border !border-border-default !bg-bg-surface !text-text-primary !shadow-panel',
+            toast: 'scrimble-toast !rounded-[14px] !border !border-border-default !bg-bg-surface !text-text-primary !shadow-panel',
             title: '!font-sans !text-[14px] !font-medium !text-text-primary',
             description: '!font-sans !text-[13px] !text-text-secondary',
             actionButton: '!bg-accent-primary !text-text-primary',

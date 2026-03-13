@@ -112,8 +112,18 @@ function maskSecret(secret: string) {
     return '••••••••';
   }
 
-  const lastFour = trimmed.slice(-4);
-  return `••••••••${lastFour}`;
+  if (trimmed.length <= 12) {
+    const prefixLength = Math.max(1, Math.min(4, trimmed.length - 4));
+    const prefix = trimmed.slice(0, prefixLength);
+    const suffix = trimmed.slice(-4);
+    const maskLength = Math.max(4, trimmed.length - prefix.length - suffix.length);
+    return `${prefix}${'•'.repeat(maskLength)}${suffix}`;
+  }
+
+  const prefix = trimmed.slice(0, 8);
+  const suffix = trimmed.slice(-4);
+  const maskLength = Math.max(8, trimmed.length - prefix.length - suffix.length);
+  return `${prefix}${'•'.repeat(maskLength)}${suffix}`;
 }
 
 export function getMCPServerDisplayName(serverType: MCPServerType, providedName?: string) {

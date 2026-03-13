@@ -309,6 +309,7 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
   'batch_5_enrich_steps',
   'batch_6_generate_files',
 ]);
+const ACTIVE_GENERATION_HEARTBEAT_STATUSES = Array.from(ACTIVE_GENERATION_STATUSES);
 
 export const GENERATION_STALE_MS = 15 * 60 * 1000;
 export const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
@@ -1611,10 +1612,11 @@ async function updateProjectGenerationStatus(
     touchHeartbeat?: boolean;
     generationRunId?: string | null;
     generationProviderId?: string | null;
+    expectedRunId?: string | null;
   } = {},
 ) {
   const generationError = options.generationError ?? null;
-  await env.DB.prepare(`
+  const result = await env.DB.prepare(`
     UPDATE projects
     SET generation_status = ?,
         generation_error = ?,
@@ -1641,6 +1643,12 @@ async function updateProjectGenerationStatus(
         END,
         updated_at = datetime("now")
     WHERE id = ?
+      AND generation_status <> 'cancelled'
+      AND (
+        ? IS NULL
+        OR generation_run_id IS NULL
+        OR generation_run_id = ?
+      )
   `)
     .bind(
       generationStatus,
@@ -1654,8 +1662,12 @@ async function updateProjectGenerationStatus(
       options.clearCompletedAt ? 1 : 0,
       options.touchHeartbeat ? 1 : 0,
       projectId,
+      options.expectedRunId ?? null,
+      options.expectedRunId ?? null,
     )
     .run();
+
+  return Number((result as { meta?: { changes?: number } }).meta?.changes || 0);
 }
 
 async function touchGenerationHeartbeat(
@@ -1664,28 +1676,40 @@ async function touchGenerationHeartbeat(
   runId?: string | null,
 ) {
   if (runId) {
-    await env.DB.prepare(`
+    const result = await env.DB.prepare(`
       UPDATE projects
-      SET generation_run_id = ?,
+      SET generation_run_id = CASE
+            WHEN generation_run_id IS NULL THEN ?
+            ELSE generation_run_id
+          END,
           generation_heartbeat_at = datetime("now"),
           updated_at = datetime("now")
       WHERE id = ?
+        AND generation_status IN (${ACTIVE_GENERATION_HEARTBEAT_STATUSES.map(() => '?').join(', ')})
+        AND (generation_run_id IS NULL OR generation_run_id = ?)
     `)
-      .bind(runId, projectId)
+      .bind(runId, projectId, ...ACTIVE_GENERATION_HEARTBEAT_STATUSES, runId)
       .run();
-    lastHeartbeatTouchByProject.set(projectId, Date.now());
+
+    if (Number((result as { meta?: { changes?: number } }).meta?.changes || 0) > 0) {
+      lastHeartbeatTouchByProject.set(projectId, Date.now());
+    }
     return;
   }
 
-  await env.DB.prepare(`
+  const result = await env.DB.prepare(`
     UPDATE projects
     SET generation_heartbeat_at = datetime("now"),
         updated_at = datetime("now")
     WHERE id = ?
+      AND generation_status IN (${ACTIVE_GENERATION_HEARTBEAT_STATUSES.map(() => '?').join(', ')})
   `)
-    .bind(projectId)
+    .bind(projectId, ...ACTIVE_GENERATION_HEARTBEAT_STATUSES)
     .run();
-  lastHeartbeatTouchByProject.set(projectId, Date.now());
+
+  if (Number((result as { meta?: { changes?: number } }).meta?.changes || 0) > 0) {
+    lastHeartbeatTouchByProject.set(projectId, Date.now());
+  }
 }
 
 async function maybeTouchGenerationHeartbeat(
@@ -1933,13 +1957,25 @@ function activityIconForKind(kind: ActivityKind) {
   }
 }
 
-async function emitBatchStart(env: Bindings, projectId: string, batchName: GenerationBatchName) {
-  await updateProjectGenerationStatus(env, projectId, batchName, {
+function staleGenerationRunError(projectId: string, runId: string, phase: string) {
+  return new GenerationPipelineError(
+    `Generation run ${runId} for project ${projectId} is no longer active while ${phase}.`,
+    true,
+  );
+}
+
+async function emitBatchStart(env: Bindings, projectId: string, runId: string, batchName: GenerationBatchName) {
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, batchName, {
     generationError: null,
     markStarted: true,
     clearCompletedAt: true,
     touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
   });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, `starting ${batchName}`);
+  }
   await resetGenerationThinkingState(env, projectId, batchName);
   await persistGenerationStreamEvent(env, {
     projectId,
@@ -2048,11 +2084,12 @@ async function logActivity(
   payload: {
     projectId: string;
     batchName: GenerationBatchName;
+    runId?: string | null;
     kind: ActivityKind;
     message: string;
   },
 ) {
-  await maybeTouchGenerationHeartbeat(env, payload.projectId);
+  await maybeTouchGenerationHeartbeat(env, payload.projectId, payload.runId);
   await insertGenerationEvent(env, {
     projectId: payload.projectId,
     eventType: 'activity',
@@ -2069,18 +2106,19 @@ async function logActivity(
 async function callAITextWithHeartbeat(
   env: Bindings,
   projectId: string,
+  runId: string,
   payload: Parameters<typeof callAIText>[0],
 ) {
   const intervalId = setInterval(() => {
-    void touchGenerationHeartbeat(env, projectId).catch((error) => {
+    void touchGenerationHeartbeat(env, projectId, runId).catch((error) => {
       console.warn('[generation-heartbeat] Failed to refresh heartbeat during AI call:', error);
     });
   }, HEARTBEAT_TOUCH_INTERVAL_MS);
 
   try {
-    await touchGenerationHeartbeat(env, projectId);
+    await touchGenerationHeartbeat(env, projectId, runId);
     const response = await callAIText(payload);
-    await touchGenerationHeartbeat(env, projectId);
+    await touchGenerationHeartbeat(env, projectId, runId);
     return response;
   } finally {
     clearInterval(intervalId);
@@ -2377,6 +2415,7 @@ async function callValidatedBatch<T>(
   options: {
     env: Bindings;
     projectId: string;
+    runId: string;
     runType: GenerationBatchName;
     systemPrompt: string;
     prompt: string;
@@ -2398,7 +2437,7 @@ async function callValidatedBatch<T>(
             ? `Waiting for ${provider.model} to ${getBatchWorkDescription(options.runType)}...`
             : `Retrying ${getBatchStartLabel(options.runType).toLowerCase()} with a stricter JSON correction pass...`,
       });
-      const { text } = await callAITextWithHeartbeat(options.env, options.projectId, {
+      const { text } = await callAITextWithHeartbeat(options.env, options.projectId, options.runId, {
         providerType: provider.providerType,
         apiKey: provider.apiKey,
         model: provider.model,
@@ -2450,16 +2489,18 @@ async function callValidatedBatch<T>(
         };
       }
 
-      lastError = `Validation failed for ${options.runType}: ${validated.error.message}`;
+      const validationError = validated.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ');
+      lastError = `Validation failed for ${options.runType}: ${validationError}`;
       logBatchResponseFailure(options.runType, 'schema', cleanedText);
+      
       if (attempt === 1) {
           await logActivity(options.env, {
             projectId: options.projectId,
             batchName: options.runType,
             kind: 'warning',
-            message: 'The first model reply did not match Scrimble’s expected shape, so I requested a corrected version.',
+            message: `The first model reply had a schema error, so I'm asking for a correction.`,
           });
-          prompt = formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
+          prompt = formatValidationRetryPrompt(options.prompt, cleanedText, `${options.schemaDescription}\n\nERROR TO FIX: ${validationError}`);
           continue;
       }
 
@@ -2475,12 +2516,25 @@ async function callValidatedBatch<T>(
 async function failBatch(
   env: Bindings,
   projectId: string,
+  runId: string,
   provider: ProviderConfig,
   runType: GenerationBatchName,
   input: unknown,
   message: string,
   attemptCount: number,
 ): Promise<never> {
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'failed', {
+    generationError: message,
+    markStarted: true,
+    markCompleted: true,
+    touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
+  });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, `failing ${runType}`);
+  }
+
   await insertAgentRun(env, {
     projectId,
     runType,
@@ -2491,13 +2545,6 @@ async function failBatch(
     model: provider.model,
     sequenceIndex: batchSequenceIndexes[runType],
     attemptCount,
-  });
-
-  await updateProjectGenerationStatus(env, projectId, 'failed', {
-    generationError: message,
-    markStarted: true,
-    markCompleted: true,
-    touchHeartbeat: true,
   });
 
   await insertGenerationEvent(env, {
@@ -2518,6 +2565,7 @@ async function failBatch(
 async function completeBatch<T>(
   env: Bindings,
   projectId: string,
+  runId: string,
   provider: ProviderConfig,
   runType: GenerationBatchName,
   input: unknown,
@@ -2526,6 +2574,17 @@ async function completeBatch<T>(
   storedOutput: unknown = data,
   durationMs = 0,
 ) {
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, runType, {
+    generationError: null,
+    markStarted: true,
+    touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
+  });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, `completing ${runType}`);
+  }
+
   await insertAgentRun(env, {
     projectId,
     runType,
@@ -2536,12 +2595,6 @@ async function completeBatch<T>(
     model: provider.model,
     sequenceIndex: batchSequenceIndexes[runType],
     attemptCount,
-  });
-
-  await updateProjectGenerationStatus(env, projectId, runType, {
-    generationError: null,
-    markStarted: true,
-    touchHeartbeat: true,
   });
 
   await insertGenerationEvent(env, {
@@ -2773,7 +2826,7 @@ async function executeBatch1(
   env: Bindings,
   project: ProjectRecord,
   provider: ProviderConfig,
-  _runId: string,
+  runId: string,
   _builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
 ): Promise<BatchExecutionResult> {
@@ -2782,7 +2835,7 @@ async function executeBatch1(
     description: projectBrief.summary || project.description || '',
   };
 
-  await emitBatchStart(env, project.id, 'batch_1_research_stack');
+  await emitBatchStart(env, project.id, runId, 'batch_1_research_stack');
   await logActivity(env, {
     projectId: project.id,
     batchName: 'batch_1_research_stack',
@@ -2809,6 +2862,7 @@ Identify the stack implied by the idea. For each technology, provide:
     const result = await callValidatedBatch(provider, {
       env,
       projectId: project.id,
+      runId,
       runType: 'batch_1_research_stack',
       systemPrompt,
       prompt,
@@ -2833,6 +2887,7 @@ Identify the stack implied by the idea. For each technology, provide:
     await completeBatch(
       env,
       project.id,
+      runId,
       provider,
       'batch_1_research_stack',
       input,
@@ -2864,6 +2919,7 @@ Identify the stack implied by the idea. For each technology, provide:
     await failBatch(
       env,
       project.id,
+      runId,
       provider,
       'batch_1_research_stack',
       input,
@@ -2936,7 +2992,7 @@ async function executeBatch2(
     });
   };
 
-  await emitBatchStart(env, projectId, 'batch_2_fetch_and_read');
+  await emitBatchStart(env, projectId, runId, 'batch_2_fetch_and_read');
   await logActivity(env, {
     projectId,
     batchName: 'batch_2_fetch_and_read',
@@ -3450,6 +3506,7 @@ Preserve specific version and compatibility details.`;
     const result = await callValidatedBatch(provider, {
       env,
       projectId,
+      runId,
       runType: 'batch_2_fetch_and_read',
       systemPrompt,
       prompt,
@@ -3487,6 +3544,7 @@ Preserve specific version and compatibility details.`;
     await completeBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_2_fetch_and_read',
       input,
@@ -3518,6 +3576,7 @@ Preserve specific version and compatibility details.`;
     await failBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_2_fetch_and_read',
       input,
@@ -3530,6 +3589,7 @@ Preserve specific version and compatibility details.`;
 async function executeBatch3(
   env: Bindings,
   projectId: string,
+  runId: string,
   provider: ProviderConfig,
   project: ProjectRecord,
   _builderProfile: LoadedBuilderProfileContext,
@@ -3546,7 +3606,7 @@ async function executeBatch3(
     review_feedback_provided: false,
   };
 
-  await emitBatchStart(env, projectId, 'batch_3_architect');
+  await emitBatchStart(env, projectId, runId, 'batch_3_architect');
   await logActivity(env, {
     projectId,
     batchName: 'batch_3_architect',
@@ -3583,6 +3643,7 @@ IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "Postgr
     const result = await callValidatedBatch(provider, {
       env,
       projectId,
+      runId,
       runType: 'batch_3_architect',
       systemPrompt,
       prompt,
@@ -3593,6 +3654,7 @@ IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "Postgr
     await completeBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_3_architect',
       input,
@@ -3632,6 +3694,7 @@ IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "Postgr
     await failBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_3_architect',
       input,
@@ -3644,6 +3707,7 @@ IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "Postgr
 async function executeBatch4(
   env: Bindings,
   projectId: string,
+  runId: string,
   provider: ProviderConfig,
   _builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
@@ -3656,7 +3720,7 @@ async function executeBatch4(
     review_feedback_provided: reviewContext.reviewFeedbackProvided,
   };
 
-  await emitBatchStart(env, projectId, 'batch_4_plan_build');
+  await emitBatchStart(env, projectId, runId, 'batch_4_plan_build');
   await logActivity(env, {
     projectId,
     batchName: 'batch_4_plan_build',
@@ -3689,6 +3753,7 @@ Rules:
     const result = await callValidatedBatch(provider, {
       env,
       projectId,
+      runId,
       runType: 'batch_4_plan_build',
       systemPrompt,
       prompt,
@@ -3700,6 +3765,7 @@ Rules:
     await completeBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_4_plan_build',
       input,
@@ -3731,6 +3797,7 @@ Rules:
     await failBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_4_plan_build',
       input,
@@ -3770,7 +3837,7 @@ async function executeBatch5(
     : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
 
-  await emitBatchStart(env, projectId, 'batch_5_enrich_steps');
+  await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
   await logActivity(env, {
     projectId,
     batchName: 'batch_5_enrich_steps',
@@ -3878,6 +3945,7 @@ For each step, obey any requirements array included in the live step research co
     const result = await callValidatedBatch(provider, {
       env,
       projectId,
+      runId,
       runType: 'batch_5_enrich_steps',
       systemPrompt,
       prompt,
@@ -3898,6 +3966,7 @@ For each step, obey any requirements array included in the live step research co
     await completeBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_5_enrich_steps',
       input,
@@ -3930,6 +3999,7 @@ For each step, obey any requirements array included in the live step research co
     await failBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_5_enrich_steps',
       input,
@@ -3942,6 +4012,7 @@ For each step, obey any requirements array included in the live step research co
 async function executeBatch6(
   env: Bindings,
   projectId: string,
+  runId: string,
   provider: ProviderConfig,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
@@ -3961,7 +4032,7 @@ async function executeBatch6(
     current_step: currentActiveStep,
   };
 
-  await emitBatchStart(env, projectId, 'batch_6_generate_files');
+  await emitBatchStart(env, projectId, runId, 'batch_6_generate_files');
   await logActivity(env, {
     projectId,
     batchName: 'batch_6_generate_files',
@@ -4046,6 +4117,7 @@ ${skillFileProfileInstructions}`;
     const result = await callValidatedBatch(provider, {
       env,
       projectId,
+      runId,
       runType: 'batch_6_generate_files',
       systemPrompt,
       prompt,
@@ -4060,6 +4132,7 @@ ${skillFileProfileInstructions}`;
     await completeBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_6_generate_files',
       input,
@@ -4091,6 +4164,7 @@ ${skillFileProfileInstructions}`;
     await failBatch(
       env,
       projectId,
+      runId,
       provider,
       'batch_6_generate_files',
       input,
@@ -4100,14 +4174,19 @@ ${skillFileProfileInstructions}`;
   }
 }
 
-async function pauseForArchitectureReview(env: Bindings, projectId: string) {
+async function pauseForArchitectureReview(env: Bindings, projectId: string, runId: string) {
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
 
-  await updateProjectGenerationStatus(env, projectId, 'awaiting_review', {
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'awaiting_review', {
     generationError: null,
     markStarted: true,
     touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
   });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, 'pausing for architecture review');
+  }
   await logActivity(env, {
     projectId,
     batchName: 'batch_3_architect',
@@ -4124,14 +4203,19 @@ async function pauseForArchitectureReview(env: Bindings, projectId: string) {
   });
 }
 
-async function finalizeProjectGeneration(env: Bindings, projectId: string) {
-  await clearGenerationCheckpoints(env, projectId);
-  await updateProjectGenerationStatus(env, projectId, 'complete', {
+async function finalizeProjectGeneration(env: Bindings, projectId: string, runId: string) {
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'complete', {
     generationError: null,
     markStarted: true,
     markCompleted: true,
     touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
   });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, 'finalizing generation');
+  }
+  await clearGenerationCheckpoints(env, projectId, runId);
   await logActivity(env, {
     projectId,
     batchName: 'batch_6_generate_files',
@@ -4241,7 +4325,12 @@ async function processProjectGenerationTurn(
   }
 
   const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
-  if (currentStatus === 'complete' || currentStatus === 'failed' || currentStatus === 'awaiting_review') {
+  if (
+    currentStatus === 'complete'
+    || currentStatus === 'failed'
+    || currentStatus === 'awaiting_review'
+    || currentStatus === 'cancelled'
+  ) {
     return false;
   }
 
@@ -4265,24 +4354,32 @@ async function processProjectGenerationTurn(
   const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
   const statusToRun = resolvePipelineStatusToRun(currentStatus, completed);
 
-  await updateProjectGenerationStatus(env, project.id, currentStatus, {
+  const primingChanges = await updateProjectGenerationStatus(env, project.id, currentStatus, {
     generationError: null,
     markStarted: true,
     clearCompletedAt: true,
     touchHeartbeat: true,
     generationRunId: activeRunId,
     generationProviderId: provider.providerId,
+    expectedRunId: activeRunId,
   });
+  if (primingChanges === 0) {
+    return false;
+  }
 
   if (statusToRun === 'queued' && !completed.includes('batch_1_research_stack')) {
-    await updateProjectGenerationStatus(env, project.id, 'queued', {
+    const queuedChanges = await updateProjectGenerationStatus(env, project.id, 'queued', {
       generationError: null,
       markStarted: true,
       clearCompletedAt: true,
       touchHeartbeat: true,
       generationRunId: activeRunId,
       generationProviderId: provider.providerId,
+      expectedRunId: activeRunId,
     });
+    if (queuedChanges === 0) {
+      return false;
+    }
     await logActivity(env, {
       projectId: project.id,
       batchName: 'batch_1_research_stack',
@@ -4333,16 +4430,16 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_2_fetch_and_read':
       if (!completed.includes('batch_3_architect')) {
-        await executeBatch3(env, project.id, provider, project, builderProfile, projectBrief);
+        await executeBatch3(env, project.id, activeRunId, provider, project, builderProfile, projectBrief);
       }
-      await pauseForArchitectureReview(env, project.id);
+      await pauseForArchitectureReview(env, project.id, activeRunId);
       return false;
     case 'batch_3_architect':
-      await pauseForArchitectureReview(env, project.id);
+      await pauseForArchitectureReview(env, project.id, activeRunId);
       return false;
     case 'approved':
       if (!completed.includes('batch_4_plan_build')) {
-        await executeBatch4(env, project.id, provider, builderProfile, projectBrief);
+        await executeBatch4(env, project.id, activeRunId, provider, builderProfile, projectBrief);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
@@ -4372,12 +4469,12 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_5_enrich_steps':
       if (!completed.includes('batch_6_generate_files')) {
-        await executeBatch6(env, project.id, provider, builderProfile, projectBrief);
+        await executeBatch6(env, project.id, activeRunId, provider, builderProfile, projectBrief);
       }
-      await finalizeProjectGeneration(env, project.id);
+      await finalizeProjectGeneration(env, project.id, activeRunId);
       return false;
     case 'batch_6_generate_files':
-      await finalizeProjectGeneration(env, project.id);
+      await finalizeProjectGeneration(env, project.id, activeRunId);
       return false;
     default:
       return false;

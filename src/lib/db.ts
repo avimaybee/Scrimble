@@ -223,7 +223,7 @@ async function fetchWithAuth(endpoint: string, options: APIRequestOptions = {}):
       }
 
       if (response.status >= 500) {
-        throw new Error(errorBody?.error || 'The server hit a snag. Try again in a moment.');
+        throw new Error(errorBody?.error || "Something's off on our end. Give it a second.");
       }
 
       throw new Error(errorBody?.error || `API error: ${response.statusText}`);
@@ -255,9 +255,10 @@ export const dbService = {
     return fetchAPI<Project | null>(`/projects/${id}`);
   },
 
-  async resumeProjectGeneration(id: string): Promise<{ success: boolean; generation_status: string; resumedAt?: string }> {
+  async resumeProjectGeneration(id: string, options: { description?: string; providerId?: string } = {}): Promise<{ success: boolean; generation_status: string; resumedAt?: string }> {
     return fetchAPI(`/projects/${id}/resume`, {
       method: 'POST',
+      body: JSON.stringify(options),
     });
   },
 
