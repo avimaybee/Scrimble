@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Hexagon, ArrowRight } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { useCountUp } from '../hooks/useCountUp';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 const HERO_SOCIAL_PROOF_TARGET = 2000;
@@ -428,11 +427,7 @@ export default function LandingPage() {
   const { ref: planSectionRef, hasRevealed: hasPlanRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
   const { ref: aiSectionRef, hasRevealed: hasAiRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
   const { ref: morningSectionRef, hasRevealed: hasMorningRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
-  const heroBuilderCount = useCountUp({
-    target: HERO_SOCIAL_PROOF_TARGET,
-    durationMs: 1200,
-    enabled: true,
-  });
+  const heroBuilderCount = HERO_SOCIAL_PROOF_TARGET;
   const [typedPrompt, setTypedPrompt] = useState('');
 
   useEffect(() => {

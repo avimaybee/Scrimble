@@ -116,10 +116,6 @@ export default function NewProject() {
   const conversationProgress = Math.min(Math.max(intakeSession?.brief.conversation_turns || 1, 1), 4);
   const needsAiSetup = !isPreparationLoading && !generationPreparation?.has_ai_provider;
 
-  useEffect(() => {
-    document.title = 'Plan — Scrimble';
-  }, []);
-
   const preparationBadges = useMemo(() => {
     if (!generationPreparation) {
       return [];
@@ -608,7 +604,7 @@ export default function NewProject() {
                     </p>
                   </div>
                   <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
-                    Building context... {conversationProgress} / 4 steps
+                    Building context... {conversationProgress}/4
                   </div>
                 </div>
 
