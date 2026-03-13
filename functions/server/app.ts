@@ -81,7 +81,7 @@ app.onError((error, c) => {
 
 app.use('*', async (c, next) => {
   await next();
-  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://identitytoolkit.googleapis.com https://firebaseinstallations.googleapis.com https://securetoken.googleapis.com; img-src 'self' data: https://lh3.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
+  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://openrouter.ai https://identitytoolkit.googleapis.com https://firebaseinstallations.googleapis.com https://securetoken.googleapis.com; img-src 'self' data: https://lh3.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('X-Frame-Options', 'DENY');
@@ -90,7 +90,7 @@ app.use('*', async (c, next) => {
 
 const providerSchema = z.object({
   name: z.string().trim().min(1),
-  provider: z.enum(['anthropic', 'gemini', 'openai', 'custom']),
+  provider: z.enum(['anthropic', 'gemini', 'openai', 'custom', 'openrouter']),
   apiKey: z.string().trim().min(1),
   baseUrl: z.string().trim().optional(),
   model: z.string().trim().optional(),
@@ -335,7 +335,28 @@ function mapProviderRow(row: any) {
     base_url: row.base_url || undefined,
     model: row.model || undefined,
     is_default: toBoolean(row.is_default),
+    masked_key: row.masked_key || undefined,
   };
+}
+
+function maskApiKeyPreview(secret: string) {
+  const trimmed = secret.trim();
+  if (!trimmed) {
+    return '••••••••';
+  }
+
+  if (trimmed.length <= 12) {
+    const prefixLength = Math.max(1, Math.min(4, trimmed.length - 4));
+    const prefix = trimmed.slice(0, prefixLength);
+    const suffix = trimmed.slice(-4);
+    const maskLength = Math.max(4, trimmed.length - prefix.length - suffix.length);
+    return `${prefix}${'•'.repeat(maskLength)}${suffix}`;
+  }
+
+  const prefix = trimmed.slice(0, 8);
+  const suffix = trimmed.slice(-4);
+  const maskLength = Math.max(8, trimmed.length - prefix.length - suffix.length);
+  return `${prefix}${'•'.repeat(maskLength)}${suffix}`;
 }
 
 function mapProjectRow(row: any) {
@@ -691,12 +712,32 @@ app.use('*', async (c, next) => {
 
 app.get('/ai/providers', async (c) => {
   const providers = await c.env.DB.prepare(
-    'SELECT id, name, provider, base_url, model, is_default FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC'
+    'SELECT id, name, provider, base_url, model, is_default, api_key_enc FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC'
   )
     .bind(c.get('uid'))
     .all();
 
-  return c.json(providers.results.map(mapProviderRow));
+  const rows = providers.results as any[];
+  const mappedProviders = await Promise.all(
+    rows.map(async (row) => {
+      let maskedKey: string | undefined;
+      if (typeof row.api_key_enc === 'string' && row.api_key_enc.trim().length > 0) {
+        try {
+          const decrypted = await decrypt(row.api_key_enc, c.env.ENCRYPTION_KEY);
+          maskedKey = maskApiKeyPreview(decrypted);
+        } catch {
+          maskedKey = '••••••••';
+        }
+      }
+
+      return mapProviderRow({
+        ...row,
+        masked_key: maskedKey,
+      });
+    }),
+  );
+
+  return c.json(mappedProviders);
 });
 
 app.post('/ai/providers', async (c) => {
@@ -1418,7 +1459,7 @@ app.post('/projects/:id/resume', async (c) => {
     (project.generation_heartbeat_at as string | null) || null,
   );
 
-  if (status !== 'failed' && !executionStale && !queuedResumeReady) {
+  if (status !== 'failed' && status !== 'cancelled' && !executionStale && !queuedResumeReady) {
     return c.json({ error: 'This generation run is still active. Wait for it to finish or stall before resuming.' }, 409);
   }
 
@@ -1426,10 +1467,18 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'Architecture review is waiting for approval, so there is nothing to resume yet.' }, 409);
   }
 
-  const providerId = (project.generation_provider_id as string | null) || undefined;
+  const body = await c.req.json().catch(() => ({}));
+  const providerId = (body.providerId as string | undefined) || (project.generation_provider_id as string | null) || undefined;
 
   if (!providerId) {
-    return c.json({ error: 'The original AI provider for this generation run is missing. Start a new generation instead.' }, 409);
+    return c.json({ error: 'An AI provider is required to resume this project.' }, 409);
+  }
+
+  // If the user provided a new description, update it now.
+  if (typeof body.description === 'string' && body.description.trim()) {
+    await c.env.DB.prepare('UPDATE projects SET description = ?, updated_at = datetime("now") WHERE id = ?')
+      .bind(body.description.trim(), projectId)
+      .run();
   }
 
   const runId = crypto.randomUUID();
@@ -1541,6 +1590,10 @@ app.post('/projects/:id/nudge', async (c) => {
 
   if (status === 'failed') {
     return c.json({ error: 'This build stopped. Use resume so Scrimble can continue from the latest completed checkpoint.' }, 409);
+  }
+
+  if (status === 'cancelled') {
+    return c.json({ error: 'This build is cancelled. Use resume so Scrimble can continue from the latest completed checkpoint.' }, 409);
   }
 
   const providerId = (project.generation_provider_id as string | null) || undefined;
@@ -1658,16 +1711,18 @@ app.post('/projects/:id/cancel', async (c) => {
   }
 
   // Always update D1 directly as the source of truth
+  const cancelledRunId = crypto.randomUUID();
   await c.env.DB.prepare(`
     UPDATE projects
     SET generation_status = 'cancelled',
         generation_error = 'Generation cancelled by user.',
+        generation_run_id = ?,
         generation_completed_at = datetime("now"),
         generation_heartbeat_at = datetime("now"),
         updated_at = datetime("now")
     WHERE id = ? AND user_id = ?
   `)
-    .bind(projectId, c.get('uid'))
+    .bind(cancelledRunId, projectId, c.get('uid'))
     .run();
 
   await persistGenerationStreamEvent(c.env, {
@@ -1763,7 +1818,7 @@ app.patch('/projects/:id', async (c) => {
   const body = await c.req.json();
   await c.env.DB.prepare(`
     UPDATE projects
-    SET name = ?, description = ?, project_type = ?, stack = ?, status = ?, risk_score = ?, updated_at = datetime("now")
+    SET name = ?, description = ?, project_type = ?, stack = ?, status = ?, risk_score = ?, generation_provider_id = ?, updated_at = datetime("now")
     WHERE id = ?
   `)
     .bind(
@@ -1773,6 +1828,7 @@ app.patch('/projects/:id', async (c) => {
       body.stack !== undefined ? serializeJson(body.stack) || '{}' : existingProject.stack,
       optionalText(body.status) || existingProject.status,
       body.risk_score !== undefined ? asNumber(body.risk_score, 0) : asNumber(existingProject.risk_score, 0),
+      optionalText(body.generation_provider_id) || existingProject.generation_provider_id,
       projectId,
     )
     .run();

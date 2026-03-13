@@ -269,17 +269,19 @@ export class ProjectGeneratorDO {
 
     // Reset the pipeline chain so any queued-but-not-yet-started run is dropped
     this.pipelineChain = Promise.resolve();
+    const cancelledRunId = crypto.randomUUID();
 
     await this.env.DB.prepare(`
       UPDATE projects
       SET generation_status = 'cancelled',
           generation_error = 'Generation cancelled by user.',
+          generation_run_id = ?,
           generation_completed_at = datetime("now"),
           generation_heartbeat_at = datetime("now"),
           updated_at = datetime("now")
       WHERE id = ?
     `)
-      .bind(projectId)
+      .bind(cancelledRunId, projectId)
       .run();
 
     await persistGenerationStreamEvent(this.env, {

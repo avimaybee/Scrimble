@@ -98,6 +98,8 @@ const providerLabels: Record<AIProviderType, string> = {
   anthropic: 'Anthropic',
   gemini: 'Gemini',
   custom: 'Custom',
+  openrouter: 'OpenRouter',
+  groq: 'Groq',
 };
 
 const inputClassName = 'field-input';
