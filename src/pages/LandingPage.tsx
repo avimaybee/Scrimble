@@ -1,10 +1,14 @@
-import type { ReactNode } from 'react';
+import React, { useState, useEffect, useRef, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Hexagon, ArrowRight } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { useCountUp } from '../hooks/useCountUp';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
+const HERO_SOCIAL_PROOF_TARGET = 2000;
+const PROMPT_DEMO_TEXT =
+  'I want to build a booking app for independent dog walkers with recurring billing, client notes, and a clear daily checklist for each walk.';
 
 const heroContainerVariants = {
   hidden: {},
@@ -160,13 +164,56 @@ const canvasPreviewPaths = [
   'M 46 56 C 39 56, 39 44, 34 44',
 ];
 
-function SectionLabel({ children }: { children: ReactNode }) {
+function SectionLabel({ children, variant = "default" }: { children: ReactNode, variant?: "default" | "pill" | "subtle" }) {
+  if (variant === "pill") {
+    return (
+      <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-border-strong bg-bg-elevated px-3 py-1 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-text-primary shadow-sm">
+        <span className="h-1.5 w-1.5 rounded-full bg-accent-primary" />
+        {children}
+      </div>
+    );
+  }
+  if (variant === "subtle") {
+    return (
+      <div className="mb-4 flex items-center gap-2.5 font-mono text-[11px] font-medium uppercase tracking-[0.12em] text-text-tertiary">
+        <span className="text-status-secure">✦</span>
+        {children}
+      </div>
+    );
+  }
   return (
     <div className="mb-4 flex items-center gap-2.5 font-mono text-[11px] font-medium uppercase tracking-[0.08em] text-[var(--color-accent-soft)]">
       <span className="h-[1.5px] w-4 shrink-0 rounded-sm bg-accent-primary" />
       {children}
     </div>
   );
+}
+
+function useRevealOnIntersect<T extends HTMLElement>(threshold = 0.2) {
+  const ref = useRef<T | null>(null);
+  const [hasRevealed, setHasRevealed] = useState(false);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node || hasRevealed) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting && entry.intersectionRatio >= threshold) {
+          setHasRevealed(true);
+          observer.disconnect();
+        }
+      },
+      { threshold: [threshold] },
+    );
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasRevealed, threshold]);
+
+  return { ref, hasRevealed };
 }
 
 function CanvasPreview({
@@ -231,9 +278,12 @@ function CanvasPreview({
             ))}
           </svg>
 
-          {canvasPreviewSteps.map((step) => (
-            <div
+          {canvasPreviewSteps.map((step, index) => (
+            <motion.div
               key={step.id}
+              initial={isHero ? { opacity: 0, y: 20 } : false}
+              animate={{ opacity: 1, y: 0 }}
+              transition={isHero ? { duration: 0.45, delay: index * 0.08, ease: 'easeOut' } : undefined}
               className={cn(
                 'absolute rounded-[10px] bg-bg-surface/96 p-3 backdrop-blur-sm',
                 isHero ? 'w-[176px]' : 'w-[152px]',
@@ -257,7 +307,7 @@ function CanvasPreview({
               <div className="h-[2px] overflow-hidden rounded-[2px] bg-[rgba(204,197,185,0.08)]">
                 <div className={cn('h-full', step.progressClassName)} />
               </div>
-            </div>
+            </motion.div>
           ))}
 
           <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(145deg,transparent_65%,rgba(15,14,14,0.8)_85%,rgba(15,14,14,1)_100%)]" />
@@ -267,7 +317,13 @@ function CanvasPreview({
   );
 }
 
-function PromptPreview() {
+function PromptPreview({
+  typedPrompt,
+  showCursor,
+}: {
+  typedPrompt: string;
+  showCursor: boolean;
+}) {
   return (
     <div className="relative overflow-hidden rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel">
       <div className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent_0%,rgba(235,94,40,0.52)_50%,transparent_100%)]" />
@@ -282,7 +338,10 @@ function PromptPreview() {
             Describe it in your own words. The more detail you give, the better your plan will be.
           </div>
           <div className="min-h-[152px] rounded-[12px] border border-border-default bg-bg-base/50 px-4 py-4 text-[15px] leading-relaxed text-text-primary">
-            I want to build a booking app for independent dog walkers with recurring billing, client notes, and a clear daily checklist for each walk.
+            <span className="whitespace-pre-wrap">{typedPrompt}</span>
+            {showCursor ? (
+              <span className="ml-0.5 inline-block h-[18px] w-px animate-pulse bg-accent-primary align-middle" />
+            ) : null}
           </div>
         </div>
 
@@ -298,7 +357,7 @@ function PromptPreview() {
   );
 }
 
-function MorningPreview() {
+function MorningPreview({ revealProgress }: { revealProgress: boolean }) {
   return (
     <div className="rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel">
       <div className="rounded-[16px] border border-border-default bg-bg-elevated/80 p-6">
@@ -330,7 +389,12 @@ function MorningPreview() {
             <span className="font-mono text-[12px] font-normal text-text-muted">42%</span>
           </div>
           <div className="h-[3px] overflow-hidden rounded-full bg-bg-base">
-            <div className="h-full w-[42%] rounded-full bg-accent-primary" />
+            <motion.div
+              initial={{ width: 0 }}
+              animate={{ width: revealProgress ? '42%' : '0%' }}
+              transition={{ duration: 0.8, ease: 'easeOut' }}
+              className="h-full rounded-full bg-accent-primary"
+            />
           </div>
         </div>
 
@@ -360,9 +424,42 @@ function MorningPreview() {
 }
 
 export default function LandingPage() {
+  const [isScrolled, setIsScrolled] = useState(false);
+  const { ref: planSectionRef, hasRevealed: hasPlanRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
+  const { ref: aiSectionRef, hasRevealed: hasAiRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
+  const { ref: morningSectionRef, hasRevealed: hasMorningRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
+  const heroBuilderCount = useCountUp({
+    target: HERO_SOCIAL_PROOF_TARGET,
+    durationMs: 1200,
+    enabled: true,
+  });
+  const [typedPrompt, setTypedPrompt] = useState('');
+
+  useEffect(() => {
+    document.title = 'Scrimble — Build it. Ship it.';
+  }, []);
+
+  useEffect(() => {
+    const handleScroll = () => setIsScrolled(window.scrollY > 20);
+    window.addEventListener("scroll", handleScroll);
+    return () => window.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!hasAiRevealed || typedPrompt.length >= PROMPT_DEMO_TEXT.length) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setTypedPrompt(PROMPT_DEMO_TEXT.slice(0, typedPrompt.length + 1));
+    }, 40);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [hasAiRevealed, typedPrompt.length]);
+
   return (
-    <div className="min-h-screen overflow-x-clip bg-bg-base font-sans text-text-primary selection:bg-accent-primary-muted selection:text-accent-primary">
-      <nav className="fixed left-0 right-0 top-0 z-50 flex h-[60px] items-center justify-between border-b border-border-subtle bg-bg-base/80 px-6 backdrop-blur-lg sm:px-10 lg:px-20">
+    <div className="min-h-screen overflow-x-clip bg-bg-base font-sans text-text-primary">
+      <nav className={cn("sticky top-0 z-[100] flex h-[64px] items-center justify-between px-6 sm:px-10 lg:px-20 transition-all duration-200", isScrolled ? "bg-[rgba(10,10,10,0.85)] backdrop-blur-[12px] border-b border-[rgba(255,255,255,0.06)]" : "bg-transparent border-b-transparent")}>
         <div className="flex items-center gap-2">
           <Hexagon className="h-5 w-5 text-accent-primary" />
           <span className="text-[15px] font-semibold tracking-[-0.03em] text-text-primary">Scrimble</span>
@@ -371,32 +468,27 @@ export default function LandingPage() {
           <Link to="/login" className="text-sm font-medium text-text-secondary transition-colors hover:text-text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent-primary">
             Sign in
           </Link>
-          <Link to="/signup" className="btn-primary rounded-[8px]">
+          <Link to="/signup" className="btn-primary flex items-center justify-center h-[36px] px-4 rounded-[8px]">
             Get started
           </Link>
         </div>
       </nav>
 
-      <main className="relative pt-[60px]">
+      <main className="relative">
         <div className="pointer-events-none absolute right-[-140px] top-[-220px] h-[720px] w-[720px] bg-[radial-gradient(ellipse_at_center,rgba(235,94,40,0.06)_0%,transparent_70%)]" />
 
-        <section className="mx-auto grid max-w-[1480px] gap-12 px-6 pb-6 pt-14 sm:px-10 sm:pt-[72px] lg:min-h-[780px] lg:grid-cols-[minmax(0,34rem)_minmax(0,1fr)] lg:items-center lg:gap-24 lg:px-20 lg:pb-0 lg:pt-12 xl:min-h-[840px] xl:grid-cols-[minmax(0,37rem)_minmax(0,1fr)] xl:gap-28">
+        <section className="mx-auto grid max-w-[1480px] gap-12 px-6 pb-6 pt-6 sm:px-10 sm:pt-6 lg:min-h-[720px] lg:grid-cols-[minmax(0,34rem)_minmax(0,1fr)] lg:items-center lg:gap-24 lg:px-20 lg:pb-0 lg:pt-0 xl:min-h-[760px] xl:grid-cols-[minmax(0,37rem)_minmax(0,1fr)] xl:gap-28">
           <motion.div
             className="relative z-10 flex max-w-[540px] flex-col items-start justify-center lg:pb-10 xl:pb-14"
             initial="hidden"
             animate="visible"
             variants={heroContainerVariants}
           >
-            <motion.div 
-              variants={heroItemVariants} 
-              className="mb-8 self-start rounded-[6px] border border-border-strong px-2.5 py-1 font-mono text-[11px] font-medium uppercase tracking-[0.04em] text-text-tertiary bg-transparent"
-            >
-              Now in beta
-            </motion.div>
+            <motion.div variants={heroItemVariants} className="mb-8 self-start inline-flex items-center gap-2 rounded-full border border-accent-border bg-accent-primary-muted/10 px-3 py-1 font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-accent-primary shadow-[0_0_15px_rgba(235,94,40,0.15)]"><Hexagon className="h-3 w-3 fill-accent-primary opacity-50" /> Now in beta</motion.div>
 
             <motion.h1 variants={heroItemVariants} className="text-hero max-w-[11.2ch]" style={{ textWrap: 'balance' }}>
-              <span className="display-bold">Build it. Ship it.</span>
-              <span className="display-italic">Don't lose the thread.</span>
+              <span className="display-bold block">Build it. Ship it.</span>
+              <span className="display-bold block text-text-secondary">Don't lose the thread.</span>
             </motion.h1>
 
             <motion.p 
@@ -404,43 +496,65 @@ export default function LandingPage() {
               className="mb-10 max-w-[440px] text-body text-[17px] leading-relaxed" 
               style={{ textWrap: 'pretty' }}
             >
-              Scrimble keeps solo builders on track — one step at a time, with AI doing the heavy lifting.
+              The AI project planner built for solo builders.
             </motion.p>
 
             <motion.div
               variants={heroItemVariants}
-              className="flex flex-wrap items-center gap-4"
+              className="flex flex-col items-start gap-4"
             >
-              <Link to="/signup" className="btn-primary rounded-[8px]">
-                Start building
-              </Link>
-              <a
-                href="#how-it-works"
-                className="group flex items-center gap-2 px-4 py-2 text-sm font-medium text-text-secondary transition-colors hover:text-text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent-primary"
-              >
-                See how it works
-                <ArrowRight aria-hidden="true" className="h-4 w-4 transition-transform group-hover:translate-x-1" />
-              </a>
+              <div className="flex flex-wrap items-center gap-4">
+                <Link to="/signup" className="btn-primary flex items-center justify-center h-[40px] px-6 rounded-[8px]">
+                  Start building
+                </Link>
+                <a
+                  href="#how-it-works"
+                  className="group flex items-center justify-center h-[40px] gap-2 px-5 rounded-[8px] text-sm font-medium text-text-primary border border-border-default hover:bg-bg-elevated/50 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent-primary"
+                >
+                  See how it works
+                  <ArrowRight aria-hidden="true" className="h-4 w-4 transition-transform group-hover:translate-x-1" />
+                </a>
+              </div>
+              <div className="flex items-center gap-2 text-[12px] font-medium text-text-secondary mt-2">
+                <span className="tracking-tight">⚡ AI-generated plans</span>
+                <span className="text-text-tertiary">·</span>
+                <span className="tracking-tight">🔑 Bring your own key</span>
+                <span className="text-text-tertiary">·</span>
+                <span className="tracking-tight">🔒 No subscription required</span>
+              </div>
             </motion.div>
-          </motion.div>
+              <motion.div variants={heroItemVariants} className="mt-8 flex items-center gap-3">
+                <div className="flex -space-x-2">
+                  {[1, 2, 3, 4].map((i) => (
+                    <div key={i} className="h-8 w-8 rounded-full border-2 border-bg-base bg-bg-surface flex items-center justify-center text-[10px] font-bold text-text-secondary overflow-hidden">
+                      <img src={`https://i.pravatar.cc/100?img=${i + 10}`} alt={`User ${i}`} className="w-full h-full object-cover" />
+                    </div>
+                  ))}
+                </div>
+                <div className="text-sm font-medium text-text-secondary">
+                  Join <span className="text-text-primary">{heroBuilderCount.toLocaleString()}+</span> solo builders
+                </div>
+              </motion.div>
+            </motion.div>
 
-          <motion.div
-            initial={{ opacity: 0, y: 32, scale: 0.98 }}
+            <motion.div
+              initial={{ opacity: 0, y: 32, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ duration: 0.95, delay: 0.22, ease: EASE_OUT_EXPO }}
-            className="hidden self-end lg:flex lg:min-h-[720px] lg:items-end lg:justify-end xl:min-h-[780px]"
+            className="hidden self-end lg:flex lg:min-h-[720px] lg:items-end lg:justify-end xl:min-h-[780px] relative"
           >
-            <CanvasPreview variant="hero" className="lg:-mr-6 xl:mr-0" />
+            <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(235,94,40,0.15)_0%,transparent_60%)] scale-150 blur-3xl rounded-full z-0 opacity-60"></div>
+            <CanvasPreview variant="hero" className="lg:-mr-6 xl:mr-0 relative z-10" />
           </motion.div>
         </section>
 
         <section id="how-it-works" className="scroll-mt-24 border-t border-border-subtle pb-[100px] pt-[100px]">
           <div className="mx-auto max-w-[1200px] space-y-[100px] px-6 sm:px-10 lg:px-20">
             <motion.div
+              ref={planSectionRef}
               className="grid items-center gap-14 md:grid-cols-2 lg:gap-20"
               initial="hidden"
-              whileInView="visible"
-              viewport={{ once: true, amount: 0.35 }}
+              animate={hasPlanRevealed ? 'visible' : 'hidden'}
               variants={featureContainerVariants}
             >
               <motion.div variants={featureItemVariants}>
@@ -456,68 +570,170 @@ export default function LandingPage() {
             </motion.div>
 
             <motion.div
+              ref={aiSectionRef}
               className="grid items-center gap-14 md:grid-cols-2 lg:gap-20"
               initial="hidden"
-              whileInView="visible"
-              viewport={{ once: true, amount: 0.35 }}
+              animate={hasAiRevealed ? 'visible' : 'hidden'}
               variants={featureContainerVariants}
             >
               <motion.div variants={featureItemVariants} className="order-1 md:order-2 text-right md:text-left flex flex-col md:items-start items-end">
-                <SectionLabel>Your AI</SectionLabel>
+                <SectionLabel variant="pill">Your AI</SectionLabel>
                 <h2 className="mb-5 text-heading">Tell it what you're building. It handles the rest.</h2>
                 <p className="max-w-[390px] text-body">
                   No forms, no dropdowns, no lists to pick from. You describe the idea naturally and Scrimble turns it into a plan you can follow.
                 </p>
               </motion.div>
               <motion.div variants={featureItemVariants} className="order-2 md:order-1">
-                <PromptPreview />
+                <PromptPreview
+                  typedPrompt={typedPrompt}
+                  showCursor={hasAiRevealed && typedPrompt.length < PROMPT_DEMO_TEXT.length}
+                />
               </motion.div>
             </motion.div>
 
             <motion.div
+              ref={morningSectionRef}
               className="grid items-center gap-14 md:grid-cols-2 lg:gap-20"
               initial="hidden"
-              whileInView="visible"
-              viewport={{ once: true, amount: 0.35 }}
+              animate={hasMorningRevealed ? 'visible' : 'hidden'}
               variants={featureContainerVariants}
             >
               <motion.div variants={featureItemVariants}>
-                <SectionLabel>Every morning</SectionLabel>
+                <SectionLabel variant="subtle">Every morning</SectionLabel>
                 <h2 className="mb-5 text-heading">Open it every morning. Know exactly what's next.</h2>
                 <p className="max-w-[390px] text-body">
                   Your project state stays current, your next move stays obvious, and the work picks up exactly where you left it.
                 </p>
               </motion.div>
               <motion.div variants={featureItemVariants}>
-                <MorningPreview />
+                <MorningPreview revealProgress={hasMorningRevealed} />
               </motion.div>
             </motion.div>
           </div>
         </section>
+
+        {/* Step 5 — Social Proof Section */}
+        <section className="mx-auto max-w-[1200px] px-6 sm:px-10 lg:px-20 pb-[100px]">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="rounded-[14px] bg-[#161616] border border-[rgba(255,255,255,0.06)] p-6 flex flex-col justify-between">
+              <p className="font-serif italic text-text-primary text-[17px] leading-relaxed mb-6">
+                “I've started ten projects this year and finished none. Scrimble actually forced me to ship by breaking my monolithic anxiety into tiny steps.”
+              </p>
+              <div className="flex items-center gap-3 mt-auto">
+                <div className="h-8 w-8 rounded-full overflow-hidden bg-bg-surface">
+                  <img src="https://i.pravatar.cc/100?img=33" alt="Builder" className="w-full h-full object-cover" />
+                </div>
+                <div className="text-[13px] font-medium text-text-muted">
+                  @mkdev · Full-stack dev
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-[14px] bg-[#161616] border border-[rgba(255,255,255,0.06)] p-6 flex flex-col justify-between">
+              <p className="font-serif italic text-text-primary text-[17px] leading-relaxed mb-6">
+                “The AI planning is magical. It spotted edge cases in my auth flow that I hadn't even considered. Finally, an AI tool that organizes instead of just generating code.”
+              </p>
+              <div className="flex items-center gap-3 mt-auto">
+                <div className="h-8 w-8 rounded-full overflow-hidden bg-bg-surface">
+                  <img src="https://i.pravatar.cc/100?img=12" alt="Builder" className="w-full h-full object-cover" />
+                </div>
+                <div className="text-[13px] font-medium text-text-muted">
+                  @sarah_codes · Indie hacker
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-[14px] bg-[#161616] border border-[rgba(255,255,255,0.06)] p-6 flex flex-col justify-between">
+              <p className="font-serif italic text-text-primary text-[17px] leading-relaxed mb-6">
+                “Bring your own key is the best part. I'm not trapped in another $20/mo subscription just to have a competent project manager.”
+              </p>
+              <div className="flex items-center gap-3 mt-auto">
+                <div className="h-8 w-8 rounded-full overflow-hidden bg-bg-surface">
+                  <img src="https://i.pravatar.cc/100?img=68" alt="Builder" className="w-full h-full object-cover" />
+                </div>
+                <div className="text-[13px] font-medium text-text-muted">
+                  @joshbuilds · Solo founder
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Step 6 — Bottom CTA Section */}
+        <section className="relative w-full border-t border-[rgba(255,255,255,0.06)] bg-bg-base overflow-hidden py-24 sm:py-32">
+          <div className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-[radial-gradient(ellipse_at_center,rgba(230,100,30,0.06)_0%,transparent_70%)]" />
+          
+          <div className="relative z-10 mx-auto max-w-[600px] px-6 text-center flex flex-col items-center">
+            <h2 className="font-serif text-[32px] font-bold text-text-primary mb-4">Start your first project free.</h2>
+            <p className="text-body text-[17px] text-text-secondary mb-10">No subscription. Bring your own AI key.</p>
+            
+            <div className="flex flex-wrap items-center justify-center gap-4">
+              <Link to="/signup" className="btn-primary flex items-center justify-center h-[44px] px-6 rounded-[8px] text-[15px]">
+                Start building
+                <ArrowRight className="ml-2 h-4 w-4" />
+              </Link>
+              <Link
+                to="/login"
+                className="group flex items-center justify-center h-[44px] px-6 rounded-[8px] text-[15px] font-medium text-text-primary border border-border-default hover:bg-bg-elevated/50 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-primary"
+              >
+                Sign in
+              </Link>
+            </div>
+          </div>
+        </section>
       </main>
 
-      <footer className="border-t border-border-subtle px-6 py-8 sm:px-10 lg:px-20">
-        <div className="mx-auto flex max-w-[1440px] flex-col items-center justify-between gap-4 md:flex-row">
-          <div className="flex items-center gap-4 text-text-tertiary">
-            <div className="flex items-center gap-2">
-              <Hexagon aria-hidden="true" className="h-5 w-5 text-accent-primary" />
-              <span className="text-[15px] font-semibold tracking-[-0.03em] text-text-primary">Scrimble</span>
+      <footer className="border-t border-border-subtle bg-bg-base/50 pt-16 pb-8 px-6 sm:px-10 lg:px-20">
+        <div className="mx-auto max-w-[1200px]">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-12 mb-16">
+            <div className="md:col-span-2">
+              <div className="flex items-center gap-2 mb-4">
+                <Hexagon aria-hidden="true" className="h-5 w-5 text-accent-primary" />
+                <span className="text-[15px] font-semibold tracking-[-0.03em] text-text-primary">Scrimble</span>
+              </div>
+              <p className="text-sm text-text-secondary max-w-xs mb-6">The technical planner and operating system for solo builders shipping software with AI.</p>
             </div>
-            <span className="text-sm font-sans">© 2026</span>
+            
+            <div>
+              <h3 className="font-mono text-[11px] uppercase tracking-widest text-text-primary mb-4 font-semibold">Product</h3>
+              <ul className="space-y-3 text-sm text-text-secondary">
+                <li><a href="#" className="hover:text-text-primary transition-colors">Features</a></li>
+                <li><a href="#" className="hover:text-text-primary transition-colors">Pricing</a></li>
+                <li><a href="#" className="hover:text-text-primary transition-colors">Changelog</a></li>
+              </ul>
+            </div>
+            
+            <div>
+              <h3 className="font-mono text-[11px] uppercase tracking-widest text-text-primary mb-4 font-semibold">Legal</h3>
+              <ul className="space-y-3 text-sm text-text-secondary">
+                <li><a href="#" className="hover:text-text-primary transition-colors">Privacy Policy</a></li>
+                <li><a href="#" className="hover:text-text-primary transition-colors">Terms of Service</a></li>
+                <li><a href="#" className="hover:text-text-primary transition-colors">Contact</a></li>
+              </ul>
+            </div>
           </div>
-          <div className="flex gap-6 text-sm font-sans text-text-tertiary">
-            <a href="#" className="transition-colors hover:text-text-primary">
-              Privacy
-            </a>
-            <a href="#" className="transition-colors hover:text-text-primary">
-              Terms
-            </a>
-            <a href="#" className="transition-colors hover:text-text-primary">
-              Twitter/X
-            </a>
+          
+          <div className="flex flex-col md:flex-row items-center justify-between pt-8 border-t border-border-subtle text-xs text-text-tertiary">
+            <p>© 2026 Scrimble Inc. All rights reserved.</p>
+            <div className="flex gap-4 mt-4 md:mt-0">
+              <a href="#" className="hover:text-text-primary transition-colors">Twitter</a>
+              <a href="#" className="hover:text-text-primary transition-colors">GitHub</a>
+            </div>
           </div>
         </div>
       </footer>
     </div>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+

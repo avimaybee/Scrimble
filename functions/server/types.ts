@@ -10,7 +10,7 @@ export interface R2Object {
   json<T = unknown>(): Promise<T>;
 }
 
-export type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom';
+export type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom' | 'openrouter';
 
 export const GENERATION_BATCHES = [
   'batch_1_research_stack',

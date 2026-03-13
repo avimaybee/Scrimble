@@ -81,7 +81,19 @@ export async function loadJsonPayload<T>(
     return null;
   }
 
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    console.error('[checkpoint-payload-parse-failed]', {
+      r2Key: r2Key || null,
+      inlinePayload: Boolean(inlineText),
+      payloadSize: text.length,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw new Error(
+      `Checkpoint payload ${r2Key || 'inline'} is corrupted and could not be parsed.`,
+    );
+  }
 }
 
 export async function deleteJsonPayload(

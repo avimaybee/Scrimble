@@ -18,6 +18,7 @@ import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import FullscreenStatus from '../components/ui/FullscreenStatus';
 import { dbService, type GenerationStreamConnectionState } from '../lib/db';
+import { getAIProviders, type AIProvider } from '../lib/ai';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
@@ -309,11 +310,20 @@ export default function ProjectGeneration() {
   const [isAutoRecovering, setIsAutoRecovering] = useState(false);
   const [autoRecoveryFailed, setAutoRecoveryFailed] = useState(false);
   const [clockNow, setClockNow] = useState(() => Date.now());
+  const [providers, setProviders] = useState<AIProvider[]>([]);
+  const [selectedProviderId, setSelectedProviderId] = useState<string>('');
+  const [isEditingBrief, setIsEditingBrief] = useState(false);
+  const [editedBrief, setEditedBrief] = useState('');
+  const [isLoadingProviders, setIsLoadingProviders] = useState(false);
   const hasNavigatedRef = useRef(false);
   const activityKeysRef = useRef(new Set<string>());
   const currentActivityRef = useRef<ActivityFeedItem | null>(null);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
   const feedbackRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    document.title = project?.name ? `${project.name} — Scrimble` : 'Plan — Scrimble';
+  }, [project?.name]);
 
   const noteProgressTimestamp = useCallback((timestamp: string | null | undefined) => {
     setLastProgressAt((previous) => pickLatestTimestamp(previous, timestamp));
@@ -495,6 +505,30 @@ export default function ProjectGeneration() {
     setIsResearchDisclosureOpen(false);
     setShowAllResearchSources(false);
   }, [reviewData?.project_id]);
+
+  useEffect(() => {
+    const fetchProviders = async () => {
+      setIsLoadingProviders(true);
+      try {
+        const result = await getAIProviders();
+        setProviders(result);
+      } catch (err) {
+        console.error('Failed to fetch providers:', err);
+      } finally {
+        setIsLoadingProviders(false);
+      }
+    };
+    void fetchProviders();
+  }, []);
+
+  useEffect(() => {
+    if (project && !isEditingBrief) {
+      setEditedBrief(project.description);
+    }
+    if (project && !selectedProviderId) {
+      setSelectedProviderId(project.generation_provider_id || '');
+    }
+  }, [project, isEditingBrief, selectedProviderId]);
 
   useEffect(() => {
     if (!id) {
@@ -896,15 +930,25 @@ export default function ProjectGeneration() {
     }
 
     try {
-      await dbService.resumeProjectGeneration(id);
+      const options = mode === 'manual' ? {
+        description: editedBrief || undefined,
+        providerId: selectedProviderId || undefined
+      } : {};
+
+      await dbService.resumeProjectGeneration(id, options);
       setShowResumeBadge(false);
+      setIsResuming(false);
+      setIsAutoRecovering(false);
+      setIsEditingBrief(false);
+
       noteProgressTimestamp(new Date().toISOString());
       toast.success(
         mode === 'automatic'
           ? 'The runner stayed quiet for too long, so I asked Scrimble to resume from the last completed checkpoint.'
-          : 'Resuming generation pipeline...',
+          : 'Resuming generation pipeline with your updates...',
       );
-      setShowResumeBadge(false);
+
+      // Refresh the stream connection to pick up the resumed state
       setStreamConnectionKey((prev) => prev + 1);
       void syncProjectState();
     } catch (err) {
@@ -919,7 +963,7 @@ export default function ProjectGeneration() {
         setIsAutoRecovering(false);
       }
     }
-  }, [id, isResuming, noteProgressTimestamp, syncProjectState]);
+  }, [id, isResuming, editedBrief, selectedProviderId, noteProgressTimestamp, syncProjectState]);
 
   const handleResume = useCallback(() => {
     void requestResume('manual');
@@ -1522,26 +1566,112 @@ export default function ProjectGeneration() {
                   </div>
                 </div>
               ) : status?.is_failed && !isAutoRecovering ? (
-                <div className="w-full rounded-[16px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
-                  <div className="flex items-start gap-3">
-                    <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
-                    <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The generation runner needs attention</div>
-                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        {error || status.generation_error || 'Project generation failed.'}
-                      </p>
-                      <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
-                        Durable checkpoints are preserved as each stage completes, so resuming picks up from the latest finished checkpoint instead of starting over.
-                      </p>
+                <div className="w-full space-y-4">
+                  <div className="w-full rounded-[16px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
+                    <div className="flex items-start gap-3">
+                      <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
+                      <div>
+                        <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Generation needs attention</div>
+                        <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
+                          {error || status.generation_error || 'Project generation failed.'}
+                        </p>
+                      </div>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleResume}
-                    className="btn-primary mt-5"
-                  >
-                    Try again
-                  </button>
+
+                  <div className="w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-6 text-left shadow-panel backdrop-blur-sm">
+                    <div className="mb-6">
+                      <div className="flex items-center justify-between">
+                        <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Tweak your brief</div>
+                        {!isEditingBrief && (
+                          <button
+                            type="button"
+                            onClick={() => setIsEditingBrief(true)}
+                            className="font-sans text-[12px] font-medium text-accent-soft hover:text-accent-primary"
+                          >
+                            Edit description
+                          </button>
+                        )}
+                      </div>
+                      
+                      {isEditingBrief ? (
+                        <div className="mt-3 space-y-3">
+                          <textarea
+                            value={editedBrief}
+                            onChange={(e) => setEditedBrief(e.target.value)}
+                            className="min-h-[120px] w-full resize-y rounded-[12px] border border-border-default bg-bg-base/60 px-4 py-3 font-sans text-[14px] leading-relaxed text-text-primary outline-none focus:border-accent-primary/60"
+                            placeholder="Describe your project in more detail..."
+                          />
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsEditingBrief(false);
+                                setEditedBrief(project?.description || '');
+                              }}
+                              className="font-sans text-[12px] text-text-muted hover:text-text-primary"
+                            >
+                              Cancel edits
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="mt-3 line-clamp-3 font-sans text-[14px] leading-relaxed text-text-secondary">
+                          {project?.description}
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="border-t border-border-subtle pt-6">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">AI Model Selection</div>
+                      <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                        {isLoadingProviders ? (
+                          <div className="col-span-full h-10 animate-pulse rounded-lg bg-bg-base/50" />
+                        ) : (
+                          providers.map((p) => {
+                            const isSelected = selectedProviderId === p.id;
+                            return (
+                              <button
+                                key={p.id}
+                                type="button"
+                                onClick={() => setSelectedProviderId(p.id)}
+                                className={cn(
+                                  'flex items-center justify-between rounded-[10px] border px-3 py-2.5 transition-all text-left',
+                                  isSelected
+                                    ? 'border-accent-border bg-accent-primary-muted text-accent-primary shadow-sm'
+                                    : 'border-border-default bg-bg-base/40 text-text-secondary hover:border-border-strong hover:text-text-primary',
+                                )}
+                              >
+                                <div>
+                                  <div className="text-[13px] font-medium">{p.provider.charAt(0).toUpperCase() + p.provider.slice(1)}</div>
+                                  <div className="text-[11px] opacity-70 truncate max-w-[120px]">{p.model || p.name}</div>
+                                </div>
+                                {isSelected && <span className="text-[14px]">✓</span>}
+                              </button>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-8 flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleResume}
+                        disabled={isResuming}
+                        className="btn-primary"
+                      >
+                        {isResuming ? 'Resuming…' : 'Apply changes & try again'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => navigate('/dashboard')}
+                        className="btn-ghost"
+                      >
+                        Back to dashboard
+                      </button>
+                    </div>
+                  </div>
                 </div>
               ) : isAutoRecovering ? (
                 <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">

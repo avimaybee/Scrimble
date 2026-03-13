@@ -1,6 +1,6 @@
 # Scrimble — Complete Project Documentation
 ### The Focus & Build Engine for Vibe Coders
-*Version 4.0 — March 2026 — Single source of truth*
+*Version 4.1 — March 2026 — Single source of truth*
 
 ---
 
@@ -151,13 +151,13 @@ npm run deploy:consumer  # uses wrangler and wrangler.consumer.toml
 npm run deploy:all
 ```
 
-Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that now hosts the primary `ProjectGeneratorDO` runtime plus the legacy queue consumer fallback.
+Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that hosts the primary `ProjectGeneratorDO` runtime.
 
 ### Backend
 | Concern | Choice | Notes |
 |---|---|---|
 | Runtime | Cloudflare Pages Functions | Edge serverless — owns the API, chooses DO vs queue fallback, and streams generation state |
-| Background Jobs | Cloudflare Workers (Standalone) | Hosts `ProjectGeneratorDO` for the primary pipeline and keeps the `scrimble` queue consumer as fallback |
+| Background Jobs | Cloudflare Workers (Standalone) | Hosts `ProjectGeneratorDO` for the primary pipeline; enqueues jobs and manages generation state |
 | Database | Cloudflare D1 (SQLite) | Relational, edge-native, shared between environments |
 | Auth | Firebase Auth (auth only) | Google OAuth + email/password — JWT verification in Functions |
 | AI Routing | Function-side proxy | All AI calls proxied through Functions or Background Worker |
@@ -598,15 +598,16 @@ Animations alone aren’t enough — Scrimble must be transparent about *why* th
 /signup               → Signup
 /dashboard            → Projects list — daily re-entry screen
 /new                  → New project (natural language input)
-/project/[id]         → Main plan canvas
+/project/[id]         → Main plan timeline/stream view
 /project/[id]/step/[stepId] → Step detail (URL state)
+/project/[id]/generating → Live generation progress screen
 /settings             → User preferences, AI key management
 ```
 
 ### Navigation Patterns
 
-- Landing, authentication, `/new`, and the live generation journeys intentionally render without the pill nav so those entry points stay focused. Only the dashboard, the canvas (`/project/:id`), and the settings shell inherit the nav chrome from `AppLayout`.
-- The bottom Pill Nav labels its tabs **Plan / Projects / Settings**. “Plan” links to the current project (and is disabled until a plan is open), “Projects” always returns to `/dashboard`, and “Settings” anchors to `/settings`. The active pill uses the layoutId “pill-nav-active” so the paprika indicator animates smoothly between tabs, and the layout also adds 104px of bottom padding whenever the nav is present so content never collides with it.
+- Landing, authentication, `/new`, and the live generation journeys intentionally render without the pill nav so those entry points stay focused. Only the dashboard, the timeline (`/project/:id`), and the settings shell inherit the nav chrome from `AppLayout`.
+- The bottom Pill Nav labels its tabs **Plan / Projects / Settings**. “Plan” links to the last active project (and is disabled until a plan is open), “Projects” always returns to `/dashboard`, and “Settings” anchors to `/settings`. The active pill uses the layoutId “pill-nav-active” so the paprika indicator animates smoothly between tabs, and the layout also adds 104px of bottom padding whenever the nav is present so content never collides with it.
 - All other routes (landing, `/login`, `/signup`, `/new`, `/project/:id/step/[stepId]`, the generation screen, and any modal-heavy state) deliberately hide the nav, keeping the interface free of distracting chrome while the user is signing in, starting a plan, or reviewing a step.
 
 ### Build Stages
@@ -817,17 +818,15 @@ CREATE INDEX IF NOT EXISTS idx_steps_workflow     ON steps(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_user   ON mcp_servers(user_id);
-
--- ────────────────────────────────────────────
--- TRANSIENT STATE (Thinking / Reasoning Relay)
--- Rows are physically DELETED on batch/pipeline completion
--- ────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS project_generation_live_state (
-  project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-  reasoning       TEXT,                 -- the current accumulated thinking block
-  updated_at      TEXT DEFAULT (datetime('now'))
-);
 ```
+
+```text
+-- TRANSIENT STATE (Thinking / Reasoning Relay)
+-- These reasoning deltas are now streamed directly to the frontend via SSE
+-- rather than being persisted in D1.
+```
+
+Migration `010_schema_reconciliation.sql` patches the legacy schema (adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, adds `last_error` to `generation_dispatches`, and removes the obsolete `project_generation_live_state` table) so the backend and worker can rely on a single consistent set of column names while reasoning data flows through the SSE `thinking` events instead of extra tables.
 
 
 ---
@@ -885,7 +884,7 @@ Project generation now runs inside `ProjectGeneratorDO`, a standalone Cloudflare
 
 - **One DO per project**: Each run keeps its own `run_id`, persists batch state in D1 + R2, and streams progress events through the durable `project_generation_events` table.
 - **Timeouts & retries**: The DO updates `projects.generation_status` as soon as each batch starts, retries transient provider/timeout errors via D1-stored alarms, and reschedules itself instead of failing the project.
-- **SSE-friendly**: Reasoning deltas feed `project_generation_live_state`, and the Pages `/api/projects/:id/generation-stream` route polls D1 + replays events so the SPA receives live thinking without sharing memory across runtimes.
+- **SSE-friendly**: Durable events are written to `project_generation_events`, and the Pages `/api/projects/:id/generation-stream` route replays history + polls D1 so the SPA receives live updates even though the runner is in a separate runtime. Reasoning deltas now flow straight from the worker as `thinking` SSE messages, so no table is required and `writer.close()` runs on all terminal events.
 - **Checkpoint durability**: Every batch writes both inline JSON and R2 payloads, so the pipeline can resume instantly after any interruption without re-running prior work.
 - **Fallback safety**: Pages always records a `generation_dispatches` row before handing work to the DO; if something fails before the DO takes over, the dispatch rollbacks the project status so no “ghost queued” runs appear.
 
@@ -920,6 +919,7 @@ The pipeline is designed for resilience. If a project hits a "snag" (timeout, pr
 1. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches even `failed` projects, picking up from the last incomplete batch through the active backend.
 2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend resume request, reconnecting the SSE stream only after the run is scheduled again.
 3. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints now rebuild their updates as compare-and-set statements against the four `generation_*` columns (run id, provider, heartbeat, completed). If another agent already flipped the status, the request returns `409` so the UI can refresh instead of scheduling another overlapping run.
+4. **Manual stop / kill switch**: The generation screen’s `Stop generation` button posts to `/api/projects/:id/cancel`, which calls the Durable Object’s `cancelPipeline()` helper to clear alarms, resolve the queued `pipelineChain`, and mark the run as `cancelled`. Checkpoints remain intact and the cancelled UI invites the builder to resume from the latest completed batch or return to the dashboard, letting you kill runaway runs without losing work.
 
 
 ### Professional Icon System
@@ -1242,7 +1242,9 @@ If no AI provider is configured, `/new` blocks submission and shows a direct "Yo
 - A scrollable activity log (max-height 280px) streams persisted events (`activity`, `batch_complete`, `checkpoint`, `pipeline_failed`) with icons (🔍, 📦, ⚠️, 🏗️, ✅, 📝), timestamps (HH:MM:SS JetBrains Mono), and auto-scroll behavior. Each durable event carries an SSE `id:` from D1, the frontend tracks the latest seen event ID and a rendered-ID set, and reconnects after ~2 seconds with `Last-Event-ID` so replayed history never duplicates in the UI.
 - A six-dot progress indicator (connected line) mirrors the batch order. Completed dots glow emerald, the current batch glows paprika with a halo, and pending dots stay muted. Labels beneath each dot match the batch short names.
 - Estimated time remaining counts down from 12 minutes and recalculates dynamically as each `batch_complete` event reports `duration_ms`.
-- The entire feed runs without cancel/back controls—Scrimble silently works until a terminal event arrives.
+- A `Stop generation` control sits inside the connection bar (XCircle icon). It fires `POST /api/projects/:id/cancel`, kills the Durable Object runner, and surfaces a cancelled banner with “Resume from checkpoint” and “Back to dashboard” actions so checkpoints are preserved after a manual halt.
+
+When a run is cancelled via the stop control the generation screen switches into the “Generation stopped” banner state: a muted XCircle explains that checkpoints remain intact, offers to resume or exit to the dashboard, and quietly marks the run `cancelled` so the backend can reject duplicate runners while the frontend keeps the builder in control.
 - If a builder returns to `/project/:id` while generation is still running (or while the architecture checkpoint is waiting), the canvas route redirects them back to `/project/:id/generating`, the screen reloads `projects.generation_status`, reconnects to the SSE stream, and reconstructs the full generation state from replayed D1 events before resuming live updates.
 
 **Review checkpoint**
@@ -1299,22 +1301,21 @@ Good morning.                                    [+ New project]
 
 ---
 
-### 15.4 Plan Canvas (`/project/[id]`)
+### 15.4 Project View (`/project/[id]`)
+
+The project view has evolved from a node-based graph to a **vertical timeline "Infinite Spine"** layout, prioritizing focus and linear progression.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  TOP BAR (48px) — project name + avatar                  │
-├────────────────┬─────────────────────────────────────────┤
+│  SIDEBAR       │  TIMELINE VIEW (INFINITE SPINE)         │
+│  280px         │  Central vertical spine connecting steps │
 │                │                                         │
-│  SIDEBAR       │  REACT FLOW CANVAS                      │
-│  280px         │  warm dot-grid background               │
-│                │  Stage groups containing step cards     │
-│  Project name  │  Edges connecting steps                 │
-│  Progress ring │                                         │
-│  Risk score    │                           [minimap]     │
-│  Stage list    │                      [zoom controls]    │
+│  Project name  │  [○] Stage: Understanding (Pillar)      │
+│  Progress ring │   |                                     │
+│  Stage list    │  [●] Step 1: Define Goals (Active)      │
+│                │   |                                     │
+│  ──────────    │  [○] Step 2: User Personas (Locked)     │
 │                │                                         │
-│  ──────────    │                                         │
 │  Update plan   │                                         │
 │  Export        │                                         │
 └────────────────┴─────────────────────────────────────────┘
@@ -1327,7 +1328,14 @@ Sidebar extras:
 [BOTTOM PILL NAV]  ◇ Plan   ⊞ Projects   ⚙ Settings
 ```
 
-**App Bottom Pill Nav** (canvas, dashboard, settings only):
+- **Vertical Spine**: A central line connecting all steps. It changes color (Solid Paprika/Solid Green/Dashed Grey) based on the nearest step state.
+- **Stage Clusters**: Steps are grouped under sticky Stage headers that mark your progress through the project lifecycle.
+- **Micro-interactions**:
+  - Hovering a step reveals completion/skip actions inline.
+  - Clicking a step slides the **Detail Panel** over the right side, dimming but not hiding the timeline.
+- **Timeline Progress**: The spine fills dynamically as steps are completed, providing a clear visual representation of "distance covered."
+
+**App Bottom Pill Nav** (timeline, dashboard, settings only):
 position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
 background: rgba(36,33,30,0.92); backdrop-filter: blur(20px);
 border: 1px solid var(--border-default); border-radius: 16px;
@@ -1504,8 +1512,10 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 ### Custom Components (visual identity — not shadcn)
 | Component | Description |
 |---|---|
-| `StepCard` | React Flow custom node — all status states |
-| `StageGroup` | React Flow group container for stage clusters |
+| `TimelineCard` | Vertical timeline step node — all status states |
+| `InfiniteSpine` | Vertical spine component connecting timeline steps |
+| `WelcomeModal` | Staggered onboarding flow for keys and profile |
+| `OnboardingChecklist` | Persistent dash checklist for missing setup steps |
 | `StepPanel` | Right drawer — full step detail view |
 | `ChecklistItem` | Interactive row with draw-on checkmark |
 | `ProgressRing` | SVG circular progress (sidebar) |
@@ -1536,7 +1546,6 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 
 ### ✅ Complete
 - Firebase Auth (Google OAuth) + protected routes (Zustand authStore)
-- Natural language project intake → AI plan generation
 - Cloudflare D1 schema (controlled by `001_initial_schema.sql`)
 - Firebase JWT verification in Pages Functions (fixed "iss" claim logic)
 - Security Headers (CSP, X-Frame-Options, etc.) on all API routes
@@ -1545,6 +1554,17 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - Optimistic UI: Checklist toggles, step completion, and panel transitions
 - Step detail panel with section-level loading shimmers
 - Dashboard with project cards, progress calculation, and empty states
+- **Infinite Spine Timeline**: Transitioned project view from a graph canvas to a linear, high-focus vertical timeline.
+- **Onboarding Journey**: Dedicated `WelcomeModal` and `OnboardingChecklist` to guide users through AI key and profile setup.
+- **Route Handling**: Logical `PlanRoute` for deep-linking into active work.
+- **Landing Page Overhaul**: New animations, intersection observer scroll reveals, `useCountUp` hook for animated statistics, social proof counter, demo prompt preview.
+- **Auth Page Redesign**: Split-screen layout with branded visuals, animated state transitions, improved error handling.
+- **Settings Page Expansion**: Builder profile management, AI provider configuration, MCP server connections, preference toggles.
+- **New UI Components**: `InlineError` for inline validation, `NewProjectModal` for streamlined project creation, `Sidebar` for project navigation.
+- **Onboarding Store**: Zustand store for tracking onboarding completion state.
+- **Formatting Utilities**: `formatStepCount`, `roundPercent` helpers for consistent number display.
+- **CSS Design System Expansion**: Extended design tokens for timeline, onboarding, and component states.
+- Natural language project intake → AI plan generation
 - AI key management with custom provider URL hints
 - AI step enrichment ( Gemini/OpenAI integration + D1 persistence)
 - AI plan update (natural language diffing + D1 mutation)
@@ -1558,14 +1578,12 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - **Dispatch Safety & R2 Checkpoints**: Every run writes a `generation_dispatches` row before enqueuing, and the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`), multiplying the durable history without hitting D1 row limits and keeping the queue state honest.
   - **Provider Pinning & Prompt Guardrails**: The queue enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now builds a trimmed prompt payload from the richest sources so bloated payloads no longer leave AI providers stuck in “isn’t responding.”
   - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
-- Batch 2 now relies on the Worker-side tools layer (`fetchUrl`, `analyzeGithubRepo`, `getLibraryDocs`, `getLibraryIssues`, `searchWeb`), collecting docs, releases, issues, and Brave Search chatter, while also writing the `research_sources` ledger plus `data_quality` stats (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`). These metadata power the Research depth badges, "What I read" list, and per-step footers. Batch 6 still returns the six required skill/context files that are stored in D1 and zipped through `/api/projects/:id/skill-files` for download.
-
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
 - **SSE Streaming Overhaul**: Fully migrated AI reasoning deltas to a throttled, D1-buffered polling model. This architecture supports distributed Cloudflare Queue workers without triggering SQLite performance bottlenecks, ensuring smooth "thinking" streams for project generation, step enrichment, and plan updates.
 - **Connection Safety**: Implemented strict stream lifecycle management; `writer.close()` is now guaranteed on all terminal pipeline events and server-side cleanups.
 - **UI Transparency**: Introduced `Skeleton` and `ThinkingBubble` components across the dashboard and project canvas to maintain transparency during agent work.
 - Research depth badges and the "Researched {date} using {tools}" footer inject transparency into the detail panel and architecture review, highlighting when Context7, Brave Search, or GitHub were used and nudging builders to connect any missing tools for deeper next-time results.
-- Live generation screen now streams durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` events plus transient `thinking` deltas: animated batch headings, a dedicated “Currently working” live line, icon-coded history entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
+- Live generation screen now streams durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_failed` events plus transient `thinking` deltas: animated batch headings, a dedicated “Currently working” live line, icon-coded history entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
 - Canvas sidebar exposes a "Download AI files" button with download icon, hint text ("Paste these into your IDE…"), and tooltip-disabled state until the files are ready.
 - Human-in-the-loop review panel (Approve/Reject gates)
 - Tiered Export system (Markdown + JSON)
@@ -1573,11 +1591,28 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - Agent working states (sweep animations) and needs-review states (amber pulse)
 - First-time user guide (contextual tooltips)
 - Project renaming and archiving
+- **Manual stop & resume**: The generation screen now exposes a `Stop generation` button that calls `/api/projects/:id/cancel` and invokes the Durable Object’s `cancelPipeline()` helper.
+- **Durable Infrastructure**: Fully migrated the generation runner to Cloudflare Durable Objects, eliminating queue-based race conditions and enabling real-time bi-directional state synchronization.
+- **Provider Management**: Implemented AI provider removal with confirmation dialogs and active-check safety guards.
+- **Schema reconciliation**: Migration `010_schema_reconciliation.sql` adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, adds `last_error` to `generation_dispatches`, and drops the erstwhile `project_generation_live_state` table.
 
 ---
 
-### 18. Documentation & Handoff Checklist
+### 18. Remaining Work
 
+**In Progress:**
+- Error boundary improvements across all routes
+- Mobile responsive design for timeline view
+- Performance optimization for large projects (100+ steps)
+
+**Pending:**
+- Team collaboration + multi-user editing
+- GitHub Issues sync — generate tickets from steps automatically
+- Notion export
+- Project analytics — time per step, skip rates, risk trends
+- Template library — community-built plan templates for common project types
+
+**Documentation & Handoff Checklist:**
 - [x] All environment variables documented in `ENV_MANIFEST.md`
 - [x] Database schema source of truth established in `migrations/001_initial_schema.sql`
 - [x] Security audit complete — no sensitive logging, CSP active
@@ -1588,12 +1623,9 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 
 ## 19. Future Roadmap
 
-### Post-MVP V2
-- Team collaboration + multi-user editing
-- GitHub Issues sync — generate tickets from steps automatically
-- Notion export
-- Project analytics — time per step, skip rates, risk trends
-- Template library — community-built plan templates for common project types
+### V2 Features (In Development)
+- Mobile companion app — morning re-entry on your phone
+- IDE extension — Scrimble context injected directly into Cursor/VS Code
 
 ### V3+
 - **CLI companion** — stay on track natively in your terminal
@@ -1603,11 +1635,9 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   scrimble next      # what unlocks?
   scrimble update "switching to Railway" # update the plan
   ```
-- Mobile companion app — morning re-entry on your phone
-- IDE extension — Scrimble context injected directly into Cursor/VS Code
 - Multi-agent orchestration — parallel agent workers for independent stages
 
 ---
 
-*Scrimble Documentation v4.0 — March 2026*
+*Scrimble Documentation v4.1 — March 2026*
 *This document supersedes all previous versions and all FlowForge documentation.*

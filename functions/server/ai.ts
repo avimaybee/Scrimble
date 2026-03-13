@@ -5,8 +5,21 @@ type StreamCallbacks = {
 };
 
 export function extractJSON(raw: string): string {
-  const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  return match ? match[1].trim() : raw.trim();
+  // First, try to find the last markdown code block (models often repeat or correct themselves)
+  const codeBlockMatches = Array.from(raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/g));
+  if (codeBlockMatches.length > 0) {
+    return codeBlockMatches[codeBlockMatches.length - 1][1].trim();
+  }
+
+  // Fallback: search for the first '{' and the last '}' in the entire string
+  const firstBrace = raw.indexOf('{');
+  const lastBrace = raw.lastIndexOf('}');
+
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return raw.slice(firstBrace, lastBrace + 1).trim();
+  }
+
+  return raw.trim();
 }
 
 export function containsStreamTransportMarkers(raw: string) {
@@ -23,6 +36,8 @@ export function defaultModelForProvider(provider: ProviderType): string {
       return 'claude-3-5-sonnet-latest';
     case 'gemini':
       return 'gemini-2.0-flash';
+    case 'openrouter':
+      return 'anthropic/claude-3.5-sonnet';
     case 'custom':
       return 'gpt-4o-mini';
     case 'openai':
@@ -71,16 +86,15 @@ export async function streamToText(
       }
 
       try {
-        const parsed = JSON.parse(jsonStr);
-        const delta = parsed?.choices?.[0]?.delta;
-        if (!delta) continue;
-
-        if (delta.reasoning_content) {
-          callbacks?.onReasoningDelta?.(delta.reasoning_content);
+        const parsed = JSON.parse(jsonStr) as unknown;
+        const reasoningDelta = extractReasoningFromProviderChunk(parsed);
+        if (reasoningDelta) {
+          callbacks?.onReasoningDelta?.(reasoningDelta);
         }
 
-        if (typeof delta.content === 'string' && delta.content) {
-          contentBuffer += delta.content;
+        const contentDelta = extractTextFromProviderChunk(parsed);
+        if (contentDelta) {
+          contentBuffer += contentDelta;
         }
       } catch {
         // malformed chunk — skip silently
@@ -93,9 +107,11 @@ export async function streamToText(
     const jsonStart = remaining.indexOf('{');
     if (jsonStart !== -1) {
       try {
-        const parsed = JSON.parse(remaining.slice(jsonStart));
-        const delta = parsed?.choices?.[0]?.delta;
-        if (delta?.content) contentBuffer += delta.content;
+        const parsed = JSON.parse(remaining.slice(jsonStart)) as unknown;
+        const contentDelta = extractTextFromProviderChunk(parsed);
+        if (contentDelta) {
+          contentBuffer += contentDelta;
+        }
       } catch {}
     }
   }
@@ -259,6 +275,196 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
   return extractString(value.delta?.thinking);
 }
 
+type StructuredTransportParseResult = {
+  jsonBlocks: string[];
+  rest: string;
+  sawDone: boolean;
+};
+
+function extractBalancedJsonObject(
+  source: string,
+  startIndex: number,
+): { json: string; endIndex: number } | null {
+  if (source[startIndex] !== '{') {
+    return null;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+
+  for (let index = startIndex; index < source.length; index += 1) {
+    const char = source[index];
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        isEscaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        inString = false;
+      }
+
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return {
+          json: source.slice(startIndex, index + 1),
+          endIndex: index + 1,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function skipMetadataLine(source: string, startIndex: number): number | null {
+  const newlineIndex = source.indexOf('\n', startIndex);
+  if (newlineIndex === -1) {
+    return null;
+  }
+
+  return newlineIndex + 1;
+}
+
+function consumeStructuredTransportBuffer(buffer: string): StructuredTransportParseResult {
+  const jsonBlocks: string[] = [];
+  let cursor = 0;
+  let sawDone = false;
+
+  while (cursor < buffer.length) {
+    while (cursor < buffer.length) {
+      const char = buffer[cursor];
+      if (char === '[' || char === ']' || char === ',' || /\s/.test(char)) {
+        cursor += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (cursor >= buffer.length) {
+      break;
+    }
+
+    const slice = buffer.slice(cursor);
+    if (
+      slice.startsWith(':')
+      || slice.startsWith('event:')
+      || slice.startsWith('id:')
+      || slice.startsWith('retry:')
+    ) {
+      const nextLine = skipMetadataLine(buffer, cursor);
+      if (nextLine === null) {
+        break;
+      }
+      cursor = nextLine;
+      continue;
+    }
+
+    if (slice.startsWith('data:')) {
+      cursor += 5;
+
+      while (cursor < buffer.length && /\s/.test(buffer[cursor])) {
+        cursor += 1;
+      }
+
+      if (buffer.startsWith('[DONE]', cursor)) {
+        sawDone = true;
+        cursor += '[DONE]'.length;
+        const nextLine = skipMetadataLine(buffer, cursor);
+        cursor = nextLine === null ? buffer.length : nextLine;
+        continue;
+      }
+
+      const dataLineEnd = buffer.indexOf('\n', cursor);
+      const jsonStart = buffer.indexOf('{', cursor);
+      if (jsonStart === -1 || (dataLineEnd !== -1 && jsonStart > dataLineEnd)) {
+        if (dataLineEnd === -1) {
+          break;
+        }
+
+        cursor = dataLineEnd + 1;
+        continue;
+      }
+
+      const extracted = extractBalancedJsonObject(buffer, jsonStart);
+      if (!extracted) {
+        break;
+      }
+
+      jsonBlocks.push(extracted.json);
+      cursor = extracted.endIndex;
+      continue;
+    }
+
+    if (buffer.startsWith('[DONE]', cursor)) {
+      sawDone = true;
+      cursor += '[DONE]'.length;
+      continue;
+    }
+
+    const jsonStart = buffer.indexOf('{', cursor);
+    if (jsonStart === -1) {
+      break;
+    }
+
+    const nextLineBreak = buffer.indexOf('\n', cursor);
+    if (nextLineBreak !== -1 && nextLineBreak < jsonStart) {
+      cursor = nextLineBreak + 1;
+      continue;
+    }
+
+    const extracted = extractBalancedJsonObject(buffer, jsonStart);
+    if (!extracted) {
+      cursor = jsonStart;
+      break;
+    }
+
+    jsonBlocks.push(extracted.json);
+    cursor = extracted.endIndex;
+  }
+
+  return {
+    jsonBlocks,
+    rest: buffer.slice(cursor),
+    sawDone,
+  };
+}
+
+function appendStructuredChunk(chunk: string, callbacks?: StreamCallbacks): string {
+  try {
+    const parsed = JSON.parse(chunk) as unknown;
+    const reasoningDelta = extractReasoningFromProviderChunk(parsed);
+    if (reasoningDelta) {
+      callbacks?.onReasoningDelta?.(reasoningDelta);
+    }
+
+    return extractTextFromProviderChunk(parsed);
+  } catch {
+    return '';
+  }
+}
+
 async function streamStructuredProviderText(
   stream: ReadableStream<Uint8Array>,
   callbacks?: StreamCallbacks,
@@ -266,7 +472,7 @@ async function streamStructuredProviderText(
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let contentBuffer = '';
-  let leftover = '';
+  let transportBuffer = '';
   let isDone = false;
 
   while (!isDone) {
@@ -275,56 +481,29 @@ async function streamStructuredProviderText(
       break;
     }
 
-    const chunk = leftover + decoder.decode(value, { stream: true });
-    const lines = chunk.split('\n');
-    leftover = lines.pop() ?? '';
+    transportBuffer += decoder.decode(value, { stream: true });
+    const parsed = consumeStructuredTransportBuffer(transportBuffer);
+    transportBuffer = parsed.rest;
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(':')) {
-        continue;
+    for (const jsonBlock of parsed.jsonBlocks) {
+      const contentDelta = appendStructuredChunk(jsonBlock, callbacks);
+      if (contentDelta) {
+        contentBuffer += contentDelta;
       }
-      if (!trimmed.startsWith('data:')) {
-        continue;
-      }
+    }
 
-      const data = trimmed.slice(5).trim();
-      if (!data) continue;
-      if (data === '[DONE]') {
-        isDone = true;
-        break;
-      }
-
-      try {
-        const parsed = JSON.parse(data) as unknown;
-        const reasoningDelta = extractReasoningFromProviderChunk(parsed);
-        if (reasoningDelta) {
-          callbacks?.onReasoningDelta?.(reasoningDelta);
-        }
-
-        const contentDelta = extractTextFromProviderChunk(parsed);
-        if (contentDelta) {
-          contentBuffer += contentDelta;
-        }
-      } catch {
-        // malformed chunk — skip silently
-      }
+    if (parsed.sawDone) {
+      isDone = true;
     }
   }
 
-  const remaining = leftover + decoder.decode();
-  if (remaining.trim()) {
-    const trimmed = remaining.trim();
-    if (trimmed.startsWith('data:')) {
-      const data = trimmed.slice(5).trim();
-      if (data && data !== '[DONE]') {
-        try {
-          const parsed = JSON.parse(data) as unknown;
-          const contentDelta = extractTextFromProviderChunk(parsed);
-          if (contentDelta) {
-            contentBuffer += contentDelta;
-          }
-        } catch {}
+  transportBuffer += decoder.decode();
+  if (transportBuffer.trim()) {
+    const parsed = consumeStructuredTransportBuffer(transportBuffer);
+    for (const jsonBlock of parsed.jsonBlocks) {
+      const contentDelta = appendStructuredChunk(jsonBlock, callbacks);
+      if (contentDelta) {
+        contentBuffer += contentDelta;
       }
     }
   }
@@ -333,14 +512,10 @@ async function streamStructuredProviderText(
 }
 
 export async function streamProviderText(
-  providerType: ProviderType,
+  _providerType: ProviderType,
   stream: ReadableStream<Uint8Array>,
   callbacks?: StreamCallbacks,
 ): Promise<string> {
-  if (providerType === 'custom' || providerType === 'openai') {
-    return streamToText(stream, callbacks);
-  }
-
   return streamStructuredProviderText(stream, callbacks);
 }
 
@@ -454,6 +629,26 @@ export async function callProvider(payload: {
             parts: [{ text: payload.system ? `${payload.system}\n\n${payload.prompt}` : payload.prompt }],
           },
         ],
+      }),
+    });
+  }
+
+  if (payload.providerType === 'openrouter') {
+    return fetch('https://openrouter.ai/api/v1/chat/completions', {
+      ...commonFetchOptions,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${payload.apiKey}`,
+        'HTTP-Referer': 'https://scrimble.build',
+        'X-Title': 'Scrimble',
+      },
+      body: JSON.stringify({
+        model: payload.model,
+        messages: [
+          ...(payload.system ? [{ role: 'system', content: payload.system }] : []),
+          { role: 'user', content: payload.prompt },
+        ],
+        stream: true,
       }),
     });
   }

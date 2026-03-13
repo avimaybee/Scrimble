@@ -1,6 +1,7 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
-import { Hexagon, RotateCcw, Home } from 'lucide-react';
+import { Hexagon, RotateCcw, LayoutDashboard } from 'lucide-react';
 import { motion } from 'framer-motion';
+import { useNavigate } from 'react-router-dom';
 
 interface Props {
   children: ReactNode;
@@ -11,6 +12,33 @@ interface Props {
 interface State {
   hasError: boolean;
   error: Error | null;
+}
+
+function ErrorActions() {
+  const navigate = useNavigate();
+
+  const handleRetry = () => {
+    window.location.reload();
+  };
+
+  return (
+    <div className="flex items-center gap-4">
+      <button
+        onClick={handleRetry}
+        className="btn-secondary flex items-center gap-2 rounded-lg px-6"
+      >
+        <RotateCcw className="h-4 w-4" />
+        Retry
+      </button>
+      <button
+        onClick={() => navigate('/dashboard')}
+        className="btn-ghost flex items-center gap-2 px-6"
+      >
+        <LayoutDashboard className="h-4 w-4" />
+        Go to Dashboard
+      </button>
+    </div>
+  );
 }
 
 export class ErrorBoundary extends Component<Props, State> {
@@ -27,16 +55,6 @@ export class ErrorBoundary extends Component<Props, State> {
     console.error(`ErrorBoundary [${this.props.name || 'Global'}]:`, error, errorInfo);
   }
 
-  private handleReset = () => {
-    this.setState({ hasError: false, error: null });
-    window.location.reload();
-  };
-
-  private handleGoHome = () => {
-    this.setState({ hasError: false, error: null });
-    window.location.href = '/';
-  };
-
   public render() {
     if (this.state.hasError) {
       if (this.props.fallback) {
@@ -44,38 +62,23 @@ export class ErrorBoundary extends Component<Props, State> {
       }
 
       return (
-        <div className="flex min-h-[400px] w-full flex-col items-center justify-center rounded-[16px] border border-border-default bg-bg-surface p-12 text-center shadow-panel">
+        <div className="flex min-h-[400px] w-full flex-col items-center justify-center py-12 text-center">
           <motion.div
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            className="mb-6 text-accent-primary"
+            className="mb-6 text-text-muted"
           >
             <Hexagon className="h-8 w-8" />
           </motion.div>
 
-          <h2 className="mb-2 font-serif text-2xl tracking-[-0.03em] text-text-primary">
-            Something broke here
+          <h2 className="mb-2 text-heading">
+            Something went wrong
           </h2>
           <p className="mb-8 max-w-md text-text-secondary">
-            {this.props.name ? `The ${this.props.name} view` : 'This part of the app'} hit a problem. Reload and pick up where you left off.
+            We hit an unexpected bump. Give it another shot or head back to your dashboard.
           </p>
 
-          <div className="flex items-center gap-4">
-            <button
-              onClick={this.handleReset}
-              className="btn-primary flex items-center gap-2 rounded-lg px-6"
-            >
-              <RotateCcw className="h-4 w-4" />
-              Try again
-            </button>
-            <button
-              onClick={this.handleGoHome}
-              className="btn-ghost flex items-center gap-2 px-6"
-            >
-              <Home className="h-4 w-4" />
-              Go home
-            </button>
-          </div>
+          <ErrorActions />
 
           {process.env.NODE_ENV === 'development' && (
             <div className="mt-8 w-full max-w-2xl overflow-hidden rounded-lg border border-border-subtle bg-bg-elevated p-4 text-left">

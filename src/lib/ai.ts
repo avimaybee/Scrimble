@@ -2,7 +2,7 @@ import { auth } from './firebase';
 import { z } from 'zod';
 import { toast } from 'sonner';
 
-export type AIProviderType = 'gemini' | 'anthropic' | 'openai' | 'custom';
+export type AIProviderType = 'gemini' | 'anthropic' | 'openai' | 'custom' | 'openrouter' | 'groq';
 
 export interface AIProvider {
   id: string;
@@ -11,6 +11,7 @@ export interface AIProvider {
   base_url?: string;
   model?: string;
   is_default: boolean;
+  masked_key?: string;
 }
 
 // Zod Schemas for AI Validation
@@ -196,6 +197,20 @@ export async function callAIProxy(params: {
   }
 
   return result;
+}
+
+export async function testAIProvider(providerId: string): Promise<boolean> {
+  try {
+    const result = await callAIProxy({
+      providerId,
+      system: 'You are a connection tester.',
+      prompt: 'Respond with exactly "OK" and nothing else.'
+    });
+    return result.trim().toUpperCase().includes('OK');
+  } catch (error) {
+    console.error('Connection test failed:', error);
+    return false;
+  }
 }
 
 export type AIStep = z.infer<typeof PlanSchema>['stages'][number]['steps'][number];
