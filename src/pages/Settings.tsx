@@ -20,6 +20,7 @@ import {
 import { cn } from '../lib/utils';
 import { useAuthStore } from '../store/authStore';
 import { logout } from '../lib/firebase';
+import { InlineError } from '../components/ui/InlineError';
 import {
   AIProvider,
   AIProviderType,
@@ -284,6 +285,7 @@ export default function Settings() {
   const [savingMCPType, setSavingMCPType] = useState<MCPServerType | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [providerErrors, setProviderErrors] = useState<Record<string, string>>({});
   const [removingMCPId, setRemovingMCPId] = useState<string | null>(null);
   const [togglingMCPId, setTogglingMCPId] = useState<string | null>(null);
 
@@ -404,15 +406,19 @@ export default function Settings() {
 
   const handleTestProvider = async (providerId: string) => {
     setTestingId(providerId);
+    setProviderErrors((prev) => ({ ...prev, [providerId]: '' }));
     try {
       const success = await testAIProvider(providerId);
       if (success) {
         toast.success('Connection successful! The AI key is working.');
+        setProviderErrors((prev) => ({ ...prev, [providerId]: '' }));
       } else {
-        toast.error('Connection failed. Please check your API key.');
+        const errorMsg = 'Connection failed. Please check your API key.';
+        setProviderErrors((prev) => ({ ...prev, [providerId]: errorMsg }));
       }
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not test the connection.');
+      const errorMsg = error instanceof Error ? error.message : 'Could not test the connection.';
+      setProviderErrors((prev) => ({ ...prev, [providerId]: errorMsg }));
     } finally {
       setTestingId(null);
     }
@@ -730,14 +736,22 @@ export default function Settings() {
                     </div>
                     <p className="mb-3 text-sm text-text-secondary">{getProviderSummary(provider)}</p>
 
+                    {providerErrors[provider.id] ? (
+                      <InlineError 
+                        message={providerErrors[provider.id]} 
+                        onRetry={() => handleTestProvider(provider.id)}
+                        className="mb-3"
+                      />
+                    ) : null}
+
                     <div className="space-y-2">
                       <label className="block text-[10px] font-mono uppercase tracking-[0.16em] text-text-tertiary">
                         Saved key
                       </label>
                       <input
                         readOnly
-                        value="••••••••••••••••"
-                        className={cn(inputClassName, 'cursor-default bg-bg-base/60 opacity-85')}
+                        value={provider.masked_key || '••••••••••••••••'}
+                        className={cn(inputClassName, 'cursor-default bg-bg-base/60 opacity-85', provider.masked_key && 'font-mono text-xs')}
                       />
                     </div>
                   </div>
