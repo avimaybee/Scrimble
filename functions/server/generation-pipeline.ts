@@ -2264,12 +2264,25 @@ export async function saveArchitectureReviewApproval(
 }
 
 export async function hasApprovedArchitectureReview(env: Bindings, projectId: string) {
-  try {
-    const context = await loadArchitectureReviewContext(env, projectId);
-    return optionalText(context.input.review_feedback_updated_at) !== null;
-  } catch {
-    return false;
+  const runs = await env.DB.prepare(`
+    SELECT input
+    FROM agent_runs
+    WHERE project_id = ?
+      AND run_type = 'batch_3_architect'
+      AND status = 'complete'
+    ORDER BY created_at DESC
+  `)
+    .bind(projectId)
+    .all();
+
+  for (const row of runs.results as Array<{ input: string | null }>) {
+    const parsedInput = parseJsonObject(row.input);
+    if (optionalText(parsedInput.review_feedback_updated_at) !== null) {
+      return true;
+    }
   }
+
+  return false;
 }
 
 export function isGenerationExecutionStale(
@@ -2615,7 +2628,8 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
   if (!workflowId) {
     workflowId = crypto.randomUUID();
     await env.DB.prepare('INSERT INTO workflows (id, project_id, version, canvas_state) VALUES (?, ?, ?, ?)')
-      .bind(workflowId, projectId, 1, JSON.stringify({ x: 0, y: 0, zoom: 1 }));
+      .bind(workflowId, projectId, 1, JSON.stringify({ x: 0, y: 0, zoom: 1 }))
+      .run();
   }
 
   const statements: Array<any> = [

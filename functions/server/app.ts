@@ -1249,14 +1249,21 @@ app.get('/projects/:id/status', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
+  const generationStatus = (project.generation_status as string | null) || 'complete';
   const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
   const completedBatchNames = completedBatchRows.map((row) => row.run_type);
+  const reviewConfirmedByStatus =
+    generationStatus === 'approved'
+    || generationStatus === 'batch_4_plan_build'
+    || generationStatus === 'batch_5_enrich_steps'
+    || generationStatus === 'batch_6_generate_files'
+    || generationStatus === 'complete';
   const hasReviewApproval =
+    reviewConfirmedByStatus ||
     completedBatchNames.includes('batch_4_plan_build') ||
     completedBatchNames.includes('batch_5_enrich_steps') ||
     completedBatchNames.includes('batch_6_generate_files') ||
     await hasApprovedArchitectureReview(c.env, projectId);
-  const generationStatus = (project.generation_status as string | null) || 'complete';
   const generationHeartbeat = (project.generation_heartbeat_at as string | null) || null;
   const executionStale = isGenerationExecutionStale(generationStatus, generationHeartbeat);
   const queuedResumeReady = isQueuedGenerationResumeReady(generationStatus, generationHeartbeat);
@@ -1444,7 +1451,14 @@ app.post('/projects/:id/resume', async (c) => {
 
   const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
   const completedBatchNames = completedBatchRows.map((row) => row.run_type);
+  const reviewConfirmedByStatus =
+    status === 'approved'
+    || status === 'batch_4_plan_build'
+    || status === 'batch_5_enrich_steps'
+    || status === 'batch_6_generate_files'
+    || status === 'complete';
   const hasReviewApproval =
+    reviewConfirmedByStatus ||
     completedBatchNames.includes('batch_4_plan_build') ||
     completedBatchNames.includes('batch_5_enrich_steps') ||
     completedBatchNames.includes('batch_6_generate_files') ||

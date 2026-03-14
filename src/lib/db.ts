@@ -344,10 +344,10 @@ export const dbService = {
       generation_status: Project['generation_status'];
       feedback_provided: boolean;
       preferred_ide: PreferredIde;
-    }>(`/projects/${projectId}/architecture-review`, {
+    }>(`/projects/${projectId}/architecture-review`, withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify({ feedback, preferredIde }),
-    });
+    }));
   },
 
   async downloadSkillFiles(projectId: string): Promise<void> {
