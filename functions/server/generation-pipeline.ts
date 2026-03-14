@@ -2185,14 +2185,19 @@ export async function loadBatchOutput<T>(
   runType: GenerationBatchName,
   schema: ZodType<T>,
 ) {
+  console.log(`[PIPELINE_TRACE] loadBatchOutput for project ${projectId}, runType ${runType}`);
   const typedRecord = await loadBatchRunRecord(env, projectId, runType);
 
-  const storedOutput = typedRecord
-    ? await loadJsonPayloadText(env, typedRecord.output, typedRecord.output_r2_key)
-    : null;
+  if (!typedRecord) {
+    console.warn(`[PIPELINE_TRACE] loadBatchOutput: Missing output record for ${runType}`);
+    throw new GenerationPipelineError(`Missing output record for ${runType}. Please ensure the previous step completed successfully.`);
+  }
+
+  const storedOutput = await loadJsonPayloadText(env, typedRecord.output, typedRecord.output_r2_key);
 
   if (!storedOutput) {
-    throw new GenerationPipelineError(`Missing output for ${runType}.`);
+    console.warn(`[PIPELINE_TRACE] loadBatchOutput: Output record exists for ${runType} but content is empty`);
+    throw new GenerationPipelineError(`Output record for ${runType} exists but content is empty.`);
   }
 
   let parsed: unknown;
@@ -2563,18 +2568,6 @@ async function failBatch(
   message: string,
   attemptCount: number,
 ): Promise<never> {
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'failed', {
-    generationError: message,
-    markStarted: true,
-    markCompleted: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
-  });
-  if (statusChanges === 0) {
-    throw staleGenerationRunError(projectId, runId, `failing ${runType}`);
-  }
-
   await insertAgentRun(env, {
     projectId,
     runType,
@@ -2586,6 +2579,18 @@ async function failBatch(
     sequenceIndex: batchSequenceIndexes[runType],
     attemptCount,
   });
+
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'failed', {
+    generationError: message,
+    markStarted: true,
+    markCompleted: true,
+    touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
+  });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, `failing ${runType}`);
+  }
 
   await insertGenerationEvent(env, {
     projectId,
@@ -2614,17 +2619,6 @@ async function completeBatch<T>(
   storedOutput: unknown = data,
   durationMs = 0,
 ) {
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, runType, {
-    generationError: null,
-    markStarted: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
-  });
-  if (statusChanges === 0) {
-    throw staleGenerationRunError(projectId, runId, `completing ${runType}`);
-  }
-
   await insertAgentRun(env, {
     projectId,
     runType,
@@ -2636,6 +2630,17 @@ async function completeBatch<T>(
     sequenceIndex: batchSequenceIndexes[runType],
     attemptCount,
   });
+
+  const statusChanges = await updateProjectGenerationStatus(env, projectId, runType, {
+    generationError: null,
+    markStarted: true,
+    touchHeartbeat: true,
+    generationRunId: runId,
+    expectedRunId: runId,
+  });
+  if (statusChanges === 0) {
+    throw staleGenerationRunError(projectId, runId, `completing ${runType}`);
+  }
 
   await insertGenerationEvent(env, {
     projectId,
@@ -4306,15 +4311,20 @@ async function resolvePipelineStatusToRun(
   currentStatus: ProjectGenerationStatus,
   completedBatches: string[],
 ): Promise<ProjectGenerationStatus> {
-  if (currentStatus === 'queued' && completedBatches.includes('batch_1_research_stack')) {
+  const hasOutput = async (batch: GenerationBatchName) => {
+    const record = await loadBatchRunRecord(env, projectId, batch);
+    return !!record?.output || !!record?.output_r2_key;
+  };
+
+  if (currentStatus === 'queued' && completedBatches.includes('batch_1_research_stack') && await hasOutput('batch_1_research_stack')) {
     return 'batch_1_research_stack';
   }
 
-  if (currentStatus === 'batch_1_research_stack' && completedBatches.includes('batch_2_fetch_and_read')) {
+  if (currentStatus === 'batch_1_research_stack' && completedBatches.includes('batch_2_fetch_and_read') && await hasOutput('batch_2_fetch_and_read')) {
     return 'batch_2_fetch_and_read';
   }
 
-  if (currentStatus === 'batch_2_fetch_and_read' && completedBatches.includes('batch_3_architect')) {
+  if (currentStatus === 'batch_2_fetch_and_read' && completedBatches.includes('batch_3_architect') && await hasOutput('batch_3_architect')) {
     // If it's already approved, we should go to 'approved' instead of re-running architect
     if (await hasApprovedArchitectureReview(env, projectId)) {
       return 'approved';
@@ -4322,15 +4332,15 @@ async function resolvePipelineStatusToRun(
     return 'batch_3_architect';
   }
 
-  if (currentStatus === 'approved' && completedBatches.includes('batch_4_plan_build')) {
+  if (currentStatus === 'approved' && completedBatches.includes('batch_4_plan_build') && await hasOutput('batch_4_plan_build')) {
     return 'batch_4_plan_build';
   }
 
-  if (currentStatus === 'batch_4_plan_build' && completedBatches.includes('batch_5_enrich_steps')) {
+  if (currentStatus === 'batch_4_plan_build' && completedBatches.includes('batch_5_enrich_steps') && await hasOutput('batch_5_enrich_steps')) {
     return 'batch_5_enrich_steps';
   }
 
-  if (currentStatus === 'batch_5_enrich_steps' && completedBatches.includes('batch_6_generate_files')) {
+  if (currentStatus === 'batch_5_enrich_steps' && completedBatches.includes('batch_6_generate_files') && await hasOutput('batch_6_generate_files')) {
     return 'batch_6_generate_files';
   }
 

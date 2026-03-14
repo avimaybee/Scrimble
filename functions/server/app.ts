@@ -1772,14 +1772,30 @@ app.get('/projects/:id/generation-stream', async (c) => {
     proxyUrl.pathname = '/stream';
     proxyUrl.searchParams.set('projectId', projectId);
     proxyUrl.searchParams.set('lastEventId', lastEventId.toString());
-    
+
+    const proxyHeaders = new Headers(c.req.raw.headers);
+    proxyHeaders.delete('host');
+    proxyHeaders.delete('cf-ray');
+    proxyHeaders.delete('cf-visitor');
+    proxyHeaders.delete('cf-connecting-ip');
+    proxyHeaders.delete('cf-ipcountry');
+    proxyHeaders.delete('x-forwarded-for');
+    proxyHeaders.delete('x-forwarded-proto');
+    proxyHeaders.delete('x-real-ip');
+
+    console.log(`[STREAM_PROXY] Proxying SSE request for ${projectId} to DO: ${proxyUrl.toString()}`);
     const request = new Request(proxyUrl.toString(), {
       method: 'GET',
-      headers: c.req.raw.headers,
+      headers: proxyHeaders,
       signal: c.req.raw.signal,
     });
 
-    return stub.fetch(request);
+    try {
+      return await stub.fetch(request);
+    } catch (error) {
+      console.error(`[STREAM_PROXY] DO fetch failed for ${projectId}:`, error);
+      throw error;
+    }
   }
 
   const stream = createGenerationSseStream(c.env, {

@@ -94,12 +94,13 @@ export class ProjectGeneratorDO {
 
   async fetch(request: Request) {
     const url = new URL(request.url);
+    console.log(`[PROJECT_GENERATOR_DO] fetch: method=${request.method}, url=${request.url}, pathname=${url.pathname}`);
 
-    if (request.method === 'GET' && url.pathname === '/state') {
+    if (request.method === 'GET' && (url.pathname === '/state' || url.pathname.endsWith('/state'))) {
       return Response.json({ scheduled: true });
     }
 
-    if (request.method === 'GET' && url.pathname === '/stream') {
+    if (request.method === 'GET' && (url.pathname === '/stream' || url.pathname.endsWith('/stream'))) {
       const projectId = url.searchParams.get('projectId');
       const lastEventId = parseInt(url.searchParams.get('lastEventId') || '0', 10);
       
