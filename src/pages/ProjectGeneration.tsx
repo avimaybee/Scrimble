@@ -491,7 +491,7 @@ export default function ProjectGeneration() {
     applyStatusUpdate(statusData);
     noteProgressTimestamp(statusData.generation_heartbeat_at || projectData.generation_started_at || projectData.updated_at);
 
-    setShowResumeBadge(statusData.can_resume && (statusData.execution_stale || statusData.is_failed));
+    setShowResumeBadge(statusData.can_resume && statusData.execution_stale);
 
     if (isGenerationBatchName(statusData.generation_status)) {
       setActiveBatch(statusData.generation_status);
@@ -1589,18 +1589,6 @@ export default function ProjectGeneration() {
                     >
                       Back to dashboard
                     </button>
-                  </div>
-                </div>
-              ) : status?.is_failed && showResumeBadge && !autoRecoveryFailed ? (
-                <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">
-                  <div className="flex items-start gap-3">
-                    <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
-                    <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Rechecking the runner</div>
-                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        The last runner heartbeat went quiet, so I&apos;m asking Scrimble to resume from the last completed checkpoint.
-                      </p>
-                    </div>
                   </div>
                 </div>
               ) : status?.is_failed && !isAutoRecovering ? (
