@@ -1791,13 +1791,12 @@ app.get('/projects/:id/generation-stream', async (c) => {
 
     try {
       const resp = await stub.fetch(request);
-      if (resp.status === 405) {
-        console.warn(`[STREAM_PROXY] DO returned 405 for GET ${proxyUrl}. This suggests a routing mismatch inside the DO handler.`);
+      if (resp.ok || (resp.status !== 404 && resp.status !== 405)) {
+        return resp;
       }
-      return resp;
+      console.warn(`[STREAM_PROXY] DO returned ${resp.status} for ${projectId}. Falling back to local SSE.`);
     } catch (error) {
-      console.error(`[STREAM_PROXY] DO fetch failed for ${projectId}:`, error);
-      throw error;
+      console.error(`[STREAM_PROXY] DO proxy failed for ${projectId}, falling back to local SSE:`, error);
     }
   }
 

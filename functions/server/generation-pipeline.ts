@@ -2354,40 +2354,6 @@ function isHeartbeatOlderThan(
   return now - heartbeatTimestamp > maxAgeMs;
 }
 
-export function resolveResumeGenerationStatus(
-  completedBatches: string[],
-  hasReviewApproval: boolean,
-): ProjectGenerationStatus {
-  if (!completedBatches.includes('batch_1_research_stack')) {
-    return 'queued';
-  }
-
-  if (!completedBatches.includes('batch_2_fetch_and_read')) {
-    return 'batch_1_research_stack';
-  }
-
-  if (!completedBatches.includes('batch_3_architect')) {
-    return 'batch_2_fetch_and_read';
-  }
-
-  if (!hasReviewApproval) {
-    return 'awaiting_review';
-  }
-
-  if (!completedBatches.includes('batch_4_plan_build')) {
-    return 'approved';
-  }
-
-  if (!completedBatches.includes('batch_5_enrich_steps')) {
-    return 'batch_4_plan_build';
-  }
-
-  if (!completedBatches.includes('batch_6_generate_files')) {
-    return 'batch_5_enrich_steps';
-  }
-
-  return 'batch_6_generate_files';
-}
 
 async function resolveProviderConfiguration(
   env: Bindings,
@@ -4308,43 +4274,51 @@ async function getCompletedBatches(projectId: string, env: Bindings): Promise<st
 export async function resolvePipelineStatusToRun(
   env: Bindings,
   projectId: string,
-  currentStatus: ProjectGenerationStatus,
+  _currentStatus: ProjectGenerationStatus,
   completedBatches: string[],
 ): Promise<ProjectGenerationStatus> {
   const hasOutput = async (batch: GenerationBatchName) => {
     const record = await loadBatchRunRecord(env, projectId, batch);
-    return !!record?.output || !!record?.output_r2_key;
+    // Be strict: if the record exists but text is empty, it's not a valid output for resumption
+    return (!!record?.output && record.output.length > 10) || !!record?.output_r2_key;
   };
 
-  if (currentStatus === 'queued' && completedBatches.includes('batch_1_research_stack') && await hasOutput('batch_1_research_stack')) {
+  // 1. Research Stack
+  if (!completedBatches.includes('batch_1_research_stack') || !(await hasOutput('batch_1_research_stack'))) {
+    return 'queued';
+  }
+
+  // 2. Fetch and Read
+  if (!completedBatches.includes('batch_2_fetch_and_read') || !(await hasOutput('batch_2_fetch_and_read'))) {
     return 'batch_1_research_stack';
   }
 
-  if (currentStatus === 'batch_1_research_stack' && completedBatches.includes('batch_2_fetch_and_read') && await hasOutput('batch_2_fetch_and_read')) {
+  // 3. Architect
+  if (!completedBatches.includes('batch_3_architect') || !(await hasOutput('batch_3_architect'))) {
     return 'batch_2_fetch_and_read';
   }
 
-  if (currentStatus === 'batch_2_fetch_and_read' && completedBatches.includes('batch_3_architect') && await hasOutput('batch_3_architect')) {
-    // If it's already approved, we should go to 'approved' instead of re-running architect
-    if (await hasApprovedArchitectureReview(env, projectId)) {
-      return 'approved';
-    }
-    return 'batch_3_architect';
+  // Human Gate: Review Approval
+  if (!(await hasApprovedArchitectureReview(env, projectId))) {
+    return 'awaiting_review';
   }
 
-  if (currentStatus === 'approved' && completedBatches.includes('batch_4_plan_build') && await hasOutput('batch_4_plan_build')) {
+  // 4. Plan Build
+  if (!completedBatches.includes('batch_4_plan_build') || !(await hasOutput('batch_4_plan_build'))) {
+    return 'approved';
+  }
+
+  // 5. Enrich Steps
+  if (!completedBatches.includes('batch_5_enrich_steps') || !(await hasOutput('batch_5_enrich_steps'))) {
     return 'batch_4_plan_build';
   }
 
-  if (currentStatus === 'batch_4_plan_build' && completedBatches.includes('batch_5_enrich_steps') && await hasOutput('batch_5_enrich_steps')) {
+  // 6. Generate Files
+  if (!completedBatches.includes('batch_6_generate_files') || !(await hasOutput('batch_6_generate_files'))) {
     return 'batch_5_enrich_steps';
   }
 
-  if (currentStatus === 'batch_5_enrich_steps' && completedBatches.includes('batch_6_generate_files') && await hasOutput('batch_6_generate_files')) {
-    return 'batch_6_generate_files';
-  }
-
-  return currentStatus;
+  return 'complete';
 }
 
 async function enqueueProjectGeneration(
