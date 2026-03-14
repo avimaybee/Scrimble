@@ -1762,6 +1762,26 @@ app.get('/projects/:id/generation-stream', async (c) => {
   }
 
   const lastEventId = asNumber(c.req.header('Last-Event-ID'), 0);
+  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  
+  // Try proxying to Durable Object if configured
+  if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
+    const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
+    const stub = c.env.PROJECT_GENERATOR.get(objectId);
+    const proxyUrl = new URL(c.req.url);
+    proxyUrl.pathname = '/stream';
+    proxyUrl.searchParams.set('projectId', projectId);
+    proxyUrl.searchParams.set('lastEventId', lastEventId.toString());
+    
+    const request = new Request(proxyUrl.toString(), {
+      method: 'GET',
+      headers: c.req.raw.headers,
+      signal: c.req.raw.signal,
+    });
+
+    return stub.fetch(request);
+  }
+
   const stream = createGenerationSseStream(c.env, {
     projectId,
     lastEventId,

@@ -476,6 +476,7 @@ export const dbService = {
             if (currentEvent === 'checkpoint' && parsed.adr && typeof parsed.adr === 'object') {
               options.onCheckpoint?.({
                 adr: parsed.adr as ArchitectureDecisionRecord,
+                run_id: typeof parsed.run_id === 'string' ? parsed.run_id : undefined,
               });
             }
 

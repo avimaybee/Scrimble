@@ -4,7 +4,7 @@ import {
   processProjectGeneration,
   RetryableGenerationPipelineError,
 } from './generation-pipeline';
-import { persistGenerationStreamEvent } from './generation-events';
+import { listPersistedGenerationEventsSince, persistGenerationStreamEvent, subscribeToGenerationEvents, type GenerationStreamEvent } from './generation-events';
 import type {
   Bindings,
   DurableObjectAlarmInfoLike,
@@ -46,17 +46,118 @@ function isProjectGeneratorRequestBody(value: unknown): value is ProjectGenerato
 
 export class ProjectGeneratorDO {
   private pipelineChain: Promise<void> = Promise.resolve();
+  private streams: Map<string, Set<WritableStreamDefaultWriter>> = new Map();
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private unsubscribeEvents: () => void;
 
   constructor(
     private readonly state: DurableObjectStateLike,
     private readonly env: Bindings,
-  ) {}
+  ) {
+    // Keep alive ping for all active writers
+    this.pingInterval = setInterval(() => {
+      const encoder = new TextEncoder();
+      const pingChunk = encoder.encode(': ping\n\n');
+      for (const [projectId, writers] of this.streams.entries()) {
+        for (const writer of writers) {
+          writer.write(pingChunk).catch(() => {
+            writers.delete(writer);
+          });
+        }
+        if (writers.size === 0) {
+          this.streams.delete(projectId);
+        }
+      }
+    }, 20_000);
+
+    // Subscribe to events originating in this DO isolate
+    this.unsubscribeEvents = subscribeToGenerationEvents((projectId, eventEnvelope) => {
+      this.broadcast(projectId, eventEnvelope);
+    });
+  }
+
+  public broadcast(projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) {
+    const writers = this.streams.get(projectId);
+    if (!writers || writers.size === 0) return;
+
+    const idLine = eventEnvelope.id === null ? '' : `id: ${eventEnvelope.id}\n`;
+    const payload = `${idLine}event: ${eventEnvelope.event.type}\ndata: ${JSON.stringify(eventEnvelope.event)}\n\n`;
+    const encoder = new TextEncoder();
+    const chunk = encoder.encode(payload);
+
+    for (const writer of writers) {
+      writer.write(chunk).catch(() => {
+        writers.delete(writer);
+      });
+    }
+  }
 
   async fetch(request: Request) {
     const url = new URL(request.url);
 
     if (request.method === 'GET' && url.pathname === '/state') {
       return Response.json({ scheduled: true });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/stream') {
+      const projectId = url.searchParams.get('projectId');
+      const lastEventId = parseInt(url.searchParams.get('lastEventId') || '0', 10);
+      
+      if (!projectId) {
+        return Response.json({ error: 'Missing projectId' }, { status: 400 });
+      }
+
+      const stream = new TransformStream();
+      const writer = stream.writable.getWriter();
+      const encoder = new TextEncoder();
+
+      // Ensure stream collection exists
+      let writers = this.streams.get(projectId);
+      if (!writers) {
+        writers = new Set();
+        this.streams.set(projectId, writers);
+      }
+      writers.add(writer);
+      console.log(`[PROJECT_GENERATOR_DO] Client connected for project ${projectId}. Active writers: ${writers.size}`);
+
+      request.signal.addEventListener('abort', () => {
+        console.log(`[PROJECT_GENERATOR_DO] Client aborted connection for project ${projectId}`);
+        writers?.delete(writer);
+        try { writer.close(); } catch (e) {}
+        if (writers?.size === 0) {
+          this.streams.delete(projectId);
+          console.log(`[PROJECT_GENERATOR_DO] Removed empty stream set for project ${projectId}`);
+        }
+      });
+
+      // Async replay of missed events from D1
+      void (async () => {
+        try {
+          const replayEvents = await listPersistedGenerationEventsSince(this.env, projectId, lastEventId);
+          console.log(`[PROJECT_GENERATOR_DO] Replaying ${replayEvents.length} events for project ${projectId} since ID ${lastEventId}`);
+          let latestEventId = lastEventId;
+          
+          for (const event of replayEvents) {
+            if (!writers?.has(writer)) return; // abort if client disconnected during replay
+            latestEventId = Math.max(latestEventId, event.id);
+            const idLine = event.id === null ? '' : `id: ${event.id}\n`;
+            const payload = `${idLine}event: ${event.event.type}\ndata: ${JSON.stringify(event.event)}\n\n`;
+            await writer.write(encoder.encode(payload));
+          }
+        } catch (err) {
+          console.error('[PROJECT_GENERATOR_DO] Error replaying events', err);
+          writers?.delete(writer);
+          try { await writer.close(); } catch (e) {}
+        }
+      })();
+
+      return new Response(stream.readable, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+        },
+      });
     }
 
     if (request.method !== 'POST') {

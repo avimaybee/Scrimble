@@ -175,6 +175,7 @@ export interface ProjectGenerationThinking {
 
 export interface ProjectGenerationCheckpointEvent {
   adr: ArchitectureDecisionRecord;
+  run_id?: string;
 }
 
 export interface ProjectGenerationStatusResponse {

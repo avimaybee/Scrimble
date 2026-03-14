@@ -26,6 +26,7 @@ import type {
   PreferredIde,
   Project,
   ProjectGenerationEvent,
+  ProjectGenerationCheckpointEvent,
   ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
 } from '../types';
@@ -198,6 +199,22 @@ function isGenerationBatchName(value: string | null | undefined): value is Gener
   return generationBatches.some((batch) => batch.id === value);
 }
 
+function isApprovedOrLaterStatus(status: ProjectGenerationStatusResponse | null | undefined) {
+  if (!status) {
+    return false;
+  }
+
+  if (status.generation_status === 'approved' || status.is_approved || status.is_complete) {
+    return true;
+  }
+
+  if (!isGenerationBatchName(status.generation_status)) {
+    return false;
+  }
+
+  return generationBatches.findIndex((batch) => batch.id === status.generation_status) >= 3;
+}
+
 function getActivityToneClass(icon: ActivityFeedItem['icon']) {
   switch (icon) {
     case '⚠️':
@@ -314,6 +331,32 @@ export default function ProjectGeneration() {
   const currentActivityRef = useRef<ActivityFeedItem | null>(null);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
   const feedbackRef = useRef<HTMLTextAreaElement | null>(null);
+  const statusRef = useRef<ProjectGenerationStatusResponse | null>(null);
+  const reviewDataRef = useRef<ArchitectureReviewResponse | null>(null);
+
+  const applyStatusUpdate = useCallback((
+    updater:
+      | ProjectGenerationStatusResponse
+      | null
+      | ((previous: ProjectGenerationStatusResponse | null) => ProjectGenerationStatusResponse | null),
+  ) => {
+    setStatus((previous) => {
+      const nextStatus =
+        typeof updater === 'function'
+          ? (updater as (previous: ProjectGenerationStatusResponse | null) => ProjectGenerationStatusResponse | null)(previous)
+          : updater;
+      statusRef.current = nextStatus;
+      return nextStatus;
+    });
+  }, []);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => {
+    reviewDataRef.current = reviewData;
+  }, [reviewData]);
 
   const noteProgressTimestamp = useCallback((timestamp: string | null | undefined) => {
     setLastProgressAt((previous) => pickLatestTimestamp(previous, timestamp));
@@ -403,6 +446,7 @@ export default function ProjectGeneration() {
       const review = await dbService.getArchitectureReview(id);
       setError('');
       setReviewData(review);
+      reviewDataRef.current = review;
       setReviewFeedback((previous) => (hasEditedReview ? previous : review.review_feedback));
       setPreferredIde((previous) => (hasEditedPreferredIde ? previous : review.preferred_ide));
     } catch (err) {
@@ -421,6 +465,10 @@ export default function ProjectGeneration() {
       dbService.getProject(id),
       dbService.getProjectGenerationStatus(id),
     ]);
+    const currentStatus = statusRef.current;
+    const currentReviewData = reviewDataRef.current;
+
+    console.log(`[FRONTEND_STATUS] syncProjectState: status=${statusData.generation_status}, is_review_required=${statusData.is_review_required}`);
 
     if (!projectData) {
       throw new Error('Project not found.');
@@ -431,8 +479,16 @@ export default function ProjectGeneration() {
       return;
     }
 
+    const isFurtherThanReview = isApprovedOrLaterStatus(currentStatus);
+
+    if (statusData.generation_status === 'awaiting_review' && isFurtherThanReview) {
+      console.log(`[FRONTEND_STATUS] Ignoring status regression from ${currentStatus?.generation_status} to awaiting_review`);
+      setProject(projectData);
+      return;
+    }
+
     setProject(projectData);
-    setStatus(statusData);
+    applyStatusUpdate(statusData);
     noteProgressTimestamp(statusData.generation_heartbeat_at || projectData.generation_started_at || projectData.updated_at);
 
     setShowResumeBadge(statusData.can_resume && (statusData.execution_stale || statusData.is_failed));
@@ -441,7 +497,8 @@ export default function ProjectGeneration() {
       setActiveBatch(statusData.generation_status);
     }
 
-    if (statusData.is_review_required && (!reviewData || reviewData.project_id !== id)) {
+    if (statusData.is_review_required && (!currentReviewData || currentReviewData.project_id !== id)) {
+      console.log(`[FRONTEND_STATUS] Loading review data because statusData.is_review_required is true`);
       void loadReviewData();
     }
 
@@ -454,7 +511,7 @@ export default function ProjectGeneration() {
     if (statusData.is_complete) {
       scheduleProjectNavigation();
     }
-  }, [id, loadReviewData, noteProgressTimestamp, reviewData, scheduleProjectNavigation]);
+  }, [applyStatusUpdate, id, loadReviewData, noteProgressTimestamp, scheduleProjectNavigation]);
 
 
   const needsPreparationNudge = Boolean(
@@ -552,16 +609,19 @@ export default function ProjectGeneration() {
       .streamProjectGeneration(id, {
         signal: controller.signal,
         onBatchStart: (event) => {
+          console.log(`[SSE_EVENT] onBatchStart: ${event.batch}`);
           replaceCurrentActivity(null);
           setActiveBatch(event.batch);
           setError('');
           setAutoRecoveryFailed(false);
           noteProgressTimestamp(new Date().toISOString());
-          setStatus((previous) =>
+          applyStatusUpdate((previous) =>
             previous
               ? {
                   ...previous,
                   generation_status: event.batch,
+                  is_review_required: false,
+                  is_approved: false,
                   is_failed: false,
                   generation_error: null,
                 }
@@ -588,6 +648,7 @@ export default function ProjectGeneration() {
           appendThinkingActivity(event.content, event.timestamp);
         },
         onBatchCompleted: (event) => {
+          console.log(`[SSE_EVENT] onBatchCompleted: ${event.batch}`);
           noteProgressTimestamp(event.completed_at || new Date().toISOString());
           setStreamEvents((previous) => {
             const next = previous.filter((item) => item.batch !== event.batch);
@@ -595,10 +656,28 @@ export default function ProjectGeneration() {
             return next;
           });
         },
-        onCheckpoint: () => {
+        onCheckpoint: (event: ProjectGenerationCheckpointEvent) => {
+          const currentStatus = statusRef.current;
+          if (!currentStatus) {
+            console.log('[SSE_EVENT] onCheckpoint ignored before status bootstrap completed');
+            return;
+          }
+
+          const currentRunId = currentStatus?.generation_run_id || null;
+          const isStaleRun = Boolean(event.run_id && currentRunId && event.run_id !== currentRunId);
+          const shouldIgnore = isStaleRun || isApprovedOrLaterStatus(currentStatus);
+
+          console.log(
+            `[SSE_EVENT] onCheckpoint (review_required) run_id=${event.run_id ?? 'none'} current_run_id=${currentRunId ?? 'none'} ignored=${shouldIgnore}`,
+          );
+
+          if (shouldIgnore) {
+            return;
+          }
+
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
-          setStatus((previous) =>
+          applyStatusUpdate((previous) =>
             previous
               ? {
                   ...previous,
@@ -611,9 +690,10 @@ export default function ProjectGeneration() {
           void loadReviewData();
         },
         onComplete: () => {
+          console.log(`[SSE_EVENT] onComplete`);
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
-          setStatus((previous) =>
+          applyStatusUpdate((previous) =>
             previous
               ? {
                   ...previous,
@@ -627,10 +707,11 @@ export default function ProjectGeneration() {
           void syncProjectState().finally(() => scheduleProjectNavigation());
         },
         onFailed: (message) => {
+          console.log(`[SSE_EVENT] onFailed: ${message}`);
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
           setError(message);
-          setStatus((previous) =>
+          applyStatusUpdate((previous) =>
             previous
               ? {
                   ...previous,
@@ -657,6 +738,7 @@ export default function ProjectGeneration() {
     return () => controller.abort();
   }, [
     appendThinkingActivity,
+    applyStatusUpdate,
     hasPreparationCompleted,
     id,
     loadReviewData,
@@ -858,7 +940,7 @@ export default function ProjectGeneration() {
 
     try {
       await dbService.approveArchitectureReview(id, reviewFeedback, preferredIde);
-      setStatus((previous) =>
+      applyStatusUpdate((previous) =>
         previous
           ? {
               ...previous,
@@ -875,7 +957,7 @@ export default function ProjectGeneration() {
     } finally {
       setIsSubmittingReview(false);
     }
-  }, [id, preferredIde, reviewFeedback, syncProjectState]);
+  }, [applyStatusUpdate, id, preferredIde, reviewFeedback, syncProjectState]);
 
   const reconnectLiveFeed = useCallback(() => {
     setError('');
@@ -959,14 +1041,14 @@ export default function ProjectGeneration() {
       const result = await dbService.cancelProjectGeneration(id);
       if (result.success) {
         toast.success('Generation cancelled.');
-        setStatus((prev) => prev ? { ...prev, generation_status: 'cancelled', is_failed: true } : prev);
+        applyStatusUpdate((prev) => (prev ? { ...prev, generation_status: 'cancelled', is_failed: true } : prev));
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to cancel generation.');
     } finally {
       setIsCancelling(false);
     }
-  }, [id, isCancelling]);
+  }, [applyStatusUpdate, id, isCancelling]);
 
   useEffect(() => {
     if (!showResumeBadge || autoRecoveryFailed || isAutoRecovering || isResuming) {

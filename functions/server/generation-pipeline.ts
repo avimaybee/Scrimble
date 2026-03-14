@@ -1615,6 +1615,9 @@ async function updateProjectGenerationStatus(
     expectedRunId?: string | null;
   } = {},
 ) {
+  const timestamp = new Date().toISOString();
+  console.log(`[STATUS_TRACE] ${timestamp} updateProjectGenerationStatus for ${projectId}: status=${generationStatus}, runId=${options.generationRunId}, expectedRunId=${options.expectedRunId}`);
+  
   const generationError = options.generationError ?? null;
   const result = await env.DB.prepare(`
     UPDATE projects
@@ -1667,7 +1670,14 @@ async function updateProjectGenerationStatus(
     )
     .run();
 
-  return Number((result as { meta?: { changes?: number } }).meta?.changes || 0);
+  const changes = Number((result as { meta?: { changes?: number } }).meta?.changes || 0);
+  if (changes > 0) {
+    console.log(`[STATUS_TRACE] ${timestamp} SUCCESS: updated project ${projectId} to status ${generationStatus}`);
+  } else {
+    console.log(`[STATUS_TRACE] ${timestamp} SKIPPED: project ${projectId} status change to ${generationStatus} not applied (likely runId mismatch or cancelled)`);
+  }
+
+  return changes;
 }
 
 async function touchGenerationHeartbeat(
@@ -2050,6 +2060,7 @@ async function insertGenerationEvent(
           event: {
             type: 'checkpoint',
             adr: payload.body.adr as Batch3Architect,
+            run_id: optionalText(payload.body.run_id) || undefined,
           },
         });
       }
@@ -2236,6 +2247,8 @@ export async function saveArchitectureReviewApproval(
   feedback: string,
   preferredIde: PreferredIde,
 ) {
+  const timestamp = new Date().toISOString();
+  console.log(`[APPROVAL_TRACE] ${timestamp} saveArchitectureReviewApproval started for project: ${projectId}`);
   const context = await loadArchitectureReviewContext(env, projectId);
   const trimmedFeedback = feedback.trim();
   const nextInput = {
@@ -2243,13 +2256,15 @@ export async function saveArchitectureReviewApproval(
     preferred_ide: preferredIde,
     review_feedback: trimmedFeedback,
     review_feedback_provided: trimmedFeedback.length > 0,
-    review_feedback_updated_at: new Date().toISOString(),
+    review_feedback_updated_at: timestamp,
   };
 
+  console.log(`[APPROVAL_TRACE] ${timestamp} Updating agent_run ${context.runId} with approval marker`);
   await env.DB.prepare('UPDATE agent_runs SET input = ? WHERE id = ?')
     .bind(JSON.stringify(nextInput), context.runId)
     .run();
 
+  console.log(`[APPROVAL_TRACE] ${timestamp} Setting project status to 'approved'`);
   await updateProjectGenerationStatus(env, projectId, 'approved', {
     generationError: null,
     markStarted: true,
@@ -4189,6 +4204,15 @@ ${skillFileProfileInstructions}`;
 }
 
 async function pauseForArchitectureReview(env: Bindings, projectId: string, runId: string) {
+  const timestamp = new Date().toISOString();
+  console.log(`[PIPELINE_TRACE] ${timestamp} pauseForArchitectureReview called for project: ${projectId}, runId: ${runId}`);
+  
+  // HARDENING: Check if we already have an approval for this run
+  if (await hasApprovedArchitectureReview(env, projectId)) {
+    console.log(`[PIPELINE_TRACE] ${timestamp} SKIPPED: project ${projectId} already has an approved architecture review`);
+    return;
+  }
+
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
 
   const statusChanges = await updateProjectGenerationStatus(env, projectId, 'awaiting_review', {
@@ -4199,8 +4223,11 @@ async function pauseForArchitectureReview(env: Bindings, projectId: string, runI
     expectedRunId: runId,
   });
   if (statusChanges === 0) {
-    throw staleGenerationRunError(projectId, runId, 'pausing for architecture review');
+    console.log(`[PIPELINE_TRACE] ${timestamp} SKIPPED: project ${projectId} status change to awaiting_review failed (likely already approved or status changed)`);
+    return;
   }
+
+  console.log(`[PIPELINE_TRACE] ${timestamp} SUCCESS: project ${projectId} is now awaiting_review`);
   await logActivity(env, {
     projectId,
     batchName: 'batch_3_architect',
@@ -4213,6 +4240,7 @@ async function pauseForArchitectureReview(env: Bindings, projectId: string, runI
     batchName: 'batch_3_architect',
     body: {
       adr: reviewContext.adr,
+      run_id: runId,
     },
   });
 }
@@ -4256,10 +4284,12 @@ async function getCompletedBatches(projectId: string, env: Bindings): Promise<st
   return rows.results.map((r: any) => r.run_type as string);
 }
 
-function resolvePipelineStatusToRun(
+async function resolvePipelineStatusToRun(
+  env: Bindings,
+  projectId: string,
   currentStatus: ProjectGenerationStatus,
   completedBatches: string[],
-): ProjectGenerationStatus {
+): Promise<ProjectGenerationStatus> {
   if (currentStatus === 'queued' && completedBatches.includes('batch_1_research_stack')) {
     return 'batch_1_research_stack';
   }
@@ -4269,6 +4299,10 @@ function resolvePipelineStatusToRun(
   }
 
   if (currentStatus === 'batch_2_fetch_and_read' && completedBatches.includes('batch_3_architect')) {
+    // If it's already approved, we should go to 'approved' instead of re-running architect
+    if (await hasApprovedArchitectureReview(env, projectId)) {
+      return 'approved';
+    }
     return 'batch_3_architect';
   }
 
@@ -4329,26 +4363,34 @@ async function processProjectGenerationTurn(
   message: QueueMessageBody,
   continuationMode: GenerationContinuationMode,
 ) {
+  const timestamp = new Date().toISOString();
+  console.log(`[PIPELINE_TRACE] ${timestamp} processProjectGenerationTurn started for project: ${message.projectId}, runId: ${message.runId}`);
   const project = await getProjectById(env, message.projectId);
   if (!project) {
     throw new GenerationPipelineError('The queued project no longer exists.');
   }
 
   if (message.runId && project.generation_run_id && message.runId !== project.generation_run_id) {
+    console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: runId mismatch. Message runId=${message.runId}, Project runId=${project.generation_run_id}`);
     return false;
   }
 
   const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
+  console.log(`[PIPELINE_TRACE] ${timestamp} currentStatus: ${currentStatus}`);
+  
   if (
     currentStatus === 'complete'
     || currentStatus === 'failed'
     || currentStatus === 'awaiting_review'
     || currentStatus === 'cancelled'
   ) {
+    console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: currentStatus ${currentStatus} is terminal or awaiting review`);
     return false;
   }
 
   const completed = await getCompletedBatches(message.projectId, env);
+  console.log(`[PIPELINE_TRACE] ${timestamp} completed batches: ${completed.join(', ')}`);
+
   if (message.providerId && project.generation_provider_id && message.providerId !== project.generation_provider_id) {
     throw new GenerationPipelineError('Queued generation provider does not match the project’s pinned provider.');
   }
@@ -4366,7 +4408,8 @@ async function processProjectGenerationTurn(
     pinnedProviderId,
   );
   const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
-  const statusToRun = resolvePipelineStatusToRun(currentStatus, completed);
+  const statusToRun = await resolvePipelineStatusToRun(env, project.id, currentStatus, completed);
+  console.log(`[PIPELINE_TRACE] ${timestamp} activeRunId: ${activeRunId}, statusToRun: ${statusToRun}`);
 
   const primingChanges = await updateProjectGenerationStatus(env, project.id, currentStatus, {
     generationError: null,
@@ -4378,6 +4421,7 @@ async function processProjectGenerationTurn(
     expectedRunId: activeRunId,
   });
   if (primingChanges === 0) {
+    console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: failed to prime project status update`);
     return false;
   }
 
@@ -4392,6 +4436,7 @@ async function processProjectGenerationTurn(
       expectedRunId: activeRunId,
     });
     if (queuedChanges === 0) {
+      console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: failed to update project status to 'queued'`);
       return false;
     }
     await logActivity(env, {
@@ -4409,6 +4454,7 @@ async function processProjectGenerationTurn(
     existingTools: builderProfile.declaredTools.map((tool) => tool.name),
   });
 
+  console.log(`[PIPELINE_TRACE] ${timestamp} Executing turn for status: ${statusToRun}`);
   switch (statusToRun) {
     case 'intake':
       return false;

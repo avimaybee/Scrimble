@@ -6,7 +6,7 @@ export type GenerationStreamEvent =
   | { type: 'activity'; icon: string; message: string; timestamp: string }
   | { type: 'thinking'; content: string }
   | { type: 'batch_complete'; batch: GenerationBatchName; duration_ms: number }
-  | { type: 'checkpoint'; adr: Batch3Architect }
+  | { type: 'checkpoint'; adr: Batch3Architect; run_id?: string }
   | { type: 'pipeline_complete'; project_id: string }
   | { type: 'pipeline_failed'; error: string };
 
@@ -20,6 +20,11 @@ type LiveGenerationEventEnvelope = {
 
 type PersistedGenerationEvent = LiveGenerationEventEnvelope & {
   id: number;
+};
+
+type GenerationReplayContext = {
+  generationStatus: string | null;
+  generationRunId: string | null;
 };
 
 const encoder = new TextEncoder();
@@ -133,7 +138,13 @@ function mapLegacyStoredEvent(
         duration_ms: asNumber(payload.duration_ms),
       };
     case 'review_required':
-      return payload.adr ? { type: 'checkpoint', adr: payload.adr as Batch3Architect } : null;
+      return payload.adr
+        ? {
+            type: 'checkpoint',
+            adr: payload.adr as Batch3Architect,
+            run_id: asText(payload.run_id) || undefined,
+          }
+        : null;
     case 'generation_complete':
       return {
         type: 'pipeline_complete',
@@ -171,6 +182,38 @@ function parseStoredGenerationEvent(row: Record<string, unknown>): PersistedGene
   } catch {
     return null;
   }
+}
+
+async function loadGenerationReplayContext(env: Bindings, projectId: string): Promise<GenerationReplayContext> {
+  const project = await env.DB.prepare(`
+    SELECT generation_status, generation_run_id
+    FROM projects
+    WHERE id = ?
+  `)
+    .bind(projectId)
+    .first();
+  const projectRow = (project as Record<string, unknown> | null) ?? null;
+
+  return {
+    generationStatus: asText(projectRow?.generation_status) || null,
+    generationRunId: asText(projectRow?.generation_run_id) || null,
+  };
+}
+
+function shouldReplayPersistedEvent(event: PersistedGenerationEvent, replayContext: GenerationReplayContext) {
+  if (event.event.type !== 'checkpoint') {
+    return true;
+  }
+
+  if (replayContext.generationStatus !== 'awaiting_review') {
+    return false;
+  }
+
+  return !(
+    event.event.run_id &&
+    replayContext.generationRunId &&
+    event.event.run_id !== replayContext.generationRunId
+  );
 }
 
 // In-memory live listeners removed: the pipeline runs in a separate Worker
@@ -214,6 +257,24 @@ export async function appendGenerationThinkingDelta(
   // No-op: thinking deltas are no longer persisted to D1.
 }
 
+type Subscriber = (projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) => void;
+const subscribers = new Set<Subscriber>();
+
+export function subscribeToGenerationEvents(fn: Subscriber) {
+  subscribers.add(fn);
+  return () => subscribers.delete(fn);
+}
+
+function publish(projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) {
+  for (const sub of subscribers) {
+    try {
+      sub(projectId, eventEnvelope);
+    } catch (e) {
+      console.error('[GENERATION_EVENTS] Error in subscriber', e);
+    }
+  }
+}
+
 export async function persistGenerationStreamEvent(
   env: Bindings,
   payload: {
@@ -234,40 +295,72 @@ export async function persistGenerationStreamEvent(
     )
     .run();
 
-  return {
+  const persisted = {
     id: asNumber(result.meta?.last_row_id),
     projectId: payload.projectId,
     batchName: payload.batchName || null,
     createdAt: new Date().toISOString(),
     event: payload.event,
   } satisfies PersistedGenerationEvent;
+  
+  publish(payload.projectId, persisted);
+
+  return persisted;
 }
 
-export function emitTransientGenerationStreamEvent(_payload: {
+export function emitTransientGenerationStreamEvent(payload: {
   projectId: string;
   batchName?: GenerationBatchName;
   event: Extract<GenerationStreamEvent, { type: 'thinking' }>;
 }) {
-  // No-op: transient events cannot cross the Worker/Pages process boundary.
-  // Thinking state is conveyed via periodic persisted activity events instead.
+  publish(payload.projectId, { id: null, event: payload.event });
 }
 
 export function createThrottledThinkingEmitter(
   _env: Bindings,
-  _projectId: string,
-  _batchName: GenerationBatchName,
-  _flushIntervalMs = 1000,
+  projectId: string,
+  batchName: GenerationBatchName,
+  flushIntervalMs = 1000,
 ) {
-  // Thinking deltas are no longer persisted to D1 or relayed via in-memory
-  // pub/sub. The emitter is kept as a lightweight sink so pipeline call sites
-  // don't need to change.
+  let buffer = '';
+  let lastFlush = Date.now();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  const flushNow = () => {
+    if (!buffer) return;
+    emitTransientGenerationStreamEvent({
+      projectId,
+      batchName,
+      event: { type: 'thinking', content: buffer },
+    });
+    buffer = '';
+    lastFlush = Date.now();
+  };
+
   return {
-    onReasoningDelta: (_delta: string) => {
-      // Intentionally empty — reasoning is consumed by callAIText internally
-      // but not forwarded to the frontend.
+    onReasoningDelta: (delta: string) => {
+      buffer += delta;
+      
+      const now = Date.now();
+      if (now - lastFlush >= flushIntervalMs) {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        flushNow();
+      } else if (!timeoutId) {
+        timeoutId = setTimeout(() => {
+          timeoutId = null;
+          flushNow();
+        }, flushIntervalMs - (now - lastFlush));
+      }
     },
     flush: async () => {
-      // Nothing to flush.
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      flushNow();
     },
   };
 }
@@ -383,6 +476,7 @@ export function createGenerationSseStream(
   // Bootstrap: replay persisted events, then start polling
   void (async () => {
     try {
+      const replayContext = await loadGenerationReplayContext(env, payload.projectId);
       const replayEvents = await listPersistedGenerationEventsSince(
         env,
         payload.projectId,
@@ -391,6 +485,10 @@ export function createGenerationSseStream(
 
       for (const event of replayEvents) {
         latestEventId = Math.max(latestEventId, event.id);
+        if (!shouldReplayPersistedEvent(event, replayContext)) {
+          continue;
+        }
+
         enqueueChunk(formatSseEvent(event));
 
         if (isTerminalGenerationEvent(event.event)) {
