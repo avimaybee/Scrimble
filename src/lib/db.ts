@@ -274,7 +274,7 @@ export const dbService = {
     });
   },
 
-  async getProjectsByUserId(_userId: string): Promise<Project[]> {
+  async getProjectsByUserId(): Promise<Project[]> {
     return fetchAPI<Project[]>('/projects');
   },
 

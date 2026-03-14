@@ -170,7 +170,7 @@ export default function Dashboard() {
 
     try {
       const [projects, userTools] = await Promise.all([
-        dbService.getProjectsByUserId(user.uid),
+        dbService.getProjectsByUserId(),
         dbService.getUserTools(),
       ]);
       const cards = await Promise.all(

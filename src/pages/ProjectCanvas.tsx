@@ -21,6 +21,7 @@ import {
   Step,
   Edge as AppEdge,
   ChecklistItem,
+  GeneratedProjectFile,
   StepStatus,
   WorkflowBriefDrift,
   WorkflowUpdateActivity,
@@ -33,6 +34,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Activity, Hexagon, Download, LayoutPanelTop, Pencil, Check, X, FileJson, FileText, Info, RotateCcw, Trash2 } from 'lucide-react';
 import { dbService } from '../lib/db';
 import { WorkflowBriefDriftError } from '../lib/db';
+import { updatePlan } from '../lib/ai';
 import { cn } from '../lib/utils';
 import ErrorBoundary from '../components/ErrorBoundary';
 import {
@@ -78,11 +80,24 @@ export default function ProjectCanvas() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
+  const [isApplyingDiff, setIsApplyingDiff] = useState(false);
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
+  const [isLoadingGeneratedFiles, setIsLoadingGeneratedFiles] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
   const [updateActivities, setUpdateActivities] = useState<WorkflowUpdateActivity[]>([]);
   const [workflowDrift, setWorkflowDrift] = useState<WorkflowBriefDrift | null>(null);
   const [pendingDriftResolution, setPendingDriftResolution] = useState<'apply_now' | 'save_for_later' | null>(null);
+  const [generatedFiles, setGeneratedFiles] = useState<GeneratedProjectFile[]>([]);
+  const [previewFile, setPreviewFile] = useState<GeneratedProjectFile | null>(null);
+  const [showQuickPlanEditor, setShowQuickPlanEditor] = useState(false);
+  const [isSavingPlanEdit, setIsSavingPlanEdit] = useState(false);
+  const [newStageTitle, setNewStageTitle] = useState('');
+  const [newStageType, setNewStageType] = useState('build');
+  const [newStepTitle, setNewStepTitle] = useState('');
+  const [newStepObjective, setNewStepObjective] = useState('');
+  const [newStepStageId, setNewStepStageId] = useState('');
+  const [newEdgeSourceId, setNewEdgeSourceId] = useState('');
+  const [newEdgeTargetId, setNewEdgeTargetId] = useState('');
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showUnlockToast, setShowUnlockToast] = useState(false);
@@ -97,11 +112,13 @@ export default function ProjectCanvas() {
     if (!id) return;
 
     setLoading(true);
+    setIsLoadingGeneratedFiles(true);
     setLoadError(null);
     try {
       const proj = await dbService.getProject(id);
       if (!proj) {
         setProject(null);
+        setGeneratedFiles([]);
         return;
       }
 
@@ -117,10 +134,11 @@ export default function ProjectCanvas() {
 
       setProject(proj);
 
-      const [fetchedStages, fetchedSteps, fetchedEdges] = await Promise.all([
+      const [fetchedStages, fetchedSteps, fetchedEdges, fetchedGeneratedFiles] = await Promise.all([
         dbService.getStagesByProjectId(id),
         dbService.getStepsByProjectId(id),
         dbService.getEdgesByProjectId(id),
+        dbService.getGeneratedFiles(id).catch(() => [] as GeneratedProjectFile[]),
       ]);
 
       setStages(fetchedStages);
@@ -129,12 +147,14 @@ export default function ProjectCanvas() {
         status: s.status as StepStatus
       }))) as Step[]);
       setAppEdges(fetchedEdges);
+      setGeneratedFiles(fetchedGeneratedFiles);
     } catch (error) {
       console.error('Error fetching project data:', error);
       setLoadError(
         error instanceof Error ? error.message : "Couldn't reopen this project right now.",
       );
     } finally {
+      setIsLoadingGeneratedFiles(false);
       setLoading(false);
     }
   }, [id, navigate]);
@@ -151,6 +171,29 @@ export default function ProjectCanvas() {
       }
     }
   }, [loading, project, appSteps.length]);
+
+  useEffect(() => {
+    if (!newStepStageId && stages.length > 0) {
+      setNewStepStageId(stages[0].id);
+    }
+  }, [newStepStageId, stages]);
+
+  useEffect(() => {
+    if (appSteps.length === 0) {
+      setNewEdgeSourceId('');
+      setNewEdgeTargetId('');
+      return;
+    }
+
+    if (!newEdgeSourceId || !appSteps.some((step) => step.id === newEdgeSourceId)) {
+      setNewEdgeSourceId(appSteps[0].id);
+    }
+
+    if (!newEdgeTargetId || !appSteps.some((step) => step.id === newEdgeTargetId)) {
+      const fallbackTarget = appSteps.find((step) => step.id !== appSteps[0].id)?.id || appSteps[0].id;
+      setNewEdgeTargetId(fallbackTarget);
+    }
+  }, [appSteps, newEdgeSourceId, newEdgeTargetId]);
 
   const handleRename = async () => {
     if (!project || !newName.trim() || newName === project.name) {
@@ -346,12 +389,46 @@ export default function ProjectCanvas() {
     setEdges(flowEdges);
   }, [appSteps, appEdges, stages, setNodes, setEdges]);
 
-  const onConnect = useCallback(
-    (params: Connection) => setEdges((eds) => addEdge(params, eds)),
-    [setEdges],
-  );
+  const onConnect = useCallback((params: Connection) => {
+    if (!project || !params.source || !params.target) {
+      return;
+    }
+
+    const optimisticId = `temp-${crypto.randomUUID()}`;
+    setEdges((existing) =>
+      addEdge(
+        {
+          ...params,
+          id: optimisticId,
+          type: 'bezier',
+        },
+        existing,
+      ),
+    );
+
+    void (async () => {
+      try {
+        await dbService.createEdge({
+          project_id: project.id,
+          source_step_id: params.source,
+          target_step_id: params.target,
+          edge_type: 'default',
+          condition: '',
+        });
+        toast.success('Connection saved.');
+        await fetchProjectData();
+      } catch (error) {
+        setEdges((existing) => existing.filter((edge) => edge.id !== optimisticId));
+        const message = error instanceof Error ? error.message : 'Could not save this connection.';
+        toast.error(message);
+      }
+    })();
+  }, [fetchProjectData, project, setEdges]);
 
   const handleNodeClick = useCallback((event: React.MouseEvent, node: FlowNode) => {
+    if (node.type !== 'custom') {
+      return;
+    }
     setSelectedStepId(node.id);
   }, []);
 
@@ -469,6 +546,222 @@ export default function ProjectCanvas() {
       setIsDownloadingAiFiles(false);
     }
   }, [isDownloadingAiFiles, project]);
+
+  const handleRefreshGeneratedFiles = useCallback(async () => {
+    if (!project || isLoadingGeneratedFiles) {
+      return;
+    }
+
+    setIsLoadingGeneratedFiles(true);
+    try {
+      const files = await dbService.getGeneratedFiles(project.id);
+      setGeneratedFiles(files);
+      toast.success('Generated files refreshed.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to refresh generated files.';
+      toast.error(message);
+    } finally {
+      setIsLoadingGeneratedFiles(false);
+    }
+  }, [isLoadingGeneratedFiles, project]);
+
+  const handleDownloadGeneratedFile = useCallback((file: GeneratedProjectFile) => {
+    const blob = new Blob([file.content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = file.filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const ensureWorkflowExists = useCallback(async (): Promise<void> => {
+    if (!project) {
+      throw new Error('Project is unavailable.');
+    }
+
+    const existingPlan = await dbService.getPlanByProjectId(project.id);
+    if (existingPlan) {
+      return;
+    }
+
+    await dbService.createPlan({
+      project_id: project.id,
+      version: 1,
+      canvas_state: '{}',
+    });
+  }, [project]);
+
+  const handleCreateStage = useCallback(async () => {
+    if (!project || !newStageTitle.trim()) {
+      return;
+    }
+
+    setIsSavingPlanEdit(true);
+    try {
+      await ensureWorkflowExists();
+      const nextOrder = stages.length > 0
+        ? Math.max(...stages.map((stage) => stage.order_index)) + 1
+        : 0;
+      await dbService.createStage({
+        project_id: project.id,
+        title: newStageTitle.trim(),
+        type: newStageType.trim() || 'build',
+        order_index: nextOrder,
+        status: 'active',
+      });
+
+      setNewStageTitle('');
+      toast.success('Stage added to your plan.');
+      await fetchProjectData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not add a stage.';
+      toast.error(message);
+    } finally {
+      setIsSavingPlanEdit(false);
+    }
+  }, [ensureWorkflowExists, fetchProjectData, newStageTitle, newStageType, project, stages]);
+
+  const handleCreateStep = useCallback(async () => {
+    if (!project || !newStepTitle.trim() || !newStepStageId) {
+      return;
+    }
+
+    const stage = stages.find((item) => item.id === newStepStageId);
+    if (!stage) {
+      toast.error('Choose a valid stage first.');
+      return;
+    }
+
+    const stageSteps = appSteps.filter((item) => item.stage_id === stage.id);
+    const nextOrder = stageSteps.length > 0
+      ? Math.max(...stageSteps.map((item) => item.order_index || 0)) + 1
+      : 0;
+    const nextX = stageSteps.length > 0
+      ? Math.max(...stageSteps.map((item) => item.position_x || 0)) + 260
+      : stage.order_index * 260 + 120;
+    const nextY = stageSteps.length > 0
+      ? Math.max(...stageSteps.map((item) => item.position_y || 0))
+      : stage.order_index * 240 + 120;
+
+    setIsSavingPlanEdit(true);
+    try {
+      await ensureWorkflowExists();
+      await dbService.createStep({
+        project_id: project.id,
+        stage_id: stage.id,
+        title: newStepTitle.trim(),
+        type: 'task',
+        category: stage.type,
+        position_x: nextX,
+        position_y: nextY,
+        status: appSteps.length === 0 ? 'active' : 'locked',
+        is_gate: false,
+        risk_level: 'low',
+        objective: newStepObjective.trim(),
+        why_it_matters: '',
+        done_when: '',
+        ai_output: '',
+        prompts: '[]',
+        is_ai_enriched: false,
+        order_index: nextOrder,
+      });
+
+      setNewStepTitle('');
+      setNewStepObjective('');
+      toast.success('Step added.');
+      await fetchProjectData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not add this step.';
+      toast.error(message);
+    } finally {
+      setIsSavingPlanEdit(false);
+    }
+  }, [
+    appSteps,
+    ensureWorkflowExists,
+    fetchProjectData,
+    newStepObjective,
+    newStepStageId,
+    newStepTitle,
+    project,
+    stages,
+  ]);
+
+  const handleCreateEdge = useCallback(async () => {
+    if (!project || !newEdgeSourceId || !newEdgeTargetId) {
+      return;
+    }
+
+    if (newEdgeSourceId === newEdgeTargetId) {
+      toast.error('Choose two different steps for this connection.');
+      return;
+    }
+
+    setIsSavingPlanEdit(true);
+    try {
+      await ensureWorkflowExists();
+      await dbService.createEdge({
+        project_id: project.id,
+        source_step_id: newEdgeSourceId,
+        target_step_id: newEdgeTargetId,
+        edge_type: 'default',
+        condition: '',
+      });
+      toast.success('Step connection added.');
+      await fetchProjectData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not connect these steps.';
+      toast.error(message);
+    } finally {
+      setIsSavingPlanEdit(false);
+    }
+  }, [ensureWorkflowExists, fetchProjectData, newEdgeSourceId, newEdgeTargetId, project]);
+
+  const handleApplyAiDiff = useCallback(async () => {
+    if (!project || !updateMessage.trim()) {
+      return;
+    }
+
+    setIsApplyingDiff(true);
+    try {
+      const planSummary = stages
+        .slice()
+        .sort((left, right) => left.order_index - right.order_index)
+        .map((stage) => ({
+          id: stage.id,
+          title: stage.title,
+          type: stage.type,
+          order_index: stage.order_index,
+          steps: appSteps
+            .filter((step) => step.stage_id === stage.id)
+            .sort((left, right) => (left.order_index || 0) - (right.order_index || 0))
+            .map((step) => ({
+              id: step.id,
+              title: step.title,
+              type: step.type,
+              objective: step.objective || '',
+              why_it_matters: step.why_it_matters || '',
+              done_when: step.done_when || '',
+              suggested_tools: step.suggested_tools || '[]',
+            })),
+        }));
+
+      const diff = await updatePlan(planSummary, project.stack, updateMessage);
+      await dbService.applyPlanDiff(diff, project.id);
+      toast.success(diff.summary || 'Plan diff applied.');
+      await fetchProjectData();
+      setShowUpdateModal(false);
+      setUpdateMessage('');
+      setUpdateActivities([]);
+      setWorkflowDrift(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not apply this plan diff.';
+      toast.error(message);
+    } finally {
+      setIsApplyingDiff(false);
+    }
+  }, [appSteps, fetchProjectData, project, stages, updateMessage]);
 
   if (loading) {
     return (
@@ -661,6 +954,50 @@ export default function ProjectCanvas() {
             <p className="px-1 font-sans text-[12px] leading-5 text-text-tertiary">
               Paste these into your IDE so your AI coding tool knows exactly what you&apos;re building.
             </p>
+            <div className="rounded-[10px] border border-border-default bg-bg-elevated/45 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-tertiary">
+                  Generated files
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void handleRefreshGeneratedFiles()}
+                  disabled={isLoadingGeneratedFiles}
+                  className="text-[11px] font-medium text-accent-primary hover:text-accent-primary-hover disabled:opacity-60"
+                >
+                  {isLoadingGeneratedFiles ? 'Refreshing...' : 'Refresh'}
+                </button>
+              </div>
+              {generatedFiles.length > 0 ? (
+                <div className="max-h-[144px] space-y-2 overflow-y-auto pr-1">
+                  {generatedFiles.map((file) => (
+                    <div key={file.id} className="rounded-[8px] border border-border-default/70 bg-bg-base/55 px-2 py-1.5">
+                      <div className="truncate text-[12px] text-text-primary">{file.filename}</div>
+                      <div className="mt-1 flex items-center gap-3 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() => setPreviewFile(file)}
+                          className="text-accent-primary hover:text-accent-primary-hover"
+                        >
+                          View
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDownloadGeneratedFile(file)}
+                          className="text-text-secondary hover:text-text-primary"
+                        >
+                          Download
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[12px] leading-5 text-text-secondary">
+                  No generated files yet. They will appear here after generation.
+                </p>
+              )}
+            </div>
             <button 
               onClick={() => {
                 setUpdateActivities([]);
@@ -671,6 +1008,125 @@ export default function ProjectCanvas() {
               <LayoutPanelTop className="w-4 h-4 text-accent-primary" />
               Update plan
             </button>
+
+            <button
+              type="button"
+              onClick={() => setShowQuickPlanEditor((current) => !current)}
+              className="btn-ghost w-full flex items-center justify-center gap-2"
+            >
+              <Pencil className="w-4 h-4 text-accent-primary" />
+              {showQuickPlanEditor ? 'Hide quick edit' : 'Quick edit plan'}
+            </button>
+
+            {showQuickPlanEditor ? (
+              <div className="space-y-3 rounded-[10px] border border-border-default bg-bg-elevated/35 p-3">
+                <div className="space-y-2">
+                  <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                    Add stage
+                  </label>
+                  <input
+                    type="text"
+                    value={newStageTitle}
+                    onChange={(event) => setNewStageTitle(event.target.value)}
+                    placeholder="Stage title"
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  />
+                  <input
+                    type="text"
+                    value={newStageType}
+                    onChange={(event) => setNewStageType(event.target.value)}
+                    placeholder="Stage type (e.g. discover)"
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleCreateStage()}
+                    disabled={isSavingPlanEdit || !newStageTitle.trim()}
+                    className="btn-secondary w-full text-[12px] disabled:opacity-60"
+                  >
+                    Add stage
+                  </button>
+                </div>
+
+                <div className="space-y-2 border-t border-border-default pt-3">
+                  <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                    Add step
+                  </label>
+                  <select
+                    value={newStepStageId}
+                    onChange={(event) => setNewStepStageId(event.target.value)}
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  >
+                    <option value="">Select stage</option>
+                    {stages.map((stage) => (
+                      <option key={stage.id} value={stage.id}>
+                        {stage.title}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={newStepTitle}
+                    onChange={(event) => setNewStepTitle(event.target.value)}
+                    placeholder="Step title"
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  />
+                  <input
+                    type="text"
+                    value={newStepObjective}
+                    onChange={(event) => setNewStepObjective(event.target.value)}
+                    placeholder="Optional objective"
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleCreateStep()}
+                    disabled={isSavingPlanEdit || !newStepTitle.trim() || !newStepStageId}
+                    className="btn-secondary w-full text-[12px] disabled:opacity-60"
+                  >
+                    Add step
+                  </button>
+                </div>
+
+                <div className="space-y-2 border-t border-border-default pt-3">
+                  <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                    Connect steps
+                  </label>
+                  <select
+                    value={newEdgeSourceId}
+                    onChange={(event) => setNewEdgeSourceId(event.target.value)}
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  >
+                    <option value="">Source step</option>
+                    {appSteps.map((step) => (
+                      <option key={step.id} value={step.id}>
+                        {step.title}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={newEdgeTargetId}
+                    onChange={(event) => setNewEdgeTargetId(event.target.value)}
+                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                  >
+                    <option value="">Target step</option>
+                    {appSteps.map((step) => (
+                      <option key={step.id} value={step.id}>
+                        {step.title}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void handleCreateEdge()}
+                    disabled={isSavingPlanEdit || !newEdgeSourceId || !newEdgeTargetId}
+                    className="btn-secondary w-full text-[12px] disabled:opacity-60"
+                  >
+                    Add connection
+                  </button>
+                </div>
+              </div>
+            ) : null}
 
             <button 
               onClick={() => setShowDeleteDialog(true)}
@@ -874,6 +1330,7 @@ export default function ProjectCanvas() {
           project={project}
           onClose={() => setSelectedStepId(null)} 
           onStepComplete={handleStepComplete}
+          onProjectUpdated={fetchProjectData}
         />
         
         <UnlockToast 
@@ -887,7 +1344,7 @@ export default function ProjectCanvas() {
       <Dialog
         open={showUpdateModal}
         onOpenChange={(open) => {
-          if (isUpdating) {
+          if (isUpdating || isApplyingDiff) {
             return;
           }
 
@@ -1002,7 +1459,7 @@ export default function ProjectCanvas() {
           <DialogFooter>
             <button 
               onClick={() => {
-                if (isUpdating) {
+                if (isUpdating || isApplyingDiff) {
                   return;
                 }
 
@@ -1012,14 +1469,21 @@ export default function ProjectCanvas() {
                 setShowUpdateModal(false);
               }}
               className="btn-ghost"
-              disabled={isUpdating}
+              disabled={isUpdating || isApplyingDiff}
             >
               Cancel
+            </button>
+            <button
+              onClick={() => void handleApplyAiDiff()}
+              className="btn-ghost"
+              disabled={isUpdating || isApplyingDiff || !updateMessage.trim()}
+            >
+              {isApplyingDiff ? 'Applying diff...' : 'Apply AI diff'}
             </button>
             <button 
               onClick={() => void handlePlanUpdate()}
               className="btn-primary"
-              disabled={isUpdating || !updateMessage.trim()}
+              disabled={isUpdating || isApplyingDiff || !updateMessage.trim()}
             >
               {isUpdating ? 'Updating...' : 'Update'}
             </button>
@@ -1050,6 +1514,50 @@ export default function ProjectCanvas() {
               disabled={isDeleting}
             >
               {isDeleting ? 'Deleting...' : 'Delete permanently'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(previewFile)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPreviewFile(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-[760px] bg-bg-surface border-border-default">
+          <DialogHeader>
+            <DialogTitle className="truncate">{previewFile?.filename || 'Generated file'}</DialogTitle>
+            <DialogDescription>
+              Review the generated asset and download it if needed.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[52vh] overflow-auto rounded-[10px] border border-border-default bg-bg-base p-4">
+            <pre className="whitespace-pre-wrap break-words text-[12px] leading-6 text-text-secondary">
+              {previewFile?.content || ''}
+            </pre>
+          </div>
+          <DialogFooter>
+            <button
+              type="button"
+              onClick={() => setPreviewFile(null)}
+              className="btn-ghost"
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (previewFile) {
+                  handleDownloadGeneratedFile(previewFile);
+                }
+              }}
+              className="btn-primary"
+              disabled={!previewFile}
+            >
+              Download file
             </button>
           </DialogFooter>
         </DialogContent>

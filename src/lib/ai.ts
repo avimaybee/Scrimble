@@ -14,61 +14,45 @@ export interface AIProvider {
   masked_key?: string;
 }
 
-// Zod Schemas for AI Validation
-export const ChecklistItemSchema = z.object({
-  id: z.string(),
+const DiffChecklistItemSchema = z.object({
   label: z.string(),
-  is_required: z.boolean().default(false)
-});
-
-export const PlanSchema = z.object({
-  project_name: z.string().optional().default('Untitled Project'),
-  project_type: z.string().optional().default('other'),
-  stack: z.union([z.string(), z.record(z.string(), z.any())]).optional().default(''),
-  stages: z.array(z.object({
-    id: z.string(),
-    title: z.string(),
-    type: z.string(),
-    order_index: z.number().default(0),
-    steps: z.array(z.object({
-      id: z.string(),
-      title: z.string(),
-      type: z.string(),
-      category: z.string().optional().default(''),
-      objective: z.string().optional().default(''),
-      why_it_matters: z.string().optional().default(''),
-      risk_level: z.string().optional().default('low'),
-      is_gate: z.boolean().optional().default(false),
-      done_when: z.string().optional().default(''),
-      suggested_tools: z.array(z.string()).optional().default([]),
-      checklist: z.array(ChecklistItemSchema).optional().default([])
-    }))
-  })),
-  edges: z.array(z.object({
-    id: z.string(),
-    source_step_id: z.string(),
-    target_step_id: z.string(),
-    edge_type: z.string().optional().default('default')
-  })).optional().default([])
-});
-
-export const StepDetailSchema = z.object({
-  ai_output: z.string(),
-  prompts: z.array(z.object({
-    label: z.string(),
-    content: z.string()
-  })).optional().default([])
+  is_required: z.boolean().optional().default(false),
 });
 
 export const PlanDiffSchema = z.object({
   summary: z.string(),
-  changes: z.array(z.object({
-    action: z.enum(['add', 'update', 'delete']),
-    step_id: z.string().optional(),
-    stage_id: z.string().optional(),
-    updates: z.any().optional(),
-    step: z.any().optional()
-  }))
+  changes: z.array(z.discriminatedUnion('action', [
+    z.object({
+      action: z.literal('update_step'),
+      step_id: z.string(),
+      updates: z.object({
+        title: z.string().optional(),
+        objective: z.string().optional(),
+        why_it_matters: z.string().optional(),
+        suggested_tools: z.array(z.string()).optional(),
+        checklist: z.array(DiffChecklistItemSchema).optional(),
+        done_when: z.string().optional(),
+      }),
+    }),
+    z.object({
+      action: z.literal('add_step'),
+      stage_id: z.string(),
+      step: z.object({
+        title: z.string(),
+        type: z.string().optional().default('task'),
+        risk_level: z.string().optional().default('low'),
+        objective: z.string().optional(),
+        why_it_matters: z.string().optional(),
+        suggested_tools: z.array(z.string()).optional(),
+        checklist: z.array(DiffChecklistItemSchema).optional(),
+        done_when: z.string().optional(),
+      }),
+    }),
+    z.object({
+      action: z.literal('remove_step'),
+      step_id: z.string(),
+    }),
+  ])),
 });
 
 async function sleep(ms: number) {
@@ -160,18 +144,21 @@ export async function callAIProxy(params: {
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ message: "Your AI provider isn't responding. Try again shortly." }));
-    const message = err.message || "Your AI provider isn't responding. Try again shortly.";
+    const err = await response.json().catch(() => ({ error: "Your AI provider isn't responding. Try again shortly." }));
+    const message = err.error || "Your AI provider isn't responding. Try again shortly.";
     toast.error(message);
     throw new Error(message);
   }
 
   const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('AI provider stream is unavailable right now. Please try again.');
+  }
   const decoder = new TextDecoder();
   let result = '';
 
   while (true) {
-    const { done, value } = await reader!.read();
+    const { done, value } = await reader.read();
     if (done) break;
     
     const chunk = decoder.decode(value);
@@ -213,79 +200,28 @@ export async function testAIProvider(providerId: string): Promise<boolean> {
   }
 }
 
-export type AIStep = z.infer<typeof PlanSchema>['stages'][number]['steps'][number];
-export type AIStage = z.infer<typeof PlanSchema>['stages'][number];
-export type AIEdge = z.infer<typeof PlanSchema>['edges'][number];
-export type AIPlan = z.infer<typeof PlanSchema>;
 export type AIDiff = z.infer<typeof PlanDiffSchema>;
 
-export const generatePlan = async (prompt: string): Promise<AIPlan> => {
-  const systemPrompt = `You are Scrimble, an expert AI project architect. Generate a step-by-step build plan in JSON format.
-  Return an object with { stages: Stage[], steps: Step[], edges: Edge[] }.
-  Each step can have a 'checklist' array of { id, label, is_required }.`;
-
-  const result = await callAIProxy({
-    system: systemPrompt,
-    prompt: prompt
-  });
-  
-  try {
-    const parsed = JSON.parse(result);
-    const validated = PlanSchema.safeParse(parsed);
-    if (!validated.success) {
-      console.error('Plan validation failed:', validated.error);
-      console.log('Raw AI Response:', result);
-      throw new Error('Something went wrong preparing your plan. Try again.');
-    }
-    return validated.data;
-  } catch (e) {
-    if (e instanceof Error && e.message.includes('preparing your plan')) throw e;
-    console.error('Plan parsing error:', e);
-    console.log('Raw AI Response:', result);
-    throw new Error('Something went wrong preparing your plan. Try again.');
-  }
-};
-
-export const getStepDetails = async (stepData: { id: string; title: string }, projectData: { id: string; name: string; stack: string }): Promise<{ ai_output: string; prompts: string }> => {
-  const systemPrompt = `You are Scrimble's agentic specialist. Produce actionable guidance for a single project step in JSON format.
-  Return { ai_output: string, prompts: [{ label, content }] }.`;
-  const userPrompt = `Get details for: ${stepData.title} in ${projectData.name}. Stack: ${projectData.stack}`;
-  
-  const result = await callAIProxy({
-    system: systemPrompt,
-    prompt: userPrompt,
-    projectId: projectData.id,
-    stepId: stepData.id
-  });
-  
-  try {
-    const parsed = JSON.parse(result);
-    const validated = StepDetailSchema.safeParse(parsed);
-    if (!validated.success) {
-      console.error('Step detail validation failed:', validated.error);
-      console.log('Raw AI Response:', result);
-      throw new Error('Something went wrong preparing step details. Try again.');
-    }
-    
-    const data = validated.data;
-    return {
-      ai_output: data.ai_output,
-      prompts: JSON.stringify(data.prompts)
-    };
-  } catch (e) {
-    if (e instanceof Error && e.message.includes('preparing step details')) throw e;
-    console.error('Step detail parsing error:', e);
-    console.log('Raw AI Response:', result);
-    throw new Error('Something went wrong preparing step details. Try again.');
-  }
-};
-
-export const updatePlan = async (planSummary: any[], techStack: string, updateMessage: string): Promise<AIDiff> => {
-  const systemPrompt = `You are Scrimble's plan adapter. Output a JSON diff of what should change based on the request.
-  Return { summary: string, changes: [{ action, step_id?, stage_id?, updates?, step? }] }.`;
+export const updatePlan = async (
+  planSummary: unknown[],
+  techStack: string,
+  updateMessage: string,
+  providerId?: string,
+): Promise<AIDiff> => {
+  const systemPrompt = `You are Scrimble's plan adapter. Output a JSON diff based on the request.
+  Return ONLY valid JSON with shape:
+  {
+    "summary": string,
+    "changes": [
+      { "action": "update_step", "step_id": string, "updates": { "title"?: string, "objective"?: string, "why_it_matters"?: string, "suggested_tools"?: string[], "checklist"?: [{ "label": string, "is_required"?: boolean }], "done_when"?: string } }
+      | { "action": "add_step", "stage_id": string, "step": { "title": string, "type"?: string, "risk_level"?: string, "objective"?: string, "why_it_matters"?: string, "suggested_tools"?: string[], "checklist"?: [{ "label": string, "is_required"?: boolean }], "done_when"?: string } }
+      | { "action": "remove_step", "step_id": string }
+    ]
+  }`;
   const userPrompt = `Update plan for: ${updateMessage}. Current stack: ${techStack}. Plan: ${JSON.stringify(planSummary)}`;
 
   const result = await callAIProxy({
+    providerId,
     system: systemPrompt,
     prompt: userPrompt
   });
