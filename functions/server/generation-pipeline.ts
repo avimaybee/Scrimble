@@ -2120,11 +2120,22 @@ async function callAITextWithHeartbeat(
   runId: string,
   payload: Parameters<typeof callAIText>[0],
 ) {
-  const intervalId = setInterval(() => {
-    void touchGenerationHeartbeat(env, projectId, runId).catch((error) => {
-      console.warn('[generation-heartbeat] Failed to refresh heartbeat during AI call:', error);
-    });
-  }, HEARTBEAT_TOUCH_INTERVAL_MS);
+  let active = true;
+
+  // Background heartbeat loop
+  const heartbeatLoop = async () => {
+    while (active) {
+      try {
+        await new Promise((resolve) => setTimeout(resolve, HEARTBEAT_TOUCH_INTERVAL_MS));
+        if (!active) break;
+        await touchGenerationHeartbeat(env, projectId, runId);
+      } catch (error) {
+        console.warn('[generation-heartbeat] Failed to refresh heartbeat during AI call:', error);
+      }
+    }
+  };
+
+  const loopPromise = heartbeatLoop();
 
   try {
     await touchGenerationHeartbeat(env, projectId, runId);
@@ -2132,7 +2143,8 @@ async function callAITextWithHeartbeat(
     await touchGenerationHeartbeat(env, projectId, runId);
     return response;
   } finally {
-    clearInterval(intervalId);
+    active = false;
+    // We don't strictly need to await loopPromise here as the loop will exit on next tick/delay
   }
 }
 
@@ -3886,6 +3898,8 @@ async function executeBatch5(
   for (let index = startIndex; index < planSteps.length; index += 1) {
     const step = planSteps[index];
 
+    await maybeTouchGenerationHeartbeat(env, projectId, runId);
+
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
@@ -3938,6 +3952,8 @@ async function executeBatch5(
     research,
     step_research: stepResearchContexts,
   };
+
+  await touchGenerationHeartbeat(env, projectId, runId);
 
   await logActivity(env, {
     projectId,
