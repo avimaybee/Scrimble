@@ -45,7 +45,7 @@ import {
   isGenerationExecutionStale,
   isQueuedGenerationResumeReady,
   loadBatchOutput,
-  resolveResumeGenerationStatus,
+  resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 import { runProjectIntakeTurn } from './project-intake';
@@ -1267,7 +1267,8 @@ app.get('/projects/:id/status', async (c) => {
   const generationHeartbeat = (project.generation_heartbeat_at as string | null) || null;
   const executionStale = isGenerationExecutionStale(generationStatus, generationHeartbeat);
   const queuedResumeReady = isQueuedGenerationResumeReady(generationStatus, generationHeartbeat);
-  const resumeStatus = resolveResumeGenerationStatus(completedBatchNames, hasReviewApproval);
+    const resumeStatus = await resolvePipelineStatusToRun(c.env, projectId, generationStatus as ProjectGenerationStatus, completedBatchNames);
+
   const canResume =
     generationStatus !== 'complete' &&
     resumeStatus !== 'awaiting_review' &&
@@ -1463,7 +1464,8 @@ app.post('/projects/:id/resume', async (c) => {
     completedBatchNames.includes('batch_5_enrich_steps') ||
     completedBatchNames.includes('batch_6_generate_files') ||
     await hasApprovedArchitectureReview(c.env, projectId);
-  const resumeStatus = resolveResumeGenerationStatus(completedBatchNames, hasReviewApproval);
+    const resumeStatus = await resolvePipelineStatusToRun(c.env, projectId, status as ProjectGenerationStatus, completedBatchNames);
+
   const executionStale = isGenerationExecutionStale(
     status,
     (project.generation_heartbeat_at as string | null) || null,
@@ -1768,10 +1770,7 @@ app.get('/projects/:id/generation-stream', async (c) => {
   if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
     const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
     const stub = c.env.PROJECT_GENERATOR.get(objectId);
-    const proxyUrl = new URL(c.req.url);
-    proxyUrl.pathname = '/stream';
-    proxyUrl.searchParams.set('projectId', projectId);
-    proxyUrl.searchParams.set('lastEventId', lastEventId.toString());
+    const proxyUrl = 'http://do/stream?projectId=' + encodeURIComponent(projectId) + '&lastEventId=' + lastEventId;
 
     const proxyHeaders = new Headers(c.req.raw.headers);
     proxyHeaders.delete('host');
@@ -1783,15 +1782,19 @@ app.get('/projects/:id/generation-stream', async (c) => {
     proxyHeaders.delete('x-forwarded-proto');
     proxyHeaders.delete('x-real-ip');
 
-    console.log(`[STREAM_PROXY] Proxying SSE request for ${projectId} to DO: ${proxyUrl.toString()}`);
-    const request = new Request(proxyUrl.toString(), {
+    console.log(`[STREAM_PROXY] Proxying SSE request to Durable Object: ${proxyUrl}`);
+    const request = new Request(proxyUrl, {
       method: 'GET',
       headers: proxyHeaders,
       signal: c.req.raw.signal,
     });
 
     try {
-      return await stub.fetch(request);
+      const resp = await stub.fetch(request);
+      if (resp.status === 405) {
+        console.warn(`[STREAM_PROXY] DO returned 405 for GET ${proxyUrl}. This suggests a routing mismatch inside the DO handler.`);
+      }
+      return resp;
     } catch (error) {
       console.error(`[STREAM_PROXY] DO fetch failed for ${projectId}:`, error);
       throw error;

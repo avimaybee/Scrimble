@@ -100,7 +100,8 @@ export class ProjectGeneratorDO {
       return Response.json({ scheduled: true });
     }
 
-    if (request.method === 'GET' && (url.pathname === '/stream' || url.pathname.endsWith('/stream'))) {
+    const isStreamPath = url.pathname === '/stream' || url.pathname.endsWith('/stream') || url.hostname === 'do' && url.pathname === '/stream';
+    if (request.method === 'GET' && isStreamPath) {
       const projectId = url.searchParams.get('projectId');
       const lastEventId = parseInt(url.searchParams.get('lastEventId') || '0', 10);
       
@@ -162,7 +163,7 @@ export class ProjectGeneratorDO {
     }
 
     if (request.method !== 'POST') {
-      return Response.json({ error: 'Method not allowed.' }, { status: 405 });
+      return Response.json({ error: `Path ${url.pathname} with method ${request.method} not found in DO.` }, { status: 404 });
     }
 
     if (url.pathname === '/cancel') {

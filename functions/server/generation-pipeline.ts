@@ -4305,7 +4305,7 @@ async function getCompletedBatches(projectId: string, env: Bindings): Promise<st
   return rows.results.map((r: any) => r.run_type as string);
 }
 
-async function resolvePipelineStatusToRun(
+export async function resolvePipelineStatusToRun(
   env: Bindings,
   projectId: string,
   currentStatus: ProjectGenerationStatus,
