@@ -354,19 +354,19 @@ export const dbService = {
     const response = await fetchWithAuth(`/projects/${projectId}/skill-files`, {
       method: 'GET',
       headers: {
-        Accept: 'application/zip',
+        Accept: 'text/markdown',
       },
     });
 
     if (!response.ok) {
       const errorBody = await response.json().catch(() => null) as { error?: string } | null;
-      throw new Error(errorBody?.error || `Skill files download failed: ${response.statusText}`);
+      throw new Error(errorBody?.error || `Plan download failed: ${response.statusText}`);
     }
 
     const blob = await response.blob();
     const contentDisposition = response.headers.get('Content-Disposition') || '';
     const filenameMatch = contentDisposition.match(/filename="([^"]+)"/i);
-    const filename = filenameMatch?.[1] || `scrimble-${projectId}-ai-files.zip`;
+    const filename = filenameMatch?.[1] || `plan-${projectId}.md`;
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -457,6 +457,7 @@ export const dbService = {
             }
 
             if (currentEvent === 'thinking' && typeof parsed.content === 'string') {
+              console.log(`[STREAM] Received thinking event: ${parsed.content.slice(0, 50)}...`);
               options.onThinking?.({
                 content: parsed.content,
                 timestamp: new Date().toISOString(),

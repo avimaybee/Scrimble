@@ -72,14 +72,21 @@ export class ProjectGeneratorDO {
 
     // Subscribe to events originating in this DO isolate
     this.unsubscribeEvents = subscribeToGenerationEvents((projectId, eventEnvelope) => {
+      console.log(`[PROJECT_GENERATOR_DO] Event received: type=${eventEnvelope.event.type}, projectId=${projectId}`);
       this.broadcast(projectId, eventEnvelope);
     });
   }
 
   public broadcast(projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) {
     const writers = this.streams.get(projectId);
-    if (!writers || writers.size === 0) return;
+    
+    if (!writers || writers.size === 0) {
+      console.log(`[PROJECT_GENERATOR_DO] broadcast: no writers for project ${projectId}, dropping event type=${eventEnvelope.event.type}`);
+      return;
+    }
 
+    console.log(`[PROJECT_GENERATOR_DO] broadcasting to ${writers.size} writer(s): type=${eventEnvelope.event.type}`);
+    
     const idLine = eventEnvelope.id === null ? '' : `id: ${eventEnvelope.id}\n`;
     const payload = `${idLine}event: ${eventEnvelope.event.type}\ndata: ${JSON.stringify(eventEnvelope.event)}\n\n`;
     const encoder = new TextEncoder();

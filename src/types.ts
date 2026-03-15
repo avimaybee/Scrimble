@@ -77,6 +77,8 @@ export interface Step {
   position_y: number;
   status: StepStatus;
   is_gate: boolean;
+  is_milestone: boolean;
+  milestone_label?: string;
   risk_level: RiskLevel;
   objective?: string;
   why_it_matters?: string;

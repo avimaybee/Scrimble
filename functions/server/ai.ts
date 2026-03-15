@@ -335,6 +335,7 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
     extractString(value.choices?.[0]?.delta?.reasoning);
 
   if (openAiReasoning) {
+    console.log(`[AI] OpenAI reasoning extracted: ${openAiReasoning.slice(0, 100)}...`);
     return openAiReasoning;
   }
 
@@ -345,10 +346,15 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
       .join('') || '';
 
   if (anthropicThinking) {
+    console.log(`[AI] Anthropic thinking extracted: ${anthropicThinking.slice(0, 100)}...`);
     return anthropicThinking;
   }
 
-  return extractString(value.delta?.thinking);
+  const deltaThinking = extractString(value.delta?.thinking);
+  if (deltaThinking) {
+    console.log(`[AI] Delta thinking extracted: ${deltaThinking.slice(0, 100)}...`);
+  }
+  return deltaThinking;
 }
 
 type StructuredTransportParseResult = {

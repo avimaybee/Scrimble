@@ -302,6 +302,8 @@ const planStepSchema = z.preprocess(
     why_it_matters: createOptionalTextSchema(''),
     risk_level: createOptionalTextSchema('low'),
     is_gate: createBooleanSchema(false),
+    is_milestone: createBooleanSchema(false),
+    milestone_label: createOptionalTextSchema(''),
     done_when: createOptionalTextSchema(''),
     suggested_tools: createStringArraySchema(),
     checklist: z.preprocess(normalizeObjectArray, z.array(checklistItemSchema)),
@@ -313,6 +315,7 @@ export const Batch4PlanBuildSchema = z.preprocess(
   z.object({
     project_name: createRequiredTextSchema('Untitled Project'),
     project_type: createRequiredTextSchema('other'),
+    prd_markdown: createRequiredTextSchema(''),
     stack: z.preprocess((value) => {
       if (typeof value === 'string') {
         return value.trim();
@@ -387,38 +390,35 @@ export const Batch5EnrichStepsSchema = z.preprocess(
 );
 
 export const SKILL_FILE_NAMES = [
-  '.cursor/rules/scrimble-project.mdc',
-  'CLAUDE.md',
-  '.github/copilot-instructions.md',
-  '.windsurfrules',
-  'scrimble-context.md',
-  'scrimble-mcp.json',
+  'plan.md',
 ] as const;
 
 export type SkillFileName = (typeof SKILL_FILE_NAMES)[number];
 
 export function getSkillFileSortIndex(filename: string) {
-  const index = SKILL_FILE_NAMES.findIndex((name) => name === filename);
-  return index === -1 ? SKILL_FILE_NAMES.length : index;
+  return 0;
 }
 
 const skillFileSchema = z.preprocess(
   (value) => normalizeObject(value, () => ({})),
   z.object({
-    filename: createOptionalTextSchema(''),
-    content: createOptionalTextSchema(''),
+    filename: z.literal('plan.md'),
+    content: createRequiredTextSchema(''),
   }),
 );
 
 export const Batch6GenerateFilesSchema = z.preprocess(
   (value) => {
+    if (value && typeof value === 'object' && !Array.isArray(value) && 'plan.md' in value) {
+      return { files: [{ filename: 'plan.md', content: String((value as any)['plan.md']) }] };
+    }
     if (Array.isArray(value)) {
       return { files: value };
     }
     return normalizeObject(value, () => ({}));
   },
   z.object({
-    files: z.preprocess(normalizeObjectArray, z.array(skillFileSchema)),
+    files: z.array(skillFileSchema).length(1),
   }),
 );
 
@@ -430,11 +430,11 @@ export const schemaDescriptions = {
   batch_3_architect:
     '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:
-    '{ project_name?: string, project_type?: string, stack?: string | Record<string, unknown>, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
+    '{ project_name: string, project_type: string, prd_markdown: string, stack?: string | Record<string, unknown>, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, is_milestone?, milestone_label?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
   batch_5_enrich_steps:
     '{ enrichments: [{ step_id: string, ai_output: string, prompts: [{ label: string, content: string }] }] }',
   batch_6_generate_files:
-    `{ files: [{ filename: one of ${SKILL_FILE_NAMES.join(' | ')}, content: string }] }`,
+    '{ files: [{ filename: "plan.md", content: string }] }',
 } as const;
 
 export type Batch1ResearchStack = z.infer<typeof Batch1ResearchStackSchema>;

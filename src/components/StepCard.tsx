@@ -2,7 +2,7 @@ import React, { memo } from 'react';
 import { Handle, Position } from '@xyflow/react';
 import { StepStatus, RiskLevel } from '../types';
 import { cn } from '../lib/utils';
-import { AlertTriangle, CheckCircle2, Circle, Lock, PlayCircle, SkipForward, RefreshCw } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Circle, Lock, PlayCircle, SkipForward, RefreshCw, Flag, Sparkles } from 'lucide-react';
 
 import { motion } from 'framer-motion';
 
@@ -14,6 +14,8 @@ interface StepCardData {
   riskLevel: RiskLevel;
   progress: number;
   isGate: boolean;
+  isMilestone: boolean;
+  milestoneLabel?: string;
 }
 
 function StepCard({ data, selected }: { data: StepCardData; selected?: boolean }) {
@@ -24,6 +26,56 @@ function StepCard({ data, selected }: { data: StepCardData; selected?: boolean }
   const isWaiting = data.status === 'waiting';
   const needsReview = data.status === 'needs_review';
   const isAgentWorking = data.status === 'agent_working';
+
+  if (data.isMilestone) {
+    return (
+      <div className={cn(
+        "milestone-card group",
+        selected && "milestone-card--selected",
+        isLocked && "milestone-card--locked",
+        isActive && "milestone-card--active",
+        isComplete && "milestone-card--complete",
+        needsReview && "milestone-card--needs-review",
+      )}>
+        <div className="p-4 flex items-center gap-4">
+          <div className={cn(
+            "milestone-icon-container",
+            isComplete ? "bg-status-secure/10 text-status-secure border-status-secure/20" : 
+            needsReview ? "bg-status-warning/10 text-status-warning border-status-warning/20 animate-pulse" :
+            "bg-bg-elevated text-text-tertiary border-border-default"
+          )}>
+            {isComplete ? <CheckCircle2 className="w-5 h-5" /> : <Flag className="w-5 h-5" />}
+          </div>
+          
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-0.5">
+              <span className="text-[10px] font-mono uppercase tracking-[0.12em] text-text-tertiary">
+                Milestone
+              </span>
+              {data.isGate && (
+                <div className="px-1.5 py-0.5 rounded-full bg-status-warning/10 border border-status-warning/20">
+                  <span className="text-[8px] font-bold uppercase text-status-warning">Human Gate</span>
+                </div>
+              )}
+            </div>
+            <h3 className="font-serif text-lg text-text-primary truncate">
+              {data.milestoneLabel || data.title}
+            </h3>
+          </div>
+
+          {isActive && !needsReview && (
+            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-accent-primary/10 text-accent-primary border border-accent-primary/20">
+              <Sparkles className="w-3.5 h-3.5 animate-pulse" />
+              <span className="text-[10px] font-bold uppercase tracking-wider">In progress</span>
+            </div>
+          )}
+        </div>
+
+        <Handle type="target" position={Position.Left} className="step-card__handle" />
+        <Handle type="source" position={Position.Right} className="step-card__handle" />
+      </div>
+    );
+  }
 
   return (
     <div className={cn(

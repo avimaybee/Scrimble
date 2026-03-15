@@ -267,6 +267,7 @@ export function subscribeToGenerationEvents(fn: Subscriber) {
 }
 
 function publish(projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) {
+  console.log(`[GENERATION_EVENTS] Publishing to ${subscribers.size} subscriber(s): type=${eventEnvelope.event.type}, projectId=${projectId}`);
   for (const sub of subscribers) {
     try {
       sub(projectId, eventEnvelope);
@@ -314,6 +315,7 @@ export function emitTransientGenerationStreamEvent(payload: {
   batchName?: GenerationBatchName;
   event: Extract<GenerationStreamEvent, { type: 'thinking' }>;
 }) {
+  console.log(`[GENERATION_EVENTS] Emitting thinking event for ${payload.projectId}: ${payload.event.content.slice(0, 100)}...`);
   publish(payload.projectId, { id: null, event: payload.event });
 }
 
@@ -329,6 +331,7 @@ export function createThrottledThinkingEmitter(
 
   const flushNow = () => {
     if (!buffer) return;
+    console.log(`[THINKING_EMITTER] Flushing ${buffer.length} chars for ${projectId}/${batchName}`);
     emitTransientGenerationStreamEvent({
       projectId,
       batchName,
@@ -341,6 +344,7 @@ export function createThrottledThinkingEmitter(
   return {
     onReasoningDelta: (delta: string) => {
       buffer += delta;
+      console.log(`[THINKING_EMITTER] Buffer now has ${buffer.length} chars for ${projectId}/${batchName}`);
       
       const now = Date.now();
       if (now - lastFlush >= flushIntervalMs) {

@@ -644,6 +644,7 @@ export default function ProjectGeneration() {
           });
         },
         onThinking: (event: ProjectGenerationThinking) => {
+          console.log(`[SSE_EVENT] onThinking received: ${event.content.slice(0, 100)}...`);
           noteProgressTimestamp(event.timestamp);
           appendThinkingActivity(event.content, event.timestamp);
         },

@@ -11,7 +11,9 @@
   --font-mono: "JetBrains Mono", monospace;
 
   --color-bg-base: #0f0e0e;
+  --color-bg-canvas: #0f0e0e;
   --color-bg-surface: #1e1d1b;
+
   --color-bg-elevated: #252422;
   --color-bg-overlay: #34312e;
 
@@ -570,6 +572,49 @@ body {
   color: var(--color-text-primary);
 }
 .next-up-arrow { color: var(--color-accent-primary); font-size: 12px; }
+
+/* Milestone Cards */
+.milestone-card {
+  background: var(--color-bg-surface);
+  border: 1.5px solid var(--color-border-default);
+  border-radius: var(--radius-step);
+  width: 100%;
+  min-width: 280px;
+  box-shadow: var(--shadow-step);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: hidden;
+  position: relative;
+}
+
+.milestone-card--active {
+  border-color: var(--color-accent-border);
+  background: rgba(235, 94, 40, 0.02);
+}
+
+.milestone-card--needs-review {
+  border-color: var(--color-status-warning);
+  background: rgba(244, 187, 102, 0.04);
+}
+
+.milestone-card--complete {
+  border-color: var(--color-status-secure);
+  background: rgba(52, 211, 153, 0.02);
+}
+
+.milestone-card--locked {
+  opacity: 0.5;
+}
+
+.milestone-icon-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  flex-shrink: 0;
+}
 
 /* Step Cards */
 .step-card {

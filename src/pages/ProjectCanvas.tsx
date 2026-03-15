@@ -11,17 +11,15 @@ import {
   Connection,
   Edge as FlowEdge,
   Node as FlowNode,
-  Panel
+  BackgroundVariant,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
   Project,
-  Plan,
   Stage,
   Step,
   Edge as AppEdge,
   ChecklistItem,
-  GeneratedProjectFile,
   StepStatus,
   WorkflowBriefDrift,
   WorkflowUpdateActivity,
@@ -31,7 +29,24 @@ import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Activity, Hexagon, Download, LayoutPanelTop, Pencil, Check, X, FileJson, FileText, Info, RotateCcw, Trash2 } from 'lucide-react';
+import { 
+  Activity, 
+  Hexagon, 
+  Download, 
+  LayoutPanelTop, 
+  Pencil, 
+  Check, 
+  X, 
+  FileJson, 
+  FileText, 
+  Info, 
+  RotateCcw, 
+  Trash2, 
+  ChevronRight,
+  Sparkles,
+  Brain,
+  LucideIcon
+} from 'lucide-react';
 import { dbService } from '../lib/db';
 import { WorkflowBriefDriftError } from '../lib/db';
 import { updatePlan } from '../lib/ai';
@@ -57,7 +72,6 @@ import {
 } from "@/components/ui/dialog";
 import { Skeleton } from '@/components/ui/Skeleton';
 import { ThinkingBubble } from '@/components/ui/ThinkingBubble';
-import { Brain, LucideIcon, Sparkles } from 'lucide-react';
 
 const nodeTypes = {
   custom: StepCard,
@@ -82,13 +96,7 @@ export default function ProjectCanvas() {
   const [isUpdating, setIsUpdating] = useState(false);
   const [isApplyingDiff, setIsApplyingDiff] = useState(false);
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
-  const [isLoadingGeneratedFiles, setIsLoadingGeneratedFiles] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
-  const [updateActivities, setUpdateActivities] = useState<WorkflowUpdateActivity[]>([]);
-  const [workflowDrift, setWorkflowDrift] = useState<WorkflowBriefDrift | null>(null);
-  const [pendingDriftResolution, setPendingDriftResolution] = useState<'apply_now' | 'save_for_later' | null>(null);
-  const [generatedFiles, setGeneratedFiles] = useState<GeneratedProjectFile[]>([]);
-  const [previewFile, setPreviewFile] = useState<GeneratedProjectFile | null>(null);
   const [showQuickPlanEditor, setShowQuickPlanEditor] = useState(false);
   const [isSavingPlanEdit, setIsSavingPlanEdit] = useState(false);
   const [newStageTitle, setNewStageTitle] = useState('');
@@ -106,19 +114,20 @@ export default function ProjectCanvas() {
   const [isEditingName, setIsEditingName] = useState(false);
   const [newName, setNewName] = useState('');
   const [guideStep, setGuideStep] = useState<number | null>(null);
+  const [updateActivities, setUpdateActivities] = useState<WorkflowUpdateActivity[]>([]);
+  const [workflowDrift, setWorkflowDrift] = useState<WorkflowBriefDrift | null>(null);
+  const [pendingDriftResolution, setPendingDriftResolution] = useState<'apply_now' | 'save_for_later' | null>(null);
   const updateActivityLogRef = useRef<HTMLDivElement | null>(null);
 
   const fetchProjectData = useCallback(async () => {
     if (!id) return;
 
     setLoading(true);
-    setIsLoadingGeneratedFiles(true);
     setLoadError(null);
     try {
       const proj = await dbService.getProject(id);
       if (!proj) {
         setProject(null);
-        setGeneratedFiles([]);
         return;
       }
 
@@ -134,11 +143,10 @@ export default function ProjectCanvas() {
 
       setProject(proj);
 
-      const [fetchedStages, fetchedSteps, fetchedEdges, fetchedGeneratedFiles] = await Promise.all([
+      const [fetchedStages, fetchedSteps, fetchedEdges] = await Promise.all([
         dbService.getStagesByProjectId(id),
         dbService.getStepsByProjectId(id),
         dbService.getEdgesByProjectId(id),
-        dbService.getGeneratedFiles(id).catch(() => [] as GeneratedProjectFile[]),
       ]);
 
       setStages(fetchedStages);
@@ -147,14 +155,12 @@ export default function ProjectCanvas() {
         status: s.status as StepStatus
       }))) as Step[]);
       setAppEdges(fetchedEdges);
-      setGeneratedFiles(fetchedGeneratedFiles);
     } catch (error) {
       console.error('Error fetching project data:', error);
       setLoadError(
         error instanceof Error ? error.message : "Couldn't reopen this project right now.",
       );
     } finally {
-      setIsLoadingGeneratedFiles(false);
       setLoading(false);
     }
   }, [id, navigate]);
@@ -364,6 +370,7 @@ export default function ProjectCanvas() {
         position,
         parentId: stageGroupNode ? stageGroupNode.id : undefined,
         extent: 'parent',
+        style: step.is_milestone ? { width: (stageGroupNode?.style?.width as number || 400) - 80 } : undefined,
         data: {
           title: step.title,
           type: step.type,
@@ -372,6 +379,8 @@ export default function ProjectCanvas() {
           riskLevel: step.risk_level,
           progress: step.status === 'complete' ? 100 : step.status === 'active' ? 25 : 0,
           isGate: step.is_gate,
+          isMilestone: step.is_milestone,
+          milestoneLabel: step.milestone_label,
         },
       });
     });
@@ -538,42 +547,14 @@ export default function ProjectCanvas() {
 
     try {
       await dbService.downloadSkillFiles(project.id);
-      toast.success('AI files download started');
+      toast.success('Project plan download started');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to download AI files.';
+      const message = error instanceof Error ? error.message : 'Failed to download project plan.';
       toast.error(message);
     } finally {
       setIsDownloadingAiFiles(false);
     }
   }, [isDownloadingAiFiles, project]);
-
-  const handleRefreshGeneratedFiles = useCallback(async () => {
-    if (!project || isLoadingGeneratedFiles) {
-      return;
-    }
-
-    setIsLoadingGeneratedFiles(true);
-    try {
-      const files = await dbService.getGeneratedFiles(project.id);
-      setGeneratedFiles(files);
-      toast.success('Generated files refreshed.');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to refresh generated files.';
-      toast.error(message);
-    } finally {
-      setIsLoadingGeneratedFiles(false);
-    }
-  }, [isLoadingGeneratedFiles, project]);
-
-  const handleDownloadGeneratedFile = useCallback((file: GeneratedProjectFile) => {
-    const blob = new Blob([file.content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = file.filename;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }, []);
 
   const ensureWorkflowExists = useCallback(async (): Promise<void> => {
     if (!project) {
@@ -928,8 +909,28 @@ export default function ProjectCanvas() {
             </div>
           </div>
           
-          <div className="p-4 border-t border-border-subtle space-y-3">
-            <TooltipProvider>
+          <div className="p-4 border-t border-border-subtle space-y-4">
+            <button 
+              onClick={() => {
+                setUpdateActivities([]);
+                setShowUpdateModal(true);
+              }}
+              className="group w-full flex items-center justify-between px-4 py-3 rounded-xl bg-bg-elevated border border-border-default hover:border-accent-primary/30 transition-all hover:shadow-sm"
+            >
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-accent-primary/10 text-accent-primary group-hover:bg-accent-primary group-hover:text-white transition-colors">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div className="text-left">
+                  <div className="text-sm font-medium text-text-primary">Update plan</div>
+                  <div className="text-[10px] text-text-tertiary">Reshape the build</div>
+                </div>
+              </div>
+              <ChevronRight className="w-4 h-4 text-text-tertiary group-hover:translate-x-0.5 transition-transform" />
+            </button>
+
+            <div className="space-y-3">
+              <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className="block">
@@ -940,74 +941,17 @@ export default function ProjectCanvas() {
                       className="btn-primary w-full flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       <Download className="w-4 h-4" />
-                      {isDownloadingAiFiles ? 'Preparing AI files...' : 'Download AI files'}
+                      {isDownloadingAiFiles ? 'Preparing plan.md...' : 'Download plan.md'}
                     </button>
                   </span>
                 </TooltipTrigger>
                 {!aiFilesReady ? (
                   <TooltipContent className="max-w-[240px] whitespace-normal px-3 py-2 text-[12px] leading-5">
-                    Files will be ready when your plan is complete.
+                    Plan will be ready when your project generation is complete.
                   </TooltipContent>
                 ) : null}
               </Tooltip>
             </TooltipProvider>
-            <p className="px-1 font-sans text-[12px] leading-5 text-text-tertiary">
-              Paste these into your IDE so your AI coding tool knows exactly what you&apos;re building.
-            </p>
-            <div className="rounded-[10px] border border-border-default bg-bg-elevated/45 p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-tertiary">
-                  Generated files
-                </p>
-                <button
-                  type="button"
-                  onClick={() => void handleRefreshGeneratedFiles()}
-                  disabled={isLoadingGeneratedFiles}
-                  className="text-[11px] font-medium text-accent-primary hover:text-accent-primary-hover disabled:opacity-60"
-                >
-                  {isLoadingGeneratedFiles ? 'Refreshing...' : 'Refresh'}
-                </button>
-              </div>
-              {generatedFiles.length > 0 ? (
-                <div className="max-h-[144px] space-y-2 overflow-y-auto pr-1">
-                  {generatedFiles.map((file) => (
-                    <div key={file.id} className="rounded-[8px] border border-border-default/70 bg-bg-base/55 px-2 py-1.5">
-                      <div className="truncate text-[12px] text-text-primary">{file.filename}</div>
-                      <div className="mt-1 flex items-center gap-3 text-[11px]">
-                        <button
-                          type="button"
-                          onClick={() => setPreviewFile(file)}
-                          className="text-accent-primary hover:text-accent-primary-hover"
-                        >
-                          View
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDownloadGeneratedFile(file)}
-                          className="text-text-secondary hover:text-text-primary"
-                        >
-                          Download
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[12px] leading-5 text-text-secondary">
-                  No generated files yet. They will appear here after generation.
-                </p>
-              )}
-            </div>
-            <button 
-              onClick={() => {
-                setUpdateActivities([]);
-                setShowUpdateModal(true);
-              }}
-              className="btn-ghost w-full flex items-center justify-center gap-2"
-            >
-              <LayoutPanelTop className="w-4 h-4 text-accent-primary" />
-              Update plan
-            </button>
 
             <button
               type="button"
@@ -1193,10 +1137,11 @@ export default function ProjectCanvas() {
               }}
             >
               <Background 
-                color="rgba(204,197,185,0.08)" 
+                color="rgba(204,197,185,0.18)" 
                 gap={28} 
                 size={1} 
                 className="bg-bg-base"
+                variant={BackgroundVariant.Dots}
               />
               <Controls 
                 className="bg-bg-surface border-border-default fill-text-primary rounded-lg shadow-panel overflow-hidden" 
@@ -1204,6 +1149,7 @@ export default function ProjectCanvas() {
               />
               <MiniMap 
                 nodeColor={(n) => {
+                  if (n.data?.isMilestone) return 'var(--color-status-warning)';
                   if (n.data?.status === 'complete') return 'var(--color-status-secure)';
                   if (n.data?.status === 'active') return 'var(--color-accent-primary)';
                   if (n.data?.status === 'needs_review') return 'var(--color-status-warning)';
@@ -1216,27 +1162,16 @@ export default function ProjectCanvas() {
             </ReactFlow>
           </ErrorBoundary>
           
-          {/* Empty State Overlay */}
+          {/* Canvas Subtle Empty State */}
           {!loading && appSteps.length === 0 && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-              <div className="max-w-md p-8 bg-bg-surface border border-dashed border-border-strong rounded-[14px] shadow-panel text-center pointer-events-auto">
-                <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[8px] bg-accent-primary-muted/20">
-                  <LayoutPanelTop className="h-8 w-8 text-accent-primary" />
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none z-10">
+              <div className="flex flex-col items-center gap-4 opacity-40">
+                <div className="p-4 rounded-full bg-bg-surface border border-dashed border-border-strong">
+                  <LayoutPanelTop className="h-6 w-6 text-text-tertiary" />
                 </div>
-
-                <h3 className="text-2xl font-serif mb-2">Ready to build?</h3>
-                <p className="text-text-secondary mb-6 leading-relaxed">
-                  Tell Scrimble what changed and it will reshape the plan from here.
+                <p className="text-sm font-medium text-text-tertiary">
+                  Your plan is being built...
                 </p>
-                <button 
-                  onClick={() => {
-                    setUpdateActivities([]);
-                    setShowUpdateModal(true);
-                  }}
-                  className="btn-primary"
-                >
-                  Update this plan
-                </button>
               </div>
             </div>
           )}
@@ -1514,50 +1449,6 @@ export default function ProjectCanvas() {
               disabled={isDeleting}
             >
               {isDeleting ? 'Deleting...' : 'Delete permanently'}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={Boolean(previewFile)}
-        onOpenChange={(open) => {
-          if (!open) {
-            setPreviewFile(null);
-          }
-        }}
-      >
-        <DialogContent className="sm:max-w-[760px] bg-bg-surface border-border-default">
-          <DialogHeader>
-            <DialogTitle className="truncate">{previewFile?.filename || 'Generated file'}</DialogTitle>
-            <DialogDescription>
-              Review the generated asset and download it if needed.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="max-h-[52vh] overflow-auto rounded-[10px] border border-border-default bg-bg-base p-4">
-            <pre className="whitespace-pre-wrap break-words text-[12px] leading-6 text-text-secondary">
-              {previewFile?.content || ''}
-            </pre>
-          </div>
-          <DialogFooter>
-            <button
-              type="button"
-              onClick={() => setPreviewFile(null)}
-              className="btn-ghost"
-            >
-              Close
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (previewFile) {
-                  handleDownloadGeneratedFile(previewFile);
-                }
-              }}
-              className="btn-primary"
-              disabled={!previewFile}
-            >
-              Download file
             </button>
           </DialogFooter>
         </DialogContent>

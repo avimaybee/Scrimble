@@ -1466,35 +1466,13 @@ function normalizeGeneratedFileName(value: string): SkillFileName | null {
 
 function buildFallbackGeneratedFileContent(filename: SkillFileName) {
   switch (filename) {
-    case '.cursor/rules/scrimble-project.mdc':
-      return [
-        '---',
-        'description: Scrimble fallback project rules',
-        'globs:',
-        'alwaysApply: false',
-        '---',
-        '',
-        'Scrimble could not fully regenerate this file in the last pass.',
-        'Use the approved architecture, plan, and generated context files as the source of truth, then rerun generation when you want a refreshed rules file.',
-      ].join('\n');
-    case 'scrimble-mcp.json':
-      return JSON.stringify({ mcpServers: {} }, null, 2);
-    case '.windsurfrules':
-      return [
-        'Scrimble fallback rules',
-        '',
-        'The latest generation run could not fully rewrite this file.',
-        'Use the approved architecture, the enriched plan, and the downloaded context files as the current source of truth.',
-      ].join('\n');
-    case 'CLAUDE.md':
-    case '.github/copilot-instructions.md':
-    case 'scrimble-context.md':
+    case 'plan.md':
     default:
       return [
-        `# ${filename}`,
+        '# Build Plan',
         '',
         'Scrimble could not fully regenerate this file in the last pass.',
-        'Use the approved architecture, the enriched plan, and the rest of the generated files as the current source of truth, then rerun generation when you want a refreshed version.',
+        'Use the approved architecture and the enriched plan as the current source of truth.',
       ].join('\n');
   }
 }
@@ -2677,8 +2655,8 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
 
   for (const stage of plan.stages) {
     statements.push(
-      env.DB.prepare('INSERT INTO stages (id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
-        .bind(stage.id, workflowId, stage.title, stage.type, stage.order_index, stage.order_index === 0 ? 'active' : 'locked'),
+      env.DB.prepare('INSERT INTO stages (id, project_id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(stage.id, projectId, workflowId, stage.title, stage.type, stage.order_index, stage.order_index === 0 ? 'active' : 'locked'),
     );
 
     stage.steps.forEach((step, stepIndex) => {
@@ -2693,12 +2671,13 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
       statements.push(
         env.DB.prepare(`
           INSERT INTO steps (
-            id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
-            is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when,
+            id, project_id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
+            is_gate, is_milestone, milestone_label, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when,
             ai_output, prompts, is_ai_enriched
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           step.id,
+          projectId,
           workflowId,
           stage.id,
           step.title,
@@ -2708,6 +2687,8 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
           stage.order_index * 400 + 100,
           stage.order_index === 0 && stepIndex === 0 ? 'active' : 'locked',
           isGate ? 1 : 0,
+          step.is_milestone ? 1 : 0,
+          step.milestone_label || null,
           step.risk_level || 'low',
           globalOrderIndex,
           step.objective || '',
@@ -2736,9 +2717,9 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
   for (const edge of plan.edges || []) {
     statements.push(
       env.DB.prepare(`
-        INSERT INTO edges (id, workflow_id, source_step_id, target_step_id, edge_type)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(edge.id, workflowId, edge.source_step_id, edge.target_step_id, edge.edge_type || 'default'),
+        INSERT INTO edges (id, project_id, workflow_id, source_step_id, target_step_id, edge_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(edge.id, projectId, workflowId, edge.source_step_id, edge.target_step_id, edge.edge_type || 'default'),
     );
   }
 
@@ -3776,25 +3757,86 @@ async function executeBatch4(
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s build planner. Generate the full staged implementation plan in JSON. Every step must reference the exact packages, services, and versions from the approved architecture context, including any human-reviewed changes. Return only valid JSON.',
+    'You are Scrimble’s Product Lead and Build Architect. Your goal is to produce two authoritative outputs: 1) A comprehensive Product Requirements Document (plan.md) and 2) A derived implementation plan (JSON stages/steps). The document is the source of truth; the JSON plan must strictly reflect the MVP scope defined within it. Return only valid JSON.',
     projectBrief.promptContext,
   );
-  const prompt = `Architecture decision record:
+  const prompt = `Architecture Decision Record & Research:
 ${JSON.stringify(reviewContext.adr, null, 2)}
 
 Human review feedback:
 ${reviewContext.reviewFeedbackProvided ? reviewContext.reviewFeedback : 'No changes requested. Continue with the approved architecture as written.'}
 
-Generate the full build plan in the existing Scrimble shape with stages, steps, and edges.
+STEP 1: Generate the authoritative plan.md PRD content.
+This must be a highly detailed, 600-1000 line document using EXACTLY this structure:
+
+# [Project Name]
+[One line — what this is]
+
+## The problem
+[What problem this solves and for who. Why it matters. What happens without it.]
+
+## What we're building
+[Full product description in plain language. Every major feature. What the finished product looks and feels like. What a user can do from the moment they open it to the moment they're done.]
+
+## Who it's for
+[Primary user. What they're trying to do. What they already know. What they don't want to deal with.]
+
+## MVP scope
+### In scope
+[Everything that must exist for this to be a usable V1. Feature by feature.]
+
+### Out of scope (V2+)
+[Everything explicitly deferred. Why each item was deferred.]
+
+### Done when...
+[Exact definition of a shippable MVP. What a user can do. What works end to end.]
+
+## How it's built
+[Every technology from the ADR with pinned version, reason for choice, and any known gotchas from research.]
+
+## How the pieces connect
+[Full data flow in plain prose. Step by step: signup, core feature use, edge cases. How frontend talks to backend. How auth works. How background jobs are triggered.]
+
+## Data model
+[Every table from the ADR. Every column, type, constraint, and a plain English description of what each stores.]
+
+## API surface
+[Every logical route — method, path, what it does, auth required, what it returns.]
+
+## Security model
+[How auth works end to end. What's encrypted. What never touches the DB. Access control rules.]
+
+## Environment variables
+[Every variable — name, where it lives, what it's for, whether it's secret.]
+
+## Conventions
+[File structure, naming patterns, how queries are written, error handling, background job dispatch, response formats.]
+
+## Known gotchas
+[Breaking changes, version incompatibilities, infrastructure limits, and critical research findings.]
+
+## Hard rules
+[Project-specific "never-dos" based on the architecture and security model.]
+
+## Build plan
+[Summarize the stages and steps below. Mark Milestones clearly.]
+
+---
+
+STEP 2: Generate the JSON Build Plan (stages, steps, edges).
+- Derive this strictly from the "In scope" MVP features in your PRD.
+- EXCLUDE all V2+ items.
+- suggested_tools must reference specific packages/versions from the ADR.
+- Include mandatory milestones as gate steps:
+  1. "MVP complete" — sits at the end of the build stage. Prompt: "Your core product is built. Before we move to testing and launch — does everything work the way you expected?"
+  2. "Ready to launch" — sits at the end of the deploy stage. Prompt: "Everything is live. Take a moment to check it yourself before we call this done."
+- Add inflection point milestones where meaningful (e.g., "Auth working end to end", "Data model locked").
+- Milestone nodes must have is_milestone: true and a milestone_label.
 
 Rules:
-- if human feedback asks to swap, remove, or add technologies, you must honour it everywhere it applies
-- when feedback overrides the ADR, treat the feedback as the approved source of truth for those decisions
-- suggested_tools must reference specific packages and versions from the approved architecture context
-- objective must reference the actual implementation approach, not generic advice
-- why_it_matters must explain the real risk of getting the chosen technology wrong
-- ids must be stable strings
-- include checklist items where they improve execution`;
+- if human feedback asks to swap, remove, or add technologies, you must honour it everywhere.
+- return ONLY a single valid JSON object: { "prd_markdown": string, "project_name": string, "project_type": string, "stages": [...], "edges": [...] }
+- content must be dense and senior-developer quality.`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -4104,79 +4146,29 @@ async function executeBatch6(
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s file generator. Produce every downloadable AI context file from the approved architecture and enriched plan. Return only valid JSON with the exact required filenames and complete file contents.',
+    'You are Scrimble’s Product Lead. Your goal is to produce the final "plan.md" by taking the authoritative PRD from Batch 4 and updating its "Build plan" section with the final enriched implementation details and current step statuses. Return only valid JSON with the filename "plan.md".',
     projectBrief.promptContext,
   );
-  const skillFileProfileInstructions = buildSkillFileProfileInstructions(
-    builderProfile.primaryCodingEnvironment,
-  );
-  const prompt = `Architecture:
+
+  const prompt = `Authoritative PRD from Batch 4:
+${(plan as any).prd_markdown || 'No PRD found in Batch 4 output. Generate from scratch using the context below.'}
+
+Architecture Decision Record:
 ${JSON.stringify(reviewContext.adr, null, 2)}
 
-Complete enriched plan:
+Complete Enriched Implementation Plan (JSON):
 ${JSON.stringify(enrichedPlan, null, 2)}
 
-Human review feedback:
+Human Review Feedback:
 ${reviewContext.reviewFeedbackProvided ? reviewContext.reviewFeedback : 'No review adjustments were requested.'}
 
-Preferred IDE for MCP configuration:
-${formatPreferredIdeLabel(reviewContext.preferredIde)} (${reviewContext.preferredIde})
-
-Current active step:
-${currentActiveStep ? JSON.stringify(currentActiveStep, null, 2) : 'No active step found. Use the first step in the plan order.'}
-
-Generate exactly these six files and no others:
-1. .cursor/rules/scrimble-project.mdc
-   - Cursor MDC format
-   - Sections in this order: description, stack, data-model, conventions, never-do, current-step
-   - description: one-paragraph project overview
-   - stack: every technology with exact version and import convention
-   - data-model: each table as a code block showing column names and types
-   - conventions: coding patterns derived from the chosen libraries
-   - never-do: anti-patterns and deprecated approaches found during research, with the correct alternative
-   - current-step: the first active step from the plan and what the user is building right now
-2. CLAUDE.md
-   - Markdown for Claude Projects / claude.md
-   - Include project name and one-line description
-   - Include full stack with versions
-   - Include data model as markdown tables
-   - Include all architecture decisions with reasoning
-   - Include the complete plan as a numbered list of stages and steps using step title + one-line objective only
-   - Include key constraints and conventions
-   - Include the gotchas list with mitigations
-3. .github/copilot-instructions.md
-   - Concise GitHub Copilot instructions format
-   - Include stack, conventions, data model summary, and never-do list
-   - Keep it under 400 lines
-4. .windsurfrules
-   - Plain markdown rules format
-   - Same project guidance as the Cursor file, adapted for Windsurf
-5. scrimble-context.md
-   - The most comprehensive universal context file
-   - Include full project context summary
-   - Include the full data model with relationships
-   - Include all integration details with package names, versions, and required environment variable names
-   - Include the security surface area with specific mitigations
-   - Summarize the enriched plan (all stages and steps), including at least the objective and why_it_matters for every step. Include the full ai_output and prompts only for the first stage and the current step to stay within output limits.
-6. scrimble-mcp.json
-   - Standard JSON configuration for MCP servers
-   - Tailor the config and paste instructions to ${formatPreferredIdeLabel(reviewContext.preferredIde)}
-   - Include the servers Scrimble used during research: fetch and github
-   - Include brave-search only if the research context explicitly indicates it was used
+Generate the final "plan.md". This is a comprehensive Product Requirements Document. 
+Keep the exact structure and content from the Batch 4 PRD, but ENSURE the "Build plan" section is exhaustive and uses the detail from the Enriched Implementation Plan (JSON) including objectives, suggested tools, and current statuses (e.g., [Active], [Locked], [Complete]).
 
 Rules:
-- return ONLY a single valid JSON object: { "files": [{ "filename": string, "content": string }] }
-- filenames must exactly match these values: ${SKILL_FILE_NAMES.join(', ')}
-- do not wrap file content in markdown code fences
-- content must be a single string per file. YOU MUST EXTREMELY CAREFULLY ESCAPE double quotes (") as \" and backslashes (\) as \\ within the content strings.
-- use exact package names and versions from the approved architecture context, applying any human review changes everywhere they matter
-- if the approved feedback changes a package choice, the generated files must reflect the approved choice, not the original ADR wording
-- use ${currentActiveStep ? `"${currentActiveStep.title}" in stage "${currentActiveStep.stage_title}"` : 'the first step in the plan order'} as the current-step context
-- the scrimble-mcp.json file must be PURE JSON (no comments), properly escaped within the wrapper JSON object
-- if the output is getting too large, prioritize correctness of the JSON structure over exhaustive detail in context files.
-
-Builder profile file rules:
-${skillFileProfileInstructions}`;
+- Return ONLY a single valid JSON object: { "files": [{ "filename": "plan.md", "content": string }] }
+- Content must be dense (600-1000 lines).
+- Extremely carefully escape double quotes (") and backslashes (\\) in the JSON content string.`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -4189,7 +4181,8 @@ ${skillFileProfileInstructions}`;
       schema: Batch6GenerateFilesSchema,
       schemaDescription: schemaDescriptions.batch_6_generate_files,
     });
-    const finalFiles = await ensureCompleteGeneratedFiles(env, projectId, result.data.files);
+    
+    const finalFiles = result.data.files;
     const finalResult: Batch6GenerateFiles = {
       files: finalFiles,
     };
@@ -4211,7 +4204,7 @@ ${skillFileProfileInstructions}`;
       projectId,
       batchName: 'batch_6_generate_files',
       kind: 'complete',
-      message: `Files prepared — ${finalFiles.length} downloadable artifact${finalFiles.length === 1 ? '' : 's'} ready.`,
+      message: 'Project plan.md is ready for download.',
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Batch 6 failed.';

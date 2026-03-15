@@ -1791,10 +1791,18 @@ app.get('/projects/:id/generation-stream', async (c) => {
 
     try {
       const resp = await stub.fetch(request);
-      if (resp.ok || (resp.status !== 404 && resp.status !== 405)) {
+      console.log(`[STREAM_PROXY] DO response status: ${resp.status}, ok: ${resp.ok}`);
+      
+      if (resp.ok) {
+        console.log(`[STREAM_PROXY] Returning DO stream response for ${projectId}`);
         return resp;
       }
-      console.warn(`[STREAM_PROXY] DO returned ${resp.status} for ${projectId}. Falling back to local SSE.`);
+      
+      if (resp.status === 404 || resp.status === 405) {
+        console.warn(`[STREAM_PROXY] DO returned ${resp.status}, falling back to local SSE.`);
+      } else {
+        console.warn(`[STREAM_PROXY] DO returned non-ok status ${resp.status}, falling back to local SSE.`);
+      }
     } catch (error) {
       console.error(`[STREAM_PROXY] DO proxy failed for ${projectId}, falling back to local SSE:`, error);
     }
@@ -1833,29 +1841,19 @@ app.get('/projects/:id/skill-files', async (c) => {
   }
 
   const files = await loadStoredSkillFiles(c, projectId);
-  if (files.length === 0) {
-    return c.json({ error: 'Files will be ready when your plan is complete.' }, 409);
+  const planFile = files.find((f: any) => f.filename === 'plan.md');
+  
+  if (!planFile) {
+    return c.json({ error: 'Plan will be ready when your project generation is complete.' }, 409);
   }
 
-  const zip = new JSZip();
-  files.forEach((file: { filename: string; content: string }) => {
-    zip.file(file.filename, file.content);
-  });
+  const filename = `${slugifyProjectName(asText(project.name, 'project'))}-plan.md`;
 
-  const zipBytes = await zip.generateAsync({
-    type: 'uint8array',
-    compression: 'DEFLATE',
-    compressionOptions: { level: 6 },
-  });
-
-  const filename = `scrimble-${slugifyProjectName(asText(project.name, 'project'))}-ai-files.zip`;
-
-  return new Response(toUint8ArrayStream(zipBytes), {
+  return new Response(planFile.content, {
     headers: {
-      'Content-Type': 'application/zip',
+      'Content-Type': 'text/markdown; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}"`,
       'Cache-Control': 'no-store',
-      'Content-Length': `${zipBytes.byteLength}`,
     },
   });
 });
@@ -2000,8 +1998,8 @@ app.post('/stages', async (c) => {
   const workflowId = workflowRecord.id;
 
   const id = crypto.randomUUID();
-  await c.env.DB.prepare('INSERT INTO stages (id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(id, workflowId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
+  await c.env.DB.prepare('INSERT INTO stages (id, project_id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .bind(id, projectId, workflowId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
     .run();
 
   await touchProject(c, projectId);
@@ -2072,13 +2070,14 @@ app.post('/steps', async (c) => {
 
   await c.env.DB.prepare(`
     INSERT INTO steps (
-      id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
+      id, project_id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
       is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools,
       done_when, ai_output, prompts, is_ai_enriched
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
+      projectId,
       workflowId,
       optionalText(body.stage_id),
       title,
@@ -2293,10 +2292,10 @@ app.post('/edges', async (c) => {
   const edgeWorkflowId = workflowRow?.id as string || '';
 
   await c.env.DB.prepare(`
-    INSERT INTO edges (id, workflow_id, source_step_id, target_step_id, edge_type, condition)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO edges (id, project_id, workflow_id, source_step_id, target_step_id, edge_type, condition)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `)
-    .bind(id, edgeWorkflowId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
+    .bind(id, projectId, edgeWorkflowId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
     .run();
 
   await touchProject(c, projectId);

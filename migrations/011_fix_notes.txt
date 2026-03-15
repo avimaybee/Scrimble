@@ -1,0 +1,26 @@
+-- ────────────────────────────────────────────────────────────────
+-- 011: Make project_id optional on stages, steps, and edges
+-- 
+-- Migration 010 added workflow_id but left project_id as NOT NULL
+-- for environments that started with the 0000 schema.
+-- Since the codebase now prefers workflow_id and often omits 
+-- project_id in INSERT statements, we must make it nullable.
+-- ────────────────────────────────────────────────────────────────
+
+-- SQLite doesn't support ALTER COLUMN ... DROP NOT NULL directly.
+-- We have to do the recreate-and-copy dance if we want to be strict,
+-- but D1 often handles this differently. 
+-- However, we can also just ensure all NEW projects use workflow_id.
+
+-- For now, we'll try to add the column if it's missing (it shouldn't be)
+-- but more importantly, we want to ensure the codebase can insert without it.
+
+-- Actually, a better reconciliation is to ensure the code 
+-- INCLUDES project_id if it's available, just in case.
+
+-- But to be safe for all environments, let's just make it nullable 
+-- where possible. In SQLite, you can't easily drop NOT NULL.
+
+-- Alternatively, we can just fix the code to include project_id.
+-- Since we ALWAYS have project_id in the context of these inserts,
+-- it's easier and safer to just include it in the SQL.
