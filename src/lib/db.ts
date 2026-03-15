@@ -757,6 +757,13 @@ export const dbService = {
     });
   },
 
+  async updateChecklistItem(id: string, updates: Partial<Omit<ChecklistItem, 'id' | 'step_id'>>): Promise<void> {
+    await fetchAPI(`/checklist-items/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(updates),
+    });
+  },
+
   async applyPlanDiff(diff: unknown, projectId: string): Promise<void> {
     await fetchAPI(`/projects/${projectId}/plan-diff`, {
       method: 'POST',

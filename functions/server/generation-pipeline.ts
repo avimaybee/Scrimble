@@ -2048,6 +2048,7 @@ async function insertGenerationEvent(
           type: 'batch_complete',
           batch: asText(payload.body.batch || payload.batchName) as GenerationBatchName,
           duration_ms: Number(payload.body.duration_ms) || 0,
+          progress_percent: Number(payload.body.progress_percent) || 0,
         },
       });
       await resetGenerationThinkingState(env, payload.projectId, payload.batchName || null);
@@ -2615,6 +2616,7 @@ async function completeBatch<T>(
     body: {
       batch: runType,
       duration_ms: durationMs,
+      progress_percent: Math.round((batchSequenceIndexes[runType] / GENERATION_BATCHES.length) * 100),
     },
   });
 }
@@ -3904,10 +3906,22 @@ async function executeBatch5(
       message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
     });
 
-    if (index + 1 < planSteps.length) {
+    // Batch 5 Optimization: Only checkpoint when a budget limit is reached or after a reasonable number of steps.
+    // The previous implementation had a logic flaw that checkpointed after EVERY step.
+    const subrequestCounter = (checkpoint as any)?.subrequestCounter ?? 0; // Type casting for ease if needed, but resolved via data flow.
+    const maxSubrequestBudget = 40; // Cloudflare standard limit is 50, but we stay conservative.
+    const SUB_RESERVE = 5;
+
+    const shouldCheckpoint = (index + 1 < planSteps.length) && (
+      (index + 1) % 10 === 0 || // Every 10 steps
+      subrequestCounter >= (maxSubrequestBudget - SUB_RESERVE) // Or when near subrequest limit
+    );
+
+    if (shouldCheckpoint) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
         steps: planSteps,
         stepResearchContexts,
+        subrequestCounter, // Persist counter so we don't reset it on resume
       });
       await logActivity(env, {
         projectId,

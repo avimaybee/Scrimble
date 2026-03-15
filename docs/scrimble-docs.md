@@ -636,7 +636,7 @@ Every project is guided through these stages (AI selects relevant ones based on 
 | ai_output | What the AI prepared | Generated artifact — brief, plan, checklist |
 | prompts | Prompts to use | Copy-pasteable prompts for your coding tool |
 | checklist | Things to check | Concrete items, some required before moving on |
-| exit_criteria | Done when... | Exact definition of done |
+| done_when | Done when... | Exact definition of done |
 | status | State | waiting / working / needs your input / done / skipped |
 | risk_level | Importance | low / medium / high / critical |
 | is_gate | Requires your review | Must be reviewed before AI continues |
@@ -755,7 +755,7 @@ CREATE TABLE IF NOT EXISTS steps (
   objective           TEXT,
   why_it_matters      TEXT,
   suggested_tools     TEXT,             -- JSON: [{ name, url, reason }]
-  exit_criteria       TEXT,
+  done_when           TEXT,
   -- AI enrichment content (generated when step is first opened)
   is_ai_enriched      INTEGER DEFAULT 0,
   ai_output           TEXT,             -- generated artifact
@@ -1098,7 +1098,7 @@ Return:
           "why_it_matters": "...",
           "suggested_tools": [{ "name": "", "url": "", "reason": "" }],
           "checklist": [{ "label": "", "is_required": true }],
-          "exit_criteria": "...",
+          "done_when": "...",
           "depends_on": []
         }
       ]
@@ -1595,6 +1595,8 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **Durable Infrastructure**: Fully migrated the generation runner to Cloudflare Durable Objects, eliminating queue-based race conditions and enabling real-time bi-directional state synchronization.
 - **Provider Management**: Implemented AI provider removal with confirmation dialogs and active-check safety guards.
 - **Schema reconciliation**: Migration `010_schema_reconciliation.sql` adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, adds `last_error` to `generation_dispatches`, and drops the erstwhile `project_generation_live_state` table.
+- **Checklist Interactions**: Added `updateChecklistItem` to db client allowing full checklist item mutations (labels, requirement status) beyond simple toggles.
+- **SSE Progress Sync**: Added `progress_percent` metric to `batch_complete` events in the generation pipeline to ensure the client-side progress bar perfectly reflects backend generation state.
 
 ---
 

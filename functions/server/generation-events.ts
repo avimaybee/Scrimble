@@ -5,7 +5,7 @@ export type GenerationStreamEvent =
   | { type: 'batch_start'; batch: GenerationBatchName; label: string }
   | { type: 'activity'; icon: string; message: string; timestamp: string }
   | { type: 'thinking'; content: string }
-  | { type: 'batch_complete'; batch: GenerationBatchName; duration_ms: number }
+  | { type: 'batch_complete'; batch: GenerationBatchName; duration_ms: number; progress_percent: number }
   | { type: 'checkpoint'; adr: Batch3Architect; run_id?: string }
   | { type: 'pipeline_complete'; project_id: string }
   | { type: 'pipeline_failed'; error: string };
@@ -136,6 +136,7 @@ function mapLegacyStoredEvent(
         type: 'batch_complete',
         batch: asText(payload.batch || batchName) as GenerationBatchName,
         duration_ms: asNumber(payload.duration_ms),
+        progress_percent: asNumber(payload.progress_percent),
       };
     case 'review_required':
       return payload.adr
@@ -320,7 +321,7 @@ export function createThrottledThinkingEmitter(
   _env: Bindings,
   projectId: string,
   batchName: GenerationBatchName,
-  flushIntervalMs = 1000,
+  flushIntervalMs = 150,
 ) {
   let buffer = '';
   let lastFlush = Date.now();

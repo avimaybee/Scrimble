@@ -32,5 +32,8 @@ CREATE INDEX IF NOT EXISTS idx_edges_workflow ON edges(workflow_id);
 -- Add last_error to generation_dispatches (009 defines it but 001 created the table first)
 ALTER TABLE generation_dispatches ADD COLUMN last_error TEXT;
 
+-- Add done_when to steps (0000 has it, but if 001 created the table first it uses exit_criteria)
+ALTER TABLE steps ADD COLUMN done_when TEXT;
+
 -- Drop the orphaned live_state table (thinking deltas are no longer persisted)
 DROP TABLE IF EXISTS project_generation_live_state;

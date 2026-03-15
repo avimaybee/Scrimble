@@ -123,6 +123,19 @@ export default function DetailPanel({
     }
   };
 
+  const updateTask = async (task: ChecklistItem, newLabel: string) => {
+    const trimmed = newLabel.trim();
+    if (!trimmed || trimmed === task.label) return;
+
+    setTasks(prev => prev.map(t => t.id === task.id ? { ...t, label: trimmed } : t));
+    try {
+      await dbService.updateChecklistItem(task.id, { label: trimmed });
+    } catch {
+      setTasks(prev => prev.map(t => t.id === task.id ? { ...t, label: task.label } : t));
+      toast.error('Failed to update task.');
+    }
+  };
+
   const handleCompleteStep = async () => {
     if (!step) {
       return;
@@ -294,20 +307,30 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                       <h3 className="mb-3 text-[11px] font-bold uppercase tracking-wider text-text-muted">Tasks</h3>
                       <div className="flex flex-col gap-2">
                         {tasks.map(task => (
-                          <label key={task.id} className="flex items-start gap-3 cursor-pointer group" onClick={() => toggleTask(task)}>
-                             <div className={cn(
-                               "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors duration-150",
-                               task.is_completed ? "border-accent-primary bg-accent-primary text-white" : "border-border-strong text-transparent group-hover:border-accent-primary"
+                          <div key={task.id} className="flex items-start gap-3 group">
+                             <button
+                               onClick={() => void toggleTask(task)}
+                               className={cn(
+                               "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors duration-150 cursor-pointer",
+                               task.is_completed ? "border-accent-primary bg-accent-primary text-white" : "border-border-strong text-transparent hover:border-accent-primary"
                              )}>
                                <Check className="h-3 w-3 stroke-[3]" />
-                             </div>
-                             <span className={cn(
-                               "text-[14px] leading-snug transition-colors duration-150 flex-1 select-none",
-                               task.is_completed ? "text-text-muted line-through" : "text-text-primary"
-                             )}>
-                               {task.label}
-                             </span>
-                          </label>
+                             </button>
+                             <input
+                               type="text"
+                               defaultValue={task.label}
+                               onBlur={(e) => void updateTask(task, e.target.value)}
+                               onKeyDown={(e) => {
+                                 if (e.key === 'Enter') {
+                                   e.currentTarget.blur();
+                                 }
+                               }}
+                               className={cn(
+                                 "text-[14px] leading-snug transition-colors duration-150 flex-1 bg-transparent border-none outline-none focus:ring-1 focus:ring-accent-primary/50 focus:bg-bg-elevated rounded px-1 -ml-1",
+                                 task.is_completed ? "text-text-muted line-through" : "text-text-primary"
+                               )}
+                             />
+                          </div>
                         ))}
                       </div>
                     </div>

@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS steps (
   objective           TEXT,
   why_it_matters      TEXT,
   suggested_tools     TEXT,             -- JSON: [{ name, url, reason }]
-  exit_criteria       TEXT,
+  done_when           TEXT,
   -- AI enrichment content (generated when step is first opened)
   is_ai_enriched      INTEGER DEFAULT 0,
   ai_output           TEXT,             -- generated artifact
