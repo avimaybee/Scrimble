@@ -5,18 +5,82 @@ type StreamCallbacks = {
 };
 
 export function extractJSON(raw: string): string {
-  // First, try to find the last markdown code block (models often repeat or correct themselves)
+  // 1. Try to find markdown code blocks first
   const codeBlockMatches = Array.from(raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/g));
   if (codeBlockMatches.length > 0) {
-    return codeBlockMatches[codeBlockMatches.length - 1][1].trim();
+    // Return the last one, as models often correct themselves
+    const candidate = codeBlockMatches[codeBlockMatches.length - 1][1].trim();
+    if (candidate.startsWith('{') || candidate.startsWith('[')) {
+      return candidate;
+    }
   }
 
-  // Fallback: search for the first '{' and the last '}' in the entire string
+  // 2. Find the first '{' or '[' and find the largest balanced object starting from there
+  // We prefer '{' as all our current schemas are objects.
   const firstBrace = raw.indexOf('{');
-  const lastBrace = raw.lastIndexOf('}');
+  const firstBracket = raw.indexOf('[');
+  
+  let startIndex = -1;
+  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
+    startIndex = firstBrace;
+  } else if (firstBracket !== -1) {
+    startIndex = firstBracket;
+  }
 
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    return raw.slice(firstBrace, lastBrace + 1).trim();
+  if (startIndex === -1) {
+    return raw.trim();
+  }
+
+  // Find the largest balanced structure
+  const opener = raw[startIndex];
+  const closer = opener === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+  let lastValidEnd = -1;
+
+  for (let i = startIndex; i < raw.length; i++) {
+    const char = raw[i];
+
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      isEscaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (char === opener) {
+        depth++;
+      } else if (char === closer) {
+        depth--;
+        if (depth === 0) {
+          lastValidEnd = i;
+          // Keep going to find the absolute largest block (in case there are multiple top-level objects)
+        }
+      }
+    }
+  }
+
+  if (lastValidEnd !== -1) {
+    return raw.slice(startIndex, lastValidEnd + 1).trim();
+  }
+
+  // 3. Absolute fallback: the simple slice if we couldn't balance it
+  const lastBrace = raw.lastIndexOf('}');
+  const lastBracket = raw.lastIndexOf(']');
+  const endIdx = Math.max(lastBrace, lastBracket);
+
+  if (startIndex !== -1 && endIdx !== -1 && endIdx > startIndex) {
+    return raw.slice(startIndex, endIdx + 1).trim();
   }
 
   return raw.trim();
@@ -26,7 +90,17 @@ export function containsStreamTransportMarkers(raw: string) {
   return (
     raw.includes('"object":"chat.completion.chunk"') ||
     raw.includes('"reasoning_content"') ||
+    raw.includes('"reasoning"') ||
+    raw.includes('"thinking"') ||
     (raw.includes('"choices":[') && raw.includes('"delta":'))
+  );
+}
+
+export function containsReasoningMarkers(raw: string) {
+  return (
+    raw.includes('"reasoning_content"') ||
+    raw.includes('"reasoning"') ||
+    raw.includes('"thinking"')
   );
 }
 

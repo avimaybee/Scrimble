@@ -28,7 +28,7 @@ import type {
 } from './builder-profile';
 
 const API_BASE = '/api';
-const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MESSAGE = 'This is taking longer than expected. Check your connection and try again.';
 
 export type GenerationStreamConnectionState = 'connecting' | 'live' | 'reconnecting' | 'closed';

@@ -39,6 +39,7 @@ import {
 } from './generation-events';
 import {
   callAIText,
+  containsReasoningMarkers,
   containsStreamTransportMarkers,
   defaultModelForProvider,
   extractJSON,
@@ -2388,12 +2389,29 @@ async function resolveProviderConfiguration(
 }
 
 function formatValidationRetryPrompt(basePrompt: string, previousResponse: string, schemaDescription: string) {
+  // Truncate previous response if it's too long to avoid context limit issues
+  const truncatedResponse = previousResponse.length > 4000 
+    ? previousResponse.slice(0, 2000) + '\n... [truncated] ...\n' + previousResponse.slice(-2000)
+    : previousResponse;
+
   return `${basePrompt}
 
 your previous response failed validation — here is what you returned and here is the schema you must follow
 
-Previous response:
-${previousResponse}
+Previous response (truncated if long):
+${truncatedResponse}
+
+Required schema:
+${schemaDescription}`;
+}
+
+function formatReasoningOnlyRetryPrompt(basePrompt: string, schemaDescription: string) {
+  return `${basePrompt}
+
+Your previous response contained only reasoning/thoughts but no JSON data. 
+YOU MUST RETURN ONLY A VALID JSON OBJECT matching the schema below. 
+DO NOT include any reasoning, thoughts, or conversational text. 
+DO NOT use markdown code fences.
 
 Required schema:
 ${schemaDescription}`;
@@ -2467,7 +2485,12 @@ async function callValidatedBatch<T>(
 
       let parsed: unknown;
       const cleanedText = extractJSON(text);
+      const isReasoningOnly = containsReasoningMarkers(text) && !cleanedText.startsWith('{') && !cleanedText.startsWith('[');
+
       try {
+        if (isReasoningOnly) {
+          throw new Error('Reasoning only detected');
+        }
         parsed = JSON.parse(cleanedText);
       } catch {
         logBatchResponseFailure(
@@ -2475,17 +2498,27 @@ async function callValidatedBatch<T>(
           containsStreamTransportMarkers(text) ? 'transport' : 'json',
           text,
         );
-        lastError = `The AI response for ${options.runType} was not valid JSON.`;
+        lastError = isReasoningOnly 
+          ? `The AI only provided reasoning for ${options.runType} and no JSON.`
+          : `The AI response for ${options.runType} was not valid JSON.`;
+
         if (attempt === 1) {
           await logActivity(options.env, {
             projectId: options.projectId,
             batchName: options.runType,
             kind: 'warning',
-            message: 'The first model reply was not valid JSON, so I asked for a corrected response before continuing.',
+            message: isReasoningOnly
+              ? 'The model provided only thoughts but no data, so I am retrying with a direct JSON instruction.'
+              : 'The first model reply was not valid JSON, so I asked for a corrected response before continuing.',
           });
-          prompt = containsStreamTransportMarkers(text)
-            ? formatTransportRetryPrompt(options.prompt, options.schemaDescription)
-            : formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
+          
+          if (isReasoningOnly) {
+            prompt = formatReasoningOnlyRetryPrompt(options.prompt, options.schemaDescription);
+          } else {
+            prompt = containsStreamTransportMarkers(text)
+              ? formatTransportRetryPrompt(options.prompt, options.schemaDescription)
+              : formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
+          }
           continue;
         }
 
@@ -4120,25 +4153,27 @@ Generate exactly these six files and no others:
    - Same project guidance as the Cursor file, adapted for Windsurf
 5. scrimble-context.md
    - The most comprehensive universal context file
-   - Include full project context
+   - Include full project context summary
    - Include the full data model with relationships
    - Include all integration details with package names, versions, and required environment variable names
    - Include the security surface area with specific mitigations
-   - Include the full enriched plan with every step's ai_output and prompts
+   - Summarize the enriched plan (all stages and steps), including at least the objective and why_it_matters for every step. Include the full ai_output and prompts only for the first stage and the current step to stay within output limits.
 6. scrimble-mcp.json
-   - JSONC-style MCP configuration with a top comment block that explains what each server does and where to get API keys
+   - Standard JSON configuration for MCP servers
    - Tailor the config and paste instructions to ${formatPreferredIdeLabel(reviewContext.preferredIde)}
    - Include the servers Scrimble used during research: fetch and github
    - Include brave-search only if the research context explicitly indicates it was used
 
 Rules:
-- return { "files": [{ "filename": string, "content": string }] }
+- return ONLY a single valid JSON object: { "files": [{ "filename": string, "content": string }] }
 - filenames must exactly match these values: ${SKILL_FILE_NAMES.join(', ')}
 - do not wrap file content in markdown code fences
+- content must be a single string per file. YOU MUST EXTREMELY CAREFULLY ESCAPE double quotes (") as \" and backslashes (\) as \\ within the content strings.
 - use exact package names and versions from the approved architecture context, applying any human review changes everywhere they matter
 - if the approved feedback changes a package choice, the generated files must reflect the approved choice, not the original ADR wording
 - use ${currentActiveStep ? `"${currentActiveStep.title}" in stage "${currentActiveStep.stage_title}"` : 'the first step in the plan order'} as the current-step context
-- the scrimble-mcp.json file should stay valid JSONC-style text and use the configuration shape expected by the selected IDE
+- the scrimble-mcp.json file must be PURE JSON (no comments), properly escaped within the wrapper JSON object
+- if the output is getting too large, prioritize correctness of the JSON structure over exhaustive detail in context files.
 
 Builder profile file rules:
 ${skillFileProfileInstructions}`;

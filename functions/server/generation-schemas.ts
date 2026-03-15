@@ -411,7 +411,12 @@ const skillFileSchema = z.preprocess(
 );
 
 export const Batch6GenerateFilesSchema = z.preprocess(
-  (value) => normalizeObject(value, () => ({})),
+  (value) => {
+    if (Array.isArray(value)) {
+      return { files: value };
+    }
+    return normalizeObject(value, () => ({}));
+  },
   z.object({
     files: z.preprocess(normalizeObjectArray, z.array(skillFileSchema)),
   }),
