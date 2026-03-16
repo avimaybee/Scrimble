@@ -1,6 +1,6 @@
 # Scrimble — Complete Project Documentation
 ### The Focus & Build Engine for Vibe Coders
-*Version 4.1 — March 2026 — Single source of truth*
+*Version 4.2 — March 2026 — Single source of truth*
 
 ---
 
@@ -23,6 +23,7 @@
 16. [Component Library](#16-component-library)
 17. [Build Status](#17-build-status)
 18. [Remaining Work](#18-remaining-work)
+    - [Known Issue: High Reasoning Model Timeouts](#known-issue-high-reasoning-model-timeouts-march-2026)
 19. [Future Roadmap](#19-future-roadmap)
 
 ---
@@ -933,7 +934,7 @@ Scrimble strictly uses technical, engineering-focused icons (Lucide React) to ma
 The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. 
 That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate background worker runtime. 
 
-To handle the high-frequency nature of AI reasoning deltas from distributed global isolates, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`). This utility buffers incoming reasoning tokens in memory and performs a single `ON CONFLICT DO UPDATE` write to the `project_generation_live_state` table every 1000ms. This prevents D1 row-locking congestion while maintaining a fluid user experience.
+To handle the high-frequency nature of AI reasoning deltas from distributed global isolates, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`). This utility buffers incoming reasoning tokens in memory and performs a single `ON CONFLICT DO UPDATE` write to the `project_generation_live_state` table every **150ms**. This prevents D1 row-locking congestion while maintaining a fluid user experience. The faster flush interval (reduced from 1000ms) ensures the UI receives updates in near-real-time while still gently buffering to avoid overloading the browser.
 
 On terminal events (`pipeline_complete`, `pipeline_failed`), the system explicitly calls `writer.close()` after the final flush to ensure the browser strictly severs the connection and doesn't leave "ghost" streams polling the edge.
 
@@ -977,9 +978,13 @@ Users connect their own AI provider keys in Settings. Scrimble supports:
 | OpenAI | Official | `https://api.openai.com/v1` |
 | Anthropic | Official | `https://api.anthropic.com` |
 | Google Gemini | Official | `https://generativelanguage.googleapis.com` |
+| OpenRouter | Official | `https://openrouter.ai/api/v1` |
+| Groq | Official | `https://api.groq.com/openai/v1` |
 | Custom | OpenAI-compatible | User provides base URL |
 
-**Custom providers** include: Ollama, LM Studio, Together AI, Groq, Azure OpenAI, OpenRouter, and any other service that exposes an OpenAI-compatible `/chat/completions` endpoint.
+**OpenRouter** provides access to 100+ models including Claude, GPT, Llama, and DeepSeek at competitive pricing. **Groq** offers ultra-fast inference for quick iterations. Both are fully integrated with automatic model selection defaults (Claude 3.5 Sonnet for OpenRouter, Llama 3.3 70B for Groq).
+
+**Custom providers** include: Ollama, LM Studio, Together AI, Azure OpenAI, and any other service that exposes an OpenAI-compatible `/chat/completions` endpoint.
 
 **AI Provider abstraction:**
 ```typescript
@@ -1594,9 +1599,16 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **Manual stop & resume**: The generation screen now exposes a `Stop generation` button that calls `/api/projects/:id/cancel` and invokes the Durable Object’s `cancelPipeline()` helper.
 - **Durable Infrastructure**: Fully migrated the generation runner to Cloudflare Durable Objects, eliminating queue-based race conditions and enabling real-time bi-directional state synchronization.
 - **Provider Management**: Implemented AI provider removal with confirmation dialogs and active-check safety guards.
+- **Provider Test Connection**: Added a "Test" button to each AI provider card in Settings that validates the API key works before saving, with inline error display using `InlineError` component and retry capability.
 - **Schema reconciliation**: Migration `010_schema_reconciliation.sql` adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, adds `last_error` to `generation_dispatches`, and drops the erstwhile `project_generation_live_state` table.
 - **Checklist Interactions**: Added `updateChecklistItem` to db client allowing full checklist item mutations (labels, requirement status) beyond simple toggles.
 - **SSE Progress Sync**: Added `progress_percent` metric to `batch_complete` events in the generation pipeline to ensure the client-side progress bar perfectly reflects backend generation state.
+- **Review Flapping Fixes**: Hardened the approval/resume flow to prevent status oscillation:
+  - SSE checkpoint events now carry `run_id` to identify which generation run they belong to
+  - Event replay skips stale `review_required` events if the project status has moved past `awaiting_review`
+  - Frontend maintains a live status reference and ignores stale review checkpoints after approval or later batches
+  - Status-based guardrails prevent the pipeline from regressing to `awaiting_review` after approval
+- **Thinking Stream Debug Logging (March 2026)**: Added comprehensive debug logging across the thinking event flow to diagnose why real-time thinking isn't visible in the frontend. Logs added to DO broadcast, generation-events publish/emit, AI reasoning extraction, app.ts proxy handling, and frontend SSE handlers.
 
 ---
 
@@ -1606,6 +1618,44 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - Error boundary improvements across all routes
 - Mobile responsive design for timeline view
 - Performance optimization for large projects (100+ steps)
+- **Real-time thinking streaming debugging** (see below)
+
+---
+
+### Known Issue: High Reasoning Model Timeouts (March 2026)
+
+When using high reasoning/depth models (e.g., DeepSeek R1, OpenAI o1, Claude Opus), the AI can take 100+ seconds to generate responses due to extended thinking. Cloudflare Workers enforces a ~100-second timeout on subrequests. If the AI doesn't send chunks for >100 seconds, the fetch fails with:
+
+```
+Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
+```
+
+**Debug Logging Added:**
+- `functions/server/project-generator-do.ts`: Added broadcast logging for event reception and client connection state
+- `functions/server/generation-events.ts`: Added logging in `publish()`, `emitTransientGenerationStreamEvent()`, and `createThrottledThinkingEmitter()`
+- `functions/server/ai.ts`: Added logging when reasoning/thinking is extracted from provider responses
+- `functions/server/app.ts`: Improved DO proxy error handling with better logging
+- Frontend (`src/lib/db.ts`, `src/pages/ProjectGeneration.tsx`): Added thinking event debug logs
+
+**Expected Log Flow (for debugging):**
+```
+[AI] OpenAI/Anthropic reasoning extracted: "..."     # AI returns thinking
+[THINKING_EMITTER] Buffer now has X chars             # Reasoning buffered
+[THINKING_EMITTER] Flushing X chars                   # Thinking emitted
+[GENERATION_EVENTS] Emitting thinking event           # Event being published
+[GENERATION_EVENTS] Publishing to N subscriber(s)     # Subscribers receive
+[PROJECT_GENERATOR_DO] Event received                 # DO receives event
+[PROJECT_GENERATOR_DO] broadcasting to N writer(s)     # DO broadcasts to frontend
+[STREAM] Received thinking event                      # Frontend receives
+[SSE_EVENT] onThinking received                        # Frontend processes
+```
+
+**Proposed Solutions (under evaluation):**
+- Option A: Use Durable Objects for long-running AI calls (DO has higher timeout limits)
+- Option B: Implement periodic heartbeat chunks during AI streaming to prevent idle gaps
+- Option C: Checkpoint and resume from partial reasoning when timeout occurs
+
+---
 
 **Pending:**
 - Team collaboration + multi-user editing
@@ -1641,5 +1691,5 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 
 ---
 
-*Scrimble Documentation v4.1 — March 2026*
+*Scrimble Documentation v4.2 — March 2026*
 *This document supersedes all previous versions and all FlowForge documentation.*
