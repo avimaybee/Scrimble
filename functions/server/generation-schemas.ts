@@ -186,6 +186,10 @@ export const Batch2FetchAndReadSchema = z.preprocess(
         technologies_researched: createNonNegativeIntSchema(0),
         urls_fetched: createNonNegativeIntSchema(0),
         issues_found: createNonNegativeIntSchema(0),
+        model_context_window: createNonNegativeIntSchema(128_000),
+        source_target_count: createNonNegativeIntSchema(0),
+        used_full_context_window: createBooleanSchema(false),
+        truncated_to_fit_context: createBooleanSchema(false),
         degraded_tools: createStringArraySchema(),
         partial_failures: z.preprocess(normalizeObjectArray, z.array(partialFailureSchema)),
       }),
@@ -426,7 +430,7 @@ export const schemaDescriptions = {
   batch_1_research_stack:
     '{ technologies: [{ name: string, docs_url: url, github_url: url, changelog_url: url, community_search_results?: [{ title, url, description }], breaking_change_search_results?: [{ title, url, description }] }] }',
   batch_2_fetch_and_read:
-    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary? }] }], sources?: [{ technology?, url, tool, title?, summary? }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
+    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary? }] }], sources?: [{ technology?, url, tool, title?, summary? }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, model_context_window?: number, source_target_count?: number, used_full_context_window?: boolean, truncated_to_fit_context?: boolean, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
   batch_3_architect:
     '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:

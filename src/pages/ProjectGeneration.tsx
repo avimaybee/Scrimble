@@ -917,8 +917,15 @@ export default function ProjectGeneration() {
     const hasGithubApi = reviewData.data_quality.has_github_token;
     const hasContext7 = reviewData.data_quality.has_context7;
     const hasBraveSearch = reviewData.data_quality.has_brave_search;
+    const sourceCount = reviewData.data_quality.urls_fetched || reviewData.research_sources.length;
+    const technologyCount = reviewData.data_quality.technologies_researched;
 
     return [
+      {
+        key: 'source-depth',
+        label: `${sourceCount} sources read across ${technologyCount} technologies`,
+        active: true,
+      },
       {
         key: 'jina-reader',
         label: 'Jina Reader',
@@ -945,6 +952,30 @@ export default function ProjectGeneration() {
         active: hasBraveSearch,
       },
     ];
+  }, [reviewData]);
+  const researchDepthContextNote = useMemo(() => {
+    if (!reviewData) {
+      return null;
+    }
+
+    const quality = reviewData.data_quality;
+    const sourceCount = quality.urls_fetched || reviewData.research_sources.length;
+
+    if (quality.truncated_to_fit_context) {
+      return {
+        message: 'Truncated to fit model context — consider a larger context model for deeper research.',
+        tone: 'warning' as const,
+      };
+    }
+
+    if (quality.used_full_context_window) {
+      return {
+        message: `Used full context window — ${sourceCount} sources read.`,
+        tone: 'positive' as const,
+      };
+    }
+
+    return null;
   }, [reviewData]);
   const visibleResearchSources = useMemo(() => {
     if (!reviewData) {
@@ -1354,8 +1385,18 @@ export default function ProjectGeneration() {
                             </div>
 
                             <div className="mt-4 font-sans text-[13px] text-text-tertiary">
-                              Researched {reviewData.data_quality.technologies_researched} technologies · {reviewData.research_sources.length} sources
+                              Researched {reviewData.data_quality.technologies_researched} technologies · {reviewData.data_quality.urls_fetched || reviewData.research_sources.length} sources
                             </div>
+                            {researchDepthContextNote ? (
+                              <div
+                                className={cn(
+                                  'mt-2 font-sans text-[12px] leading-5',
+                                  researchDepthContextNote.tone === 'warning' ? 'text-status-warning' : 'text-status-secure',
+                                )}
+                              >
+                                {researchDepthContextNote.message}
+                              </div>
+                            ) : null}
 
                             {reviewData.data_quality.partial_failures.length > 0 ? (
                               <div className="mt-3 font-sans text-[12px] leading-5 text-status-warning">

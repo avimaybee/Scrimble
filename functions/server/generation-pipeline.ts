@@ -38,10 +38,12 @@ import {
   resetGenerationThinkingState,
 } from './generation-events';
 import {
+  calculateResearchBudget,
   callAIText,
   containsReasoningMarkers,
   containsStreamTransportMarkers,
   extractJSON,
+  getModelContextWindow,
   getProvider,
   type ModelRole,
   PipelineQuotaExceededError,
@@ -274,6 +276,8 @@ type Batch2CheckpointData = {
   issuesFound: number;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
   subrequestCounter: number;
+  totalCandidateTargets?: number;
+  truncationApplied?: boolean;
 };
 
 type Batch5ResearchStep = Pick<
@@ -312,9 +316,9 @@ export const MAX_PROJECT_GENERATION_RETRY_ATTEMPTS = 3;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
-const MAX_BATCH2_RESEARCH_TARGETS = 10;
-const MAX_INFERRED_BATCH2_RESEARCH_TARGETS = 6;
-const MAX_PROFILE_BATCH2_RESEARCH_TARGETS = 2;
+const BATCH2_SOURCE_TARGETS_SMALL_CONTEXT = 5;
+const BATCH2_SOURCE_TARGETS_MEDIUM_CONTEXT = 10;
+const BATCH2_SOURCE_TARGETS_LARGE_CONTEXT = 20;
 const lastHeartbeatTouchByProject = new Map<string, number>();
 
 const batchCompletionMessages: Record<GenerationBatchName, string> = {
@@ -752,50 +756,122 @@ function filterRelevantProfileTargets(
   );
 
   if (relevantTargets.length > 0) {
-    return relevantTargets.slice(0, MAX_PROFILE_BATCH2_RESEARCH_TARGETS);
+    return relevantTargets;
   }
 
   if (projectTokens.length === 0) {
-    return builderProfile.declaredTools.slice(0, MAX_PROFILE_BATCH2_RESEARCH_TARGETS);
+    return builderProfile.declaredTools;
   }
 
   return [];
 }
 
-function limitResearchTargets(targets: ResearchTechnologyTarget[]) {
-  const selected: ResearchTechnologyTarget[] = [];
-  let inferredCount = 0;
-  let profileCount = 0;
-
-  for (const target of targets) {
-    if (selected.length >= MAX_BATCH2_RESEARCH_TARGETS) {
-      break;
-    }
-
-    if (target.source === 'inferred' && inferredCount >= MAX_INFERRED_BATCH2_RESEARCH_TARGETS) {
-      continue;
-    }
-
-    if (target.source === 'profile' && profileCount >= MAX_PROFILE_BATCH2_RESEARCH_TARGETS) {
-      continue;
-    }
-
-    selected.push(target);
-
-    if (target.source === 'inferred') {
-      inferredCount += 1;
-    } else if (target.source === 'profile') {
-      profileCount += 1;
-    }
+function resolveBatch2SourceTargetCount(contextWindow: number) {
+  if (contextWindow < 64_000) {
+    return BATCH2_SOURCE_TARGETS_SMALL_CONTEXT;
   }
 
-  return selected;
+  if (contextWindow <= 256_000) {
+    return BATCH2_SOURCE_TARGETS_MEDIUM_CONTEXT;
+  }
+
+  return BATCH2_SOURCE_TARGETS_LARGE_CONTEXT;
+}
+
+function resolveBatch2SearchResultLimit(contextWindow: number) {
+  if (contextWindow < 64_000) {
+    return 2;
+  }
+
+  if (contextWindow <= 256_000) {
+    return 4;
+  }
+
+  return 6;
+}
+
+function getResearchTargetSourcePriority(source: ResearchTechnologyTarget['source']) {
+  switch (source) {
+    case 'brief':
+      return 0;
+    case 'profile':
+      return 1;
+    case 'inferred':
+    default:
+      return 2;
+  }
+}
+
+function scoreResearchTargetRelevance(
+  target: ResearchTechnologyTarget,
+  projectBrief: LoadedProjectBriefContext,
+) {
+  const targetTokens = buildMatchTokens(
+    target.name,
+    target.docs_topic,
+    target.docs_url,
+    target.github_url,
+    target.changelog_url,
+  );
+  const confirmedTokens = projectBrief.confirmedStackTools.flatMap((tool) => buildMatchTokens(tool));
+  const summaryTokens = buildMatchTokens(projectBrief.summary);
+  const normalizedSummary = projectBrief.summary.toLowerCase();
+
+  let score = 0;
+  if (targetsOverlap(targetTokens, confirmedTokens)) {
+    score += 8;
+  }
+  if (targetsOverlap(targetTokens, summaryTokens)) {
+    score += 4;
+  }
+  if (normalizedSummary.includes(target.name.toLowerCase())) {
+    score += 3;
+  }
+  if (target.source === 'brief') {
+    score += 3;
+  } else if (target.source === 'profile') {
+    score += 1;
+  }
+  if (target.docs_url) {
+    score += 1;
+  }
+  if (target.github_url) {
+    score += 1;
+  }
+
+  return score;
+}
+
+function limitResearchTargets(
+  targets: ResearchTechnologyTarget[],
+  projectBrief: LoadedProjectBriefContext,
+  maxTargets: number,
+) {
+  const ranked = dedupeResearchTargets(targets).sort((left, right) => {
+    const priorityDiff = getResearchTargetSourcePriority(left.source) - getResearchTargetSourcePriority(right.source);
+    if (priorityDiff !== 0) {
+      return priorityDiff;
+    }
+
+    const scoreDiff = scoreResearchTargetRelevance(right, projectBrief) - scoreResearchTargetRelevance(left, projectBrief);
+    if (scoreDiff !== 0) {
+      return scoreDiff;
+    }
+
+    return left.name.localeCompare(right.name);
+  });
+
+  return {
+    targets: ranked.slice(0, Math.max(1, maxTargets)),
+    totalCandidates: ranked.length,
+  };
 }
 
 function buildResearchTargets(
   inferredTechnologies: Batch1ResearchStack['technologies'],
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
+  maxTargets: number,
 ) {
   const inferredTargets: ResearchTechnologyTarget[] = inferredTechnologies.map((technology) =>
     toResearchTechnologyTarget(
@@ -840,7 +916,7 @@ function buildResearchTargets(
     source: 'profile',
   }));
 
-  return limitResearchTargets(dedupeResearchTargets([...briefTargets, ...inferredTargets, ...profileTargets]));
+  return limitResearchTargets([...briefTargets, ...inferredTargets, ...profileTargets], projectBrief, maxTargets);
 }
 
 function createResearchSource(
@@ -882,24 +958,33 @@ function pushPartialFailure(
   }
 }
 
-const MAX_BATCH2_PROMPT_CHARS = 120_000;
+const MIN_BATCH2_PROMPT_CHARS = 120_000;
+
+function resolveBatch2PromptCharLimit(researchBudget: ReturnType<typeof calculateResearchBudget>) {
+  return Math.max(MIN_BATCH2_PROMPT_CHARS, Math.floor(researchBudget.totalBudgetChars));
+}
 
 function buildBatch2PromptPayload(
   fetchedSources: FetchedTechnologyResearch[],
   dataQuality: Batch2FetchAndRead['data_quality'],
+  researchBudget: ReturnType<typeof calculateResearchBudget>,
 ) {
+  const maxRepoHealthSummaryChars = Math.max(1_200, Math.floor(researchBudget.perIssueChars * 0.35));
+  const maxCommunitySentimentChars = Math.max(2_000, Math.floor(researchBudget.perIssueChars * 0.8));
+  const maxBugDigestChars = Math.max(2_000, Math.floor(researchBudget.perIssueChars * 0.7));
+
   return {
     fetchedSources: fetchedSources.map((source) => ({
       technology: source.technology,
-      docs_content: trimToLimit(source.docs_content, 6_000),
-      github_readme: trimToLimit(source.github_readme, 4_000),
+      docs_content: trimToLimit(source.docs_content, researchBudget.perDocChars),
+      github_readme: trimToLimit(source.github_readme, researchBudget.perReadmeChars),
       latest_version: source.latest_version,
       last_commit_date: source.last_commit_date,
       open_issues_count: source.open_issues_count,
-      recent_breaking_changes: trimToLimit(source.recent_breaking_changes, 3_000),
-      repo_health_summary: trimToLimit(source.repo_health_summary, 1_200),
-      community_sentiment: trimToLimit(source.community_sentiment, 2_000),
-      bug_report_digest: trimToLimit(source.bug_report_digest, 2_000),
+      recent_breaking_changes: trimToLimit(source.recent_breaking_changes, researchBudget.perIssueChars),
+      repo_health_summary: trimToLimit(source.repo_health_summary, maxRepoHealthSummaryChars),
+      community_sentiment: trimToLimit(source.community_sentiment, maxCommunitySentimentChars),
+      bug_report_digest: trimToLimit(source.bug_report_digest, maxBugDigestChars),
       sources: source.source_ledger.slice(0, 8).map((entry) => ({
         technology: entry.technology,
         url: entry.url,
@@ -915,12 +1000,14 @@ function buildBatch2PromptPayload(
 function stringifyBatch2PromptPayload(
   fetchedSources: FetchedTechnologyResearch[],
   dataQuality: Batch2FetchAndRead['data_quality'],
+  researchBudget: ReturnType<typeof calculateResearchBudget>,
 ) {
-  const payload = buildBatch2PromptPayload(fetchedSources, dataQuality);
+  const payload = buildBatch2PromptPayload(fetchedSources, dataQuality, researchBudget);
   const serialized = JSON.stringify(payload, null, 2);
-  if (serialized.length > MAX_BATCH2_PROMPT_CHARS) {
+  const maxPromptChars = resolveBatch2PromptCharLimit(researchBudget);
+  if (serialized.length > maxPromptChars) {
     throw new GenerationPipelineError(
-      `Batch 2 research payload exceeded the prompt budget (${serialized.length} chars). Reduce the fetched research before calling the model.`,
+      `Batch 2 research payload exceeded the prompt budget (${serialized.length} chars > ${maxPromptChars} chars). Reduce fetched sources or use a higher-context model.`,
     );
   }
 
@@ -3002,6 +3089,7 @@ async function executeBatch2(
   env: Bindings,
   project: ProjectRecord,
   provider: ProviderConfig,
+  deepProvider: ProviderConfig,
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
@@ -3013,6 +3101,16 @@ async function executeBatch2(
     ? MAX_SUBREQUEST_BUDGET_DO
     : MAX_SUBREQUEST_BUDGET_QUEUE;
   const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
+  const deepModelContextWindow = getModelContextWindow(deepProvider.providerType, deepProvider.model);
+  const sourceTargetCount = resolveBatch2SourceTargetCount(deepModelContextWindow);
+  const searchResultLimit = resolveBatch2SearchResultLimit(deepModelContextWindow);
+  const researchBudget = calculateResearchBudget(deepModelContextWindow, sourceTargetCount);
+  const targetSelection = buildResearchTargets(
+    batch1.technologies,
+    builderProfile,
+    projectBrief,
+    sourceTargetCount,
+  );
   const checkpoint = await loadGenerationCheckpoint<Batch2CheckpointData>(
     env,
     projectId,
@@ -3020,7 +3118,8 @@ async function executeBatch2(
     'batch_2_fetch_and_read',
   );
   const researchTargets =
-    checkpoint?.data.researchTargets || buildResearchTargets(batch1.technologies, builderProfile, projectBrief);
+    checkpoint?.data.researchTargets || targetSelection.targets;
+  const totalCandidateTargets = checkpoint?.data.totalCandidateTargets ?? targetSelection.totalCandidates;
   const fetchedSources: FetchedTechnologyResearch[] = checkpoint?.data.fetchedSources
     ? [...checkpoint.data.fetchedSources]
     : [];
@@ -3030,6 +3129,7 @@ async function executeBatch2(
   let issuesFound = checkpoint?.data.issuesFound ?? 0;
   const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
+  let truncationApplied = checkpoint?.data.truncationApplied ?? totalCandidateTargets > researchTargets.length;
   let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
   const researchService = createResearchService({
@@ -3062,12 +3162,18 @@ async function executeBatch2(
           ? `Reading the docs for ${researchTargets.length} technologies, starting with ${profileResearchCount} relevant saved tool${profileResearchCount === 1 ? '' : 's'} from your builder profile...`
           : `Reading the docs for ${researchTargets.length} technolog${researchTargets.length === 1 ? 'y' : 'ies'}...`,
   });
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_2_fetch_and_read',
+    kind: 'system',
+    message: `Context-aware depth enabled from ${deepProvider.model} (${deepModelContextWindow.toLocaleString()} tokens): target tier ${sourceTargetCount} with docs/readme/issue caps ${researchBudget.perDocChars.toLocaleString()}/${researchBudget.perReadmeChars.toLocaleString()}/${researchBudget.perIssueChars.toLocaleString()} chars.`,
+  });
 
-    if (checkpoint) {
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_2_fetch_and_read',
-        kind: 'system',
+  if (checkpoint) {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_2_fetch_and_read',
+      kind: 'system',
       message: `Resuming fetched-doc research at technology ${startIndex + 1} of ${researchTargets.length}.`,
     });
   }
@@ -3094,6 +3200,8 @@ async function executeBatch2(
         issuesFound,
         partialFailures,
         subrequestCounter,
+        totalCandidateTargets,
+        truncationApplied,
       });
       await logActivity(env, {
         projectId,
@@ -3120,7 +3228,7 @@ async function executeBatch2(
       githubRepository
         ? researchService.fetchGitHubRepo(githubRepository.owner, githubRepository.repo)
         : Promise.resolve(emptyResearchResult('', `No GitHub repo found for ${technology.name}.`)),
-      researchService.searchWeb(searchQuery, 4),
+      researchService.searchWeb(searchQuery, searchResultLimit),
     ]);
 
     subrequestCounter += (docsUrl ? 1 : 0) + (githubRepository ? 1 : 0) + 1;
@@ -3229,6 +3337,17 @@ async function executeBatch2(
     const communitySentiment = communityPages
       .map((page) => `${page.title}: ${trimToLimit(page.content || page.description, 2_000)} (${page.url})`)
       .join('\n\n');
+    const recentBreakingChangesRaw = releaseSignal || 'Release notes unavailable.';
+    const docsContentTrimmed = trimToLimit(docsResult.content, researchBudget.perDocChars);
+    const githubReadmeTrimmed = trimToLimit(githubResult.content, researchBudget.perReadmeChars);
+    const recentBreakingChangesTrimmed = trimToLimit(recentBreakingChangesRaw, researchBudget.perIssueChars);
+    if (
+      docsResult.content.length > researchBudget.perDocChars
+      || githubResult.content.length > researchBudget.perReadmeChars
+      || recentBreakingChangesRaw.length > researchBudget.perIssueChars
+    ) {
+      truncationApplied = true;
+    }
     const latestVersion = parseLatestVersionFromText(githubResult.content, releaseSignal);
     const lastCommitDate = parseLastCommitDateFromText(githubResult.content);
     const openIssuesCount = parseOpenIssuesCount(githubResult.content);
@@ -3275,12 +3394,12 @@ async function executeBatch2(
       docs_url: docsUrl,
       github_url: githubUrl,
       changelog_url: changelogUrl,
-      docs_content: trimToLimit(docsResult.content, 15_000) || 'Documentation source unavailable.',
-      github_readme: trimToLimit(githubResult.content, 10_000) || 'GitHub repository data unavailable.',
+      docs_content: docsContentTrimmed || 'Documentation source unavailable.',
+      github_readme: githubReadmeTrimmed || 'GitHub repository data unavailable.',
       latest_version: latestVersion,
       last_commit_date: lastCommitDate,
       open_issues_count: openIssuesCount,
-      recent_breaking_changes: trimToLimit(releaseSignal || 'Release notes unavailable.', 8_000),
+      recent_breaking_changes: recentBreakingChangesTrimmed,
       repo_health_summary: repoHealthSummary,
       community_sentiment:
         trimToLimit(communitySentiment || formatSearchResults(searchResults), 5_000) || 'Community sentiment unavailable.',
@@ -3302,15 +3421,17 @@ async function executeBatch2(
         issuesFound,
         partialFailures,
         subrequestCounter,
+        totalCandidateTargets,
+        truncationApplied,
       });
-          await logActivity(env, {
-            projectId,
-            batchName: 'batch_2_fetch_and_read',
-            kind: 'system',
-            message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
-          });
-          return 'checkpointed';
-        }
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'system',
+        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
+      });
+      return 'checkpointed';
+    }
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
@@ -3323,6 +3444,10 @@ async function executeBatch2(
     issues_found: issuesFound,
     degraded_tools: Array.from(degradedTools),
     partial_failures: partialFailures,
+    model_context_window: deepModelContextWindow,
+    source_target_count: sourceTargetCount,
+    used_full_context_window: !truncationApplied && sourceLedger.length >= sourceTargetCount,
+    truncated_to_fit_context: truncationApplied,
   };
 
   const input = {
@@ -3344,7 +3469,7 @@ async function executeBatch2(
     'You are Scrimble’s technical research analyst. Turn fetched docs, readmes, metadata, and changelog snippets into a structured research corpus. Keep the important technical details concrete. Return only valid JSON.',
     projectBrief.promptContext,
   );
-  const promptPayload = stringifyBatch2PromptPayload(fetchedSources, dataQuality);
+  const promptPayload = stringifyBatch2PromptPayload(fetchedSources, dataQuality, researchBudget);
   const prompt = `Research the following fetched technology materials and convert them into a structured corpus.
 
 ${promptPayload}
@@ -4379,7 +4504,7 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_1_research_stack':
       if (!completed.includes('batch_2_fetch_and_read')) {
-        await executeBatch2(env, project, fastProvider, activeRunId, builderProfile, projectBrief, continuationMode);
+        await executeBatch2(env, project, fastProvider, deepProvider, activeRunId, builderProfile, projectBrief, continuationMode);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,

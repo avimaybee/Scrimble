@@ -317,7 +317,31 @@ export function getModelContextWindow(providerName: string, modelName: string): 
     return 128_000;
   }
 
-  return 200_000;
+  return 128_000;
+}
+
+export function calculateResearchBudget(contextWindow: number, numSources: number) {
+  const normalizedContextWindow = Number.isFinite(contextWindow) && contextWindow > 0
+    ? Math.floor(contextWindow)
+    : 128_000;
+  const normalizedSourceCount = Number.isFinite(numSources) && numSources > 0
+    ? Math.floor(numSources)
+    : 1;
+
+  // Keep 30% reserved for instructions, formatting, and model output.
+  const availableTokens = normalizedContextWindow * 0.7;
+  const availableChars = Math.floor(availableTokens * 3.5);
+  const perSource = Math.min(
+    Math.max(Math.floor(availableChars / normalizedSourceCount), 8_000),
+    200_000,
+  );
+
+  return {
+    perDocChars: perSource,
+    perReadmeChars: Math.floor(perSource * 0.8),
+    perIssueChars: Math.floor(perSource * 0.5),
+    totalBudgetChars: availableChars,
+  };
 }
 
 export async function streamToText(

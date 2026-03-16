@@ -308,6 +308,10 @@ export interface ArchitectureReviewDataQuality {
   technologies_researched: number;
   urls_fetched: number;
   issues_found: number;
+  model_context_window: number;
+  source_target_count: number;
+  used_full_context_window: boolean;
+  truncated_to_fit_context: boolean;
   degraded_tools: string[];
   partial_failures: Array<{
     tool: string;
