@@ -638,6 +638,7 @@ export default function ProjectCanvas() {
         position_y: nextY,
         status: appSteps.length === 0 ? 'active' : 'locked',
         is_gate: false,
+        is_milestone: false,
         risk_level: 'low',
         objective: newStepObjective.trim(),
         why_it_matters: '',
@@ -1098,6 +1099,7 @@ export default function ProjectCanvas() {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+            </div>
           </div>
         </div>
 

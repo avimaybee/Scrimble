@@ -281,6 +281,7 @@ type Batch2CheckpointData = {
   contextSevenBroken: boolean;
   githubIssuesBroken: boolean;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
+  subrequestCounter: number;
 };
 
 type Batch5ResearchStep = Pick<
@@ -291,6 +292,7 @@ type Batch5ResearchStep = Pick<
 type Batch5CheckpointData = {
   steps: Batch5ResearchStep[];
   stepResearchContexts: StepResearchContext[];
+  subrequestCounter: number;
 };
 
 type GenerationCheckpointRecord = {
@@ -3006,7 +3008,7 @@ async function executeBatch2(
   // Circuit-breakers: stop calling tools that consistently fail
   let contextSevenBroken = checkpoint?.data.contextSevenBroken ?? false;
   let githubIssuesBroken = checkpoint?.data.githubIssuesBroken ?? false;
-  let subrequestCounter = 0;
+  let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
 
   const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
@@ -3065,6 +3067,7 @@ async function executeBatch2(
         contextSevenBroken,
         githubIssuesBroken,
         partialFailures,
+        subrequestCounter,
       });
       await logActivity(env, {
         projectId,
@@ -3468,6 +3471,7 @@ async function executeBatch2(
         contextSevenBroken,
         githubIssuesBroken,
         partialFailures,
+        subrequestCounter,
       });
           await logActivity(env, {
             projectId,
@@ -3925,6 +3929,7 @@ async function executeBatch5(
     ? [...checkpoint.data.stepResearchContexts]
     : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
+  let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
   await logActivity(env, {
@@ -3981,14 +3986,19 @@ async function executeBatch5(
       message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
     });
 
-    // Batch 5 Optimization: Only checkpoint when a budget limit is reached or after a reasonable number of steps.
-    // The previous implementation had a logic flaw that checkpointed after EVERY step.
-    const subrequestCounter = (checkpoint as any)?.subrequestCounter ?? 0; // Type casting for ease if needed, but resolved via data flow.
-    const maxSubrequestBudget = 40; // Cloudflare standard limit is 50, but we stay conservative.
-    const SUB_RESERVE = 5;
+    // Estimate subrequests used by this research step
+    let stepSubrequests = 3; // Heartbeat + 2 logActivity calls
+    if (stepResearch.toolsUsed.includes('Live docs')) stepSubrequests += 4;
+    if (stepResearch.toolsUsed.includes('GitHub')) stepSubrequests += 2;
+    if (stepResearch.toolsUsed.includes('Brave Search')) stepSubrequests += 4;
+    if (stepResearch.toolsUsed.includes('Context7')) stepSubrequests += 4;
+    subrequestCounter += stepSubrequests;
+
+    const maxSubrequestBudget = 40; // Cloudflare standard limit is 50
+    const SUB_RESERVE = 8;
 
     const shouldCheckpoint = (index + 1 < planSteps.length) && (
-      (index + 1) % 10 === 0 || // Every 10 steps
+      (index + 1 - startIndex) >= 3 || // Every 3 steps within this turn to stay under 30s wall-clock limit
       subrequestCounter >= (maxSubrequestBudget - SUB_RESERVE) // Or when near subrequest limit
     );
 
@@ -3996,7 +4006,7 @@ async function executeBatch5(
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
         steps: planSteps,
         stepResearchContexts,
-        subrequestCounter, // Persist counter so we don't reset it on resume
+        subrequestCounter,
       });
       await logActivity(env, {
         projectId,
@@ -4182,7 +4192,7 @@ Rules:
       schemaDescription: schemaDescriptions.batch_6_generate_files,
     });
     
-    const finalFiles = result.data.files;
+    const finalFiles = result.data.files as Array<{ filename: SkillFileName; content: string }>;
     const finalResult: Batch6GenerateFiles = {
       files: finalFiles,
     };
