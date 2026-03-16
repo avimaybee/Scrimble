@@ -35,6 +35,12 @@ type WorkflowUpdateProviderContext = {
   baseUrl?: string | null;
 };
 
+type WorkflowUpdateProviders = {
+  default: WorkflowUpdateProviderContext;
+  fast: WorkflowUpdateProviderContext;
+  deep: WorkflowUpdateProviderContext;
+};
+
 type WorkflowUpdateProjectRecord = {
   id: string;
   user_id: string;
@@ -352,6 +358,7 @@ Rules:
     baseUrl: options.provider.baseUrl,
     system: systemPrompt,
     prompt,
+    role: 'fast',
   });
 
   return parseJsonResponse<WorkflowUpdateIntent>(
@@ -567,6 +574,7 @@ Rules:
     baseUrl: options.provider.baseUrl,
     system: systemPrompt,
     prompt,
+    role: 'deep',
   });
 
   return parseJsonResponse<PlanDiff>(text, diffSchema, 'Failed to generate a workflow diff');
@@ -652,6 +660,7 @@ async function reEnrichAffectedSteps(options: {
       system: systemPrompt,
       prompt,
       onReasoningDelta: (delta) => options.onProgress?.({ thinking: delta }),
+      role: 'deep',
     });
 
     const enriched = parseJsonResponse(text, stepDetailSchema, `Failed to re-enrich ${step.title}`);
@@ -743,7 +752,7 @@ export async function processWorkflowUpdate(options: {
   env: Bindings;
   workflowId: string;
   project: WorkflowUpdateProjectRecord;
-  provider: WorkflowUpdateProviderContext;
+  providers: WorkflowUpdateProviders;
   message: string;
   driftResolution?: WorkflowDriftResolution;
   onProgress?: (progress: WorkflowUpdateProgress) => Promise<void> | void;
@@ -769,7 +778,7 @@ export async function processWorkflowUpdate(options: {
   });
 
   const intent = await analyzeWorkflowUpdateIntent({
-    provider: options.provider,
+    provider: options.providers.fast,
     project: options.project,
     adr,
     research,
@@ -849,7 +858,7 @@ export async function processWorkflowUpdate(options: {
   });
 
   const diff = await generatePlanDiff({
-    provider: options.provider,
+    provider: options.providers.deep,
     project: options.project,
     workflowSnapshot,
     adr,
@@ -870,7 +879,7 @@ export async function processWorkflowUpdate(options: {
       env: options.env,
       workflowId: options.workflowId,
       project: options.project,
-      provider: options.provider,
+      provider: options.providers.deep,
       adr,
       research,
       miniResearch,

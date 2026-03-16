@@ -1,6 +1,9 @@
 # Scrimble — Complete Project Documentation
-### The Focus & Build Engine for Vibe Coders
-*Version 4.2 — March 2026 — Single source of truth*
+### The Research-First Build Companion for Solo Builders
+*Version 5.0 — March 2026 — Single source of truth*
+
+> [!NOTE]
+> Version 5.0 — Realigned to true product vision. Previous versions described implementation state. This version describes intended product experience.
 
 ---
 
@@ -30,11 +33,18 @@
 
 ## 1. Product Vision
 
-**One line:** Scrimble keeps builders on track — one step at a time, powered by AI that does the work for you.
+**One line:** Scrimble is a research-first, turn-by-turn build companion for solo builders and vibe coders.
 
-**The emotional promise:** Scrimble is the tool that turns idea-havers into builders who actually finish things. Not by slowing them down. Not by making them learn engineering theory. By giving them a system that matches their energy, handles the cognitive overhead, and keeps them locked in on what matters right now.
+**The core product vision:** Scrimble sits open next to your IDE while you build. It tells you exactly what to do, where to go, and what to type — referenced to your actual tools — one step at a time. You read a step, implement it, mark it done, and the next step unlocks. The plan is alive and can be updated at any point through natural language.
 
-You describe what you want to build in plain language. Scrimble figures out the path, does the research, writes the docs, and walks you through it — one step at a time. Every morning you open Scrimble and you know exactly what to do next.
+**The Three Pillars:**
+1. **Deep research upfront** — before generating any plan, the agent studies your exact stack, reads real documentation, fetches GitHub issues, and understands your specific tools. The plan it produces is evidence-based, not generic.
+2. **Turn-by-turn navigation** — step content is not guidance or advice. It is exact, executable instructions. Not "set up your database." Instead: "Open Supabase. Go to Table Editor. Create a table called 'users'. Add these exact columns. Then come back here and mark this done."
+3. **The forcing function** — users cannot proceed to the next step until the current one is complete. This is the core behaviour-change mechanism. It is not gamification. It is structured discipline that prevents scope drift — the single biggest problem vibe coders face.
+
+**The emotional promise:** Scrimble is a companion you have open alongside your IDE, not a tool you visit occasionally. The north star is that after building 3-5 projects through Scrimble, users subconsciously learn the end-to-end process of building real software — not because Scrimble teaches them explicitly, but because they live it step by step every time.
+
+**Built for vibe coders:** Built first and foremost for the builder who vibe codes — someone who moves fast, loses context easily, and gets distracted by shiny features before core ones are done. "If it works perfectly for the builder who made it, it works for everyone."
 
 ---
 
@@ -56,30 +66,37 @@ The result: projects that are 70% done forever, or apps that work in demos but f
 
 ## 3. What Scrimble Is
 
-Scrimble is a **living, AI-powered project guide** that:
+Scrimble is a **build companion** that guides you through the entire lifecycle of a project:
 
-1. Takes your project idea in plain language and builds a personalised step-by-step path
-2. Has AI agents do the heavy work at each step — research, writing, planning
-3. Pauses for your input at key moments before moving forward (human-in-the-loop)
-4. Updates and evolves the entire plan whenever your project changes — just describe the change
-5. Becomes the single place you return to every day: *"what's my next step?"*
+1. **Intake & Research:** Takes your project idea, asks clarifying questions, and performs deep research into your specific tools and stack.
+2. **Turn-by-Turn Navigation:** Breaks the project into exact, executable instructions (e.g. "Open AI Studio → Build mode → paste this prompt → download the output → open in VS Code").
+3. **The Bridge:** Connects planning and building by telling you exactly what to do in your specific tools, in sequence, without ambiguity.
+4. **Structured Discipline:** Prevents scope drift by locking the path forward until the current step is confirmed done.
+5. **Living Plan:** The workflow adapts in real-time to your changes through natural language.
+
+**The Companion App Use Pattern:**
+- User has IDE open on one side, Scrimble open on the other.
+- They read the current, tool-specific step in Scrimble.
+- They go implement it in their IDE/Tools.
+- They come back and mark it done; the next step unlocks.
+- This loop repeats until the project is finished.
 
 **What Scrimble is NOT:**
 
 | It's not... | Because... |
 |---|---|
-| A place to read documentation | AI agents do the reading, you get the results |
-| A project manager | It doesn't track teams, sprints, or deadlines |
-| A code generator | Your coding tool does that — Scrimble guides the process |
-| A static checklist | The plan is alive and changes with your project |
-| Another chatbot | It has memory, structure, and a visual workflow — not just conversation |
+| A research tool | It *uses* research to give you executable steps |
+| A build companion | It guides the builder, it doesn't just manage tasks |
+| A code generator | Your AI coding tools do that — Scrimble guides the *how* and *when* |
+| A static checklist | The plan is alive and knows your specific tools |
+| Another chatbot | It has structure, memory, and a visual workflow anchor |
 
 ---
 
 ## 4. Core Philosophy
 
 ### One Step at a Time
-The entire experience is built around a single principle: **finish this before you touch that.** Each step is a focused unit of work. You can't move to the next step until the current one is done — or you explicitly decide to skip it (with full awareness of what that means).
+The entire experience is built around a single principle: **finish this before you touch that.** Each step is a focused unit of work. You can't move to the next step until the current one is done. This is the core mechanism of **structured discipline** that prevents the context-switching and scope drift that kills projects.
 
 ### AI Does the Work, You Make the Calls
 Scrimble's AI agents handle research, writing, planning, and suggestions. They work autonomously through each step. But at key moments — before irreversible decisions, before moving to the next stage — Scrimble pauses and puts the choice in your hands. This is **human-in-the-loop**: the AI works hard, you stay in control.
@@ -628,20 +645,20 @@ Every project is guided through these stages (AI selects relevant ones based on 
 
 ### Step Content Model (internal)
 
-| Field | Plain Name | Description |
-|---|---|---|
-| title | Step name | What this step is |
-| objective | Goal | What gets done here |
-| why_it_matters | Why this matters | What goes wrong if skipped |
-| suggested_tools | Suggested tools | Stack-specific, no generic advice |
-| ai_output | What the AI prepared | Generated artifact — brief, plan, checklist |
-| prompts | Prompts to use | Copy-pasteable prompts for your coding tool |
-| checklist | Things to check | Concrete items, some required before moving on |
-| done_when | Done when... | Exact definition of done |
-| status | State | waiting / working / needs your input / done / skipped |
-| risk_level | Importance | low / medium / high / critical |
-| is_gate | Requires your review | Must be reviewed before AI continues |
-| is_ai_enriched | AI prepared | Whether AI has generated deep content |
+| Field | Description |
+|---|---|
+| title | What this step is |
+| instructions | **Exact instructions** — e.g. "Open [specific tool], go to [specific location], do [specific action]" |
+| tool_references | References to the user's actual connected tools by name |
+| external_links | Links to the exact page or tool the user needs to open |
+| what_to_bring_back | What the user should have when they return to mark this done |
+| prompts | **Exact prompts** (approx. 10% of content) to paste into AI coding tools |
+| objective | What gets done here |
+| why_it_matters | What goes wrong if skipped (The "Why") |
+| checklist | Concrete items required before unlocking the next step |
+| status | waiting / working / needs review / complete / skipped |
+| research_attribution | Metadata on which tools were used to build this step guidance |
+| is_gate | Requires your review before AI continues |
 
 ---
 
@@ -655,11 +672,15 @@ Cloudflare D1 uses SQLite syntax. All IDs are `TEXT` generated with `nanoid`. JS
 -- Firebase UID is the primary key
 -- ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS profiles (
-  id              TEXT PRIMARY KEY,     -- Firebase UID
-  name            TEXT,
-  email           TEXT,
-  created_at      TEXT DEFAULT (datetime('now')),
-  updated_at      TEXT DEFAULT (datetime('now'))
+  id                      TEXT PRIMARY KEY,     -- Firebase UID
+  name                    TEXT,
+  email                   TEXT,
+  fast_model_provider_id  TEXT REFERENCES ai_providers(id) ON DELETE SET NULL,
+  fast_model_name         TEXT,
+  deep_model_provider_id  TEXT REFERENCES ai_providers(id) ON DELETE SET NULL,
+  deep_model_name         TEXT,
+  created_at              TEXT DEFAULT (datetime('now')),
+  updated_at              TEXT DEFAULT (datetime('now'))
 );
 
 -- ────────────────────────────────────────────
@@ -898,10 +919,15 @@ The original `scrimble` Cloudflare Queue consumer remains as a rollback. It stil
 
 ### Sequential Generation Pipeline
 
-Project creation dispatches a dedicated 6-batch generation run. Scrimble now relies on `ProjectGeneratorDO` running inline turns inside the standalone worker:
+Project creation dispatches a dedicated generation run. The flow is as follows:
 
-1. **Pages (The Boss)**: Handles the UI, updates D1 state, streams SSE, and dispatches generation through the configured backend.
-2. **ProjectGeneratorDO (Primary Runner)**: Runs the same six batches inside the Durable Object, emits batch status before it starts, writes checkpoints to D1+R2, and restarts itself via alarms when transient provider/timeouts occur.
+1. **Clarifying Questions Phase (Required)**: Before generation begins, Scrimble asks the user 2-4 clarifying questions based on their initial description. These are a mix of technical and conceptual (e.g., "Real-time sync vs local storage?"). This ensures the agent makes real architectural decisions rather than generic ones.
+2. **Batch 1 (Research Stack)**: Identifies the technologies needed based on the description and answers.
+3. **Batch 2 (Fetch & Read)**: Deep research using connected tools (Context7, GitHub, Brave). Studies actual stack-specific documentation.
+4. **Batch 3 (Architect)**: Designs the system. Pauses for human approval at the **Architecture Gate**.
+5. **Batch 4 (Plan Build)**: Generates the sequence of steps and stages.
+6. **Batch 5 (Enrich)**: Populates steps with turn-by-turn navigation, tool-specific instructions, and prompts.
+7. **Batch 6 (File Generation)**: Generates the skill files for IDE implementation.
 
 The Cloudflare Queue consumer remains only as an emergency rollback. It still exists to process a single batch when the DO binding is unavailable, but it no longer drives the default flow.
 
@@ -981,10 +1007,27 @@ Users connect their own AI provider keys in Settings. Scrimble supports:
 | OpenRouter | Official | `https://openrouter.ai/api/v1` |
 | Groq | Official | `https://api.groq.com/openai/v1` |
 | Custom | OpenAI-compatible | User provides base URL |
+| Local | Ollama / LM Studio | Standard OpenAI-compatible local endpoints |
 
-**OpenRouter** provides access to 100+ models including Claude, GPT, Llama, and DeepSeek at competitive pricing. **Groq** offers ultra-fast inference for quick iterations. Both are fully integrated with automatic model selection defaults (Claude 3.5 Sonnet for OpenRouter, Llama 3.3 70B for Groq).
+### Model Roles: Fast & Deep
 
-**Custom providers** include: Ollama, LM Studio, Together AI, Azure OpenAI, and any other service that exposes an OpenAI-compatible `/chat/completions` endpoint.
+Scrimble uses a **two-model architecture** to optimize for both speed and reasoning quality. Users can configure specific providers and model names for two distinct roles in Settings:
+
+| Role | Purpose | Recommended Models |
+|---|---|---|
+| **Fast model** | Quick tasks: structuring, routing, research summaries, tool scanning. | `gemini-2.0-flash`, `gpt-4o-mini`, `llama-3.1-70b` |
+| **Deep model** | Complex tasks: system architecture, detailed plan generation, step enrichment, file generation. | `gemini-1.5-pro` (or `2.0-pro`), `claude-3-5-sonnet`, `gpt-4o` |
+
+**Routing Logic:**
+- If only one AI provider is configured (or no specific roles are set), that provider handles all tasks.
+- If both roles are configured, Scrimble automatically routes chaque task to the most appropriate model.
+- Research phases (Batch 1 & 2) and intake conversations always use the **Fast** model to keep the feeling snappy.
+- Architecture design, Plan building, and Enrichment (Batch 3, 4, 5, 6) use the **Deep** model to ensure evidence-based, high-accuracy instructions.
+
+**Provider Options:**
+- **OpenRouter** provides access to 100+ models including Claude, GPT, Llama, and DeepSeek at competitive pricing. Fully integrated with automatic model selection defaults.
+- **Groq** offers ultra-fast inference for quick iterations.
+- **Custom providers** include: Ollama, LM Studio, Together AI, Azure OpenAI, and any other service that exposes an OpenAI-compatible `/chat/completions` endpoint.
 
 **AI Provider abstraction:**
 ```typescript
@@ -1235,9 +1278,12 @@ All section labels use the paprika dash treatment.
 └──────────────────────────────────────────────────────────┘
 ```
 
-Single large textarea. No character limit. "Build my plan →" button becomes active once they type anything.
+Single large textarea. No character limit. "Build my plan →" button starts the **Clarifying Questions Phase**.
 
-If no AI provider is configured, `/new` blocks submission and shows a direct "You need to add an AI key first." call-to-action that links to Settings. The backend also rejects `POST /api/projects` when no provider can be resolved, so generation never starts in a silent-failure state.
+**Clarifying Questions Phase:**
+Before the main generation begins, Scrimble presents 2-4 targeted questions. The user must answer these to provide the necessary context for architectural decisions. Only after these are answered does the batch-based generation pipeline start.
+
+If no AI provider is configured, `/new` blocks submission and shows a direct "You need to add an AI key first." call-to-action that links to Settings.
 
 **On submit → Generating screen:**
 - Before the activity feed begins, a short "Getting ready to research" transition screen appears when the user arrives from `/new`. It lists the active research depth for this run (`Web search`, `GitHub — authenticated/public only`, `Live docs via Context7`) using the same green/muted badge styling as the architecture review panel. If any optional tools are missing, the screen lingers for ~2.5s and links to `/settings#mcp-servers`; if everything is connected it crossfades out immediately.
@@ -1308,37 +1354,23 @@ Good morning.                                    [+ New project]
 
 ### 15.4 Project View (`/project/[id]`)
 
-The project view has evolved from a node-based graph to a **vertical timeline "Infinite Spine"** layout, prioritizing focus and linear progression.
+The vision for this view is a **Node-Based Canvas** where the project plan is a visual map.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  SIDEBAR       │  TIMELINE VIEW (INFINITE SPINE)         │
-│  280px         │  Central vertical spine connecting steps │
-│                │                                         │
-│  Project name  │  [○] Stage: Understanding (Pillar)      │
-│  Progress ring │   |                                     │
-│  Stage list    │  [●] Step 1: Define Goals (Active)      │
-│                │   |                                     │
-│  ──────────    │  [○] Step 2: User Personas (Locked)     │
-│                │                                         │
-│  Update plan   │                                         │
-│  Export        │                                         │
-└────────────────┴─────────────────────────────────────────┘
-                        ↑ Step detail panel (420px)
-                          slides from right on step click
+> [!IMPORTANT]
+> **Priority Gap**: The current implementation uses a vertical timeline "Infinite Spine" as a functional placeholder. The full Node-Based Canvas redesign is the top UI priority and is not yet implemented.
 
-Sidebar extras:
-- "Download AI files" button (download icon) sits above the exports section. It calls `GET /api/projects/:id/skill-files`, shows the tooltip "Files will be ready when your plan is complete." while the pipeline is running, and enables with paprika fill + hint text: "Paste these into your IDE so your AI coding tool knows exactly what you're building."
+**The Intended Canvas Experience:**
+- **Node-Based Workflow**: A canvas where each stage is a cluster and each step is a node.
+- **Path Visualization**: Nodes are connected with directional edges showing the linear path.
+- **Visual State**: Completed nodes are visually distinct (emerald) from active (paprika pulse) and locked (muted) nodes.
+- **Dynamic Updates**: When a new feature is added mid-build, the agent weaves new nodes into the existing workflow without disrupting completed work.
+- **Daily Anchor**: This view is the daily anchor where users see exactly where they've been and where they are going.
 
-[BOTTOM PILL NAV]  ◇ Plan   ⊞ Projects   ⚙ Settings
-```
-
-- **Vertical Spine**: A central line connecting all steps. It changes color (Solid Paprika/Solid Green/Dashed Grey) based on the nearest step state.
-- **Stage Clusters**: Steps are grouped under sticky Stage headers that mark your progress through the project lifecycle.
-- **Micro-interactions**:
-  - Hovering a step reveals completion/skip actions inline.
-  - Clicking a step slides the **Detail Panel** over the right side, dimming but not hiding the timeline.
-- **Timeline Progress**: The spine fills dynamically as steps are completed, providing a clear visual representation of "distance covered."
+**Current Placeholder (The Infinite Spine):**
+- A central vertical line connecting all steps.
+- Stage clusters grouped under sticky headers.
+- Detail panel slides from right on step click.
+- *This will be replaced by the Canvas experience described above.*
 
 **App Bottom Pill Nav** (timeline, dashboard, settings only):
 position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -1405,74 +1437,39 @@ Amber border. Fraunces heading. Warm, conversational tone.
 
 ---
 
-### 15.7 Settings — AI Keys (`/settings`)
+### 15.7 Workspace Profile & AI Settings (`/settings`)
 
-Before the key list there is a row of three readiness cards (AI coverage, Research depth, Workspace readiness) that mirror the live icons and copy the UI shows when you open `/settings`. Each card totals the connected providers/tools, signals whether the workspace is “Ready to build” or still “Needs one quick setup,” and tells the builder exactly what to do before starting `/new`.
+The **Workspace Profile** is the personalization engine that makes Scrimble's research-first plans accurate. The more a user fills this in, the more specific every generated plan becomes.
 
-```
-Your AI Keys
+**Profile Categories:**
+- **IDEs**: Cursor, Windsurf, VS Code, Claude Code, Zed, etc.
+- **Frameworks**: Next.js, React, Vue, Svelte, etc.
+- **Databases**: Supabase, PlanetScale, Cloudflare D1, Neon, etc.
+- **Hosting / Deployment**: Vercel, Railway, Cloudflare, AWS, etc.
+- **Auth Providers**: Clerk, Kinde, Firebase, Supabase Auth.
+- **Payments**: Stripe, Lemon Squeezy, Paddle.
+- **Subscriptions**: Other tools and services the user pays for.
+- **AI Models**: Preferred models for planning and coding.
 
-Connect the AI tools you already use. Scrimble will use them
-to do the work at each step of your plan.
+> [!IMPORTANT]
+> **Current Status**: While the UI for the profile exists, the deep integration between this data and the Batch 2 Research Agent is not yet fully implemented. This is a high-priority roadmap item.
 
-┌──────────────────────────────────────────────────────────┐
-│  OpenAI                                    [Connected ✓] │
-│  sk-...abc123                                [Remove]    │
-└──────────────────────────────────────────────────────────┘
+---
 
-┌──────────────────────────────────────────────────────────┐
-│  + Add another AI                                        │
-│                                                          │
-│  Which AI?  [OpenAI ▾]   [Anthropic ▾]   [Gemini ▾]    │
-│             [Custom — I'll paste my URL]                 │
-│                                                          │
-│  Your API key: [________________________]               │
-│  Model to use: [________________________]  (optional)   │
-│                                                          │
-│  For custom AIs — your API URL:                         │
-│  [https://...]                                          │
-│                                                          │
-│  [Save key]                                             │
-└──────────────────────────────────────────────────────────┘
+### 15.8 AI Keys & Research Tools (`/settings`)
 
-Your keys are encrypted and never shared. Scrimble uses
-them only to do work on your projects.
-```
+Users connect their AI provider keys and research tools to power the engine.
 
-If the provider refresh fails, a subtle error banner with the message and `Try again` button appears over the list so the builder can reload the saved AI keys without leaving the page. The Research Tools section mirrors that behavior by showing the same inline retry card whenever its load fails, keeping both surfaces deterministic even during network hiccups.
+**AI Provider List:**
+- OpenAI, Anthropic, Gemini, OpenRouter, Groq, or Custom OpenAI-compatible endpoints.
 
-### 15.8 Settings — Research Tools (`/settings`)
+**Research Tool List (The MCP Layer):**
+- **Brave Search**: Powers general web research and community chatter.
+- **GitHub**: Analyzes specific repos, issues, and releases.
+- **Context7**: Injects live documentation into the research phase.
+- **Custom MCP**: User-provided research servers.
 
-```
-Research Tools
-
-Connect tools that let Scrimble do deeper research when
-building your plan. The more you connect, the better your
-plan will be.
-
-┌──────────────────────────────────────────────────────────┐
-│  Brave Search                          [Recommended]     │
-│  API key: [________________________]     [Connect]       │
-├──────────────────────────────────────────────────────────┤
-│  GitHub                                              │
-│  Personal Access Token (public_repo): [___________]   │
-├──────────────────────────────────────────────────────────┤
-│  Context7                              [Recommended]    │
-│  API key: [________________________]     [Connect]      │
-├──────────────────────────────────────────────────────────┤
-│  Custom MCP                                             │
-│  Server name: [____________]  Base URL: [___________]   │
-└──────────────────────────────────────────────────────────┘
-
-If no tools are connected, a subtle paprika nudge appears
-between AI Keys and this section:
-"Connect research tools to make your plans significantly
-more accurate."
-
-Research tools are only used during plan building. Tokens
-are encrypted, masked in the UI, and can be paused or
-disconnected per connection.
-```
+The Research Agent uses these tools to ensure plans are evidence-based and up-to-date.
 
 ### AI Schema Resilience
 When building Zod schemas for AI outputs (especially for researchers), always prioritize resilience over strictness for non-critical fields.
@@ -1603,12 +1600,18 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **Schema reconciliation**: Migration `010_schema_reconciliation.sql` adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, adds `last_error` to `generation_dispatches`, and drops the erstwhile `project_generation_live_state` table.
 - **Checklist Interactions**: Added `updateChecklistItem` to db client allowing full checklist item mutations (labels, requirement status) beyond simple toggles.
 - **SSE Progress Sync**: Added `progress_percent` metric to `batch_complete` events in the generation pipeline to ensure the client-side progress bar perfectly reflects backend generation state.
-- **Review Flapping Fixes**: Hardened the approval/resume flow to prevent status oscillation:
-  - SSE checkpoint events now carry `run_id` to identify which generation run they belong to
-  - Event replay skips stale `review_required` events if the project status has moved past `awaiting_review`
-  - Frontend maintains a live status reference and ignores stale review checkpoints after approval or later batches
-  - Status-based guardrails prevent the pipeline from regressing to `awaiting_review` after approval
-- **Thinking Stream Debug Logging (March 2026)**: Added comprehensive debug logging across the thinking event flow to diagnose why real-time thinking isn't visible in the frontend. Logs added to DO broadcast, generation-events publish/emit, AI reasoning extraction, app.ts proxy handling, and frontend SSE handlers.
+- **Review Flapping Fixes**: Hardened the approval/resume flow to prevent status oscillation.
+- **Thinking Stream Debug Logging (March 2026)**: Added comprehensive debug logging across the thinking event flow to diagnose why real-time thinking isn't visible in the frontend.
+
+### 17.5 Known Product Gaps & Roadmap Priorities
+
+These are the priority gaps between the current implementation and the stated product vision:
+
+1. **Workspace Profile Integration**: User profile data (connected IDEs, frameworks, etc.) is not yet fully wired into Batch 2 research.
+2. **Turn-by-Turn Navigation**: Step content currently offers guidance/advice rather than exact, executable tool-specific instructions.
+3. **Node-Based Canvas**: The plan view is currently a vertical timeline placeholder instead of the intended node-based canvas.
+4. **Research Depth**: Batch 2 research is functional but does not yet consistently study documentation and issues at the depth required by the vision.
+5. **Clarifying Questions Consistency**: The questions phase is implemented but requires hardening across all project and tech stacks.
 
 ---
 
@@ -1691,5 +1694,5 @@ Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
 
 ---
 
-*Scrimble Documentation v4.2 — March 2026*
+*Scrimble Documentation v5.0 — March 2026*
 *This document supersedes all previous versions and all FlowForge documentation.*

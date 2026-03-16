@@ -14,6 +14,13 @@ export interface AIProvider {
   masked_key?: string;
 }
 
+export interface AIModelRoles {
+  fast_model_provider_id: string | null;
+  fast_model_name: string | null;
+  deep_model_provider_id: string | null;
+  deep_model_name: string | null;
+}
+
 const DiffChecklistItemSchema = z.object({
   label: z.string(),
   is_required: z.boolean().optional().default(false),
@@ -94,6 +101,63 @@ export async function saveAIProvider(data: {
     throw new Error(err.error || 'Failed to save provider');
   }
   return response.json();
+}
+
+export async function getAIModelRoles(): Promise<AIModelRoles> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('User not authenticated');
+  }
+
+  const token = await user.getIdToken();
+  const response = await fetch('/api/settings/model-roles', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: 'Failed to load model roles.' }));
+    throw new Error(err.error || 'Failed to load model roles.');
+  }
+
+  const payload = await response.json() as Partial<AIModelRoles>;
+  return {
+    fast_model_provider_id: payload.fast_model_provider_id || null,
+    fast_model_name: payload.fast_model_name || null,
+    deep_model_provider_id: payload.deep_model_provider_id || null,
+    deep_model_name: payload.deep_model_name || null,
+  };
+}
+
+export async function saveAIModelRoles(payload: AIModelRoles): Promise<AIModelRoles> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('User not authenticated');
+  }
+
+  const token = await user.getIdToken();
+  const response = await fetch('/api/settings/model-roles', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: 'Failed to save model roles.' }));
+    throw new Error(err.error || 'Failed to save model roles.');
+  }
+
+  const body = await response.json() as Partial<AIModelRoles>;
+  return {
+    fast_model_provider_id: body.fast_model_provider_id || null,
+    fast_model_name: body.fast_model_name || null,
+    deep_model_provider_id: body.deep_model_provider_id || null,
+    deep_model_name: body.deep_model_name || null,
+  };
 }
 
 export async function deleteAIProvider(providerId: string) {

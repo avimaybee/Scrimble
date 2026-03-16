@@ -1,8 +1,149 @@
-import type { ProviderType } from './types';
+import { decrypt } from '../utils/crypto';
+import type { Bindings, ProviderType } from './types';
 
 type StreamCallbacks = {
   onReasoningDelta?: (delta: string) => void;
 };
+
+export type ModelRole = 'fast' | 'deep' | 'default';
+
+export type ResolvedProvider = {
+  providerId: string;
+  providerType: ProviderType;
+  apiKey: string;
+  model: string;
+  baseUrl: string | null;
+};
+
+type ProviderRow = {
+  id: string;
+  provider: string;
+  api_key_enc: string;
+  model: string | null;
+  base_url: string | null;
+};
+
+type RoleProfileRow = {
+  fast_model_provider_id: string | null;
+  fast_model_name: string | null;
+  deep_model_provider_id: string | null;
+  deep_model_name: string | null;
+};
+
+type ProviderRoleSlot = {
+  providerId: string | null;
+  modelName: string | null;
+};
+
+function optionalTrimmedText(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isConfiguredRoleSlot(slot: ProviderRoleSlot) {
+  return Boolean(slot.providerId && slot.modelName);
+}
+
+async function loadProviderRowById(env: Bindings, userId: string, providerId: string) {
+  return env.DB.prepare('SELECT * FROM ai_providers WHERE id = ? AND user_id = ?')
+    .bind(providerId, userId)
+    .first() as Promise<ProviderRow | null>;
+}
+
+async function loadDefaultProviderRow(env: Bindings, userId: string) {
+  return env.DB.prepare(
+    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC LIMIT 1',
+  )
+    .bind(userId)
+    .first() as Promise<ProviderRow | null>;
+}
+
+async function loadResolvedProviderFromRow(env: Bindings, row: ProviderRow, modelOverride?: string | null) {
+  const providerType = row.provider as ProviderType;
+  const apiKey = await decrypt(row.api_key_enc, env.ENCRYPTION_KEY);
+
+  return {
+    providerId: row.id,
+    providerType,
+    apiKey,
+    model: optionalTrimmedText(modelOverride) || optionalTrimmedText(row.model) || defaultModelForProvider(providerType),
+    baseUrl: optionalTrimmedText(row.base_url),
+  } satisfies ResolvedProvider;
+}
+
+async function loadProfileRoleSlots(env: Bindings, userId: string) {
+  const profile = await (env.DB.prepare(`
+    SELECT
+      fast_model_provider_id,
+      fast_model_name,
+      deep_model_provider_id,
+      deep_model_name
+    FROM profiles
+    WHERE id = ?
+    LIMIT 1
+  `)
+    .bind(userId)
+    .first() as Promise<RoleProfileRow | null>);
+
+  return {
+    fast: {
+      providerId: optionalTrimmedText(profile?.fast_model_provider_id),
+      modelName: optionalTrimmedText(profile?.fast_model_name),
+    },
+    deep: {
+      providerId: optionalTrimmedText(profile?.deep_model_provider_id),
+      modelName: optionalTrimmedText(profile?.deep_model_name),
+    },
+  };
+}
+
+export async function getProvider(
+  env: Bindings,
+  userId: string,
+  options: {
+    providerId?: string;
+    role?: ModelRole;
+  } = {},
+): Promise<ResolvedProvider | null> {
+  const role = options.role || 'default';
+  const defaultRow = options.providerId
+    ? await loadProviderRowById(env, userId, options.providerId)
+    : await loadDefaultProviderRow(env, userId);
+
+  if (role === 'default') {
+    if (!defaultRow) {
+      return null;
+    }
+
+    return loadResolvedProviderFromRow(env, defaultRow);
+  }
+
+  const slots = await loadProfileRoleSlots(env, userId);
+  const primarySlot = role === 'fast' ? slots.fast : slots.deep;
+  const secondarySlot = role === 'fast' ? slots.deep : slots.fast;
+  const selectedSlot = isConfiguredRoleSlot(primarySlot)
+    ? primarySlot
+    : isConfiguredRoleSlot(secondarySlot)
+      ? secondarySlot
+      : null;
+
+  if (selectedSlot?.providerId) {
+    const slotProviderRow = await loadProviderRowById(env, userId, selectedSlot.providerId);
+    if (slotProviderRow) {
+      return loadResolvedProviderFromRow(env, slotProviderRow, selectedSlot.modelName);
+    }
+  }
+
+  if (!defaultRow) {
+    return null;
+  }
+
+  return loadResolvedProviderFromRow(env, defaultRow);
+}
 
 export function extractJSON(raw: string): string {
   // 1. Try to find markdown code blocks first
@@ -120,6 +261,63 @@ export function defaultModelForProvider(provider: ProviderType): string {
     default:
       return 'gpt-4o-mini';
   }
+}
+
+export function getModelContextWindow(providerName: string, modelName: string): number {
+  const provider = providerName.trim().toLowerCase();
+  const rawModel = modelName.trim().toLowerCase();
+
+  if (!rawModel) {
+    return 128_000;
+  }
+
+  const withoutProviderPrefix = rawModel.includes('/') ? rawModel.split('/').pop() || rawModel : rawModel;
+  const normalized = withoutProviderPrefix.replace(/_/g, '-');
+  const normalizedWithDots = normalized.replace(/\./g, '-');
+  const candidates = [normalized, normalizedWithDots, `${provider}:${normalized}`, `${provider}:${normalizedWithDots}`];
+
+  const startsWithAny = (prefixes: string[]) => candidates.some((candidate) =>
+    prefixes.some((prefix) => candidate.startsWith(prefix)));
+  const includesAny = (needles: string[]) => candidates.some((candidate) =>
+    needles.some((needle) => candidate.includes(needle)));
+
+  if (startsWithAny(['gemini-3.1-flash'])) {
+    return 1_000_000;
+  }
+
+  if (startsWithAny(['gemini-2.5-', 'gemini-2.5'])) {
+    return 1_000_000;
+  }
+
+  if (startsWithAny(['gemini-2.0-', 'gemini-2.0'])) {
+    return 1_000_000;
+  }
+
+  if (startsWithAny(['gpt-4o-mini'])) {
+    return 128_000;
+  }
+
+  if (startsWithAny(['gpt-4o'])) {
+    return 128_000;
+  }
+
+  if (includesAny(['claude-3-5-sonnet', 'claude-3.5-sonnet'])) {
+    return 200_000;
+  }
+
+  if (includesAny(['claude-3-7-sonnet', 'claude-3.7-sonnet'])) {
+    return 200_000;
+  }
+
+  if (includesAny(['deepseek-r1'])) {
+    return 128_000;
+  }
+
+  if (includesAny(['llama-3.3-70b', 'llama-3-3-70b'])) {
+    return 128_000;
+  }
+
+  return 200_000;
 }
 
 export async function streamToText(
@@ -667,15 +865,20 @@ async function readAIErrorPayload(response: Response) {
   }
 }
 
-export async function callProvider(payload: {
+export interface GenerateOptions {
   providerType: ProviderType;
   apiKey: string;
   model: string;
   baseUrl?: string | null;
   system?: string | null;
   prompt: string;
-  signal?: AbortSignal;
-}) {
+  onReasoningDelta?: (delta: string) => void | Promise<void>;
+  role?: ModelRole;
+}
+
+type ProviderRequestOptions = Omit<GenerateOptions, 'onReasoningDelta'>;
+
+export async function callProvider(payload: ProviderRequestOptions & { signal?: AbortSignal }) {
   const commonFetchOptions = {
     method: 'POST',
     signal: payload.signal,
@@ -774,17 +977,10 @@ export async function callProvider(payload: {
 }
 
 
-export async function callAIWithRetry(payload: {
-  providerType: ProviderType;
-  apiKey: string;
-  model: string;
-  baseUrl?: string | null;
-  system?: string | null;
-  prompt: string;
-}): Promise<Response> {
+export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<Response> {
   const maxRetries = 3;
   const backoffs = [1000, 3000, 7000];
-  const logTag = `[callAIWithRetry] [${payload.providerType}/${payload.model}]`;
+  const logTag = `[callAIWithRetry] [${payload.providerType}/${payload.model}/${payload.role || 'default'}]`;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     const controller = new AbortController();
@@ -903,15 +1099,7 @@ export async function readAIErrorMessage(response: Response) {
   };
 }
 
-export async function callAIText(payload: {
-  providerType: ProviderType;
-  apiKey: string;
-  model: string;
-  baseUrl?: string | null;
-  system?: string | null;
-  prompt: string;
-  onReasoningDelta?: (delta: string) => void | Promise<void>;
-}): Promise<{
+export async function callAIText(payload: GenerateOptions): Promise<{
   text: string;
   response: Response;
 }> {

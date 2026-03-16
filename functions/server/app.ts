@@ -22,6 +22,7 @@ import {
   callAIWithRetry,
   defaultModelForProvider,
   extractJSON,
+  getProvider,
   streamProviderText,
 } from './ai';
 import {
@@ -63,7 +64,6 @@ import {
   type ProjectGenerationBackend,
   type ProjectGenerationStatus,
   type PreferredIde,
-  type ProviderType,
 } from './types';
 
 export const app = new Hono<AppEnv>().basePath('/api');
@@ -126,6 +126,13 @@ const intakeRespondSchema = z.object({
 
 const intakeConfirmSchema = z.object({
   providerId: z.string().trim().optional(),
+});
+
+const modelRolesSchema = z.object({
+  fast_model_provider_id: z.string().trim().nullable().optional(),
+  fast_model_name: z.string().trim().nullable().optional(),
+  deep_model_provider_id: z.string().trim().nullable().optional(),
+  deep_model_name: z.string().trim().nullable().optional(),
 });
 
 const architectureReviewApprovalSchema = z.object({
@@ -633,30 +640,12 @@ async function resolveProvider(c: AppContext, providerId?: string) {
     .first();
 }
 
-async function resolveProviderContext(c: AppContext, providerId?: string) {
-  const providerRecord = await resolveProvider(c, providerId);
-  if (!providerRecord) {
-    return null;
-  }
-
-  let apiKey: string;
-  try {
-    apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
-  } catch {
-    throw new Error('Failed to decrypt API key');
-  }
-
-  const providerType = providerRecord.provider as ProviderType;
-  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
-  const baseUrl = providerRecord.base_url as string | null;
-
-  return {
-    providerId: providerRecord.id as string,
-    providerType,
-    apiKey,
-    model,
-    baseUrl,
-  };
+async function resolveProviderContext(
+  c: AppContext,
+  providerId?: string,
+  role: 'fast' | 'deep' | 'default' = 'default',
+) {
+  return getProvider(c.env, c.get('uid'), { providerId, role });
 }
 
 async function insertAgentRun(
@@ -785,6 +774,99 @@ app.delete('/ai/providers/:id', async (c) => {
 
   await c.env.DB.prepare('DELETE FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, c.get('uid')).run();
   return c.json({ success: true });
+});
+
+app.get('/settings/model-roles', async (c) => {
+  const profile = await c.env.DB.prepare(`
+    SELECT
+      fast_model_provider_id,
+      fast_model_name,
+      deep_model_provider_id,
+      deep_model_name
+    FROM profiles
+    WHERE id = ?
+    LIMIT 1
+  `)
+    .bind(c.get('uid'))
+    .first();
+
+  return c.json({
+    fast_model_provider_id: optionalText(profile?.fast_model_provider_id),
+    fast_model_name: optionalText(profile?.fast_model_name),
+    deep_model_provider_id: optionalText(profile?.deep_model_provider_id),
+    deep_model_name: optionalText(profile?.deep_model_name),
+  });
+});
+
+app.put('/settings/model-roles', async (c) => {
+  const parsed = modelRolesSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid model role payload', details: parsed.error.format() }, 400);
+  }
+
+  const fastModelProviderId = optionalText(parsed.data.fast_model_provider_id);
+  const fastModelName = optionalText(parsed.data.fast_model_name);
+  const deepModelProviderId = optionalText(parsed.data.deep_model_provider_id);
+  const deepModelName = optionalText(parsed.data.deep_model_name);
+
+  if ((fastModelProviderId && !fastModelName) || (!fastModelProviderId && fastModelName)) {
+    return c.json({ error: 'Fast model needs both a provider and a model name.' }, 400);
+  }
+
+  if ((deepModelProviderId && !deepModelName) || (!deepModelProviderId && deepModelName)) {
+    return c.json({ error: 'Deep model needs both a provider and a model name.' }, 400);
+  }
+
+  const selectedProviderIds = [fastModelProviderId, deepModelProviderId].filter(
+    (id): id is string => Boolean(id),
+  );
+
+  if (selectedProviderIds.length > 0) {
+    const placeholders = selectedProviderIds.map(() => '?').join(', ');
+    const ownedProviderRows = await c.env.DB.prepare(`
+      SELECT id
+      FROM ai_providers
+      WHERE user_id = ? AND id IN (${placeholders})
+    `)
+      .bind(c.get('uid'), ...selectedProviderIds)
+      .all();
+
+    const ownedProviderIds = new Set(
+      (ownedProviderRows.results as Array<{ id: string }>).map((row) => row.id),
+    );
+
+    const missingProvider = selectedProviderIds.find((id) => !ownedProviderIds.has(id));
+    if (missingProvider) {
+      return c.json({ error: 'One or more selected providers are unavailable for this account.' }, 400);
+    }
+  }
+
+  await c.env.DB.prepare(`
+    UPDATE profiles
+    SET
+      fast_model_provider_id = ?,
+      fast_model_name = ?,
+      deep_model_provider_id = ?,
+      deep_model_name = ?,
+      updated_at = datetime("now")
+    WHERE id = ?
+  `)
+    .bind(
+      fastModelProviderId,
+      fastModelName,
+      deepModelProviderId,
+      deepModelName,
+      c.get('uid'),
+    )
+    .run();
+
+  return c.json({
+    success: true,
+    fast_model_provider_id: fastModelProviderId,
+    fast_model_name: fastModelName,
+    deep_model_provider_id: deepModelProviderId,
+    deep_model_name: deepModelName,
+  });
 });
 
 app.get('/settings/mcp-servers', async (c) => {
@@ -918,7 +1000,7 @@ app.post('/intake/start', async (c) => {
 
   let providerContext;
   try {
-    providerContext = await resolveProviderContext(c, parsed.data.providerId);
+    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'fast');
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'Failed to load AI provider.' }, 500);
   }
@@ -1002,7 +1084,7 @@ app.post('/intake/:id/respond', async (c) => {
 
   let providerContext;
   try {
-    providerContext = await resolveProviderContext(c, parsed.data.providerId);
+    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'fast');
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'Failed to load AI provider.' }, 500);
   }
@@ -2440,21 +2522,15 @@ app.post('/workflows/:id/update', async (c) => {
     return c.json({ error: 'Invalid workflow update payload', details: parsed.error.format() }, 400);
   }
 
-  const providerRecord = await resolveProvider(c, parsed.data.providerId);
-  if (!providerRecord) {
+  const [defaultProviderContext, fastProviderContext, deepProviderContext] = await Promise.all([
+    resolveProviderContext(c, parsed.data.providerId, 'default'),
+    resolveProviderContext(c, parsed.data.providerId, 'fast'),
+    resolveProviderContext(c, parsed.data.providerId, 'deep'),
+  ]);
+
+  if (!defaultProviderContext || !fastProviderContext || !deepProviderContext) {
     return c.json({ error: 'You need to add an AI key first.' }, 400);
   }
-
-  let apiKey: string;
-  try {
-    apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
-  } catch {
-    return c.json({ error: 'Failed to decrypt API key' }, 500);
-  }
-
-  const providerType = providerRecord.provider as ProviderType;
-  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
-  const baseUrl = providerRecord.base_url as string | null;
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
 
@@ -2471,11 +2547,10 @@ app.post('/workflows/:id/update', async (c) => {
             description: optionalText(workflowRecord.description),
             stack: optionalText(workflowRecord.stack),
           },
-          provider: {
-            providerType,
-            apiKey,
-            model,
-            baseUrl,
+          providers: {
+            default: defaultProviderContext,
+            fast: fastProviderContext,
+            deep: deepProviderContext,
           },
           message: parsed.data.message,
           driftResolution: parsed.data.driftResolution,
@@ -2589,22 +2664,23 @@ app.post('/steps/:id/enrich', async (c) => {
     },
   );
 
-  const providerRecord = await resolveProvider(c, providerId);
-  if (!providerRecord) {
+  let providerContext;
+  try {
+    providerContext = await resolveProviderContext(c, providerId, 'deep');
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'Failed to decrypt API key' }, 500);
+  }
+
+  if (!providerContext) {
     return c.json({ error: 'No AI provider is configured yet. Add one in Settings first.' }, 400);
   }
 
-  let apiKey: string;
-  try {
-    // SECURITY: key material never logged
-    apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
-  } catch {
-    return c.json({ error: 'Failed to decrypt API key' }, 500);
-  }
-
-  const providerType = providerRecord.provider as ProviderType;
-  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
-  const baseUrl = providerRecord.base_url as string | null;
+  const {
+    providerType,
+    apiKey,
+    model,
+    baseUrl,
+  } = providerContext;
   const systemPrompt = appendProjectBriefSystemPrompt(
     `You are Scrimble's step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.`,
     projectBriefContext.promptContext,
@@ -2652,6 +2728,7 @@ app.post('/steps/:id/enrich', async (c) => {
       baseUrl,
       system: systemPrompt,
       prompt: promptSections.join('\n\n'),
+      role: 'deep',
     });
 
     if (!aiResponse.ok) {
@@ -2753,22 +2830,17 @@ app.post('/ai/proxy', async (c) => {
     return c.json({ error: 'Invalid proxy payload', details: parsed.error.format() }, 400);
   }
 
-  const providerRecord = await resolveProvider(c, parsed.data.providerId);
-  if (!providerRecord) {
+  let providerContext;
+  try {
+    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'default');
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'Failed to decrypt API key' }, 500);
+  }
+
+  if (!providerContext) {
     return c.json({ error: 'No AI provider is configured yet. Add one in Settings first.' }, 400);
   }
-
-  let apiKey: string;
-  try {
-    // SECURITY: key material never logged
-    apiKey = await decrypt(providerRecord.api_key_enc as string, c.env.ENCRYPTION_KEY);
-  } catch {
-    return c.json({ error: 'Failed to decrypt API key' }, 500);
-  }
-
-  const providerType = providerRecord.provider as ProviderType;
-  const model = (providerRecord.model as string | null) || defaultModelForProvider(providerType);
-  const baseUrl = providerRecord.base_url as string | null;
+  const { providerType, apiKey, model, baseUrl } = providerContext;
   const runId = parsed.data.projectId
     ? await insertAgentRun(c, {
         projectId: parsed.data.projectId,
@@ -2788,6 +2860,7 @@ app.post('/ai/proxy', async (c) => {
       baseUrl,
       system: parsed.data.system || null,
       prompt: parsed.data.prompt,
+      role: 'default',
     });
 
     if (!response.ok) {

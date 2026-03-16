@@ -205,13 +205,13 @@ export const Batch3ArchitectSchema = z.preprocess(
     recommended_stack: z.preprocess(
       (entry) => normalizeObject(entry, () => ({})),
       z.object({
-        frontend: createRequiredTextSchema('Not specified'),
-        backend: createRequiredTextSchema('Not specified'),
-        auth: createRequiredTextSchema('Not specified'),
-        database: createRequiredTextSchema('Not specified'),
-        payments: createRequiredTextSchema('Not specified'),
-        email: createRequiredTextSchema('Not specified'),
-        deploy: createRequiredTextSchema('Not specified'),
+        frontend: createRequiredTextSchema('Web framework'),
+        backend: createRequiredTextSchema('Server environment'),
+        auth: createRequiredTextSchema('Authentication provider'),
+        database: createRequiredTextSchema('Primary database'),
+        payments: createRequiredTextSchema('Payment processor (optional)'),
+        email: createRequiredTextSchema('Email service (optional)'),
+        deploy: createRequiredTextSchema('Deployment platform'),
       }),
     ),
     data_model: z.preprocess(
@@ -246,9 +246,9 @@ export const Batch3ArchitectSchema = z.preprocess(
         z.preprocess(
           (entry) => normalizeObject(entry, () => ({})),
           z.object({
-            service: createRequiredTextSchema('Unknown service'),
-            purpose: createRequiredTextSchema('Purpose not specified'),
-            package_name: createRequiredTextSchema('unknown-package'),
+            service: createRequiredTextSchema('External Service'),
+            purpose: createRequiredTextSchema('Implementation detail'),
+            package_name: createRequiredTextSchema('library-or-service'),
             version: createRequiredTextSchema('latest'),
           }),
         ),
@@ -272,9 +272,9 @@ export const Batch3ArchitectSchema = z.preprocess(
         z.preprocess(
           (entry) => normalizeObject(entry, () => ({})),
           z.object({
-            technology: createRequiredTextSchema('Unknown technology'),
-            issue: createRequiredTextSchema('Issue not specified'),
-            mitigation: createRequiredTextSchema('Mitigation not specified'),
+            technology: createRequiredTextSchema('General Architecture'),
+            issue: createRequiredTextSchema('General implementation consideration'),
+            mitigation: createRequiredTextSchema('Follow standard patterns and best practices'),
           }),
         ),
       ),

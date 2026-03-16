@@ -41,8 +41,9 @@ import {
   callAIText,
   containsReasoningMarkers,
   containsStreamTransportMarkers,
-  defaultModelForProvider,
   extractJSON,
+  getProvider,
+  type ModelRole,
   PipelineQuotaExceededError,
   RetryableAIError,
   trimToLimit,
@@ -56,7 +57,6 @@ import {
 import { sendGenerationDispatch } from './generation-dispatch';
 
 
-import { decrypt } from '../utils/crypto';
 import { extractGitHubRepository } from '../utils/fetch-url';
 import {
   analyzeGithubRepo,
@@ -929,18 +929,26 @@ function findMatchingGotcha(
   });
 }
 
-function fallbackStackCardsFromRecommendedStack(adr: Batch3Architect): ArchitectureReviewStackCard[] {
+function fallbackStackCardsFromRecommendedStack(adr: Batch3Architect, research: Batch2FetchAndRead['research'] = []): ArchitectureReviewStackCard[] {
   return Object.entries(adr.recommended_stack).map(([category, selection]) => {
     const versionMatch = selection.match(/\bv?\d+(?:\.\d+)+(?:[-\w.]*)?/i);
     const version = versionMatch?.[0] || 'See ADR';
-    const packageName = normalizeToNpmPackage(
-      selection.replace(versionMatch?.[0] || '', '').replace(/[()]/g, '').trim() || selection,
+    
+    // Attempt to find a matching technology in the research corpus for better package naming
+    const cleanSelection = selection.replace(versionMatch?.[0] || '', '').replace(/[()]/g, '').trim();
+    const researchEntry = research.find(r => 
+      r.technology.toLowerCase() === cleanSelection.toLowerCase() ||
+      cleanSelection.toLowerCase().includes(r.technology.toLowerCase())
     );
+
+    const packageName = researchEntry 
+      ? normalizeToNpmPackage(researchEntry.technology)
+      : normalizeToNpmPackage(cleanSelection || selection);
 
     return {
       technology: category.replace(/^\w/, (character) => character.toUpperCase()),
       package_name: packageName,
-      version,
+      version: researchEntry?.latest_version || version,
       reason: `Recommended ${category} choice for this architecture.`,
     };
   });
@@ -1261,7 +1269,7 @@ function buildArchitectureReviewPayload(
       optionalText(adr.how_it_connects)
       || 'The interface talks to the application backend, the backend writes to the core database, and the supporting services handle the surrounding workflows.',
     recommended_stack: adr.recommended_stack,
-    stack_cards: stackCards.length > 0 ? stackCards : fallbackStackCardsFromRecommendedStack(adr),
+    stack_cards: stackCards.length > 0 ? stackCards : fallbackStackCardsFromRecommendedStack(adr, research.research),
     stack_sections: buildArchitectureStackSections(adr),
     data_model: adr.data_model.map((table) => ({
       table: table.table,
@@ -2341,31 +2349,14 @@ async function resolveProviderConfiguration(
   env: Bindings,
   userId: string,
   providerId?: string,
+  role: ModelRole = 'default',
 ): Promise<ProviderConfig> {
-  const providerRecord = providerId
-    ? await env.DB.prepare('SELECT * FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, userId).first()
-    : await env.DB.prepare(
-        'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC LIMIT 1',
-      )
-        .bind(userId)
-        .first();
-
-  const typedProviderRecord = providerRecord as Record<string, unknown> | null;
-
-  if (!typedProviderRecord) {
+  const provider = await getProvider(env, userId, { providerId, role });
+  if (!provider) {
     throw new GenerationPipelineError('No AI provider is configured yet. Add one in Settings first.');
   }
 
-  const apiKey = await decrypt(asText(typedProviderRecord.api_key_enc), env.ENCRYPTION_KEY);
-  const providerType = asText(typedProviderRecord.provider) as ProviderType;
-
-  return {
-    providerId: asText(typedProviderRecord.id),
-    providerType,
-    model: optionalText(typedProviderRecord.model) || defaultModelForProvider(providerType),
-    baseUrl: optionalText(typedProviderRecord.base_url),
-    apiKey,
-  };
+  return provider;
 }
 
 function formatValidationRetryPrompt(basePrompt: string, previousResponse: string, schemaDescription: string) {
@@ -2427,6 +2418,7 @@ async function callValidatedBatch<T>(
     projectId: string;
     runId: string;
     runType: GenerationBatchName;
+    role: ModelRole;
     systemPrompt: string;
     prompt: string;
     schema: ZodType<T>;
@@ -2454,6 +2446,7 @@ async function callValidatedBatch<T>(
         baseUrl: provider.baseUrl,
         system: options.systemPrompt,
         prompt,
+        role: options.role,
         onReasoningDelta: emitter.onReasoningDelta,
       });
       await logActivity(options.env, {
@@ -2894,6 +2887,7 @@ Identify the stack implied by the idea. For each technology, provide:
       projectId: project.id,
       runId,
       runType: 'batch_1_research_stack',
+      role: 'fast',
       systemPrompt,
       prompt,
       schema: Batch1ResearchStackSchema,
@@ -3540,6 +3534,7 @@ Preserve specific version and compatibility details.`;
       projectId,
       runId,
       runType: 'batch_2_fetch_and_read',
+      role: 'fast',
       systemPrompt,
       prompt,
       schema: Batch2FetchAndReadSchema,
@@ -3647,7 +3642,7 @@ async function executeBatch3(
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s staff engineer architect. Use the research corpus to produce a clear architecture decision record with explicit package and service choices. Return only valid JSON.',
+    'You are Scrimble’s staff engineer architect. Use the research corpus to produce a clear architecture decision record with explicit package and service choices. Every recommendation must be grounded in the provided research data. Return only valid JSON.',
     projectBrief.promptContext,
   );
   const prompt = `Project description:
@@ -3656,20 +3651,24 @@ ${projectBrief.summary || project.description || 'No description provided.'}
 Research corpus:
 ${JSON.stringify(batch2.research, null, 2)}
 
-Produce:
-- project_name (string)
-- project_type (string)
-- project_summary (2-3 sentence plain-language prose summary of what the product does, who it's for, and what problem it solves)
-- how_it_connects (4-6 sentence plain-language prose explanation of how the main pieces connect and how data moves through the system)
-- recommended_stack (each field should be a plain string like "Next.js", not an object)
-- data_model
-- integrations with package_name and version
-- security_surface
-- gotchas with mitigations
+Produce a structured Architecture Decision Record (ADR):
+- project_name: A concise, catchy name.
+- project_type: The primary technical category (e.g., "SaaS", "Mobile App", "Internal Tool").
+- project_summary: 2-3 sentence plain-language prose summary of what the product does, who it's for, and what problem it solves.
+- how_it_connects: 4-6 sentence plain-language prose explanation of how the main pieces connect and how data moves through the system.
+- recommended_stack: A flat object with keys { frontend, backend, auth, database, payments, email, deploy }.
+  IMPORTANT: Each value must be a plain string technology name (e.g., "Next.js", "Firebase", "Stripe"). 
+  ONLY use technology names found in the research corpus technology list.
 
-Base every recommendation on the provided research corpus.
+- data_model: Array of tables with columns (name, type, nullable), and relationships.
+- integrations: Array of { service, purpose, package_name, version }. 
+  IMPORTANT: The "service" field should be the common name of the technology (e.g., "Next.js", "Firebase", "Stripe"). 
+  Retrieve the exact package_name and highest stable version from the research corpus for each integration. Do not use "latest" or placeholder names if the information is available in the research.
 
-IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "PostgreSQL", NOT objects like { label: "Next.js", value: "nextjs" }. Each field (frontend, backend, auth, database, payments, email, deploy) must be a single technology name as a string.`;
+- security_surface: Critical concerns and mitigation strategies.
+- gotchas: Explicit technology-specific warnings (technology, issue, mitigation) derived from the "recent_breaking_changes" and "bug_report_digest" in the research corpus.
+
+Base every single recommendation on the provided research corpus. If a technology was not researched in Batch 2, do not recommend it unless it is a standard browser feature.`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -3677,6 +3676,7 @@ IMPORTANT: For recommended_stack, return plain strings like "Next.js" or "Postgr
       projectId,
       runId,
       runType: 'batch_3_architect',
+      role: 'deep',
       systemPrompt,
       prompt,
       schema: Batch3ArchitectSchema,
@@ -3848,6 +3848,7 @@ Rules:
       projectId,
       runId,
       runType: 'batch_4_plan_build',
+      role: 'deep',
       systemPrompt,
       prompt,
       schema: Batch4PlanBuildSchema,
@@ -4062,6 +4063,7 @@ For each step, obey any requirements array included in the live step research co
       projectId,
       runId,
       runType: 'batch_5_enrich_steps',
+      role: 'deep',
       systemPrompt,
       prompt,
       schema: Batch5EnrichStepsSchema,
@@ -4186,6 +4188,7 @@ Rules:
       projectId,
       runId,
       runType: 'batch_6_generate_files',
+      role: 'deep',
       systemPrompt,
       prompt,
       schema: Batch6GenerateFilesSchema,
@@ -4454,10 +4457,23 @@ async function processProjectGenerationTurn(
     );
   }
 
-  const provider = await resolveProviderConfiguration(
+  const defaultProvider = await resolveProviderConfiguration(
     env,
     message.userId,
     pinnedProviderId,
+    'default',
+  );
+  const fastProvider = await resolveProviderConfiguration(
+    env,
+    message.userId,
+    pinnedProviderId,
+    'fast',
+  );
+  const deepProvider = await resolveProviderConfiguration(
+    env,
+    message.userId,
+    pinnedProviderId,
+    'deep',
   );
   const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
   const statusToRun = await resolvePipelineStatusToRun(env, project.id, currentStatus, completed);
@@ -4469,7 +4485,7 @@ async function processProjectGenerationTurn(
     clearCompletedAt: true,
     touchHeartbeat: true,
     generationRunId: activeRunId,
-    generationProviderId: provider.providerId,
+    generationProviderId: defaultProvider.providerId,
     expectedRunId: activeRunId,
   });
   if (primingChanges === 0) {
@@ -4484,7 +4500,7 @@ async function processProjectGenerationTurn(
       clearCompletedAt: true,
       touchHeartbeat: true,
       generationRunId: activeRunId,
-      generationProviderId: provider.providerId,
+      generationProviderId: defaultProvider.providerId,
       expectedRunId: activeRunId,
     });
     if (queuedChanges === 0) {
@@ -4512,12 +4528,12 @@ async function processProjectGenerationTurn(
       return false;
     case 'queued':
       if (!completed.includes('batch_1_research_stack')) {
-        await executeBatch1(env, project, provider, activeRunId, builderProfile, projectBrief);
+        await executeBatch1(env, project, fastProvider, activeRunId, builderProfile, projectBrief);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: provider.providerId,
+            providerId: defaultProvider.providerId,
             runId: activeRunId,
             targetStatus: 'queued',
           });
@@ -4527,12 +4543,12 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_1_research_stack':
       if (!completed.includes('batch_2_fetch_and_read')) {
-        await executeBatch2(env, project, provider, activeRunId, builderProfile, projectBrief, continuationMode);
+        await executeBatch2(env, project, fastProvider, activeRunId, builderProfile, projectBrief, continuationMode);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: provider.providerId,
+            providerId: defaultProvider.providerId,
             runId: activeRunId,
             targetStatus: 'batch_1_research_stack',
           });
@@ -4542,7 +4558,7 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_2_fetch_and_read':
       if (!completed.includes('batch_3_architect')) {
-        await executeBatch3(env, project.id, activeRunId, provider, project, builderProfile, projectBrief);
+        await executeBatch3(env, project.id, activeRunId, deepProvider, project, builderProfile, projectBrief);
       }
       await pauseForArchitectureReview(env, project.id, activeRunId);
       return false;
@@ -4551,12 +4567,12 @@ async function processProjectGenerationTurn(
       return false;
     case 'approved':
       if (!completed.includes('batch_4_plan_build')) {
-        await executeBatch4(env, project.id, activeRunId, provider, builderProfile, projectBrief);
+        await executeBatch4(env, project.id, activeRunId, deepProvider, builderProfile, projectBrief);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: provider.providerId,
+            providerId: defaultProvider.providerId,
             runId: activeRunId,
             targetStatus: 'approved',
           });
@@ -4566,12 +4582,12 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_4_plan_build':
       if (!completed.includes('batch_5_enrich_steps')) {
-        await executeBatch5(env, project.id, provider, activeRunId, builderProfile, projectBrief);
+        await executeBatch5(env, project.id, deepProvider, activeRunId, builderProfile, projectBrief);
         if (continuationMode === 'queue') {
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: provider.providerId,
+            providerId: defaultProvider.providerId,
             runId: activeRunId,
             targetStatus: 'batch_4_plan_build',
           });
@@ -4581,7 +4597,7 @@ async function processProjectGenerationTurn(
       return false;
     case 'batch_5_enrich_steps':
       if (!completed.includes('batch_6_generate_files')) {
-        await executeBatch6(env, project.id, activeRunId, provider, builderProfile, projectBrief);
+        await executeBatch6(env, project.id, activeRunId, deepProvider, builderProfile, projectBrief);
       }
       await finalizeProjectGeneration(env, project.id, activeRunId);
       return false;

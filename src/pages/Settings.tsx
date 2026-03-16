@@ -22,10 +22,13 @@ import { useAuthStore } from '../store/authStore';
 import { logout } from '../lib/firebase';
 import { InlineError } from '../components/ui/InlineError';
 import {
+  AIModelRoles,
   AIProvider,
   AIProviderType,
   deleteAIProvider,
+  getAIModelRoles,
   getAIProviders,
+  saveAIModelRoles,
   saveAIProvider,
   testAIProvider,
 } from '../lib/ai';
@@ -125,6 +128,16 @@ type ProviderFormState = {
   baseUrl: string;
 };
 
+type ModelRoleSlotFormState = {
+  providerId: string;
+  modelName: string;
+};
+
+type ModelRoleFormState = {
+  fast: ModelRoleSlotFormState;
+  deep: ModelRoleSlotFormState;
+};
+
 type MCPFormFieldName = 'apiKey' | 'token' | 'name' | 'baseUrl';
 
 type MCPFormState = {
@@ -160,6 +173,17 @@ const defaultFormState: ProviderFormState = {
   apiKey: '',
   model: '',
   baseUrl: '',
+};
+
+const defaultModelRoleFormState: ModelRoleFormState = {
+  fast: {
+    providerId: '',
+    modelName: '',
+  },
+  deep: {
+    providerId: '',
+    modelName: '',
+  },
 };
 
 const defaultMCPFormState: MCPFormState = {
@@ -270,6 +294,33 @@ function getProviderSummary(provider: AIProvider) {
   return provider.name;
 }
 
+function mapRolesToFormState(roles: AIModelRoles): ModelRoleFormState {
+  return {
+    fast: {
+      providerId: roles.fast_model_provider_id || '',
+      modelName: roles.fast_model_name || '',
+    },
+    deep: {
+      providerId: roles.deep_model_provider_id || '',
+      modelName: roles.deep_model_name || '',
+    },
+  };
+}
+
+function buildRolePayload(state: ModelRoleFormState): AIModelRoles {
+  const fastProviderId = state.fast.providerId.trim();
+  const fastModelName = state.fast.modelName.trim();
+  const deepProviderId = state.deep.providerId.trim();
+  const deepModelName = state.deep.modelName.trim();
+
+  return {
+    fast_model_provider_id: fastProviderId || null,
+    fast_model_name: fastModelName || null,
+    deep_model_provider_id: deepProviderId || null,
+    deep_model_name: deepModelName || null,
+  };
+}
+
 function getToolStatusText(server: MCPServer) {
   return server.is_active ? 'Connected' : 'Paused';
 }
@@ -287,13 +338,17 @@ export default function Settings() {
   const [providers, setProviders] = useState<AIProvider[]>([]);
   const [mcpServers, setMCPServers] = useState<MCPServer[]>([]);
   const [form, setForm] = useState<ProviderFormState>(defaultFormState);
+  const [modelRoleForm, setModelRoleForm] = useState<ModelRoleFormState>(defaultModelRoleFormState);
   const [mcpForms, setMCPForms] = useState<Record<MCPServerType, MCPFormState>>(defaultMCPForms);
   const [expandedMCPType, setExpandedMCPType] = useState<MCPServerType | null>(null);
   const [isLoadingProviders, setIsLoadingProviders] = useState(true);
+  const [isLoadingModelRoles, setIsLoadingModelRoles] = useState(true);
   const [isLoadingMCPServers, setIsLoadingMCPServers] = useState(true);
   const [providerLoadError, setProviderLoadError] = useState<string | null>(null);
+  const [modelRoleLoadError, setModelRoleLoadError] = useState<string | null>(null);
   const [mcpLoadError, setMCPLoadError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isSavingModelRoles, setIsSavingModelRoles] = useState(false);
   const [savingMCPType, setSavingMCPType] = useState<MCPServerType | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
@@ -335,6 +390,25 @@ export default function Settings() {
     }
   };
 
+  const loadModelRoles = async (silent = false) => {
+    setIsLoadingModelRoles(true);
+    setModelRoleLoadError(null);
+
+    try {
+      const result = await getAIModelRoles();
+      setModelRoleForm(mapRolesToFormState(result));
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : 'Could not load your model role preferences right now.';
+      setModelRoleLoadError(message);
+      if (!silent) {
+        toast.error(message);
+      }
+    } finally {
+      setIsLoadingModelRoles(false);
+    }
+  };
+
   const loadMCPServers = async (silent = false) => {
     setIsLoadingMCPServers(true);
     setMCPLoadError(null);
@@ -357,7 +431,7 @@ export default function Settings() {
   };
 
   useEffect(() => {
-    void Promise.all([loadProviders(), loadMCPServers()]);
+    void Promise.all([loadProviders(), loadModelRoles(), loadMCPServers()]);
   }, []);
 
   const handleSaveProvider = async (event: FormEvent<HTMLFormElement>) => {
@@ -407,7 +481,7 @@ export default function Settings() {
 
     try {
       await deleteAIProvider(providerId);
-      await loadProviders(true);
+      await Promise.all([loadProviders(true), loadModelRoles(true)]);
       toast.success('Provider removed.');
     } catch (error: unknown) {
       toast.error(error instanceof Error ? error.message : 'Could not remove that AI key.');
@@ -433,6 +507,50 @@ export default function Settings() {
       setProviderErrors((prev) => ({ ...prev, [providerId]: errorMsg }));
     } finally {
       setTestingId(null);
+    }
+  };
+
+  const handleModelRoleFieldChange = (
+    role: 'fast' | 'deep',
+    field: keyof ModelRoleSlotFormState,
+    value: string,
+  ) => {
+    setModelRoleForm((current) => ({
+      ...current,
+      [role]: {
+        ...current[role],
+        [field]: value,
+      },
+    }));
+  };
+
+  const handleSaveModelRoles = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    const payload = buildRolePayload(modelRoleForm);
+    const hasFastMismatch = Boolean(payload.fast_model_provider_id) !== Boolean(payload.fast_model_name);
+    const hasDeepMismatch = Boolean(payload.deep_model_provider_id) !== Boolean(payload.deep_model_name);
+
+    if (hasFastMismatch) {
+      toast.error('Fast model needs both a provider and a model name.');
+      return;
+    }
+
+    if (hasDeepMismatch) {
+      toast.error('Deep model needs both a provider and a model name.');
+      return;
+    }
+
+    setIsSavingModelRoles(true);
+
+    try {
+      const saved = await saveAIModelRoles(payload);
+      setModelRoleForm(mapRolesToFormState(saved));
+      toast.success('Model roles saved.');
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not save model roles.');
+    } finally {
+      setIsSavingModelRoles(false);
     }
   };
 
@@ -803,6 +921,141 @@ export default function Settings() {
             <div className="rounded-[14px] border border-dashed border-border-strong bg-bg-elevated/40 p-4 text-sm text-text-secondary">
               No AI keys saved yet. Add one below so Scrimble can work on your projects.
             </div>
+          )}
+        </div>
+
+        <div className="mt-6 rounded-[14px] border border-border-default bg-bg-elevated/40 p-5">
+          <div className="mb-4 flex items-center gap-2 text-[15px] font-medium text-text-primary">
+            <Cpu className="h-4 w-4 text-accent-primary" />
+            Model roles.
+          </div>
+
+          {modelRoleLoadError ? (
+            <div className="mb-4 flex flex-col gap-3 rounded-[12px] border border-status-error/25 bg-status-error/8 p-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-text-secondary">{modelRoleLoadError}</p>
+              <button
+                type="button"
+                onClick={() => void loadModelRoles()}
+                className="inline-flex items-center gap-2 rounded-[8px] border border-status-error/25 px-3 py-2 text-sm font-medium text-status-error transition-colors hover:bg-status-error/10"
+              >
+                <RefreshCw className="h-4 w-4" />
+                Try again
+              </button>
+            </div>
+          ) : null}
+
+          {isLoadingModelRoles ? (
+            <div className="rounded-[12px] border border-border-default bg-bg-elevated/60 p-4 text-sm text-text-secondary">
+              Loading your model role preferences...
+            </div>
+          ) : (
+            <form onSubmit={handleSaveModelRoles} className="space-y-5">
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-[12px] border border-border-default bg-bg-surface/70 p-4">
+                  <h3 className="mb-1 text-[15px] font-medium text-text-primary">Fast model</h3>
+                  <p className="mb-4 text-sm text-text-secondary">
+                    For quick tasks (structuring, routing, research summaries).
+                  </p>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                        Connected provider
+                      </label>
+                      <select
+                        value={modelRoleForm.fast.providerId}
+                        onChange={(event) => handleModelRoleFieldChange('fast', 'providerId', event.target.value)}
+                        className={inputClassName}
+                        disabled={isSavingModelRoles}
+                      >
+                        <option value="">Use default AI</option>
+                        {providers.map((provider) => (
+                          <option key={provider.id} value={provider.id}>
+                            {providerLabels[provider.provider]} — {getProviderSummary(provider)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                        Model name
+                      </label>
+                      <input
+                        type="text"
+                        value={modelRoleForm.fast.modelName}
+                        onChange={(event) => handleModelRoleFieldChange('fast', 'modelName', event.target.value)}
+                        placeholder="e.g. gemini-2.0-flash, gpt-4o-mini, llama-3.3-70b"
+                        className={inputClassName}
+                        disabled={isSavingModelRoles}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-[12px] border border-border-default bg-bg-surface/70 p-4">
+                  <h3 className="mb-1 text-[15px] font-medium text-text-primary">Deep model</h3>
+                  <p className="mb-4 text-sm text-text-secondary">
+                    For complex tasks (plan generation, architecture, step writing).
+                  </p>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                        Connected provider
+                      </label>
+                      <select
+                        value={modelRoleForm.deep.providerId}
+                        onChange={(event) => handleModelRoleFieldChange('deep', 'providerId', event.target.value)}
+                        className={inputClassName}
+                        disabled={isSavingModelRoles}
+                      >
+                        <option value="">Use default AI</option>
+                        {providers.map((provider) => (
+                          <option key={provider.id} value={provider.id}>
+                            {providerLabels[provider.provider]} — {getProviderSummary(provider)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                        Model name
+                      </label>
+                      <input
+                        type="text"
+                        value={modelRoleForm.deep.modelName}
+                        onChange={(event) => handleModelRoleFieldChange('deep', 'modelName', event.target.value)}
+                        placeholder="e.g. gemini-2.5-pro, gpt-4o, claude-3-5-sonnet"
+                        className={inputClassName}
+                        disabled={isSavingModelRoles}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <p className="font-mono text-[11px] leading-relaxed text-text-tertiary">
+                  Not sure? Leave these blank and Scrimble will use your default AI for everything.
+                </p>
+                <p className="font-mono text-[11px] leading-relaxed text-text-tertiary">
+                  For the best plans, use a fast model (e.g. Flash, mini variants) for the quick slot and your smartest model for the deep slot.
+                </p>
+              </div>
+
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={isSavingModelRoles}
+                  className="btn-secondary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSavingModelRoles ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {isSavingModelRoles ? 'Saving...' : 'Save model roles'}
+                </button>
+              </div>
+            </form>
           )}
         </div>
 

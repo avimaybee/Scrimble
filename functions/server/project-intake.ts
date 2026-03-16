@@ -151,6 +151,7 @@ Update the structured brief from the full conversation, not just the last messag
     system: systemPrompt,
     prompt,
     onReasoningDelta: options.onThinking,
+    role: 'fast',
   });
 
   const parsed = parseIntakeAgentResponse(text);
