@@ -23,7 +23,9 @@ import {
   upsertProjectBrief,
   type StoredProjectBrief,
 } from './project-briefs';
-import { appendResearchFooter, collectStepResearchContext, formatStepResearchPrompt } from './step-research';
+import { buildResearchManifest, type ResearchManifest } from './research-manifest';
+import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
+import { loadBuilderProfileContext } from './user-tools';
 import type { PlanDiff } from '../types/diff';
 import { diffSchema } from '../types/diff';
 import type { Bindings, ProviderType } from './types';
@@ -135,6 +137,14 @@ const workflowUpdateIntentSchema = z.object({
 
 const stepDetailSchema = z.object({
   ai_output: z.string(),
+  done_when: z.string().optional().default(''),
+  navigation_links: z.array(
+    z.object({
+      label: z.string(),
+      url: z.string(),
+      when: z.string(),
+    }),
+  ).optional().default([]),
   prompts: z.array(
     z.object({
       label: z.string(),
@@ -609,6 +619,7 @@ async function reEnrichAffectedSteps(options: {
   adr: Batch3Architect;
   research: Batch2FetchAndRead;
   miniResearch: WorkflowMiniResearchItem[];
+  researchManifest: ResearchManifest;
   affectedStepIds: string[];
   projectBriefPrompt: string;
   onProgress?: (progress: WorkflowUpdateProgress) => Promise<void> | void;
@@ -634,10 +645,11 @@ async function reEnrichAffectedSteps(options: {
       adr: options.adr,
       research: options.research,
       additionalResearch: options.miniResearch,
+      researchManifest: options.researchManifest,
     });
 
     const systemPrompt = appendProjectBriefSystemPrompt(
-      'You are Scrimble’s step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.',
+      'You are Scrimble’s step enrichment agent. You produce turn-by-turn navigation guidance for a single build step. Respond ONLY with valid JSON in the shape {"ai_output": string, "done_when": string, "navigation_links": [{"label": string, "url": string, "when": string}], "prompts": [{"label": string, "content": string}] }.',
       options.projectBriefPrompt,
     );
     const prompt = [
@@ -649,6 +661,9 @@ async function reEnrichAffectedSteps(options: {
       `Why it matters: ${step.why_it_matters || 'Not specified yet.'}`,
       `Done when: ${step.done_when || 'Not specified yet.'}`,
       `Live research context:\n${formatStepResearchPrompt(stepResearchContext)}`,
+      'ai_output rules: lead with WHERE to go, then WHAT to do, and end with WHAT to bring back to mark done. Use the builder’s actual tools by name. Maximum 3 paragraphs.',
+      'done_when must be concrete and verifiable, never subjective.',
+      'Populate navigation_links from researched docs URLs using concise labels and timing cues like "Start here" or "To verify".',
       'Use the live documentation provided to generate specific, current guidance. Reference actual function names, hook names, and config options from the docs. If any open bugs were found, mention them in the ai_output and explain the workaround. Follow any requirements listed in the live research context exactly.',
     ].join('\n\n');
 
@@ -664,14 +679,20 @@ async function reEnrichAffectedSteps(options: {
     });
 
     const enriched = parseJsonResponse(text, stepDetailSchema, `Failed to re-enrich ${step.title}`);
-    const aiOutputWithFooter = appendResearchFooter(enriched.ai_output, stepResearchContext.footer);
-
     await options.env.DB.prepare(`
       UPDATE steps
-      SET ai_output = ?, prompts = ?, is_ai_enriched = 1, updated_at = datetime("now")
+      SET ai_output = ?, done_when = ?, research_footer_meta = ?, prompts = ?, navigation_links = ?, is_ai_enriched = 1, updated_at = datetime("now")
       WHERE id = ? AND workflow_id = ?
     `)
-      .bind(aiOutputWithFooter, JSON.stringify(enriched.prompts), step.id, options.workflowId)
+      .bind(
+        enriched.ai_output,
+        enriched.done_when?.trim() || asText(step.done_when),
+        JSON.stringify(stepResearchContext.footerMeta),
+        JSON.stringify(enriched.prompts),
+        JSON.stringify(enriched.navigation_links || []),
+        step.id,
+        options.workflowId,
+      )
       .run();
   }
 }
@@ -843,6 +864,12 @@ export async function processWorkflowUpdate(options: {
     );
   }
 
+  const builderProfile = await loadBuilderProfileContext(options.project.user_id, options.env);
+  const researchManifest = buildResearchManifest(
+    builderProfile,
+    projectBriefContext.summary || options.project.description || '',
+  );
+
   const miniResearch = await runMiniResearch({
     env: options.env,
     userId: options.project.user_id,
@@ -883,6 +910,7 @@ export async function processWorkflowUpdate(options: {
       adr,
       research,
       miniResearch,
+      researchManifest,
       affectedStepIds: applyResult.affectedStepIds,
       projectBriefPrompt: projectBriefContext.promptContext,
       onProgress: options.onProgress,

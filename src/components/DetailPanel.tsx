@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Sparkles, Send, Check, RefreshCw } from 'lucide-react';
+import { X, Sparkles, Send, Check, RefreshCw, ExternalLink } from 'lucide-react';
 import { Step, ChecklistItem, Project } from '../types';
 import { cn } from '../lib/utils';
 import { dbService } from '../lib/db';
@@ -9,6 +9,66 @@ import ReactMarkdown from 'react-markdown';
 import confetti from 'canvas-confetti';
 import { toast } from 'sonner';
 import { useStepExecution } from '../hooks/useStepExecution';
+
+type StepResearchFooterMeta = {
+  researched_at: string;
+  tools: string[];
+};
+
+const LEGACY_RESEARCH_FOOTER_PATTERN = /(?:\n{1,2})(Researched\s+\d{4}-\d{2}-\d{2}\s+using[^\n]+\.?)\s*$/i;
+
+function parseResearchFooterMeta(rawValue: string | undefined): StepResearchFooterMeta | null {
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const candidate = parsed as { researched_at?: unknown; tools?: unknown };
+    const researchedAt =
+      typeof candidate.researched_at === 'string'
+        ? candidate.researched_at.trim()
+        : '';
+    const tools = Array.isArray(candidate.tools)
+      ? candidate.tools
+        .filter((tool): tool is string => typeof tool === 'string')
+        .map((tool) => tool.trim())
+        .filter(Boolean)
+      : [];
+
+    if (!researchedAt || tools.length === 0) {
+      return null;
+    }
+
+    return {
+      researched_at: researchedAt,
+      tools,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractLegacyResearchFooter(aiOutput: string | undefined) {
+  const raw = (aiOutput || '').trim();
+  if (!raw) {
+    return { body: '', footer: null as string | null };
+  }
+
+  const match = raw.match(LEGACY_RESEARCH_FOOTER_PATTERN);
+  if (!match) {
+    return { body: raw, footer: null as string | null };
+  }
+
+  return {
+    body: raw.slice(0, match.index).trim(),
+    footer: match[1].trim(),
+  };
+}
 
 interface DetailPanelProps {
   stepId: string | null;
@@ -112,6 +172,65 @@ export default function DetailPanel({
     setReviewFeedback('');
     setShowAiChat(false);
   }, [stepId]);
+
+  const navigationLinks = useMemo(() => {
+    if (!step?.navigation_links) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(step.navigation_links) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+
+      return parsed
+        .map((entry) => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            return null;
+          }
+
+          const candidate = entry as { label?: unknown; url?: unknown; when?: unknown };
+          const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
+          const url = typeof candidate.url === 'string' ? candidate.url.trim() : '';
+          const when = typeof candidate.when === 'string' ? candidate.when.trim() : 'Start here';
+          if (!label || !url) {
+            return null;
+          }
+
+          return { label, url, when };
+        })
+        .filter((entry): entry is { label: string; url: string; when: string } => Boolean(entry));
+    } catch {
+      return [];
+    }
+  }, [step?.navigation_links]);
+
+  const parsedFooterMeta = useMemo(
+    () => parseResearchFooterMeta(step?.research_footer_meta),
+    [step?.research_footer_meta],
+  );
+
+  const { body: aiOutputBody, footer: legacyFooter } = useMemo(
+    () => extractLegacyResearchFooter(step?.ai_output),
+    [step?.ai_output],
+  );
+
+  const researchFooterText = useMemo(() => {
+    if (parsedFooterMeta) {
+      const researchedAt = parsedFooterMeta.researched_at.includes('T')
+        ? parsedFooterMeta.researched_at.slice(0, 10)
+        : parsedFooterMeta.researched_at;
+      const sentence = `Researched ${researchedAt} using ${parsedFooterMeta.tools.join(', ')}`;
+      return sentence.endsWith('.') ? sentence : `${sentence}.`;
+    }
+
+    if (legacyFooter) {
+      return legacyFooter.endsWith('.') ? legacyFooter : `${legacyFooter}.`;
+    }
+
+    return null;
+  }, [legacyFooter, parsedFooterMeta]);
 
   const toggleTask = async (task: ChecklistItem) => {
     const newStatus = !task.is_completed;
@@ -298,9 +417,29 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                       <span className="text-[11px] font-bold uppercase tracking-wider text-accent-primary">AI Notes</span>
                     </div>
                     <div className="text-[13px] leading-relaxed text-text-primary prose prose-invert max-w-none">
-                      <ReactMarkdown>{step.ai_output || step.why_it_matters || "Scrimble suggests starting with your core user and working backwards from their specific problem."}</ReactMarkdown>
+                      <ReactMarkdown>{aiOutputBody || step.why_it_matters || "Scrimble suggests starting with your core user and working backwards from their specific problem."}</ReactMarkdown>
                     </div>
                   </div>
+
+                  {navigationLinks.length > 0 && (
+                    <div>
+                      <h3 className="mb-3 text-[11px] font-bold uppercase tracking-wider text-text-muted">Go here</h3>
+                      <div className="flex flex-wrap gap-2">
+                        {navigationLinks.map((link) => (
+                          <a
+                            key={`${link.label}-${link.url}`}
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-2 rounded-full border border-border-strong bg-bg-elevated/70 px-3 py-1.5 text-[12px] text-text-secondary transition-colors hover:border-border-default hover:text-text-primary"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5 text-accent-primary" />
+                            <span>{link.label}</span>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   {tasks.length > 0 && (
                     <div>
@@ -335,6 +474,12 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                       </div>
                     </div>
                   )}
+
+                  {researchFooterText ? (
+                    <div className="rounded-[10px] border border-border-subtle/70 bg-bg-base/50 px-3 py-2 font-mono text-[11px] text-text-muted">
+                      {researchFooterText}
+                    </div>
+                  ) : null}
                   
                   {showAiChat && (
                     <div className="mt-4 border-t border-border-subtle pt-4 flex flex-col gap-3">

@@ -10,6 +10,8 @@ import {
 } from '../../workers/tools';
 import type { Batch2FetchAndRead, Batch3Architect } from './generation-schemas';
 import { getConnectedResearchTools } from './mcp-servers';
+import { selectManifestToolsForStep, type ResearchManifest } from './research-manifest';
+import { createResearchService } from './research';
 import type { Bindings, GenerationBatchName } from './types';
 
 type ConnectedResearchTools = Awaited<ReturnType<typeof getConnectedResearchTools>>;
@@ -54,6 +56,12 @@ export type StepResearchContext = {
   toolsUsed: string[];
   requirements: string[];
   footer: string;
+  footerMeta: StepResearchFooterMeta;
+};
+
+export type StepResearchFooterMeta = {
+  researched_at: string;
+  tools: string[];
 };
 
 type CollectStepResearchArgs = {
@@ -71,6 +79,7 @@ type CollectStepResearchArgs = {
   batchName?: GenerationBatchName;
   projectId?: string;
   connectedTools?: ConnectedResearchTools;
+  researchManifest?: ResearchManifest;
   additionalResearch?: Batch2FetchAndRead['research'];
 };
 
@@ -444,12 +453,14 @@ function buildFooter(dateLabel: string, toolsUsed: string[], connectedTools: Con
     return `Researched ${dateLabel} using ${toolsUsed.join(', ')}`;
   }
 
-  return `Researched ${dateLabel} — connect more tools in Settings for deeper results.`;
+  return `Researched ${dateLabel} using the default research stack.`;
 }
 
-export function appendResearchFooter(aiOutput: string, footer: string) {
-  const trimmed = aiOutput.trim();
-  return trimmed ? `${trimmed}\n\n${footer}` : footer;
+function buildFooterMeta(dateLabel: string, toolsUsed: string[]): StepResearchFooterMeta {
+  return {
+    researched_at: dateLabel,
+    tools: toolsUsed.length > 0 ? toolsUsed : ['default research stack'],
+  };
 }
 
 function getStepKindRequirements(stepKind: StepResearchKind, frameworkLabel: string) {
@@ -533,9 +544,16 @@ export async function collectStepResearchContext({
   batchName,
   projectId,
   connectedTools,
+  researchManifest,
   additionalResearch = [],
 }: CollectStepResearchArgs): Promise<StepResearchContext> {
   const toolEnv = createToolEnv(env, batchName, projectId);
+  const researchService = createResearchService({
+    env,
+    userId,
+    projectId,
+    batchName,
+  });
   const resolvedConnectedTools = connectedTools || (await getConnectedResearchTools(env, userId));
   const mergedResearchEntries = mergeResearchEntries(research.research, additionalResearch);
   const stepKind = detectStepResearchKind({
@@ -559,6 +577,37 @@ export async function collectStepResearchContext({
   const frameworkLabel = getFrameworkLabel(adr);
   const requirements = getStepKindRequirements(stepKind, frameworkLabel);
   const shouldUseLiveResearch = stepKind !== 'general' || Boolean(stepIsGate);
+  const manifestTools = researchManifest
+    ? selectManifestToolsForStep(researchManifest, {
+        stepKind,
+        stepCategory,
+        stepTitle,
+        stepObjective,
+      })
+    : [];
+  const seenManifestDocUrls = new Set<string>();
+
+  for (const manifestTool of manifestTools) {
+    const docsUrl = (manifestTool.docsUrl || '').trim();
+    if (!docsUrl || seenManifestDocUrls.has(docsUrl.toLowerCase())) {
+      continue;
+    }
+
+    seenManifestDocUrls.add(docsUrl.toLowerCase());
+    const manifestDoc = await researchService.fetchDoc(docsUrl);
+    if (!manifestDoc.content) {
+      continue;
+    }
+
+    docs.push({
+      library: manifestTool.name,
+      source: manifestDoc.tool === 'cf_scrape' ? 'Cloudflare Scrape' : 'Jina Reader',
+      version: 'unknown',
+      url: docsUrl,
+      content: trimLongText(manifestDoc.content, 3200),
+    });
+    toolsUsed.add(manifestDoc.tool === 'cf_scrape' ? 'Cloudflare Scrape' : 'Jina Reader');
+  }
 
   for (const library of relevantLibraries) {
     const docsLibraryName =
@@ -702,6 +751,7 @@ export async function collectStepResearchContext({
     toolsUsed: orderedTools,
     requirements,
     footer: buildFooter(dateLabel, orderedTools, resolvedConnectedTools),
+    footerMeta: buildFooterMeta(dateLabel, orderedTools),
   };
 }
 
@@ -727,6 +777,7 @@ export function formatStepResearchPrompt(context: StepResearchContext) {
       community: context.community,
       requirements: context.requirements,
       footer: context.footer,
+      footer_meta: context.footerMeta,
     },
     null,
     2,

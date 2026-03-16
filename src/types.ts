@@ -42,6 +42,7 @@ export interface Project {
   generation_run_id?: string;
   generation_provider_id?: string;
   generation_heartbeat_at?: string;
+  intake_answers?: string;
   progress: number;
   created_at: string;
   updated_at: string;
@@ -84,6 +85,8 @@ export interface Step {
   why_it_matters?: string;
   suggested_tools?: string;
   prompts?: string;
+  navigation_links?: string;
+  research_footer_meta?: string;
   done_when?: string;
   ai_output?: string;
   is_ai_enriched: boolean;
@@ -208,6 +211,13 @@ export interface ProjectIntakeMessage {
   created_at: string;
 }
 
+export interface ProjectIntakeQuestion {
+  id: string;
+  text: string;
+  type: 'choice' | 'open';
+  options?: string[];
+}
+
 export interface ProjectBrief {
   id: string;
   project_id: string;
@@ -246,6 +256,10 @@ export interface ProjectIntakeSession {
   ready: boolean;
   agent_message: string;
   agent_thinking?: string;
+  questions: ProjectIntakeQuestion[];
+  current_question: ProjectIntakeQuestion | null;
+  current_question_index: number;
+  total_questions: number;
   messages: ProjectIntakeMessage[];
   brief: ProjectBrief;
 }
@@ -299,6 +313,9 @@ export interface ArchitectureReviewResearchSource {
   tool: string;
   title?: string;
   summary?: string;
+  insight?: string;
+  chars_read?: number;
+  relevance?: 'high' | 'medium' | 'low';
 }
 
 export interface ArchitectureReviewDataQuality {

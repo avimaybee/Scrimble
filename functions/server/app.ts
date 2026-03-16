@@ -49,10 +49,25 @@ import {
   resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
-import { runProjectIntakeTurn } from './project-intake';
+import {
+  createIntakeAnswersPayload,
+  generateClarifyingQuestions,
+  getNextIntakeQuestion,
+  parseIntakeAnswersPayload,
+  recordIntakeAnswer,
+  synthesizeIntakeBrief,
+} from './project-intake';
 import { applyPlanDiffToProject } from './plan-diff';
-import { appendResearchFooter, collectStepResearchContext, formatStepResearchPrompt } from './step-research';
-import { buildToolsContext, deleteUserTool, listUserTools, updateUserTool, upsertUserTool } from './user-tools';
+import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
+import { buildResearchManifest } from './research-manifest';
+import {
+  buildToolsContext,
+  deleteUserTool,
+  listUserTools,
+  loadBuilderProfileContext,
+  updateUserTool,
+  upsertUserTool,
+} from './user-tools';
 import { WorkflowBriefDriftError, processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
 import {
   GENERATION_BATCHES,
@@ -155,9 +170,17 @@ const userToolUpdateSchema = z
   .refine((value) => value.proficiency !== undefined || value.notes !== undefined, {
     message: 'Add something to update.',
   });
- 
+
+const navigationLinkSchema = z.object({
+  label: z.string().trim().min(1),
+  url: z.string().trim().min(1),
+  when: z.string().trim().min(1).default('Start here'),
+});
+
 const StepDetailSchema = z.object({
   ai_output: z.string(),
+  done_when: z.string().trim().optional(),
+  navigation_links: z.array(navigationLinkSchema).default([]),
   prompts: z.array(z.object({
     label: z.string(),
     content: z.string()
@@ -341,6 +364,7 @@ function mapProviderRow(row: any) {
     provider: row.provider,
     base_url: row.base_url || undefined,
     model: row.model || undefined,
+    models: row.models || [],
     is_default: toBoolean(row.is_default),
     masked_key: row.masked_key || undefined,
   };
@@ -382,6 +406,7 @@ function mapProjectRow(row: any) {
     generation_run_id: row.generation_run_id || undefined,
     generation_provider_id: row.generation_provider_id || undefined,
     generation_heartbeat_at: row.generation_heartbeat_at || undefined,
+    intake_answers: row.intake_answers || undefined,
     progress: asNumber(row.progress, 0),
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -428,6 +453,8 @@ function mapStepRow(row: any) {
     why_it_matters: row.why_it_matters || '',
     suggested_tools: row.suggested_tools || undefined,
     prompts: row.prompts || undefined,
+    navigation_links: row.navigation_links || undefined,
+    research_footer_meta: row.research_footer_meta || undefined,
     done_when: row.done_when || '',
     ai_output: row.ai_output || undefined,
     is_ai_enriched: toBoolean(row.is_ai_enriched),
@@ -497,13 +524,25 @@ async function buildIntakeResponse(c: AppContext, projectId: string) {
   }
 
   const latestAgentMessage = [...messages].reverse().find((message) => message.role === 'agent') || null;
-  const ready = latestAgentMessage?.content.startsWith('READY:') || false;
+  const intakeAnswers = parseIntakeAnswersPayload(project.intake_answers);
+  const currentQuestion = intakeAnswers ? getNextIntakeQuestion(intakeAnswers) : null;
+  const totalQuestions = intakeAnswers?.questions.length || 0;
+  const answeredCount = intakeAnswers?.answers.length || 0;
+  const ready = currentQuestion
+    ? false
+    : totalQuestions > 0
+      ? true
+      : latestAgentMessage?.content.startsWith('READY:') || false;
 
   return {
     project_id: projectId,
     generation_status: (project.generation_status as string | null) || 'intake',
     ready,
     agent_message: latestAgentMessage?.content || '',
+    questions: intakeAnswers?.questions || [],
+    current_question: currentQuestion,
+    current_question_index: currentQuestion ? answeredCount : Math.max(0, totalQuestions - 1),
+    total_questions: totalQuestions,
     messages,
     brief: {
       ...brief,
@@ -706,6 +745,16 @@ app.get('/ai/providers', async (c) => {
     .bind(c.get('uid'))
     .all();
 
+  const providerIds = (providers.results as any[]).map(p => p.id);
+  let models: any[] = [];
+  if (providerIds.length > 0) {
+    const placeholders = providerIds.map(() => '?').join(', ');
+    const modelsResult = await c.env.DB.prepare(`SELECT id, provider_id, name FROM ai_models WHERE provider_id IN (${placeholders}) ORDER BY created_at ASC`)
+      .bind(...providerIds)
+      .all();
+    models = modelsResult.results as any[];
+  }
+
   const rows = providers.results as any[];
   const mappedProviders = await Promise.all(
     rows.map(async (row) => {
@@ -721,6 +770,7 @@ app.get('/ai/providers', async (c) => {
 
       return mapProviderRow({
         ...row,
+        models: models.filter(m => m.provider_id === row.id),
         masked_key: maskedKey,
       });
     }),
@@ -752,14 +802,69 @@ app.post('/ai/providers', async (c) => {
     await c.env.DB.prepare('UPDATE ai_providers SET is_default = 0 WHERE user_id = ?').bind(c.get('uid')).run();
   }
 
-  await c.env.DB.prepare(`
-    INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model, is_default)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `)
-    .bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model, isDefault ? 1 : 0)
+  const stmts = [
+    c.env.DB.prepare(`
+      INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model, is_default)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model, isDefault ? 1 : 0)
+  ];
+
+  if (model) {
+    const modelId = crypto.randomUUID();
+    stmts.push(
+      c.env.DB.prepare(`
+        INSERT INTO ai_models (id, provider_id, name) VALUES (?, ?, ?)
+      `).bind(modelId, id, model)
+    );
+  }
+
+  await c.env.DB.batch(stmts);
+
+  return c.json({ success: true, id });
+});
+
+app.post('/ai/providers/:id/models', async (c) => {
+  const providerId = c.req.param('id');
+  const existingProvider = await c.env.DB.prepare('SELECT id FROM ai_providers WHERE id = ? AND user_id = ?')
+    .bind(providerId, c.get('uid'))
+    .first();
+
+  if (!existingProvider) {
+    return c.json({ error: 'Provider not found' }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+
+  if (!name) {
+    return c.json({ error: 'Model name is required' }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare('INSERT INTO ai_models (id, provider_id, name) VALUES (?, ?, ?)')
+    .bind(id, providerId, name)
     .run();
 
   return c.json({ success: true, id });
+});
+
+app.delete('/ai/providers/:id/models/:modelId', async (c) => {
+  const providerId = c.req.param('id');
+  const modelId = c.req.param('modelId');
+  
+  const existingProvider = await c.env.DB.prepare('SELECT id FROM ai_providers WHERE id = ? AND user_id = ?')
+    .bind(providerId, c.get('uid'))
+    .first();
+
+  if (!existingProvider) {
+    return c.json({ error: 'Provider not found' }, 404);
+  }
+
+  await c.env.DB.prepare('DELETE FROM ai_models WHERE id = ? AND provider_id = ?')
+    .bind(modelId, providerId)
+    .run();
+
+  return c.json({ success: true });
 });
 
 app.delete('/ai/providers/:id', async (c) => {
@@ -1028,12 +1133,12 @@ app.post('/intake/start', async (c) => {
       provisionalName || 'Untitled project',
       description,
       null,
-      '{}',
-      'active',
-      0,
-      'intake',
-      null,
-    )
+        '{}',
+        'active',
+        0,
+        'intake',
+        null,
+      )
     .run();
 
   await appendProjectIntakeMessage(c.env, id, 'user', description);
@@ -1044,24 +1149,26 @@ app.post('/intake/start', async (c) => {
     toolsContext,
     conversationTurns: 0,
   });
-
-  const intakeTurn = await runProjectIntakeTurn({
+  const questions = await generateClarifyingQuestions({
     env: c.env,
     userId: c.get('uid'),
     rawDescription: description,
-    messages: await listProjectIntakeMessages(c.env, id),
     provider: providerContext,
-    conversationTurns: 1,
   });
+  const intakeAnswers = createIntakeAnswersPayload(questions);
 
-  await appendProjectIntakeMessage(c.env, id, 'agent', intakeTurn.agentReply);
-  await upsertProjectBrief(c.env, {
-    projectId: id,
-    rawDescription: description,
-    structuredBrief: intakeTurn.structuredBrief,
-    toolsContext: intakeTurn.toolsContext,
-    conversationTurns: 1,
-  });
+  await c.env.DB.prepare(`
+    UPDATE projects
+    SET intake_answers = ?, updated_at = datetime("now")
+    WHERE id = ? AND user_id = ?
+  `)
+    .bind(JSON.stringify(intakeAnswers), id, c.get('uid'))
+    .run();
+
+  const firstQuestion = getNextIntakeQuestion(intakeAnswers);
+  if (firstQuestion) {
+    await appendProjectIntakeMessage(c.env, id, 'agent', firstQuestion.text);
+  }
 
   return c.json(await buildIntakeResponse(c, id), 202);
 });
@@ -1093,28 +1200,84 @@ app.post('/intake/:id/respond', async (c) => {
     return c.json({ error: 'You need to add an AI key first.' }, 400);
   }
 
-  await appendProjectIntakeMessage(c.env, projectId, 'user', parsed.data.message);
-  const messages = await listProjectIntakeMessages(c.env, projectId);
   const brief = await getProjectBrief(c.env, projectId);
-  const conversationTurns = (brief?.conversation_turns || 0) + 1;
+  let intakeAnswers = parseIntakeAnswersPayload(project.intake_answers);
+  if (!intakeAnswers) {
+    const existingMessages = await listProjectIntakeMessages(c.env, projectId);
+    const fallbackQuestion = [...existingMessages]
+      .reverse()
+      .find((message) => message.role === 'agent')
+      ?.content
+      ?.replace(/^READY:\s*/, '')
+      .trim();
+    intakeAnswers = createIntakeAnswersPayload([
+      {
+        id: 'legacy-intake-context',
+        text: fallbackQuestion || 'What should this plan prioritize first?',
+        type: 'open',
+      },
+    ]);
+  }
 
-  const intakeTurn = await runProjectIntakeTurn({
-    env: c.env,
-    userId: c.get('uid'),
-    rawDescription: asText(project.description, ''),
-    messages,
-    provider: providerContext,
-    conversationTurns,
-  });
+  const currentQuestion = getNextIntakeQuestion(intakeAnswers);
+  if (!currentQuestion) {
+    return c.json(await buildIntakeResponse(c, projectId));
+  }
 
-  await appendProjectIntakeMessage(c.env, projectId, 'agent', intakeTurn.agentReply);
-  await upsertProjectBrief(c.env, {
-    projectId,
-    rawDescription: asText(project.description, ''),
-    structuredBrief: intakeTurn.structuredBrief,
-    toolsContext: intakeTurn.toolsContext,
-    conversationTurns,
-  });
+  await appendProjectIntakeMessage(c.env, projectId, 'user', parsed.data.message);
+  const updatedAnswers = recordIntakeAnswer(intakeAnswers, currentQuestion, parsed.data.message);
+  const nextQuestion = getNextIntakeQuestion(updatedAnswers);
+  const rawDescription = asText(project.description, '');
+
+  if (nextQuestion) {
+    await appendProjectIntakeMessage(c.env, projectId, 'agent', nextQuestion.text);
+    const existingStructured = brief
+      ? {
+          what_it_is: brief.what_it_is,
+          who_its_for: brief.who_its_for,
+          problem_solved: brief.problem_solved,
+          v1_scope: brief.v1_scope,
+          stack_context: brief.stack_context,
+          definition_done: brief.definition_done,
+          constraints: brief.constraints,
+        }
+      : createFallbackStructuredBrief(rawDescription);
+    await upsertProjectBrief(c.env, {
+      projectId,
+      rawDescription,
+      structuredBrief: existingStructured,
+      toolsContext: await buildToolsContext(c.get('uid'), c.env),
+      conversationTurns: updatedAnswers.answers.length,
+      futureIdeas: brief?.future_ideas || [],
+    });
+  } else {
+    const intakeBrief = await synthesizeIntakeBrief({
+      env: c.env,
+      userId: c.get('uid'),
+      rawDescription,
+      intakeAnswers: updatedAnswers,
+      provider: providerContext,
+    });
+    updatedAnswers.completed_at = new Date().toISOString();
+
+    await appendProjectIntakeMessage(c.env, projectId, 'agent', `READY: ${intakeBrief.summary}`);
+    await upsertProjectBrief(c.env, {
+      projectId,
+      rawDescription,
+      structuredBrief: intakeBrief.structuredBrief,
+      toolsContext: intakeBrief.toolsContext,
+      conversationTurns: updatedAnswers.answers.length,
+      futureIdeas: brief?.future_ideas || [],
+    });
+  }
+
+  await c.env.DB.prepare(`
+    UPDATE projects
+    SET intake_answers = ?, updated_at = datetime("now")
+    WHERE id = ? AND user_id = ?
+  `)
+    .bind(JSON.stringify(updatedAnswers), projectId, c.get('uid'))
+    .run();
 
   return c.json(await buildIntakeResponse(c, projectId));
 });
@@ -2154,8 +2317,8 @@ app.post('/steps', async (c) => {
     INSERT INTO steps (
       id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
       is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools,
-      done_when, ai_output, prompts, is_ai_enriched
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      done_when, ai_output, prompts, navigation_links, is_ai_enriched
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
@@ -2176,6 +2339,7 @@ app.post('/steps', async (c) => {
       asText(body.done_when),
       optionalText(body.ai_output),
       serializeJson(body.prompts),
+      serializeJson(body.navigation_links),
       typeof body.is_ai_enriched === 'boolean' && body.is_ai_enriched ? 1 : 0,
     )
     .run();
@@ -2204,7 +2368,7 @@ app.patch('/steps/:id', async (c) => {
     UPDATE steps
     SET stage_id = ?, title = ?, type = ?, category = ?, position_x = ?, position_y = ?, status = ?,
         is_gate = ?, risk_level = ?, order_index = ?, objective = ?, why_it_matters = ?,
-        suggested_tools = ?, done_when = ?, ai_output = ?, prompts = ?, is_ai_enriched = ?, updated_at = datetime("now")
+        suggested_tools = ?, done_when = ?, ai_output = ?, prompts = ?, navigation_links = ?, is_ai_enriched = ?, updated_at = datetime("now")
     WHERE id = ?
   `)
     .bind(
@@ -2224,6 +2388,7 @@ app.patch('/steps/:id', async (c) => {
       typeof body.done_when === 'string' ? body.done_when : existingStep.done_when,
       body.ai_output !== undefined ? optionalText(body.ai_output) : existingStep.ai_output,
       body.prompts !== undefined ? serializeJson(body.prompts) : existingStep.prompts,
+      body.navigation_links !== undefined ? serializeJson(body.navigation_links) : existingStep.navigation_links,
       typeof body.is_ai_enriched === 'boolean' ? (body.is_ai_enriched ? 1 : 0) : toBoolean(existingStep.is_ai_enriched) ? 1 : 0,
       stepId,
     )
@@ -2640,6 +2805,20 @@ app.post('/steps/:id/enrich', async (c) => {
     return c.json({ error: message }, 400);
   }
 
+  const projectBriefContext = await loadProjectBriefContext(
+    c.env,
+    projectId,
+    asText(projectRecord.user_id),
+    {
+      rawDescription: asText(projectRecord.description, ''),
+      projectStack: asText(projectRecord.stack, '{}'),
+    },
+  );
+  const builderProfile = await loadBuilderProfileContext(asText(projectRecord.user_id), c.env);
+  const researchManifest = buildResearchManifest(
+    builderProfile,
+    projectBriefContext.summary || asText(projectRecord.description, ''),
+  );
   const stepResearchContext = await collectStepResearchContext({
     env: c.env,
     userId: asText(projectRecord.user_id),
@@ -2652,16 +2831,10 @@ app.post('/steps/:id/enrich', async (c) => {
     stepIsGate: toBoolean(stepRecord.is_gate),
     adr: adrContext,
     research: researchContext,
-  });
-  const projectBriefContext = await loadProjectBriefContext(
-    c.env,
+    researchManifest,
+    batchName: 'batch_5_enrich_steps',
     projectId,
-    asText(projectRecord.user_id),
-    {
-      rawDescription: asText(projectRecord.description, ''),
-      projectStack: asText(projectRecord.stack, '{}'),
-    },
-  );
+  });
 
   let providerContext;
   try {
@@ -2681,7 +2854,7 @@ app.post('/steps/:id/enrich', async (c) => {
     baseUrl,
   } = providerContext;
   const systemPrompt = appendProjectBriefSystemPrompt(
-    `You are Scrimble's step enrichment agent. You produce specific, actionable guidance for a single build step. Write for a solo builder in plain language with no jargon. Respond ONLY with valid JSON in the shape {"ai_output": string, "prompts": [{"label": string, "content": string}] }.`,
+    `You are Scrimble's step enrichment agent. You produce turn-by-turn navigation guidance for a single build step. Respond ONLY with valid JSON in the shape {"ai_output": string, "done_when": string, "navigation_links": [{"label": string, "url": string, "when": string}], "prompts": [{"label": string, "content": string}] }.`,
     projectBriefContext.promptContext,
   );
   const promptSections = [
@@ -2693,6 +2866,9 @@ app.post('/steps/:id/enrich', async (c) => {
     `Why it matters: ${stepRecord.why_it_matters || 'Not specified yet.'}`,
     `Done when: ${stepRecord.done_when || 'Not specified yet.'}`,
     `Live research context:\n${formatStepResearchPrompt(stepResearchContext)}`,
+    'ai_output rules: lead with WHERE to go, then WHAT to do, and end with WHAT to bring back to mark done. Use the builder’s actual tools by name. Maximum 3 paragraphs.',
+    'done_when must be concrete and verifiable, never subjective.',
+    'Populate navigation_links from researched docs URLs using concise labels and timing cues like "Start here" or "To verify".',
     'Use the live documentation provided to generate specific, current guidance. Reference actual function names, hook names, and config options from the docs. If any open bugs were found, mention them in the ai_output and explain the workaround. Follow any requirements listed in the live research context exactly.',
   ];
 
@@ -2764,17 +2940,19 @@ app.post('/steps/:id/enrich', async (c) => {
           }
 
           const data = validated.data;
-          const aiOutputWithFooter = appendResearchFooter(data.ai_output, stepResearchContext.footer);
           const nextStatus = toBoolean(stepRecord.is_gate) ? 'needs_review' : 'complete';
  
           await c.env.DB.batch([
             c.env.DB.prepare(`
               UPDATE steps
-              SET ai_output = ?, prompts = ?, is_ai_enriched = 1, status = ?, updated_at = datetime("now")
+              SET ai_output = ?, done_when = ?, research_footer_meta = ?, prompts = ?, navigation_links = ?, is_ai_enriched = 1, status = ?, updated_at = datetime("now")
               WHERE id = ?
             `).bind(
-              aiOutputWithFooter || null,
+              data.ai_output || null,
+              data.done_when?.trim() || asText(stepRecord.done_when, ''),
+              JSON.stringify(stepResearchContext.footerMeta),
               JSON.stringify(data.prompts || []),
+              JSON.stringify(data.navigation_links || []),
               nextStatus,
               stepId,
             ),

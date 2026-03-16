@@ -52,15 +52,18 @@ interface UpdateWorkflowOptions {
 type IntakeStartPayload = {
   description: string;
   providerId?: string;
+  modelName?: string;
 };
 
 type IntakeRespondPayload = {
   message: string;
   providerId?: string;
+  modelName?: string;
 };
 
 type IntakeConfirmPayload = {
   providerId?: string;
+  modelName?: string;
 };
 
 export type StepEnrichmentPayload = {

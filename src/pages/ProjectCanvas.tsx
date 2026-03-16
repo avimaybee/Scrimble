@@ -645,6 +645,7 @@ export default function ProjectCanvas() {
         done_when: '',
         ai_output: '',
         prompts: '[]',
+        navigation_links: '[]',
         is_ai_enriched: false,
         order_index: nextOrder,
       });

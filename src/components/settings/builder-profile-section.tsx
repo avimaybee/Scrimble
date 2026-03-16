@@ -226,9 +226,10 @@ export function BuilderProfileSection() {
 
   return (
     <section
-      id="builder-profile"
+      id="workspace"
       className="rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
     >
+      <span id="builder-profile" className="sr-only" aria-hidden="true" />
       <div className="mb-6 flex items-center gap-3">
         <span className="h-px w-8 bg-accent-primary" />
         <span className="font-mono text-[10px] uppercase tracking-[0.22em] text-accent-primary">

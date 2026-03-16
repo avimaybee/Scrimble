@@ -58,6 +58,8 @@ const itemVariants = {
   },
 };
 
+const WORKSPACE_NUDGE_DISMISSED_KEY = 'scrimble-workspace-nudge-dismissed';
+
 type ProjectCardData = {
   project: Project;
   stages: Stage[];
@@ -159,6 +161,7 @@ export default function Dashboard() {
   const [showArchived, setShowArchived] = useState(false);
   const [projectToDelete, setProjectToDelete] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [workspaceNudgeDismissed, setWorkspaceNudgeDismissed] = useState(false);
 
   const loadDashboard = useCallback(async () => {
     if (!user) {
@@ -203,6 +206,14 @@ export default function Dashboard() {
   useEffect(() => {
     void loadDashboard();
   }, [loadDashboard]);
+
+  useEffect(() => {
+    try {
+      setWorkspaceNudgeDismissed(localStorage.getItem(WORKSPACE_NUDGE_DISMISSED_KEY) === '1');
+    } catch {
+      setWorkspaceNudgeDismissed(false);
+    }
+  }, []);
 
   const handleArchiveProject = async (projectId: string) => {
     try {
@@ -297,39 +308,6 @@ export default function Dashboard() {
           </Link>
         </motion.div>
       </motion.header>
-
-      {!loading && !showArchived && builderProfileCount < 3 ? (
-        <motion.div
-          variants={itemVariants}
-          className="mb-8 overflow-hidden rounded-[18px] border border-border-default bg-bg-surface"
-        >
-          <div className="flex h-full flex-col gap-5 border-l-[3px] border-accent-primary px-5 py-5 sm:flex-row sm:items-end sm:justify-between sm:px-6">
-            <div className="max-w-[560px]">
-              <div className="font-mono text-[11px] uppercase tracking-[0.18em] text-accent-primary">
-                ◈ {builderProfileCount === 0 ? 'Your builder profile is empty' : 'Your builder profile needs a little more detail'}
-              </div>
-              <p className="mt-3 text-[15px] leading-7 text-text-primary">
-                {builderProfileCount === 0
-                  ? "Without it, every plan I build will be generic. Tell me your tools once - I'll use them everywhere."
-                  : 'Add a few more tools and I can stop defaulting to generic stack advice. Once you hit three, your plans get much sharper.'}
-              </p>
-            </div>
-
-            <div className="flex items-center justify-between gap-4 sm:flex-col sm:items-end">
-              <Link
-                to="/settings#builder-profile"
-                className="inline-flex items-center gap-2 text-[15px] font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
-              >
-                {builderProfileCount === 0 ? 'Set up my profile' : 'Finish my profile'}
-                <ArrowRight className="h-4 w-4" />
-              </Link>
-              <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                {builderProfileCount === 0 ? '2 min setup' : `${builderProfileCount}/3 saved`}
-              </span>
-            </div>
-          </div>
-        </motion.div>
-      ) : null}
 
       {loading ? (
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
@@ -593,6 +571,34 @@ export default function Dashboard() {
           })}
         </motion.div>
       )}
+
+      {!loading && !showArchived && visibleCards.length > 0 && builderProfileCount < 3 && !workspaceNudgeDismissed ? (
+        <motion.div
+          variants={itemVariants}
+          className="mt-4 flex items-center justify-between gap-4 rounded-[12px] border border-border-default bg-bg-elevated/45 px-4 py-3 text-sm text-text-secondary"
+        >
+          <Link
+            to="/settings#workspace"
+            className="text-[13px] leading-6 text-text-secondary transition-colors hover:text-text-primary"
+          >
+            Add your tools in Settings to get more specific plans.
+          </Link>
+          <button
+            type="button"
+            onClick={() => {
+              setWorkspaceNudgeDismissed(true);
+              try {
+                localStorage.setItem(WORKSPACE_NUDGE_DISMISSED_KEY, '1');
+              } catch {
+                // Ignore storage failures and keep the UI responsive.
+              }
+            }}
+            className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted transition-colors hover:text-text-secondary"
+          >
+            Dismiss
+          </button>
+        </motion.div>
+      ) : null}
 
       {!loading && visibleCards.length > 0 ? (
         <motion.div variants={itemVariants} className="mt-8 text-sm text-text-muted">

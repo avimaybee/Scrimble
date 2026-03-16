@@ -101,6 +101,20 @@ function createNonNegativeIntSchema(fallback = 0) {
   }, z.number().int().nonnegative());
 }
 
+function normalizeResearchRelevance(value: unknown) {
+  const normalized = normalizeText(value, 'medium').toLowerCase();
+  if (normalized === 'high' || normalized === 'medium' || normalized === 'low') {
+    return normalized;
+  }
+
+  return 'medium';
+}
+
+const researchRelevanceSchema = z.preprocess(
+  normalizeResearchRelevance,
+  z.enum(['high', 'medium', 'low']),
+);
+
 const searchResultSchema = z.preprocess(
   (value) => normalizeObject(value, () => ({})),
   z.object({
@@ -115,9 +129,12 @@ const researchSourceSchema = z.preprocess(
   z.object({
     technology: createOptionalTextSchema(''),
     url: createOptionalTextSchema(''),
-    tool: createOptionalTextSchema('Web fetch'),
+    tool: createOptionalTextSchema('jina_reader'),
     title: createOptionalTextSchema(''),
     summary: createOptionalTextSchema(''),
+    insight: createOptionalTextSchema(''),
+    chars_read: createNonNegativeIntSchema(0),
+    relevance: researchRelevanceSchema,
   }),
 );
 
@@ -369,16 +386,37 @@ export const Batch5EnrichStepsSchema = z.preprocess(
     enrichments: z.preprocess(
       normalizeObjectArray,
       z.array(
-        z.preprocess(
-          (entry) => normalizeObject(entry, () => ({})),
-          z.object({
-            step_id: createOptionalTextSchema(''),
-            ai_output: createOptionalTextSchema(''),
-            prompts: z.preprocess(
-              normalizeObjectArray,
-              z.array(
-                z.preprocess(
-                  (prompt) => normalizeObject(prompt, () => ({})),
+          z.preprocess(
+            (entry) => normalizeObject(entry, () => ({})),
+            z.object({
+              step_id: createOptionalTextSchema(''),
+              ai_output: createOptionalTextSchema(''),
+              done_when: createOptionalTextSchema(''),
+              research_footer_meta: z.preprocess(
+                (footerMeta) => normalizeObject(footerMeta, () => ({})),
+                z.object({
+                  researched_at: createOptionalTextSchema(''),
+                  tools: createStringArraySchema(),
+                }),
+              ).optional(),
+              navigation_links: z.preprocess(
+                normalizeObjectArray,
+                z.array(
+                  z.preprocess(
+                    (link) => normalizeObject(link, () => ({})),
+                    z.object({
+                      label: createOptionalTextSchema(''),
+                      url: createOptionalTextSchema(''),
+                      when: createOptionalTextSchema(''),
+                    }),
+                  ),
+                ),
+              ),
+              prompts: z.preprocess(
+                normalizeObjectArray,
+                z.array(
+                  z.preprocess(
+                    (prompt) => normalizeObject(prompt, () => ({})),
                   z.object({
                     label: createOptionalTextSchema(''),
                     content: createOptionalTextSchema(''),
@@ -430,13 +468,13 @@ export const schemaDescriptions = {
   batch_1_research_stack:
     '{ technologies: [{ name: string, docs_url: url, github_url: url, changelog_url: url, community_search_results?: [{ title, url, description }], breaking_change_search_results?: [{ title, url, description }] }] }',
   batch_2_fetch_and_read:
-    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary? }] }], sources?: [{ technology?, url, tool, title?, summary? }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, model_context_window?: number, source_target_count?: number, used_full_context_window?: boolean, truncated_to_fit_context?: boolean, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
+    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }] }], sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, model_context_window?: number, source_target_count?: number, used_full_context_window?: boolean, truncated_to_fit_context?: boolean, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
   batch_3_architect:
     '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:
     '{ project_name: string, project_type: string, prd_markdown: string, stack?: string | Record<string, unknown>, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, is_milestone?, milestone_label?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
   batch_5_enrich_steps:
-    '{ enrichments: [{ step_id: string, ai_output: string, prompts: [{ label: string, content: string }] }] }',
+    '{ enrichments: [{ step_id: string, ai_output: string, done_when?: string, research_footer_meta?: { researched_at: string, tools: string[] }, navigation_links?: [{ label: string, url: string, when: string }], prompts: [{ label: string, content: string }] }] }',
   batch_6_generate_files:
     '{ files: [{ filename: "plan.md", content: string }] }',
 } as const;

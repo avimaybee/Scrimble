@@ -18,6 +18,7 @@ import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import FullscreenStatus from '../components/ui/FullscreenStatus';
 import { dbService, type GenerationStreamConnectionState } from '../lib/db';
+import { getAIModelRoles, getAIProviders, type AIModelRoles, type AIProvider } from '../lib/ai';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
@@ -268,7 +269,7 @@ function getReviewSourceToolMeta(tool: string) {
     };
   }
 
-  if (normalized.includes('github api')) {
+  if (normalized === 'github_api' || normalized.includes('github api')) {
     return {
       label: 'GitHub API',
       icon: Github,
@@ -286,13 +287,18 @@ function getReviewSourceToolMeta(tool: string) {
 
   if (normalized.includes('jina')) {
     return {
-      label: normalized.includes('search') ? 'Jina Search' : 'Jina Reader',
+      label: normalized === 'jina_search' || normalized.includes('search') ? 'Jina Search' : 'Jina Reader',
       icon: Search,
       toneClass: 'text-status-secure',
     };
   }
 
-  if (normalized.includes('cloudflare scrape') || normalized.includes('cf scrape')) {
+  if (
+    normalized === 'cf_scrape'
+    || normalized.includes('cloudflare scrape')
+    || normalized.includes('cf scrape')
+    || normalized.includes('scrape')
+  ) {
     return {
       label: 'Cloudflare Scrape',
       icon: Globe,
@@ -323,6 +329,77 @@ function getReviewSourceToolMeta(tool: string) {
   };
 }
 
+function resolveDefaultProviderModel(provider: AIProvider | undefined) {
+  if (!provider) {
+    return '';
+  }
+
+  const deprecatedModel = (provider.model || '').trim();
+  if (deprecatedModel) {
+    return deprecatedModel;
+  }
+
+  const firstNamedModel = provider.models.find((model) => model.name.trim());
+  return firstNamedModel?.name.trim() || '';
+}
+
+function hasConfiguredRole(providerId: string | null, modelName: string | null) {
+  return Boolean(providerId?.trim() && modelName?.trim());
+}
+
+function resolveModelRoleDisplay(providers: AIProvider[], modelRoles: AIModelRoles) {
+  const providerById = new Map(providers.map((provider) => [provider.id, provider]));
+  const defaultProvider = providers.find((provider) => provider.is_default) || providers[0];
+
+  const fastSlot = hasConfiguredRole(modelRoles.fast_model_provider_id, modelRoles.fast_model_name)
+    ? {
+        provider: providerById.get(modelRoles.fast_model_provider_id || '') || defaultProvider,
+        model: (modelRoles.fast_model_name || '').trim(),
+      }
+    : null;
+  const deepSlot = hasConfiguredRole(modelRoles.deep_model_provider_id, modelRoles.deep_model_name)
+    ? {
+        provider: providerById.get(modelRoles.deep_model_provider_id || '') || defaultProvider,
+        model: (modelRoles.deep_model_name || '').trim(),
+      }
+    : null;
+  const defaultSlot = defaultProvider
+    ? {
+        provider: defaultProvider,
+        model: resolveDefaultProviderModel(defaultProvider),
+      }
+    : null;
+
+  const resolveRoleLabel = (role: 'fast' | 'deep') => {
+    const resolvedSlot = role === 'fast'
+      ? fastSlot || deepSlot || defaultSlot
+      : deepSlot || fastSlot || defaultSlot;
+
+    if (!resolvedSlot) {
+      return 'default model';
+    }
+
+    return resolvedSlot.model || resolveDefaultProviderModel(resolvedSlot.provider) || 'default model';
+  };
+
+  return {
+    fast: resolveRoleLabel('fast'),
+    deep: resolveRoleLabel('deep'),
+  };
+}
+
+function getResearchRelevanceTone(relevance: string | undefined) {
+  switch ((relevance || '').toLowerCase()) {
+    case 'high':
+      return 'text-status-secure';
+    case 'low':
+      return 'text-text-muted';
+    case 'medium':
+    default:
+      return 'text-text-tertiary';
+  }
+}
+
 export default function ProjectGeneration() {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
@@ -343,6 +420,10 @@ export default function ProjectGeneration() {
   const [error, setError] = useState('');
   const [isResuming, setIsResuming] = useState(false);
   const [showResumeBadge, setShowResumeBadge] = useState(false);
+  const [modelRoleDisplay, setModelRoleDisplay] = useState<{ fast: string; deep: string }>({
+    fast: 'default model',
+    deep: 'default model',
+  });
   const [isLoading, setIsLoading] = useState(true);
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
@@ -552,6 +633,30 @@ export default function ProjectGeneration() {
         !generationPreparation.has_github_token ||
         !generationPreparation.has_context7),
   );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void Promise.all([getAIProviders(), getAIModelRoles()])
+      .then(([providers, modelRoles]) => {
+        if (cancelled) {
+          return;
+        }
+        setModelRoleDisplay(resolveModelRoleDisplay(providers, modelRoles));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelRoleDisplay({
+            fast: 'default model',
+            deep: 'default model',
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
 
   useEffect(() => {
     if (status?.is_complete) {
@@ -977,6 +1082,18 @@ export default function ProjectGeneration() {
 
     return null;
   }, [reviewData]);
+  const limitedResearchNotice = useMemo(() => {
+    if (!reviewData) {
+      return null;
+    }
+
+    const sourceCount = reviewData.data_quality.urls_fetched || reviewData.research_sources.length;
+    if (sourceCount >= 3) {
+      return null;
+    }
+
+    return `Research was limited for this plan — some fetches failed. Your plan is based on ${sourceCount} source${sourceCount === 1 ? '' : 's'}. You can regenerate for a deeper result.`;
+  }, [reviewData]);
   const visibleResearchSources = useMemo(() => {
     if (!reviewData) {
       return [];
@@ -1398,6 +1515,12 @@ export default function ProjectGeneration() {
                               </div>
                             ) : null}
 
+                            {limitedResearchNotice ? (
+                              <div className="mt-3 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 font-sans text-[12px] leading-5 text-status-warning">
+                                {limitedResearchNotice}
+                              </div>
+                            ) : null}
+
                             {reviewData.data_quality.partial_failures.length > 0 ? (
                               <div className="mt-3 font-sans text-[12px] leading-5 text-status-warning">
                                 Some sources were partially degraded during this pass: {reviewData.data_quality.degraded_tools.join(', ')}.
@@ -1432,7 +1555,7 @@ export default function ProjectGeneration() {
                                     const toolMeta = getReviewSourceToolMeta(source.tool);
                                     const ToolIcon = toolMeta.icon;
 
-                                    return (
+                                   return (
                                       <a
                                         key={`${source.tool}-${source.url}`}
                                         href={source.url}
@@ -1458,12 +1581,19 @@ export default function ProjectGeneration() {
                                             {formatReviewSourceUrl(source.url)}
                                           </span>
                                         </div>
+                                        <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">
+                                          <span>{(source.chars_read || source.summary?.length || 0).toLocaleString()} chars</span>
+                                          <span aria-hidden="true">·</span>
+                                          <span className={getResearchRelevanceTone(source.relevance)}>
+                                            {source.relevance || 'medium'} relevance
+                                          </span>
+                                        </div>
                                         <div className="min-w-0 font-sans text-[12px] text-text-tertiary">
                                           <span
-                                            title={source.summary || source.title || source.url}
+                                            title={source.insight || source.summary || source.title || source.url}
                                             className="block truncate"
                                           >
-                                            {source.summary || source.title || 'Source opened for architecture validation.'}
+                                            {source.insight || source.summary || source.title || 'Source opened for architecture validation.'}
                                           </span>
                                         </div>
                                       </a>
@@ -1581,6 +1711,9 @@ export default function ProjectGeneration() {
                   {currentBatch.heading}
                 </motion.h1>
               </AnimatePresence>
+              <div className="mb-5 font-mono text-[11px] leading-5 text-text-muted">
+                Using {modelRoleDisplay.fast} for research · {modelRoleDisplay.deep} for generation
+              </div>
 
               <div className="mb-6 w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">

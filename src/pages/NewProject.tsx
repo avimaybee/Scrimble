@@ -90,7 +90,6 @@ export default function NewProject() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const historyRef = useRef<HTMLDivElement | null>(null);
 
   const [prompt, setPrompt] = useState('');
   const [reply, setReply] = useState('');
@@ -102,6 +101,7 @@ export default function NewProject() {
   const [builderProfileCount, setBuilderProfileCount] = useState(0);
   const [providers, setProviders] = useState<AIProvider[]>([]);
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [selectedModelName, setSelectedModelName] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [intakeSession, setIntakeSession] = useState<ProjectIntakeSession | null>(null);
   const [screenState, setScreenState] = useState<IntakeScreenState>('initial');
@@ -110,10 +110,15 @@ export default function NewProject() {
   const [isResumingIntake, setIsResumingIntake] = useState(false);
   const [showBriefDetails, setShowBriefDetails] = useState(false);
   const [manualPrompt, setManualPrompt] = useState('');
+  const [selectedChoice, setSelectedChoice] = useState('');
 
   const intakeProjectId = searchParams.get('intake');
-  const currentAgentMessage = manualPrompt || getCurrentAgentMessage(intakeSession);
-  const conversationProgress = Math.min(Math.max(intakeSession?.brief.conversation_turns || 1, 1), 4);
+  const currentQuestion = intakeSession?.current_question || null;
+  const totalQuestions = intakeSession?.total_questions || intakeSession?.questions?.length || 0;
+  const currentQuestionNumber = totalQuestions > 0
+    ? Math.min((intakeSession?.current_question_index || 0) + 1, totalQuestions)
+    : 0;
+  const currentAgentMessage = manualPrompt || currentQuestion?.text || getCurrentAgentMessage(intakeSession);
   const needsAiSetup = !isPreparationLoading && !generationPreparation?.has_ai_provider;
 
   const preparationBadges = useMemo(() => {
@@ -140,29 +145,6 @@ export default function NewProject() {
     ] as const;
   }, [generationPreparation]);
 
-  const historyMessages = useMemo(() => {
-    if (!intakeSession) {
-      return [];
-    }
-
-    if (manualPrompt) {
-      return intakeSession.messages;
-    }
-
-    const latestAgentMessage = getCurrentAgentMessage(intakeSession);
-    return intakeSession.messages.filter((message, index, allMessages) => {
-      if (message.role !== 'agent') {
-        return true;
-      }
-
-      const isLastAgent =
-        index ===
-        allMessages.map((entry) => entry.role).lastIndexOf('agent');
-
-      return !isLastAgent || message.content !== latestAgentMessage;
-    });
-  }, [intakeSession, manualPrompt]);
-
   const resizeTextarea = () => {
     const textarea = textareaRef.current;
 
@@ -179,13 +161,9 @@ export default function NewProject() {
   }, [prompt]);
 
   useEffect(() => {
-    const historyElement = historyRef.current;
-    if (!historyElement) {
-      return;
-    }
-
-    historyElement.scrollTop = historyElement.scrollHeight;
-  }, [historyMessages.length, currentAgentMessage]);
+    setSelectedChoice('');
+    setReply('');
+  }, [currentQuestion?.id]);
 
   const loadPreparationState = useCallback(async () => {
     setIsPreparationLoading(true);
@@ -297,8 +275,9 @@ export default function NewProject() {
     };
   }, [generationPreparation, intakeProjectId, navigate, setSearchParams, user]);
 
-  const handleConfirmIntake = async () => {
-    if (!intakeSession || !generationPreparation?.has_ai_provider) {
+  const handleConfirmIntake = async (sessionOverride?: ProjectIntakeSession) => {
+    const targetSession = sessionOverride || intakeSession;
+    if (!targetSession || !generationPreparation?.has_ai_provider) {
       return;
     }
 
@@ -307,12 +286,13 @@ export default function NewProject() {
     setError('');
 
     try {
-      await dbService.confirmProjectIntake(intakeSession.project_id, {
+      await dbService.confirmProjectIntake(targetSession.project_id, {
         providerId: selectedProviderId || undefined,
+        modelName: selectedModelName || undefined,
       });
       setLoadingSteps((previous) => [...previous.slice(-2), 'Starting the research pipeline...']);
       window.setTimeout(() => {
-        navigate(`/project/${intakeSession.project_id}/generating`, {
+        navigate(`/project/${targetSession.project_id}/generating`, {
           state: {
             preparation: generationPreparation,
           },
@@ -348,12 +328,20 @@ export default function NewProject() {
       const session = await dbService.startProjectIntake({
         description: trimmedPrompt,
         providerId: selectedProviderId || undefined,
+        modelName: selectedModelName || undefined,
       });
 
       setIntakeSession(session);
-      setScreenState(session.ready ? 'confirm' : 'conversation');
       setSearchParams({ intake: session.project_id }, { replace: true });
       setManualPrompt('');
+      setSelectedChoice('');
+
+      if (session.ready) {
+        await handleConfirmIntake(session);
+        return;
+      }
+
+      setScreenState('conversation');
     } catch (startError: unknown) {
       console.error('Error starting intake:', startError);
       setError(
@@ -369,7 +357,8 @@ export default function NewProject() {
   const handleReplySubmit = async (event?: FormEvent<HTMLFormElement>) => {
     event?.preventDefault();
 
-    if (!intakeSession || !reply.trim()) {
+    const responseValue = currentQuestion?.type === 'choice' ? selectedChoice.trim() : reply.trim();
+    if (!intakeSession || !responseValue) {
       return;
     }
 
@@ -378,14 +367,22 @@ export default function NewProject() {
 
     try {
       const session = await dbService.respondToProjectIntake(intakeSession.project_id, {
-        message: reply.trim(),
+        message: responseValue,
         providerId: selectedProviderId || undefined,
+        modelName: selectedModelName || undefined,
       });
 
       setReply('');
+      setSelectedChoice('');
       setIntakeSession(session);
-      setScreenState(session.ready ? 'confirm' : 'conversation');
       setManualPrompt('');
+
+      if (session.ready) {
+        await handleConfirmIntake(session);
+        return;
+      }
+
+      setScreenState('conversation');
     } catch (replyError: unknown) {
       console.error('Error sending intake reply:', replyError);
       setError(
@@ -595,44 +592,18 @@ export default function NewProject() {
             >
                 <div className="mb-8 flex items-start justify-between gap-6">
                   <div>
-                    <div className="section-label">Intake conversation</div>
+                    <div className="section-label">Clarifying questions</div>
                     <p className="mt-3 max-w-[420px] text-body">
-                      I am tightening the brief before the research pipeline starts.
+                      Quick questions so the plan is specific to your project and stack.
                     </p>
                     <p className="mt-2 max-w-[440px] text-[13px] leading-6 text-text-tertiary">
-                      I save this as we go, so you can leave and come back without losing the thread.
+                      One question at a time. You can leave and come back without losing progress.
                     </p>
                   </div>
                   <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
-                    Building context... {conversationProgress}/4
+                    {totalQuestions > 0 ? `Question ${Math.max(currentQuestionNumber, 1)} of ${totalQuestions}` : 'Preparing questions...'}
                   </div>
                 </div>
-
-              {historyMessages.length > 0 ? (
-                <div
-                  ref={historyRef}
-                  className="mb-6 max-h-[220px] space-y-4 overflow-y-auto pr-2"
-                >
-                  {historyMessages.map((message) => (
-                    <div
-                      key={`${message.id}-${message.role}`}
-                      className={cn(
-                        message.role === 'agent' ? '' : 'pl-5',
-                      )}
-                    >
-                      <p
-                        className={cn(
-                          message.role === 'agent'
-                            ? 'font-serif text-[16px] leading-8 text-text-primary'
-                            : 'text-[14px] leading-7 text-text-secondary',
-                        )}
-                      >
-                        {message.content.replace(/^READY:\s*/, '')}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
 
               <div className="mb-8">
                 <p className="max-w-[620px] font-serif text-[20px] leading-9 tracking-[-0.02em] text-text-primary">
@@ -641,45 +612,68 @@ export default function NewProject() {
               </div>
 
               <form onSubmit={handleReplySubmit} className="space-y-4">
-                <div className="flex items-center gap-3 rounded-[16px] border border-border-default bg-bg-elevated/60 px-4 py-3">
-                  <input
-                    value={reply}
-                    onChange={(event) => setReply(event.target.value)}
-                    placeholder="Your answer..."
-                    className="h-11 flex-1 bg-transparent text-[15px] text-text-primary outline-none placeholder:text-text-tertiary"
-                    autoFocus
-                    disabled={isSendingReply}
+                {currentQuestion?.type === 'choice' && currentQuestion.options && currentQuestion.options.length > 0 ? (
+                  <div className="grid gap-2">
+                    {currentQuestion.options.map((option) => (
+                      <button
+                        key={option}
+                        type="button"
+                        onClick={() => setSelectedChoice(option)}
+                        disabled={isSendingReply}
+                        className={cn(
+                          'rounded-full border px-4 py-2 text-left text-sm transition-colors',
+                          selectedChoice === option
+                            ? 'border-accent-border bg-accent-primary-muted text-accent-primary'
+                            : 'border-border-default bg-bg-elevated/60 text-text-secondary hover:border-border-strong hover:text-text-primary',
+                        )}
+                      >
+                        {option}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3 rounded-[16px] border border-border-default bg-bg-elevated/60 px-4 py-3">
+                    <input
+                      value={reply}
+                      onChange={(event) => setReply(event.target.value)}
+                      placeholder="Your answer..."
+                      className="h-11 flex-1 bg-transparent text-[15px] text-text-primary outline-none placeholder:text-text-tertiary"
+                      autoFocus
+                      disabled={isSendingReply}
+                    />
+                  </div>
+                )}
+
+                {isSendingReply && (
+                  <ThinkingBubble
+                    content={intakeSession?.agent_thinking}
+                    isStreaming={isSendingReply}
+                    className="mt-6 mb-2"
                   />
+                )}
+
+                <div className="flex items-center justify-between gap-4">
+                  <button
+                    type="button"
+                    onClick={() => void handleConfirmIntake()}
+                    className="text-sm text-text-tertiary transition-colors hover:text-text-secondary"
+                  >
+                    Skip and build from my description
+                  </button>
                   <button
                     type="submit"
-                    disabled={!reply.trim() || isSendingReply}
-                    className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-accent-primary text-white transition-colors hover:bg-accent-primary-hover disabled:cursor-not-allowed disabled:opacity-60"
-                    aria-label="Send reply"
+                    disabled={
+                      isSendingReply
+                      || (currentQuestion?.type === 'choice'
+                        ? !selectedChoice.trim()
+                        : !reply.trim())
+                    }
+                    className="btn-primary"
                   >
+                    Next
                     <ArrowRight className="h-4 w-4" />
                   </button>
                 </div>
-
-                  {isSendingReply && (
-                    <ThinkingBubble 
-                      content={intakeSession?.agent_thinking}
-                      isStreaming={isSendingReply}
-                      className="mt-6 mb-2"
-                    />
-                  )}
-
-                  <div className="flex items-center justify-between gap-4">
-                    <button
-                      type="button"
-                      onClick={() => void handleConfirmIntake()}
-                      className="text-sm text-text-tertiary transition-colors hover:text-text-secondary"
-                    >
-                      Skip - use my description as-is
-                    </button>
-                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                      {isSendingReply ? 'Agent is working...' : 'One question at a time'}
-                    </div>
-                  </div>
               </form>
             </motion.section>
           ) : null}
@@ -818,47 +812,94 @@ export default function NewProject() {
                 </DialogDescription>
               </DialogHeader>
 
-              <div className="space-y-2 px-6 py-2">
+              <div className="space-y-4 px-6 py-2 max-h-[60vh] overflow-y-auto">
                 {providers.map((provider) => (
-                  <button
-                    key={provider.id}
-                    onClick={() => {
-                      setSelectedProviderId(provider.id);
-                      setIsModalOpen(false);
-                    }}
-                    className={cn(
-                      'group flex w-full items-center justify-between rounded-xl border p-4 text-left transition-all duration-200',
-                      selectedProviderId === provider.id
-                        ? 'border-accent-border bg-accent-primary-muted'
-                        : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
-                    )}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div
+                  <div key={provider.id} className="space-y-2">
+                    <div className="text-xs font-semibold text-text-tertiary uppercase tracking-wider pl-1">
+                      {provider.name}
+                    </div>
+                    {provider.models && provider.models.length > 0 ? (
+                      provider.models.map((model) => {
+                        const isSelected = selectedProviderId === provider.id && selectedModelName === model.name;
+                        return (
+                          <button
+                            key={model.id}
+                            onClick={() => {
+                              setSelectedProviderId(provider.id);
+                              setSelectedModelName(model.name);
+                              setIsModalOpen(false);
+                            }}
+                            className={cn(
+                              'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
+                              isSelected
+                                ? 'border-accent-border bg-accent-primary-muted'
+                                : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
+                            )}
+                          >
+                            <div className="flex items-center gap-3">
+                              <div
+                                className={cn(
+                                  'flex h-8 w-8 items-center justify-center rounded-lg border transition-colors',
+                                  isSelected
+                                    ? 'border-accent-border bg-bg-surface text-accent-primary'
+                                    : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
+                                )}
+                              >
+                                <Sparkles className="h-4 w-4" />
+                              </div>
+                              <div>
+                                <div className="text-[14px] font-medium text-text-primary">
+                                  {model.name}
+                                </div>
+                              </div>
+                            </div>
+                            {isSelected ? (
+                              <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
+                                <ChevronRight className="h-3 w-3" />
+                              </div>
+                            ) : null}
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <button
+                        onClick={() => {
+                          setSelectedProviderId(provider.id);
+                          setSelectedModelName(null);
+                          setIsModalOpen(false);
+                        }}
                         className={cn(
-                          'flex h-9 w-9 items-center justify-center rounded-lg border transition-colors',
-                          selectedProviderId === provider.id
-                            ? 'border-accent-border bg-bg-surface text-accent-primary'
-                            : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
+                          'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
+                          selectedProviderId === provider.id && !selectedModelName
+                            ? 'border-accent-border bg-accent-primary-muted'
+                            : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
                         )}
                       >
-                        <Sparkles className="h-4.5 w-4.5" />
-                      </div>
-                      <div>
-                        <div className="text-[15px] font-medium text-text-primary">
-                          {provider.name}
+                        <div className="flex items-center gap-3">
+                          <div
+                            className={cn(
+                              'flex h-8 w-8 items-center justify-center rounded-lg border transition-colors',
+                              selectedProviderId === provider.id && !selectedModelName
+                                ? 'border-accent-border bg-bg-surface text-accent-primary'
+                                : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
+                            )}
+                          >
+                            <Sparkles className="h-4 w-4" />
+                          </div>
+                          <div>
+                            <div className="text-[14px] font-medium text-text-primary">
+                              {provider.model || 'Default Model'}
+                            </div>
+                          </div>
                         </div>
-                        <div className="text-[12px] text-text-tertiary">
-                          {provider.model || provider.provider}
-                        </div>
-                      </div>
-                    </div>
-                    {selectedProviderId === provider.id ? (
-                      <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
-                        <ChevronRight className="h-3 w-3" />
-                      </div>
-                    ) : null}
-                  </button>
+                        {selectedProviderId === provider.id && !selectedModelName ? (
+                          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
+                            <ChevronRight className="h-3 w-3" />
+                          </div>
+                        ) : null}
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
 

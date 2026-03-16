@@ -26,6 +26,8 @@ import {
   AIProvider,
   AIProviderType,
   deleteAIProvider,
+  addAIModel,
+  deleteAIModel,
   getAIModelRoles,
   getAIProviders,
   saveAIModelRoles,
@@ -392,6 +394,9 @@ export default function Settings() {
   const [savingMCPType, setSavingMCPType] = useState<MCPServerType | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [addingModelToId, setAddingModelToId] = useState<string | null>(null);
+  const [newModelName, setNewModelName] = useState<string>('');
+  const [removingModelId, setRemovingModelId] = useState<string | null>(null);
   const [providerErrors, setProviderErrors] = useState<Record<string, string>>({});
   const [removingMCPId, setRemovingMCPId] = useState<string | null>(null);
   const [togglingMCPId, setTogglingMCPId] = useState<string | null>(null);
@@ -548,6 +553,39 @@ export default function Settings() {
       setProviderErrors((prev) => ({ ...prev, [providerId]: errorMsg }));
     } finally {
       setTestingId(null);
+    }
+  };
+
+  const handleAddModel = async (event: FormEvent<HTMLFormElement>, providerId: string) => {
+    event.preventDefault();
+    if (!newModelName.trim()) {
+      toast.error('Enter a model name.');
+      return;
+    }
+    
+    setAddingModelToId(providerId);
+    try {
+      await addAIModel(providerId, newModelName.trim());
+      await Promise.all([loadProviders(true), loadModelRoles(true)]);
+      setNewModelName('');
+      toast.success('Model added.');
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not add the model.');
+    } finally {
+      setAddingModelToId(null);
+    }
+  };
+
+  const handleRemoveModel = async (providerId: string, modelId: string) => {
+    setRemovingModelId(modelId);
+    try {
+      await deleteAIModel(providerId, modelId);
+      await Promise.all([loadProviders(true), loadModelRoles(true)]);
+      toast.success('Model removed.');
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Could not remove the model.');
+    } finally {
+      setRemovingModelId(null);
     }
   };
 
@@ -925,7 +963,7 @@ export default function Settings() {
                       />
                     ) : null}
 
-                    <div className="space-y-2">
+                    <div className="space-y-2 mb-4">
                       <label className="block text-[10px] font-mono uppercase tracking-[0.16em] text-text-tertiary">
                         Saved key
                       </label>
@@ -934,6 +972,58 @@ export default function Settings() {
                         value={provider.masked_key || '••••••••••••••••'}
                         className={cn(inputClassName, 'cursor-default bg-bg-base/60 opacity-85', provider.masked_key && 'font-mono text-xs')}
                       />
+                    </div>
+                    
+                    <div className="space-y-2 mt-4 pt-4 border-t border-border-default/50">
+                      <label className="block text-[10px] font-mono uppercase tracking-[0.16em] text-text-tertiary">
+                        Models
+                      </label>
+                      {provider.models && provider.models.length > 0 ? (
+                        <div className="flex flex-col gap-2">
+                          {provider.models.map((m) => (
+                            <div key={m.id} className="flex items-center justify-between rounded-md border border-border-default bg-bg-surface/50 px-3 py-2 text-sm">
+                              <span className="text-text-primary">{m.name}</span>
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveModel(provider.id, m.id)}
+                                disabled={removingModelId === m.id}
+                                className="text-text-tertiary hover:text-status-error transition-colors"
+                              >
+                                {removingModelId === m.id ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                )}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-text-tertiary italic">No models added yet.</div>
+                      )}
+                      
+                      {addingModelToId === provider.id ? (
+                        <form onSubmit={(e) => handleAddModel(e, provider.id)} className="mt-2 flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={newModelName}
+                            onChange={(e) => setNewModelName(e.target.value)}
+                            placeholder="e.g. claude-3-5-sonnet"
+                            className={cn(inputClassName, 'flex-1 !h-8 text-xs')}
+                            autoFocus
+                          />
+                          <button type="submit" className="btn-secondary !h-8 !text-xs !px-3">Save</button>
+                          <button type="button" onClick={() => setAddingModelToId(null)} className="text-xs text-text-tertiary hover:text-text-primary px-2">Cancel</button>
+                        </form>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setAddingModelToId(provider.id)}
+                          className="mt-2 text-xs font-medium text-accent-primary hover:text-accent-primary-hover"
+                        >
+                          + Add model
+                        </button>
+                      )}
                     </div>
                   </div>
 

@@ -1305,7 +1305,7 @@ When a run is cancelled via the stop control the generation screen switches into
   - Feedback textarea (DM Sans 14px) for adjustments and preference buttons for `cursor`, `windsurf`, `vscode`, `claude_desktop`.
   - "Let me adjust" (ghost) and "Looks right, build my plan →" (paprika) buttons. Approval re-enqueues batch 4 with feedback; the panel stays until approved.
   - A Research depth row lives above the stack grid, displaying badges such as `[✓ Web search]`, `[✓ GitHub — authenticated]`, or `[✗ Brave Search — not connected]`. Connected badges follow the mint style (`bg-[rgba(52,211,153,0.1)]`, `border-[rgba(52,211,153,0.2)]`, `text-[#34d399]`, checkmark icon), while offline tools use a muted grey treatment (`bg-[rgba(204,197,185,0.05)]`, `border-[rgba(204,197,185,0.1)]`, `text-[var(--text-muted)]`, X icon, "not connected" suffix). Below the badges, a JetBrains Mono 11px line reads "Researched {n} technologies across {m} sources." If fewer than two tools were connected, a quiet amber nudge appears beneath: "Connect more research tools in Settings for deeper analysis next time." (Links to `/settings#mcp-servers`.)
-  - A collapsible "What I read" disclosure expands to show every source the agent consulted: each entry lists the URL or GitHub repo, the MCP tool that fetched it (Brave, GitHub, Context7, or fallback fetch), and a one-line summary of the insight it contributed, proving the agent actually read the Supabase changelog or docs page it cites.
+- A collapsible "What I read" disclosure expands to show every source the agent consulted: each entry now includes tool icon/label, truncated URL, `chars_read`, relevance tier (`high|medium|low`), and a one-line insight summary from the research ledger.
 - If the SSE stream reports `pipeline_failed`, the review screen surfaces the error message and a "Try again" button that reconnects the stream.
 - On success (terminal `pipeline_complete`), a Sonner toast appears ("Your project plan is ready."), waits 1.5s, then navigates to `/project/:id`.
 
@@ -1415,7 +1415,7 @@ Width 176px. Status-driven appearance:
 6. **Things to check** — interactive checklist with optimistic local toggle
 7. **Done when...** — exit criteria in emerald border container
 
- Every enriched step now ends with a JetBrains Mono 11px footer that reads `Researched {date} using {tools used}` (Context7, GitHub, Brave, or fallback fetch). The footer explicitly calls out any missing tools and invites the builder to connect them in Settings so future enrichments can go deeper. It anchors the Research depth story from the architecture review, proving the agent actually read the Supabase changelog, Stripe webhook guide, or deployment docs before writing the guidance.
+ Every enriched step now ends with a JetBrains Mono 11px footer that reads `Researched {date} using {tools used}`. The footer is rendered from persisted step metadata (`steps.research_footer_meta`) so it remains stable across refreshes and re-enrichments while keeping the AI narrative body clean.
 
 Behind the scenes the panel now routes every enrichment request through `dbService.streamStepEnrichment` and the shared `useStepExecution` hook so AI output arrives as an SSE stream and the toaster-enabled UX stays responsive. While the agent is working the drawer keeps the skeletons active, disables Skip/Mark as done until the network call completes, and instantly surfaces any fetch or enrichment errors with a subtle banner plus a “Try again” button that refreshes that step without closing the drawer. Toast guidance confirms both successes and failures, which keeps the flow feeling steady even when external services pause or hiccup.
 
@@ -1602,6 +1602,13 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **SSE Progress Sync**: Added `progress_percent` metric to `batch_complete` events in the generation pipeline to ensure the client-side progress bar perfectly reflects backend generation state.
 - **Review Flapping Fixes**: Hardened the approval/resume flow to prevent status oscillation.
 - **Thinking Stream Debug Logging (March 2026)**: Added comprehensive debug logging across the thinking event flow to diagnose why real-time thinking isn't visible in the frontend.
+- **Phase 7 — Fallback Chain Transparency**:
+  - Batch 2 now persists a structured research source ledger (`tool`, `url`, `title`, `chars_read`, `relevance`, `insight`) and carries it through the architecture review payload.
+  - The architecture review disclosure ("What I read") renders that ledger directly, including character counts and relevance labels for each source.
+  - Architecture review now surfaces an amber limited-research notice when fewer than 3 sources are fetched successfully.
+  - The generation screen now shows model-role transparency under the batch heading: `Using [fast model] for research · [deep model] for generation`.
+  - Step enrichment now stores per-step research footer metadata and the step detail drawer renders a dedicated JetBrains Mono footer from metadata instead of appending footer text into `ai_output`.
+  - Migration added: `016_step_research_footer_metadata.sql` (`steps.research_footer_meta`).
 
 ### 17.5 Known Product Gaps & Roadmap Priorities
 

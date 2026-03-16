@@ -60,6 +60,7 @@ import { sendGenerationDispatch } from './generation-dispatch';
 
 
 import { extractGitHubRepository } from '../utils/fetch-url';
+import { buildResearchManifest } from './research-manifest';
 import { createResearchService, resolveToolDocsEntry, type ResearchResult } from './research';
 import {
   getBuilderProfileDocsTopic,
@@ -69,7 +70,6 @@ import {
 import { getConnectedResearchTools } from './mcp-servers';
 import { appendProjectBriefSystemPrompt, loadProjectBriefContext } from './project-briefs';
 import {
-  appendResearchFooter,
   collectStepResearchContext,
   formatStepResearchPrompt,
   type StepResearchContext,
@@ -92,6 +92,7 @@ type ProjectRecord = {
   user_id: string;
   name: string;
   description: string | null;
+  intake_answers: string | null;
   project_type: string | null;
   stack: string | null;
   generation_status: string | null;
@@ -178,6 +179,8 @@ type PlanStepEnrichment = Batch5EnrichSteps['enrichments'][number];
 
 type EnrichedPlanStep = Batch4PlanBuild['stages'][number]['steps'][number] & {
   ai_output: string;
+  done_when: string;
+  navigation_links: PlanStepEnrichment['navigation_links'];
   prompts: PlanStepEnrichment['prompts'];
 };
 
@@ -237,6 +240,8 @@ type ResearchTechnologyTarget = {
   github_url?: string;
   changelog_url?: string;
   docs_topic: string;
+  search_query?: string;
+  priority: 'high' | 'medium' | 'low';
   community_search_results: SearchResult[];
   breaking_change_search_results: SearchResult[];
   source: 'brief' | 'profile' | 'inferred';
@@ -273,6 +278,7 @@ type BatchExecutionResult = 'complete' | 'checkpointed';
 type Batch2CheckpointData = {
   researchTargets: ResearchTechnologyTarget[];
   fetchedSources: FetchedTechnologyResearch[];
+  researchSourceLedger?: Batch2FetchAndRead['sources'];
   issuesFound: number;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
   subrequestCounter: number;
@@ -562,27 +568,19 @@ function toSearchResultFromResearch(entry: ResearchResult): SearchResult | null 
 }
 
 function toolLabelFromDocTool(tool: ResearchResult['tool']) {
-  if (tool === 'jina_reader') {
-    return 'Jina Reader';
-  }
-
   if (tool === 'cf_scrape') {
-    return 'Cloudflare Scrape';
+    return 'cf_scrape';
   }
 
-  return 'Jina Reader';
+  return 'jina_reader';
 }
 
 function toolLabelFromGithubTool(tool: ResearchResult['tool']) {
-  if (tool === 'gitmcp') {
-    return 'GitMCP';
-  }
-
   if (tool === 'github_api') {
-    return 'GitHub API';
+    return 'github_api';
   }
 
-  return 'GitMCP';
+  return 'gitmcp';
 }
 
 function parseOpenIssuesCount(content: string) {
@@ -669,6 +667,18 @@ function dedupeResearchSources(sources: Batch2FetchAndRead['sources']) {
 function dedupeResearchTargets(targets: ResearchTechnologyTarget[]) {
   const merged = new Map<string, ResearchTechnologyTarget>();
 
+  const getPriorityRank = (priority: ResearchTechnologyTarget['priority']) => {
+    switch (priority) {
+      case 'high':
+        return 0;
+      case 'medium':
+        return 1;
+      case 'low':
+      default:
+        return 2;
+    }
+  };
+
   for (const target of targets) {
     const key = normalizeBuilderProfileName(target.name);
     const existing = merged.get(key);
@@ -678,19 +688,24 @@ function dedupeResearchTargets(targets: ResearchTechnologyTarget[]) {
       continue;
     }
 
+    const useIncomingAsBase = getPriorityRank(target.priority) < getPriorityRank(existing.priority);
+    const primary = useIncomingAsBase ? target : existing;
+    const secondary = useIncomingAsBase ? existing : target;
+
     merged.set(key, {
-      ...existing,
-      docs_url: existing.docs_url || target.docs_url,
-      github_url: existing.github_url || target.github_url,
-      changelog_url: existing.changelog_url || target.changelog_url,
-      docs_topic: existing.docs_topic || target.docs_topic,
+      ...primary,
+      docs_url: primary.docs_url || secondary.docs_url,
+      github_url: primary.github_url || secondary.github_url,
+      changelog_url: primary.changelog_url || secondary.changelog_url,
+      docs_topic: primary.docs_topic || secondary.docs_topic,
+      search_query: primary.search_query || secondary.search_query,
       community_search_results: dedupeSearchResults([
-        ...existing.community_search_results,
-        ...target.community_search_results,
+        ...primary.community_search_results,
+        ...secondary.community_search_results,
       ]),
       breaking_change_search_results: dedupeSearchResults([
-        ...existing.breaking_change_search_results,
-        ...target.breaking_change_search_results,
+        ...primary.breaking_change_search_results,
+        ...secondary.breaking_change_search_results,
       ]),
     });
   }
@@ -713,6 +728,8 @@ function toResearchTechnologyTarget(
   technology: Partial<Batch1ResearchStack['technologies'][number]>,
   source: ResearchTechnologyTarget['source'],
   docsTopic: string,
+  priority: ResearchTechnologyTarget['priority'] = 'low',
+  searchQuery?: string,
 ): ResearchTechnologyTarget {
   return {
     name: technology.name || 'Unknown technology',
@@ -720,6 +737,8 @@ function toResearchTechnologyTarget(
     github_url: technology.github_url || '',
     changelog_url: technology.changelog_url || '',
     docs_topic: docsTopic,
+    search_query: searchQuery,
+    priority,
     community_search_results: normalizeStoredSearchResults(technology.community_search_results),
     breaking_change_search_results: normalizeStoredSearchResults(technology.breaking_change_search_results),
     source,
@@ -739,31 +758,6 @@ function limitBatch1Technologies(technologies: Batch1ResearchStack['technologies
     community_search_results: technology.community_search_results,
     breaking_change_search_results: technology.breaking_change_search_results,
   }));
-}
-
-function filterRelevantProfileTargets(
-  builderProfile: LoadedBuilderProfileContext,
-  projectBrief: LoadedProjectBriefContext,
-  inferredTechnologies: Batch1ResearchStack['technologies'],
-) {
-  const projectTokens = [
-    ...projectBrief.confirmedStackTools.flatMap((technology) => buildMatchTokens(technology)),
-    ...inferredTechnologies.flatMap((technology) => buildMatchTokens(technology.name)),
-  ];
-
-  const relevantTargets = builderProfile.declaredTools.filter((tool) =>
-    targetsOverlap(buildMatchTokens(tool.name), projectTokens),
-  );
-
-  if (relevantTargets.length > 0) {
-    return relevantTargets;
-  }
-
-  if (projectTokens.length === 0) {
-    return builderProfile.declaredTools;
-  }
-
-  return [];
 }
 
 function resolveBatch2SourceTargetCount(contextWindow: number) {
@@ -790,13 +784,13 @@ function resolveBatch2SearchResultLimit(contextWindow: number) {
   return 6;
 }
 
-function getResearchTargetSourcePriority(source: ResearchTechnologyTarget['source']) {
-  switch (source) {
-    case 'brief':
+function getResearchTargetPriorityValue(priority: ResearchTechnologyTarget['priority']) {
+  switch (priority) {
+    case 'high':
       return 0;
-    case 'profile':
+    case 'medium':
       return 1;
-    case 'inferred':
+    case 'low':
     default:
       return 2;
   }
@@ -848,7 +842,7 @@ function limitResearchTargets(
   maxTargets: number,
 ) {
   const ranked = dedupeResearchTargets(targets).sort((left, right) => {
-    const priorityDiff = getResearchTargetSourcePriority(left.source) - getResearchTargetSourcePriority(right.source);
+    const priorityDiff = getResearchTargetPriorityValue(left.priority) - getResearchTargetPriorityValue(right.priority);
     if (priorityDiff !== 0) {
       return priorityDiff;
     }
@@ -867,17 +861,47 @@ function limitResearchTargets(
   };
 }
 
+function mapPriorityToResearchSource(priority: 'high' | 'medium' | 'low'): ResearchTechnologyTarget['source'] {
+  switch (priority) {
+    case 'high':
+      return 'brief';
+    case 'medium':
+      return 'profile';
+    case 'low':
+    default:
+      return 'inferred';
+  }
+}
+
 function buildResearchTargets(
   inferredTechnologies: Batch1ResearchStack['technologies'],
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
   maxTargets: number,
 ) {
+  const manifest = buildResearchManifest(
+    builderProfile,
+    projectBrief.summary || inferredTechnologies.map((technology) => technology.name).join(' '),
+  );
+  const manifestTargets: ResearchTechnologyTarget[] = manifest.tools.map((tool) => ({
+    name: tool.name,
+    docs_url: tool.docsUrl,
+    github_url: tool.githubRepo ? `https://github.com/${tool.githubRepo}` : '',
+    changelog_url: '',
+    docs_topic: tool.docsTopic,
+    search_query: tool.searchQuery,
+    priority: tool.priority,
+    community_search_results: [],
+    breaking_change_search_results: [],
+    source: mapPriorityToResearchSource(tool.priority),
+  }));
+
   const inferredTargets: ResearchTechnologyTarget[] = inferredTechnologies.map((technology) =>
     toResearchTechnologyTarget(
       technology,
       'inferred',
       'installation, migration, compatibility, breaking changes, best practices',
+      'low',
     ),
   );
 
@@ -892,31 +916,15 @@ function buildResearchTargets(
         researchUrls.docsUrl || researchUrls.githubUrl || researchUrls.changelogUrl
           ? getBuilderProfileDocsTopic('frontend', technology)
           : 'installation, migration, compatibility, breaking changes, best practices',
+      search_query: buildBatch2SearchQuery(technology),
+      priority: 'high',
       community_search_results: [],
       breaking_change_search_results: [],
       source: 'brief',
     };
   });
 
-  const profileTargets: ResearchTechnologyTarget[] = filterRelevantProfileTargets(
-    builderProfile,
-    projectBrief,
-    inferredTechnologies,
-  ).map((tool) => ({
-    name: tool.name,
-    docs_url: tool.docs_url,
-    github_url: tool.github_url,
-    changelog_url: tool.changelog_url,
-    docs_topic:
-      tool.proficiency === 'learning'
-        ? `${tool.docs_topic}, beginner setup, common mistakes`
-        : tool.docs_topic,
-    community_search_results: [],
-    breaking_change_search_results: [],
-    source: 'profile',
-  }));
-
-  return limitResearchTargets([...briefTargets, ...inferredTargets, ...profileTargets], projectBrief, maxTargets);
+  return limitResearchTargets([...briefTargets, ...manifestTargets, ...inferredTargets], projectBrief, maxTargets);
 }
 
 function createResearchSource(
@@ -925,13 +933,21 @@ function createResearchSource(
   url: string,
   title: string,
   summary: string,
+  charsRead: number,
+  relevance: ResearchTechnologyTarget['priority'],
+  insight?: string,
 ): Batch2FetchAndRead['sources'][number] {
+  const summarizedInsight = summarizeSnippet(insight || summary, 220);
+
   return {
     technology,
     tool,
     url,
     title,
     summary: summarizeSnippet(summary),
+    insight: summarizedInsight,
+    chars_read: Math.max(0, Math.floor(charsRead)),
+    relevance,
   };
 }
 
@@ -991,6 +1007,9 @@ function buildBatch2PromptPayload(
         tool: entry.tool,
         title: trimToLimit(entry.title, 120),
         summary: trimToLimit(entry.summary, 360),
+        insight: trimToLimit(entry.insight || entry.summary, 220),
+        chars_read: entry.chars_read,
+        relevance: entry.relevance,
       })),
     })),
     dataQuality,
@@ -1443,6 +1462,8 @@ function mergePlanWithEnrichments(plan: Batch4PlanBuild, enrichments: Batch5Enri
         return {
           ...step,
           ai_output: enrichment?.ai_output || '',
+          done_when: enrichment?.done_when || step.done_when || '',
+          navigation_links: enrichment?.navigation_links || [],
           prompts: enrichment?.prompts || [],
         };
       }),
@@ -1563,12 +1584,100 @@ function normalizePromptCards(prompts: Batch5EnrichSteps['enrichments'][number][
   return prompts.filter((prompt) => prompt.label.trim() && prompt.content.trim());
 }
 
+function normalizeNavigationLinks(
+  links: Batch5EnrichSteps['enrichments'][number]['navigation_links'],
+) {
+  const seen = new Set<string>();
+  const normalized: Batch5EnrichSteps['enrichments'][number]['navigation_links'] = [];
+
+  for (const link of links || []) {
+    const label = (link.label || '').trim();
+    const url = (link.url || '').trim();
+    if (!label || !url) {
+      continue;
+    }
+
+    const key = `${label.toLowerCase()}::${url.toLowerCase()}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+
+    normalized.push({
+      label,
+      url,
+      when: (link.when || '').trim() || 'Start here',
+    });
+  }
+
+  return normalized.slice(0, 4);
+}
+
+function buildFallbackNavigationLinks(stepResearch: StepResearchContext | undefined) {
+  if (!stepResearch) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  return stepResearch.docs
+    .map((doc, index) => {
+      const url = (doc.url || '').trim();
+      if (!url || seen.has(url.toLowerCase())) {
+        return null;
+      }
+
+      seen.add(url.toLowerCase());
+      return {
+        label: `Open ${doc.library} docs`,
+        url,
+        when: index === 0 ? 'Start here' : 'Reference',
+      };
+    })
+    .filter((link): link is { label: string; url: string; when: string } => Boolean(link))
+    .slice(0, 3);
+}
+
+function normalizeDoneWhen(value: string, fallback: string) {
+  const trimmed = (value || '').trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.includes('feel confident')
+    || lower.includes('when ready')
+    || lower.includes('looks good')
+    || lower.includes('seems complete')
+  ) {
+    return fallback;
+  }
+
+  return trimmed;
+}
+
+function normalizeResearchFooterMeta(
+  value: Batch5EnrichSteps['enrichments'][number]['research_footer_meta'] | undefined,
+  fallbackDateLabel: string,
+) {
+  const researchedAt = (value?.researched_at || '').trim() || fallbackDateLabel;
+  const tools = (value?.tools || [])
+    .map((tool) => tool.trim())
+    .filter(Boolean);
+
+  return {
+    researched_at: researchedAt,
+    tools: tools.length > 0 ? tools : ['default research stack'],
+  };
+}
+
 function ensureCompleteStepEnrichments(
   steps: Batch5ResearchStep[],
   stepResearchById: Map<string, StepResearchContext>,
   enrichments: Batch5EnrichSteps['enrichments'],
 ): Batch5EnrichSteps['enrichments'] {
   const enrichmentById = new Map<string, Batch5EnrichSteps['enrichments'][number]>();
+  const fallbackDateLabel = new Date().toISOString().slice(0, 10);
 
   for (const enrichment of enrichments) {
     if (!enrichment.step_id || enrichmentById.has(enrichment.step_id)) {
@@ -1578,20 +1687,35 @@ function ensureCompleteStepEnrichments(
     enrichmentById.set(enrichment.step_id, {
       step_id: enrichment.step_id,
       ai_output: enrichment.ai_output.trim(),
+      done_when: normalizeDoneWhen(enrichment.done_when || '', ''),
+      research_footer_meta: normalizeResearchFooterMeta(enrichment.research_footer_meta, fallbackDateLabel),
+      navigation_links: normalizeNavigationLinks(enrichment.navigation_links),
       prompts: normalizePromptCards(enrichment.prompts),
     });
   }
 
   return steps.map((step) => {
-    const footer =
-      stepResearchById.get(step.id)?.footer
-      || `Researched ${new Date().toISOString().slice(0, 10)} — connect more tools in Settings for deeper results.`;
     const existing = enrichmentById.get(step.id);
+    const stepResearchContext = stepResearchById.get(step.id);
+    const footerMeta = normalizeResearchFooterMeta(
+      existing?.research_footer_meta || stepResearchContext?.footerMeta,
+      fallbackDateLabel,
+    );
     const body = existing?.ai_output || buildFallbackStepEnrichmentBody(step);
+    const fallbackDoneWhen =
+      step.done_when?.trim()
+      || `You can verify ${step.title.toLowerCase()} works end-to-end in your local environment.`;
+    const doneWhen = normalizeDoneWhen(existing?.done_when || '', fallbackDoneWhen);
+    const navigationLinks = existing?.navigation_links?.length
+      ? existing.navigation_links
+      : buildFallbackNavigationLinks(stepResearchById.get(step.id));
 
     return {
       step_id: step.id,
-      ai_output: appendResearchFooter(body, footer),
+      ai_output: body,
+      done_when: doneWhen,
+      research_footer_meta: footerMeta,
+      navigation_links: navigationLinks,
       prompts: existing?.prompts || [],
     };
   });
@@ -2795,8 +2919,8 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
           INSERT INTO steps (
             id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
             is_gate, is_milestone, milestone_label, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when,
-            ai_output, prompts, is_ai_enriched
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ai_output, prompts, navigation_links, is_ai_enriched
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           step.id,
           workflowId,
@@ -2817,6 +2941,7 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
           JSON.stringify(step.suggested_tools || []),
           step.done_when || '',
           null,
+          JSON.stringify([]),
           JSON.stringify([]),
           0,
         ),
@@ -2852,7 +2977,10 @@ async function applyStepEnrichments(env: Bindings, projectId: string, enrichment
     env.DB.prepare(`
       UPDATE steps
       SET ai_output = ?,
+          done_when = ?,
+          research_footer_meta = ?,
           prompts = ?,
+          navigation_links = ?,
           is_ai_enriched = 1,
           status = CASE
             WHEN is_gate = 1 AND status = 'active' THEN 'needs_review'
@@ -2862,7 +2990,15 @@ async function applyStepEnrichments(env: Bindings, projectId: string, enrichment
       WHERE id = ? AND workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)
     `).bind(
       enrichment.ai_output,
+      enrichment.done_when,
+      JSON.stringify(
+        enrichment.research_footer_meta || {
+          researched_at: new Date().toISOString().slice(0, 10),
+          tools: ['default research stack'],
+        },
+      ),
       JSON.stringify(enrichment.prompts),
+      JSON.stringify(enrichment.navigation_links || []),
       enrichment.step_id,
       projectId,
     ),
@@ -2971,6 +3107,63 @@ async function updateProjectMetadataFromAdr(env: Bindings, projectId: string, ad
     .run();
 }
 
+type StoredIntakeAnswerEntry = {
+  question: string;
+  answer: string;
+};
+
+type StoredIntakeAnswersPayload = {
+  answers: StoredIntakeAnswerEntry[];
+};
+
+function parseStoredIntakeAnswers(value: string | null | undefined): StoredIntakeAnswersPayload | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const payload = parsed as { answers?: unknown };
+    const answers = Array.isArray(payload.answers)
+      ? payload.answers
+          .map((entry) => ({
+            question:
+              entry && typeof entry === 'object' && !Array.isArray(entry) && typeof (entry as { question?: unknown }).question === 'string'
+                ? (entry as { question: string }).question.trim()
+                : '',
+            answer:
+              entry && typeof entry === 'object' && !Array.isArray(entry) && typeof (entry as { answer?: unknown }).answer === 'string'
+                ? (entry as { answer: string }).answer.trim()
+                : '',
+          }))
+          .filter((entry: StoredIntakeAnswerEntry) => entry.question && entry.answer)
+      : [];
+
+    if (answers.length === 0) {
+      return null;
+    }
+
+    return { answers };
+  } catch {
+    return null;
+  }
+}
+
+function formatStoredIntakeAnswers(value: string | null | undefined) {
+  const parsed = parseStoredIntakeAnswers(value);
+  if (!parsed) {
+    return '';
+  }
+
+  return parsed.answers
+    .map((entry, index) => `${index + 1}. ${entry.question}\nAnswer: ${entry.answer}`)
+    .join('\n\n');
+}
+
 async function executeBatch1(
   env: Bindings,
   project: ProjectRecord,
@@ -2980,8 +3173,11 @@ async function executeBatch1(
   projectBrief: LoadedProjectBriefContext,
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
+  const intakeAnswers = formatStoredIntakeAnswers(project.intake_answers);
+  const projectDescription = projectBrief.summary || project.description || '';
   const input = {
-    description: projectBrief.summary || project.description || '',
+    description: projectDescription,
+    intake_answers: intakeAnswers || undefined,
   };
 
   await emitBatchStart(env, project.id, runId, 'batch_1_research_stack');
@@ -2997,7 +3193,14 @@ async function executeBatch1(
     projectBrief.promptContext,
   );
   const prompt = `Project description:
-${projectBrief.summary || project.description || 'No description provided.'}
+${projectDescription || 'No description provided.'}
+
+${intakeAnswers
+    ? `Clarifying intake answers:
+${intakeAnswers}
+
+Use these answers as additional context when identifying implementation-critical technologies.`
+    : ''}
 
 Identify the stack implied by the idea. For each technology, provide:
 - name
@@ -3197,6 +3400,7 @@ async function executeBatch2(
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index, {
         researchTargets,
         fetchedSources,
+        researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
         issuesFound,
         partialFailures,
         subrequestCounter,
@@ -3219,7 +3423,7 @@ async function executeBatch2(
       ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
       : (technology.github_url || '').trim();
     const changelogUrl = (technology.changelog_url || '').trim();
-    const searchQuery = buildBatch2SearchQuery(technology.name);
+    const searchQuery = technology.search_query || buildBatch2SearchQuery(technology.name);
 
     const [docsResult, githubResult, webResearchResults] = await Promise.all([
       docsUrl
@@ -3362,6 +3566,8 @@ async function executeBatch2(
               docsUrl || docsResult.source,
               `${technology.name} docs`,
               docsResult.content,
+              docsResult.chars || docsResult.content.length,
+              technology.priority,
             ),
           ]
         : []),
@@ -3375,16 +3581,20 @@ async function executeBatch2(
                 ? `${githubRepository.owner}/${githubRepository.repo}`
                 : `${technology.name} repository`,
               githubResult.content,
+              githubResult.chars || githubResult.content.length,
+              technology.priority,
             ),
           ]
         : []),
       ...communityPages.map((page) =>
         createResearchSource(
           technology.name,
-          'Jina Search',
+          'jina_search',
           page.url,
           page.title,
           page.content || page.description,
+          (page.content || page.description || '').length,
+          technology.priority,
         ),
       ),
     ]);
@@ -3418,6 +3628,7 @@ async function executeBatch2(
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
         researchTargets,
         fetchedSources,
+        researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
         issuesFound,
         partialFailures,
         subrequestCounter,
@@ -3485,7 +3696,7 @@ For each technology, return:
 - repo_health_summary
 - community_sentiment
 - bug_report_digest
-- sources (copy the important sources you used as { technology, url, tool, title, summary })
+- sources (copy the important sources you used as { technology, url, tool, title, summary, insight, chars_read, relevance })
 
 Preserve specific version and compatibility details.`;
 
@@ -3505,8 +3716,31 @@ Preserve specific version and compatibility details.`;
     const researchByTechnology = new Map(
       result.data.research.map((entry) => [entry.technology.toLowerCase(), entry] as const),
     );
+    const technologyInsightByName = new Map(
+      result.data.research.map((entry) => {
+        const combinedInsight = summarizeSnippet(
+          [
+            entry.repo_health_summary,
+            entry.recent_breaking_changes,
+            entry.community_sentiment,
+            entry.bug_report_digest,
+          ]
+            .filter(Boolean)
+            .join(' '),
+          220,
+        );
+        return [entry.technology.toLowerCase(), combinedInsight] as const;
+      }),
+    );
     const finalResearch = fetchedSources.map((source) => {
       const generated = researchByTechnology.get(source.technology.toLowerCase());
+      const technologyInsight = technologyInsightByName.get(source.technology.toLowerCase()) || '';
+      const enrichedSources = source.source_ledger.map((entry) => ({
+        ...entry,
+        chars_read: entry.chars_read || entry.summary.length,
+        relevance: entry.relevance || 'medium',
+        insight: summarizeSnippet(entry.insight || technologyInsight || entry.summary, 220),
+      }));
 
       return {
         technology: source.technology,
@@ -3519,13 +3753,19 @@ Preserve specific version and compatibility details.`;
         repo_health_summary: generated?.repo_health_summary || source.repo_health_summary,
         community_sentiment: generated?.community_sentiment || source.community_sentiment,
         bug_report_digest: generated?.bug_report_digest || source.bug_report_digest,
-        sources: source.source_ledger,
+        sources: enrichedSources,
       };
     });
+    const finalSourceLedger = dedupeResearchSources(finalResearch.flatMap((entry) => entry.sources));
+    const finalDataQuality: Batch2FetchAndRead['data_quality'] = {
+      ...dataQuality,
+      urls_fetched: finalSourceLedger.length,
+      used_full_context_window: !truncationApplied && finalSourceLedger.length >= sourceTargetCount,
+    };
     const finalOutput: Batch2FetchAndRead = {
       research: finalResearch,
-      sources: sourceLedger,
-      data_quality: dataQuality,
+      sources: finalSourceLedger,
+      data_quality: finalDataQuality,
     };
 
     await clearGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read');
@@ -3867,7 +4107,7 @@ async function executeBatch5(
   projectId: string,
   provider: ProviderConfig,
   runId: string,
-  _builderProfile: LoadedBuilderProfileContext,
+  builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
@@ -3886,6 +4126,10 @@ async function executeBatch5(
     'batch_5_enrich_steps',
   );
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
+  const researchManifest = buildResearchManifest(
+    builderProfile,
+    projectBrief.summary || project.description || '',
+  );
   const planSteps = checkpoint?.data.steps || flattenPlanSteps(plan);
   const stepResearchContexts: StepResearchContext[] = checkpoint?.data.stepResearchContexts
     ? [...checkpoint.data.stepResearchContexts]
@@ -3937,6 +4181,7 @@ async function executeBatch5(
       batchName: 'batch_5_enrich_steps',
       projectId,
       connectedTools,
+      researchManifest,
     });
 
     stepResearchContexts.push(stepResearch);
@@ -3995,7 +4240,7 @@ async function executeBatch5(
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s step enrichment agent. Enrich every step in one pass with concrete AI output and copy-paste prompts. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.',
+    'You are Scrimble’s step enrichment agent. Enrich every step in one pass using turn-by-turn navigation guidance. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.',
     projectBrief.promptContext,
   );
   const prompt = `Plan:
@@ -4010,13 +4255,24 @@ ${stepResearchContexts.map((context) => formatStepResearchPrompt(context)).join(
 For every step, generate:
 - step_id
 - ai_output
+- done_when
+- navigation_links: [{ label, url, when }]
 - prompts: [{ label, content }]
 
-The ai_output should read like a senior engineer’s first pass at the work, not vague suggestions.
+The ai_output must follow this standard:
+- Lead with WHERE to go: exact tool, URL, or interface.
+- Follow with WHAT to do there: specific actions, not concepts.
+- End with WHAT to bring back when marking the step done.
+- Reference the user's actual tools by name.
+- Keep it to a maximum of 3 paragraphs.
+- If an AI coding prompt is needed, include the exact prompt but keep prompts as a small part.
+
+done_when must be concrete and verifiable, never subjective.
 Use the live documentation provided to generate specific, current guidance.
 Reference actual function names, hook names, and config options from the docs.
 If any open bugs were found, mention them in the ai_output and explain the workaround.
-For each step, obey any requirements array included in the live step research context.`;
+For each step, obey any requirements array included in the live step research context.
+Populate navigation_links from the researched docs URLs so the user can click directly into setup pages.`;
 
   try {
     const result = await callValidatedBatch(provider, {

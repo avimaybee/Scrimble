@@ -4,12 +4,19 @@ import { toast } from 'sonner';
 
 export type AIProviderType = 'gemini' | 'anthropic' | 'openai' | 'custom' | 'openrouter' | 'groq';
 
+export interface AIModel {
+  id: string;
+  provider_id: string;
+  name: string;
+}
+
 export interface AIProvider {
   id: string;
   name: string;
   provider: AIProviderType;
   base_url?: string;
-  model?: string;
+  model?: string; // deprecated, keeping for backward compatibility in some views if needed
+  models: AIModel[];
   is_default: boolean;
   masked_key?: string;
 }
@@ -175,6 +182,48 @@ export async function deleteAIProvider(providerId: string) {
   if (!response.ok) {
     const err = await response.json();
     throw new Error(err.error || 'Failed to remove provider');
+  }
+
+  return response.json();
+}
+
+export async function addAIModel(providerId: string, modelName: string) {
+  const user = auth.currentUser;
+  if (!user) throw new Error('User not authenticated');
+
+  const token = await user.getIdToken();
+  const response = await fetch(`/api/ai/providers/${providerId}/models`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name: modelName }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.error || 'Failed to add model');
+  }
+
+  return response.json();
+}
+
+export async function deleteAIModel(providerId: string, modelId: string) {
+  const user = auth.currentUser;
+  if (!user) throw new Error('User not authenticated');
+
+  const token = await user.getIdToken();
+  const response = await fetch(`/api/ai/providers/${providerId}/models/${modelId}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  });
+
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.error || 'Failed to remove model');
   }
 
   return response.json();
