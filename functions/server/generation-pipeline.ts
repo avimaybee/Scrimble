@@ -58,19 +58,7 @@ import { sendGenerationDispatch } from './generation-dispatch';
 
 
 import { extractGitHubRepository } from '../utils/fetch-url';
-import {
-  analyzeGithubRepo,
-  fetchUrl,
-  getLibraryDocs,
-  getLibraryIssues,
-  searchWeb,
-  type Env as ToolEnv,
-  type LibraryDocsResult,
-  type SearchResult,
-  type GithubIssue,
-  type GithubRepoAnalysis,
-  ToolExecutionError,
-} from '../../workers/tools';
+import { createResearchService, resolveToolDocsEntry, type ResearchResult } from './research';
 import {
   getBuilderProfileDocsTopic,
   getBuilderProfileResearchUrls,
@@ -206,6 +194,12 @@ type FetchedCommunitySource = {
   content: string;
 };
 
+type SearchResult = {
+  title: string;
+  url: string;
+  description: string;
+};
+
 type FetchedTechnologyResearch = {
   technology: string;
   docs_url: string;
@@ -278,8 +272,6 @@ type Batch2CheckpointData = {
   researchTargets: ResearchTechnologyTarget[];
   fetchedSources: FetchedTechnologyResearch[];
   issuesFound: number;
-  contextSevenBroken: boolean;
-  githubIssuesBroken: boolean;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
   subrequestCounter: number;
 };
@@ -492,32 +484,133 @@ function normalizeToNpmPackage(techName: string): string {
   return name.replace(/\(.*\)/g, '').trim().replace(/\s+/g, '-').replace(/[^a-z0-9@/-]/g, '');
 }
 
-function emptyGithubRepoAnalysis(owner = '', repo = ''): GithubRepoAnalysis {
-  return {
-    owner,
-    repo,
-    stars: 0,
-    forks: 0,
-    openIssues: 0,
-    lastPush: 'Unknown',
-    latestRelease: 'Unknown',
-    readme: '',
-    summary: '',
-    releases: [],
-    recentIssues: [],
-  };
-}
-
-function formatGithubIssues(issues: GithubIssue[]) {
-  return issues
-    .map((issue) => `Open issue (${issue.createdAt}) ${issue.title}: ${issue.body}`)
-    .join('\n\n');
-}
-
 function formatSearchResults(results: SearchResult[]) {
   return results
     .map((result) => `${result.title}: ${result.description} (${result.url})`)
     .join('\n');
+}
+
+function emptyResearchResult(source: string, error: string): ResearchResult {
+  return {
+    content: '',
+    source,
+    tool: 'failed',
+    chars: 0,
+    error,
+  };
+}
+
+function parseGitHubSlug(value: string) {
+  const normalized = value.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/^github\.com\//i, '');
+  const segments = normalized.split('/').filter(Boolean);
+  if (segments.length < 2) {
+    return null;
+  }
+
+  return {
+    owner: segments[0],
+    repo: segments[1].replace(/\.git$/i, ''),
+  };
+}
+
+function resolveResearchRepository(githubUrl: string, fallbackGithubSlug?: string) {
+  const fromPrimary = extractGitHubRepository(githubUrl.trim());
+  if (fromPrimary) {
+    return fromPrimary;
+  }
+
+  if (!fallbackGithubSlug) {
+    return null;
+  }
+
+  const fallback = parseGitHubSlug(fallbackGithubSlug);
+  if (!fallback) {
+    return null;
+  }
+
+  return {
+    owner: fallback.owner,
+    repo: fallback.repo,
+  };
+}
+
+function buildBatch2SearchQuery(technologyName: string) {
+  const versionMatch = technologyName.match(/\bv?\d+(?:\.\d+){0,2}\b/i);
+  const versionHint = versionMatch?.[0] || 'latest';
+  return `${technologyName} ${versionHint} changelog 2025`;
+}
+
+function toSearchResultFromResearch(entry: ResearchResult): SearchResult | null {
+  if (entry.tool === 'failed') {
+    return null;
+  }
+
+  const sourceUrl = entry.source.trim();
+  if (!sourceUrl) {
+    return null;
+  }
+
+  return {
+    title: entry.title || sourceUrl,
+    url: sourceUrl,
+    description: summarizeSnippet(entry.content, 360),
+  };
+}
+
+function toolLabelFromDocTool(tool: ResearchResult['tool']) {
+  if (tool === 'jina_reader') {
+    return 'Jina Reader';
+  }
+
+  if (tool === 'cf_scrape') {
+    return 'Cloudflare Scrape';
+  }
+
+  return 'Jina Reader';
+}
+
+function toolLabelFromGithubTool(tool: ResearchResult['tool']) {
+  if (tool === 'gitmcp') {
+    return 'GitMCP';
+  }
+
+  if (tool === 'github_api') {
+    return 'GitHub API';
+  }
+
+  return 'GitMCP';
+}
+
+function parseOpenIssuesCount(content: string) {
+  const match = content.match(/([0-9][0-9,]*)\s+open issues?/i);
+  if (!match) {
+    return 0;
+  }
+
+  const parsed = Number(match[1].replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseLatestVersionFromText(...values: string[]) {
+  for (const value of values) {
+    const match = value.match(/(?:latest release|latest version|release|version)\s*[:#-]?\s*(v?\d+(?:\.\d+){1,3}(?:[-+.\w]+)?)/i);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  return 'Unknown';
+}
+
+function parseLastCommitDateFromText(...values: string[]) {
+  for (const value of values) {
+    const isoMatch = value.match(/\b(20\d{2}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]*)?)\b/);
+    if (isoMatch?.[1]) {
+      return isoMatch[1];
+    }
+  }
+
+  return 'Unknown';
 }
 
 function summarizeSnippet(value: string, maxLength = 180) {
@@ -750,14 +843,6 @@ function buildResearchTargets(
   return limitResearchTargets(dedupeResearchTargets([...briefTargets, ...inferredTargets, ...profileTargets]));
 }
 
-function emptyFetchedSource(url: string, title: string) {
-  return {
-    content: '',
-    title,
-    url,
-  };
-}
-
 function createResearchSource(
   technology: string,
   tool: string,
@@ -772,51 +857,6 @@ function createResearchSource(
     title,
     summary: summarizeSnippet(summary),
   };
-}
-
-function formatReleaseDigest(releases: GithubRepoAnalysis['releases']) {
-  return releases
-    .slice(0, 3)
-    .map((release) => `${release.tagName} (${release.publishedAt}): ${release.body}`)
-    .join('\n\n');
-}
-
-function formatCompactNumber(value: number) {
-  if (value >= 1_000_000) {
-    return `${Math.round((value / 1_000_000) * 10) / 10}m`;
-  }
-
-  if (value >= 1_000) {
-    return `${Math.round(value / 1_000)}k`;
-  }
-
-  return `${value}`;
-}
-
-function formatRelativeAge(dateString: string) {
-  const timestamp = Date.parse(dateString);
-  if (Number.isNaN(timestamp)) {
-    return 'recently';
-  }
-
-  const diffMs = Math.max(Date.now() - timestamp, 0);
-  const diffMinutes = Math.floor(diffMs / (60 * 1000));
-  const diffHours = Math.floor(diffMs / (60 * 60 * 1000));
-  const diffDays = Math.floor(diffMs / (24 * 60 * 60 * 1000));
-
-  if (diffDays > 0) {
-    return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`;
-  }
-
-  if (diffHours > 0) {
-    return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
-  }
-
-  if (diffMinutes > 0) {
-    return `${diffMinutes} minute${diffMinutes === 1 ? '' : 's'} ago`;
-  }
-
-  return 'just now';
 }
 
 function pushPartialFailure(
@@ -2650,8 +2690,8 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
 
   for (const stage of plan.stages) {
     statements.push(
-      env.DB.prepare('INSERT INTO stages (id, project_id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .bind(stage.id, projectId, workflowId, stage.title, stage.type, stage.order_index, stage.order_index === 0 ? 'active' : 'locked'),
+      env.DB.prepare('INSERT INTO stages (id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(stage.id, workflowId, stage.title, stage.type, stage.order_index, stage.order_index === 0 ? 'active' : 'locked'),
     );
 
     stage.steps.forEach((step, stepIndex) => {
@@ -2666,13 +2706,12 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
       statements.push(
         env.DB.prepare(`
           INSERT INTO steps (
-            id, project_id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
+            id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
             is_gate, is_milestone, milestone_label, risk_level, order_index, objective, why_it_matters, suggested_tools, done_when,
             ai_output, prompts, is_ai_enriched
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           step.id,
-          projectId,
           workflowId,
           stage.id,
           step.title,
@@ -2712,9 +2751,9 @@ async function materializePlanStructure(env: Bindings, projectId: string, plan: 
   for (const edge of plan.edges || []) {
     statements.push(
       env.DB.prepare(`
-        INSERT INTO edges (id, project_id, workflow_id, source_step_id, target_step_id, edge_type)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(edge.id, projectId, workflowId, edge.source_step_id, edge.target_step_id, edge.edge_type || 'default'),
+        INSERT INTO edges (id, workflow_id, source_step_id, target_step_id, edge_type)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(edge.id, workflowId, edge.source_step_id, edge.target_step_id, edge.edge_type || 'default'),
     );
   }
 
@@ -2991,19 +3030,14 @@ async function executeBatch2(
   let issuesFound = checkpoint?.data.issuesFound ?? 0;
   const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
-  const toolEnv: ToolEnv = {
-    ...env,
-    TOOL_CONTEXT: {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-    },
-  };
-
-  // Circuit-breakers: stop calling tools that consistently fail
-  let contextSevenBroken = checkpoint?.data.contextSevenBroken ?? false;
-  let githubIssuesBroken = checkpoint?.data.githubIssuesBroken ?? false;
   let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
+  const researchService = createResearchService({
+    env,
+    userId: project.user_id,
+    projectId,
+    batchName: 'batch_2_fetch_and_read',
+  });
 
   const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
     pushPartialFailure(partialFailures, tool, technologyName, message);
@@ -3029,11 +3063,11 @@ async function executeBatch2(
           : `Reading the docs for ${researchTargets.length} technolog${researchTargets.length === 1 ? 'y' : 'ies'}...`,
   });
 
-  if (checkpoint) {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      kind: 'system',
+    if (checkpoint) {
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'system',
       message: `Resuming fetched-doc research at technology ${startIndex + 1} of ${researchTargets.length}.`,
     });
   }
@@ -3058,8 +3092,6 @@ async function executeBatch2(
         researchTargets,
         fetchedSources,
         issuesFound,
-        contextSevenBroken,
-        githubIssuesBroken,
         partialFailures,
         subrequestCounter,
       });
@@ -3072,186 +3104,71 @@ async function executeBatch2(
       return 'checkpointed';
     }
 
-    const githubUrl = technology.github_url || '';
-    const githubRepository = extractGitHubRepository(githubUrl);
-    
-    // We assume: searchWeb=1, fetchUrl=5 (github) or 1 (other), getLibraryDocs=1, analyzeGithubRepo=5, getLibraryIssues=1
-    
-    const communitySearchPromise =
-      technology.community_search_results.length > 0
-        ? Promise.resolve(technology.community_search_results)
-        : (async () => {
-            subrequestCounter += 1;
-            try {
-              const results = dedupeSearchResults(
-                await searchWeb(
-                  `${technology.name} vs alternatives ${new Date().getFullYear()}`,
-                  project.user_id,
-                  toolEnv,
-                  { throwOnError: true },
-                ),
-              );
-              return results;
-            } catch (error) {
-              const message = error instanceof ToolExecutionError
-                ? error.message
-                : `Brave Search could not complete community research for ${technology.name}.`;
-              await recordPartialFailure('Brave Search', technology.name, message);
-              return [];
-            }
-          })();
+    const mappedDocs = resolveToolDocsEntry(technology.name);
+    const docsUrl = (technology.docs_url || '').trim() || mappedDocs?.docs || '';
+    const githubRepository = resolveResearchRepository(technology.github_url || '', mappedDocs?.github);
+    const githubUrl = githubRepository
+      ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
+      : (technology.github_url || '').trim();
+    const changelogUrl = (technology.changelog_url || '').trim();
+    const searchQuery = buildBatch2SearchQuery(technology.name);
 
-    const breakingChangeSearchPromise =
-      technology.breaking_change_search_results.length > 0
-        ? Promise.resolve(technology.breaking_change_search_results)
-        : (async () => {
-            subrequestCounter += 1;
-            try {
-              const results = dedupeSearchResults(
-                await searchWeb(
-                  `${technology.name} breaking changes deprecations ${new Date().getFullYear()}`,
-                  project.user_id,
-                  toolEnv,
-                  { throwOnError: true },
-                ),
-              );
-              return results;
-            } catch (error) {
-              const message = error instanceof ToolExecutionError
-                ? error.message
-                : `Brave Search could not complete breaking-change research for ${technology.name}.`;
-              await recordPartialFailure('Brave Search', technology.name, message);
-              return [];
-            }
-          })();
-
-    const [communitySearchResults, breakingChangeSearchResults] = await Promise.all([
-      communitySearchPromise,
-      breakingChangeSearchPromise,
+    const [docsResult, githubResult, webResearchResults] = await Promise.all([
+      docsUrl
+        ? researchService.fetchDoc(docsUrl)
+        : Promise.resolve(emptyResearchResult('', `No docs URL found for ${technology.name}.`)),
+      githubRepository
+        ? researchService.fetchGitHubRepo(githubRepository.owner, githubRepository.repo)
+        : Promise.resolve(emptyResearchResult('', `No GitHub repo found for ${technology.name}.`)),
+      researchService.searchWeb(searchQuery, 4),
     ]);
+
+    subrequestCounter += (docsUrl ? 1 : 0) + (githubRepository ? 1 : 0) + 1;
+
+    if (docsUrl && docsResult.tool === 'failed') {
+      await recordPartialFailure(
+        'Jina Reader',
+        technology.name,
+        docsResult.error || `Jina Reader failed for ${technology.name}.`,
+      );
+    }
+
+    if (githubRepository && githubResult.tool === 'failed') {
+      await recordPartialFailure(
+        'GitMCP',
+        technology.name,
+        githubResult.error || `GitMCP failed for ${technology.name}.`,
+      );
+    }
+
+    const failedSearch = webResearchResults.find((entry) => entry.tool === 'failed');
+    if (failedSearch) {
+      await recordPartialFailure(
+        'Jina Search',
+        technology.name,
+        failedSearch.error || `Jina Search failed for ${technology.name}.`,
+      );
+    }
 
     const searchResults = dedupeSearchResults([
-      ...communitySearchResults,
-      ...breakingChangeSearchResults,
-    ]);
-    
-    const docsUrl = (technology.docs_url || '').trim();
-    const changelogUrl = (technology.changelog_url || '').trim();
-    
-    // REDUNDANCY CHECK: Is doc or changelog URL the same as the github repo?
-    const docsRepo = extractGitHubRepository(docsUrl);
-    const changelogRepo = extractGitHubRepository(changelogUrl);
-    
-    const isDocsSameAsMainRepo = githubRepository && docsRepo && 
-      githubRepository.owner === docsRepo.owner && githubRepository.repo === docsRepo.repo;
-    const isChangelogSameAsMainRepo = githubRepository && changelogRepo && 
-      githubRepository.owner === changelogRepo.owner && githubRepository.repo === changelogRepo.repo;
-
-    const attemptedContextSeven = !contextSevenBroken;
-    const attemptedGithubIssues = Boolean(githubRepository && !githubIssuesBroken);
-
-    const [githubAnalysis, liveDocsResult] = await Promise.all([
-      githubRepository
-        ? analyzeGithubRepo(
-            githubRepository.owner,
-            githubRepository.repo,
-            project.user_id,
-            toolEnv,
-            { throwOnError: true },
-          ).catch(async (err) => {
-            const message = err instanceof ToolExecutionError
-              ? err.message
-              : `GitHub research for ${technology.name} failed — using partial data.`;
-            await recordPartialFailure('GitHub repo', technology.name, message);
-            return emptyGithubRepoAnalysis(githubRepository.owner, githubRepository.repo);
-          })
-        : Promise.resolve(emptyGithubRepoAnalysis()),
-      contextSevenBroken
-        ? Promise.resolve({ content: '', source: 'Context7', version: 'unknown' })
-        : getLibraryDocs(
-            technology.name,
-            technology.docs_topic,
-            project.user_id,
-            toolEnv,
-            { throwOnError: true },
-          ).then(async (result) => {
-            if (result.degraded && result.degradationMessage) {
-              await recordPartialFailure('Context7', technology.name, result.degradationMessage);
-              if (result.degradationCode === 'context7_failed') {
-                contextSevenBroken = true;
-              }
-            }
-            return result;
-          }).catch(async (err) => {
-            const message = err instanceof ToolExecutionError
-              ? err.message
-              : `Context7 failed for ${technology.name}.`;
-            contextSevenBroken = true;
-            await recordPartialFailure('Context7', technology.name, message);
-            return { content: '', source: 'Context7', version: 'unknown' } as LibraryDocsResult;
-          }),
-    ]);
-    
-    if (githubRepository) subrequestCounter += 5;
-    if (attemptedContextSeven) subrequestCounter += 1;
-
-    // Fetch survivors (only if not redundant)
-    const [docsResult, changelogResult, githubIssues] = await Promise.all([
-      docsUrl && !isDocsSameAsMainRepo
-        ? fetchUrl(docsUrl, toolEnv, { throwOnError: true }).catch(async (err) => {
-            const message = err instanceof ToolExecutionError
-              ? err.message
-              : `Couldn't read ${docsUrl} — continuing with partial research.`;
-            await recordPartialFailure('Web fetch', technology.name, message);
-            return emptyFetchedSource(docsUrl, `${technology.name} docs`);
-          })
-        : isDocsSameAsMainRepo
-          ? Promise.resolve({ content: githubAnalysis.readme, title: `${githubAnalysis.owner}/${githubAnalysis.repo}`, url: docsUrl })
-          : Promise.resolve(emptyFetchedSource('', `${technology.name} docs`)),
-      changelogUrl && !isChangelogSameAsMainRepo
-        ? fetchUrl(changelogUrl, toolEnv, { throwOnError: true }).catch(async (err) => {
-            const message = err instanceof ToolExecutionError
-              ? err.message
-              : `Couldn't read ${changelogUrl} — continuing with partial research.`;
-            await recordPartialFailure('Web fetch', technology.name, message);
-            return emptyFetchedSource(changelogUrl, `${technology.name} changelog`);
-          })
-        : isChangelogSameAsMainRepo
-          ? Promise.resolve({ content: githubAnalysis.summary, title: `${githubAnalysis.owner}/${githubAnalysis.repo}`, url: changelogUrl })
-          : Promise.resolve(emptyFetchedSource('', `${technology.name} changelog`)),
-      githubRepository && !githubIssuesBroken
-        ? getLibraryIssues(
-            githubRepository.owner,
-            githubRepository.repo,
-            ['bug', 'breaking-change'],
-            90,
-            project.user_id,
-            toolEnv,
-            { throwOnError: true },
-          ).catch((err) => {
-            githubIssuesBroken = true;
-            const message = err instanceof ToolExecutionError
-              ? err.message
-              : `Issue lookup failed for ${githubRepository.owner}/${githubRepository.repo} — continuing without issue data.`;
-            return recordPartialFailure('GitHub issues', technology.name, message).then(() => [] as GithubIssue[]);
-          })
-        : Promise.resolve([] as GithubIssue[]),
+      ...webResearchResults
+        .map((entry) => toSearchResultFromResearch(entry))
+        .filter((entry): entry is SearchResult => Boolean(entry)),
+      ...technology.community_search_results,
+      ...technology.breaking_change_search_results,
     ]);
 
-    if (docsUrl && !isDocsSameAsMainRepo) subrequestCounter += (docsRepo ? 5 : 1);
-    if (changelogUrl && !isChangelogSameAsMainRepo) subrequestCounter += (changelogRepo ? 5 : 1);
-    if (attemptedGithubIssues) subrequestCounter += 1;
-
-
-
-    // Skip community page fetching to conserve subrequests.
-    // Use search result text summaries instead of fetching each page.
     const communityPages: FetchedCommunitySource[] = searchResults
-      .filter((r) => r.description)
-      .map((r) => ({ title: r.title, url: r.url, description: r.description, content: r.description }));
-    issuesFound += githubIssues.length;
+      .filter((result) => result.description.trim().length > 0)
+      .slice(0, 6)
+      .map((result) => ({
+        title: result.title,
+        url: result.url,
+        description: result.description,
+        content: result.description,
+      }));
 
-    if (!docsResult.content && !liveDocsResult.content) {
+    if (!docsResult.content) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
@@ -3260,59 +3177,27 @@ async function executeBatch2(
       });
     }
 
-    if (!changelogResult.content) {
+    if (!githubRepository) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'warning',
-        message: `Could not read ${technology.name} release notes — keeping the fetch moving.`,
+        message: `${technology.name} did not include a valid GitHub repository URL — skipping repository analysis.`,
       });
-    }
-
-    if (githubRepository && githubAnalysis.summary) {
-      const relativeUpdate =
-        githubAnalysis.lastPush !== 'Unknown'
-          ? `, updated ${formatRelativeAge(githubAnalysis.lastPush)}`
-          : '';
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_2_fetch_and_read',
-        kind: 'github',
-        message: `Checking ${githubAnalysis.owner}/${githubAnalysis.repo} on GitHub — ${formatCompactNumber(githubAnalysis.stars)} stars${relativeUpdate}`,
-      });
-
-      if (githubAnalysis.latestRelease !== 'Unknown') {
-        await logActivity(env, {
-          projectId,
-          batchName: 'batch_2_fetch_and_read',
-          kind: 'github',
-          message: `Checking ${githubAnalysis.owner}/${githubAnalysis.repo} — latest release ${githubAnalysis.latestRelease}`,
-        });
-      }
-
-      if (githubIssues.length > 0) {
-        await logActivity(env, {
-          projectId,
-          batchName: 'batch_2_fetch_and_read',
-          kind: 'warning',
-          message: `${githubIssues.length} recent bug or breaking-change issue${githubIssues.length === 1 ? '' : 's'} surfaced for ${githubAnalysis.owner}/${githubAnalysis.repo}.`,
-        });
-      }
-    } else if (githubRepository) {
+    } else if (!githubResult.content) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'warning',
         message: `Could not inspect ${technology.name} on GitHub — continuing with the rest of the sources.`,
       });
-    }
-
-    if (!githubRepository) {
+    } else {
+      const sourceLabel = githubResult.tool === 'gitmcp' ? 'GitMCP' : 'GitHub API fallback';
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
-        kind: 'warning',
-        message: `${technology.name} did not include a valid GitHub repository URL — skipping GitHub analysis.`,
+        kind: 'github',
+        message: `Fetched ${githubRepository.owner}/${githubRepository.repo} via ${sourceLabel}.`,
       });
     }
 
@@ -3321,132 +3206,85 @@ async function executeBatch2(
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'fetch',
-        message: `Read ${communityPages.length} community source${communityPages.length === 1 ? '' : 's'} for ${technology.name}.`,
+        message: `Read ${searchResults.length} web source${searchResults.length === 1 ? '' : 's'} for ${technology.name}.`,
       });
-    }
-
-    if (liveDocsResult.content && liveDocsResult.source === 'Context7') {
-      const versionSuffix =
-        liveDocsResult.version !== 'unknown' ? ` (${liveDocsResult.version})` : '';
+    } else {
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
-        kind: 'fetch',
-        message: `Pulled live ${technology.name} docs from Context7${versionSuffix}.`,
+        kind: 'warning',
+        message: `No web changelog sources were found for ${technology.name} in this pass.`,
       });
     }
 
-    if (githubRepository && githubAnalysis.summary) {
-      const recentBreakingSignals = githubIssues.length + breakingChangeSearchResults.length;
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_2_fetch_and_read',
-        kind: 'github',
-        message: `📦 ${githubAnalysis.owner}/${githubAnalysis.repo} — ${formatCompactNumber(githubAnalysis.stars)} stars, last commit ${formatRelativeAge(githubAnalysis.lastPush)}, ${recentBreakingSignals} recent breaking-change signal${recentBreakingSignals === 1 ? '' : 's'} found.`,
-      });
-    }
-
-    const docsContentSections = [docsResult.content];
-    if (liveDocsResult.content) {
-      const sourceLabel =
-        liveDocsResult.source === 'Context7' && liveDocsResult.version !== 'unknown'
-          ? `${liveDocsResult.source} ${liveDocsResult.version}`
-          : liveDocsResult.source;
-      docsContentSections.push(`${sourceLabel}\n${liveDocsResult.content}`);
-    }
-
-    const changelogContent = trimToLimit(changelogResult.content, 5000) || 'Release notes unavailable.';
-    const githubIssueDigest = formatGithubIssues(githubIssues); // formatGithubIssues already truncates to 1400 per issue
-    const releaseDigest = formatReleaseDigest(githubAnalysis.releases); // formatReleaseDigest already truncates to 1200 per release
-    const communitySentiment = communityPages
-      .map((page) => `${page.title}: ${trimToLimit(page.content || page.description, 2000)} (${page.url})`)
-      .join('\n\n');
-    const repoHealthSummary = githubRepository
-      ? `${githubAnalysis.owner}/${githubAnalysis.repo} has ${formatCompactNumber(githubAnalysis.stars)} stars, ${githubAnalysis.openIssues} open issues, latest release ${githubAnalysis.latestRelease}, last push ${githubAnalysis.lastPush}.`
+    const repoHealthSummary = githubResult.content
+      ? trimToLimit(githubResult.content, 1_600)
       : 'GitHub repository data unavailable.';
+    const releaseSignal = formatSearchResults(
+      searchResults.filter((result) => /release|changelog|deprecat|breaking|migration/i.test(`${result.title} ${result.description}`)),
+    );
+    const bugSignal = formatSearchResults(
+      searchResults.filter((result) => /bug|issue|regression|incident|outage/i.test(`${result.title} ${result.description}`)),
+    );
+    const communitySentiment = communityPages
+      .map((page) => `${page.title}: ${trimToLimit(page.content || page.description, 2_000)} (${page.url})`)
+      .join('\n\n');
+    const latestVersion = parseLatestVersionFromText(githubResult.content, releaseSignal);
+    const lastCommitDate = parseLastCommitDateFromText(githubResult.content);
+    const openIssuesCount = parseOpenIssuesCount(githubResult.content);
+    issuesFound += openIssuesCount;
 
     const technologySources = dedupeResearchSources([
       ...(docsResult.content
         ? [
             createResearchSource(
               technology.name,
-              'Web fetch',
-              docsUrl || liveDocsResult.source,
+              toolLabelFromDocTool(docsResult.tool),
+              docsUrl || docsResult.source,
               `${technology.name} docs`,
               docsResult.content,
             ),
           ]
         : []),
-      ...(liveDocsResult.content
+      ...(githubResult.content
         ? [
             createResearchSource(
               technology.name,
-              liveDocsResult.source === 'Context7' ? 'Context7' : 'Live docs',
-              liveDocsResult.source.startsWith('http') ? liveDocsResult.source : docsUrl,
-              `${technology.name} live docs`,
-              liveDocsResult.content,
+              toolLabelFromGithubTool(githubResult.tool),
+              githubResult.source || githubUrl,
+              githubRepository
+                ? `${githubRepository.owner}/${githubRepository.repo}`
+                : `${technology.name} repository`,
+              githubResult.content,
             ),
           ]
         : []),
-      ...(changelogResult.content
-        ? [
-            createResearchSource(
-              technology.name,
-              'Web fetch',
-              changelogUrl,
-              `${technology.name} changelog`,
-              changelogResult.content,
-            ),
-          ]
-        : []),
-      ...(githubRepository
-        ? [
-            createResearchSource(
-              technology.name,
-              'GitHub',
-                githubUrl,
-              `${githubAnalysis.owner}/${githubAnalysis.repo}`,
-              `${repoHealthSummary}\n\n${githubAnalysis.summary}\n\n${releaseDigest}`,
-            ),
-          ]
-        : []),
-      ...githubIssues.slice(0, 5).map((issue) =>
-        createResearchSource(technology.name, 'GitHub', issue.url, issue.title, issue.body),
-      ),
       ...communityPages.map((page) =>
         createResearchSource(
           technology.name,
-          connectedTools.has_brave_search ? 'Brave Search' : 'Web search',
+          'Jina Search',
           page.url,
           page.title,
           page.content || page.description,
         ),
       ),
     ]);
-      const latestVersion =
-        githubAnalysis.latestRelease !== 'Unknown'
-          ? githubAnalysis.latestRelease
-          : liveDocsResult.version !== 'unknown'
-          ? liveDocsResult.version
-          : 'Unknown';
 
     fetchedSources.push({
       technology: technology.name,
       docs_url: docsUrl,
       github_url: githubUrl,
       changelog_url: changelogUrl,
-      docs_content: trimToLimit(docsContentSections.filter(Boolean).join('\n\n'), 15000) || 'Documentation source unavailable.',
-      github_readme: trimToLimit(githubAnalysis.readme || githubAnalysis.summary, 10000) || 'GitHub repository data unavailable.',
+      docs_content: trimToLimit(docsResult.content, 15_000) || 'Documentation source unavailable.',
+      github_readme: trimToLimit(githubResult.content, 10_000) || 'GitHub repository data unavailable.',
       latest_version: latestVersion,
-      last_commit_date: githubAnalysis.lastPush || 'Unknown',
-      open_issues_count: githubAnalysis.openIssues,
-      recent_breaking_changes: trimToLimit([changelogContent, releaseDigest, githubIssueDigest]
-        .filter(Boolean)
-        .join('\n\n'), 8000),
+      last_commit_date: lastCommitDate,
+      open_issues_count: openIssuesCount,
+      recent_breaking_changes: trimToLimit(releaseSignal || 'Release notes unavailable.', 8_000),
       repo_health_summary: repoHealthSummary,
       community_sentiment:
-        trimToLimit(communitySentiment || formatSearchResults(searchResults), 5000) || 'Community sentiment unavailable.',
-      bug_report_digest: githubIssueDigest || 'No recent bug reports found.',
+        trimToLimit(communitySentiment || formatSearchResults(searchResults), 5_000) || 'Community sentiment unavailable.',
+      bug_report_digest: trimToLimit(bugSignal || 'No recent bug reports found.', 4_000),
       source_ledger: technologySources,
       community_pages: communityPages,
     });
@@ -3462,8 +3300,6 @@ async function executeBatch2(
         researchTargets,
         fetchedSources,
         issuesFound,
-        contextSevenBroken,
-        githubIssuesBroken,
         partialFailures,
         subrequestCounter,
       });

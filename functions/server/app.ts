@@ -2080,8 +2080,8 @@ app.post('/stages', async (c) => {
   const workflowId = workflowRecord.id;
 
   const id = crypto.randomUUID();
-  await c.env.DB.prepare('INSERT INTO stages (id, project_id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, projectId, workflowId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
+  await c.env.DB.prepare('INSERT INTO stages (id, workflow_id, title, type, order_index, status) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(id, workflowId, title, type, asNumber(body.order_index, 0), optionalText(body.status) || 'locked')
     .run();
 
   await touchProject(c, projectId);
@@ -2152,14 +2152,13 @@ app.post('/steps', async (c) => {
 
   await c.env.DB.prepare(`
     INSERT INTO steps (
-      id, project_id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
+      id, workflow_id, stage_id, title, type, category, position_x, position_y, status,
       is_gate, risk_level, order_index, objective, why_it_matters, suggested_tools,
       done_when, ai_output, prompts, is_ai_enriched
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
-      projectId,
       workflowId,
       optionalText(body.stage_id),
       title,
@@ -2298,8 +2297,8 @@ app.post('/steps/:id/review', async (c) => {
         c.env.DB.prepare(`
           UPDATE steps
           SET status = 'active', updated_at = datetime("now")
-          WHERE project_id = ? AND status = 'locked' AND id IN (${placeholders})
-        `).bind(stepRecord.project_id, ...unlockedStepIds),
+          WHERE status = 'locked' AND id IN (${placeholders})
+        `).bind(...unlockedStepIds),
       );
     }
 
@@ -2374,10 +2373,10 @@ app.post('/edges', async (c) => {
   const edgeWorkflowId = workflowRow?.id as string || '';
 
   await c.env.DB.prepare(`
-    INSERT INTO edges (id, project_id, workflow_id, source_step_id, target_step_id, edge_type, condition)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO edges (id, workflow_id, source_step_id, target_step_id, edge_type, condition)
+    VALUES (?, ?, ?, ?, ?, ?)
   `)
-    .bind(id, projectId, edgeWorkflowId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
+    .bind(id, edgeWorkflowId, sourceStepId, targetStepId, optionalText(body.edge_type) || 'default', optionalText(body.condition))
     .run();
 
   await touchProject(c, projectId);

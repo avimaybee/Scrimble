@@ -161,11 +161,19 @@ type MCPCardDefinition = {
   label: string;
   description: string;
   icon: LucideIcon;
+  optional?: boolean;
   recommended?: boolean;
   getLinkHref?: string;
   getLinkLabel?: string;
   note?: string;
   fields: MCPFieldDefinition[];
+};
+
+type AlwaysOnResearchCard = {
+  id: 'jina' | 'gitmcp' | 'cloudflare-scrape';
+  label: string;
+  description: string;
+  icon: LucideIcon;
 };
 
 const defaultFormState: ProviderFormState = {
@@ -200,14 +208,34 @@ const defaultMCPForms: Record<MCPServerType, MCPFormState> = {
   custom: { ...defaultMCPFormState },
 };
 
+const alwaysOnResearchCards: AlwaysOnResearchCard[] = [
+  {
+    id: 'jina',
+    label: 'Jina Reader + Search',
+    description: 'Always on — no setup needed.',
+    icon: Search,
+  },
+  {
+    id: 'gitmcp',
+    label: 'GitMCP',
+    description: 'Always on for public repos — no setup needed.',
+    icon: Github,
+  },
+  {
+    id: 'cloudflare-scrape',
+    label: 'Cloudflare Scrape',
+    description: 'Always on — powered by Cloudflare.',
+    icon: Cpu,
+  },
+];
+
 const mcpCardDefinitions: MCPCardDefinition[] = [
   {
     type: 'brave-search',
     label: 'Brave Search',
-    description:
-      'Searches the web for the latest library news, community discussions, and real-world feedback.',
+    description: 'Additional web search layer.',
     icon: Search,
-    recommended: true,
+    optional: true,
     getLinkHref: 'https://brave.com/search/api',
     getLinkLabel: 'brave.com/search/api',
     fields: [
@@ -222,12 +250,13 @@ const mcpCardDefinitions: MCPCardDefinition[] = [
   },
   {
     type: 'github',
-    label: 'GitHub',
-    description: 'Checks library health, reads real bug reports, and compares alternatives.',
+    label: 'GitHub Personal Access Token',
+    description: 'For private repos and higher rate limits.',
     icon: Github,
+    optional: true,
     getLinkHref: 'https://github.com/settings/tokens',
     getLinkLabel: 'github.com/settings/tokens',
-    note: 'Scopes needed: public_repo.',
+    note: 'Recommended scopes: public_repo for public repos, plus private repo scopes only if needed.',
     fields: [
       {
         key: 'token',
@@ -242,12 +271,12 @@ const mcpCardDefinitions: MCPCardDefinition[] = [
   {
     type: 'context7',
     label: 'Context7',
-    description:
-      'Pulls live, structured documentation for any library — always current, never stale.',
+    description: 'For indexed library documentation.',
     icon: BookText,
+    optional: true,
     recommended: true,
     getLinkHref: 'https://context7.com',
-    getLinkLabel: 'context7.com',
+    getLinkLabel: 'Get a free key at context7.com',
     fields: [
       {
         key: 'apiKey',
@@ -263,6 +292,7 @@ const mcpCardDefinitions: MCPCardDefinition[] = [
     label: 'Custom MCP',
     description: 'Any MCP-compatible server you run yourself.',
     icon: Server,
+    optional: true,
     note: 'Use this for a private MCP endpoint that should only run inside your own stack.',
     fields: [
       {
@@ -292,6 +322,16 @@ function getProviderSummary(provider: AIProvider) {
   }
 
   return provider.name;
+}
+
+function getProviderDropdownLabel(provider: AIProvider) {
+  const accountLabel = provider.provider === 'custom' && provider.base_url 
+    ? provider.base_url 
+    : provider.masked_key 
+      ? `Ends in ${provider.masked_key.slice(-4)}`
+      : provider.name;
+
+  return `${providerLabels[provider.provider]} (${accountLabel})`;
 }
 
 function mapRolesToFormState(roles: AIModelRoles): ModelRoleFormState {
@@ -367,7 +407,8 @@ export default function Settings() {
     {},
   );
 
-  const activeResearchToolCount = mcpServers.filter((server) => server.is_active).length;
+  const optionalResearchToolCount = mcpServers.filter((server) => server.is_active).length;
+  const activeResearchToolCount = alwaysOnResearchCards.length + optionalResearchToolCount;
   const aiProviderCount = providers.length;
   const isWorkspaceReady = aiProviderCount > 0;
 
@@ -515,13 +556,25 @@ export default function Settings() {
     field: keyof ModelRoleSlotFormState,
     value: string,
   ) => {
-    setModelRoleForm((current) => ({
-      ...current,
-      [role]: {
-        ...current[role],
-        [field]: value,
-      },
-    }));
+    setModelRoleForm((current) => {
+      const next = {
+        ...current,
+        [role]: {
+          ...current[role],
+          [field]: value,
+        },
+      };
+
+      // Auto-fill model name if a provider is selected and model name is currently empty
+      if (field === 'providerId' && value) {
+        const selected = providers.find(p => p.id === value);
+        if (selected?.model && !next[role].modelName) {
+          next[role].modelName = selected.model;
+        }
+      }
+
+      return next;
+    });
   };
 
   const handleSaveModelRoles = async (event: FormEvent<HTMLFormElement>) => {
@@ -706,8 +759,8 @@ export default function Settings() {
       <motion.div variants={itemVariants} className="mb-10 max-w-[620px]">
         <h1 className="text-heading mb-3">Settings</h1>
         <p className="text-body">
-          Keep your account close at hand, connect the AI tools you already use, and
-          give Scrimble better sources before every plan begins.
+          Keep your account close at hand, manage your AI providers, and tune optional
+          research connectors when you want private or indexed sources.
         </p>
       </motion.div>
 
@@ -739,9 +792,7 @@ export default function Settings() {
             {activeResearchToolCount}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
-            {activeResearchToolCount > 0
-              ? 'Live research is on, so plans can use fresh documentation and comparisons.'
-              : 'Optional, but helpful when you want deeper tradeoffs and fresher references.'}
+            {`Core stack active (${alwaysOnResearchCards.length}) with ${optionalResearchToolCount} optional connector${optionalResearchToolCount === 1 ? '' : 's'}.`}
           </p>
         </div>
 
@@ -971,7 +1022,7 @@ export default function Settings() {
                         <option value="">Use default AI</option>
                         {providers.map((provider) => (
                           <option key={provider.id} value={provider.id}>
-                            {providerLabels[provider.provider]} — {getProviderSummary(provider)}
+                            {getProviderDropdownLabel(provider)}
                           </option>
                         ))}
                       </select>
@@ -1013,7 +1064,7 @@ export default function Settings() {
                         <option value="">Use default AI</option>
                         {providers.map((provider) => (
                           <option key={provider.id} value={provider.id}>
-                            {providerLabels[provider.provider]} — {getProviderSummary(provider)}
+                            {getProviderDropdownLabel(provider)}
                           </option>
                         ))}
                       </select>
@@ -1177,14 +1228,15 @@ export default function Settings() {
         </div>
       </motion.section>
 
-      {activeResearchToolCount === 0 ? (
+      {optionalResearchToolCount === 0 ? (
         <motion.div
           variants={itemVariants}
           className="mb-8 rounded-[14px] border border-accent-border bg-accent-primary-muted px-4 py-3"
         >
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-sm leading-relaxed text-text-secondary">
-              Connect research tools if you want deeper comparisons and better tradeoffs.
+              You are already covered by the default research stack. Add optional connectors if
+              you want private repositories, indexed docs, or extra web coverage.
             </p>
             <button
               type="button"
@@ -1206,11 +1258,11 @@ export default function Settings() {
         <div className="mb-6 max-w-[720px]">
           <div className="section-label mb-4">Research tools</div>
           <h2 className="mb-2 text-2xl font-serif tracking-[-0.03em] text-text-primary">
-            Give your plan live research context.
+            Research is ready by default.
           </h2>
           <p className="text-body">
-            Connect tools that let Scrimble do deeper research when building your plan. The more
-            you connect, the better your plan will be.
+            Scrimble always uses Jina Reader + Search, GitMCP, and Cloudflare Scrape. Optional
+            connectors below expand private and indexed coverage when you need it.
           </p>
         </div>
 
@@ -1232,9 +1284,43 @@ export default function Settings() {
         ) : null}
 
         <div className="space-y-4">
+          {alwaysOnResearchCards.map((card) => (
+            <div
+              key={card.id}
+              className="rounded-[14px] border border-border-default bg-bg-elevated/70 p-4"
+            >
+              <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+                <div className="flex gap-4">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[12px] border border-border-default bg-bg-base/55">
+                    <card.icon className="h-5 w-5 text-accent-primary" />
+                  </div>
+
+                  <div className="max-w-[620px]">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
+                        {card.label}
+                      </h3>
+                    </div>
+
+                    <p className="text-sm leading-relaxed text-text-secondary">
+                      {card.description}
+                    </p>
+
+                    <div className="mt-4 flex flex-wrap items-center gap-3">
+                      <span className="inline-flex items-center gap-2 rounded-[8px] border border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)] px-3 py-1 text-[12px] font-medium text-status-secure">
+                        <span className="h-2 w-2 rounded-full bg-status-secure" />
+                        Connected
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+
           {isLoadingMCPServers ? (
             <div className="rounded-[14px] border border-border-default bg-bg-elevated/50 p-4 text-sm text-text-secondary">
-              Loading your research tools...
+              Loading your optional research connectors...
             </div>
           ) : (
             mcpCardDefinitions.map((card) => {
@@ -1259,6 +1345,11 @@ export default function Settings() {
                           <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
                             {card.label}
                           </h3>
+                          {card.optional ? (
+                            <span className="rounded-[6px] border border-border-default bg-bg-base/60 px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-text-tertiary">
+                              Optional
+                            </span>
+                          ) : null}
                           {card.recommended ? (
                             <span className="rounded-[6px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-status-warning">
                               Recommended

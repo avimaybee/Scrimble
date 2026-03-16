@@ -260,11 +260,43 @@ function formatReviewSourceUrl(url: string) {
 function getReviewSourceToolMeta(tool: string) {
   const normalized = tool.trim().toLowerCase();
 
+  if (normalized.includes('gitmcp')) {
+    return {
+      label: 'GitMCP',
+      icon: Github,
+      toneClass: 'text-status-secure',
+    };
+  }
+
+  if (normalized.includes('github api')) {
+    return {
+      label: 'GitHub API',
+      icon: Github,
+      toneClass: 'text-text-primary',
+    };
+  }
+
   if (normalized.includes('github')) {
     return {
       label: 'GitHub',
       icon: Github,
       toneClass: 'text-text-primary',
+    };
+  }
+
+  if (normalized.includes('jina')) {
+    return {
+      label: normalized.includes('search') ? 'Jina Search' : 'Jina Reader',
+      icon: Search,
+      toneClass: 'text-status-secure',
+    };
+  }
+
+  if (normalized.includes('cloudflare scrape') || normalized.includes('cf scrape')) {
+    return {
+      label: 'Cloudflare Scrape',
+      icon: Globe,
+      toneClass: 'text-accent-primary',
     };
   }
 
@@ -882,38 +914,35 @@ export default function ProjectGeneration() {
       return [];
     }
 
-    const communityUsed = reviewData.research_sources.some((source) =>
-      ['Brave Search', 'Web search'].includes(source.tool),
-    );
-    const githubUsed = reviewData.research_sources.some((source) => source.tool === 'GitHub');
-    const context7Used = reviewData.research_sources.some((source) =>
-      ['Context7', 'Live docs'].includes(source.tool),
-    );
+    const hasGithubApi = reviewData.data_quality.has_github_token;
+    const hasContext7 = reviewData.data_quality.has_context7;
+    const hasBraveSearch = reviewData.data_quality.has_brave_search;
 
     return [
       {
-        key: 'web-search',
-        label: communityUsed ? 'Web search' : 'Web search — not connected',
-        active: communityUsed,
+        key: 'jina-reader',
+        label: 'Jina Reader',
+        active: true,
       },
       {
-        key: 'github',
-        label: reviewData.data_quality.has_github_token
-          ? 'GitHub — authenticated'
-          : githubUsed
-            ? 'GitHub — public only'
-            : 'GitHub — not connected',
-        active: reviewData.data_quality.has_github_token || githubUsed,
+        key: 'gitmcp',
+        label: 'GitMCP',
+        active: true,
       },
       {
-        key: 'context7',
-        label: reviewData.data_quality.has_context7 || context7Used ? 'Context7' : 'Context7 — not connected',
-        active: reviewData.data_quality.has_context7 || context7Used,
+        key: 'github-api',
+        label: hasGithubApi ? 'GitHub API' : 'GitHub API — public-only',
+        active: hasGithubApi,
+      },
+      {
+        key: 'context7-docs',
+        label: hasContext7 ? 'Context7' : 'Context7 — optional',
+        active: hasContext7,
       },
       {
         key: 'brave-search',
-        label: reviewData.data_quality.has_brave_search ? 'Brave Search' : 'Brave Search — not connected',
-        active: reviewData.data_quality.has_brave_search,
+        label: hasBraveSearch ? 'Brave Search' : 'Brave Search — optional',
+        active: hasBraveSearch,
       },
     ];
   }, [reviewData]);
