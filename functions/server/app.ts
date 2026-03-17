@@ -50,12 +50,7 @@ import {
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 import {
-  createIntakeAnswersPayload,
-  generateClarifyingQuestions,
-  getNextIntakeQuestion,
-  parseIntakeAnswersPayload,
-  recordIntakeAnswer,
-  synthesizeIntakeBrief,
+  runProjectIntakeTurn,
 } from './project-intake';
 import { applyPlanDiffToProject } from './plan-diff';
 import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
@@ -513,43 +508,27 @@ async function getCompletedGenerationBatches(c: AppContext, projectId: string) {
 }
 
 async function buildIntakeResponse(c: AppContext, projectId: string) {
-  const [project, brief, messages] = await Promise.all([
+  const [project, messages] = await Promise.all([
     getOwnedProject(c, projectId),
-    getProjectBrief(c.env, projectId),
     listProjectIntakeMessages(c.env, projectId),
   ]);
 
-  if (!project || !brief) {
+  if (!project) {
     throw new Error('Project intake state is unavailable.');
   }
 
   const latestAgentMessage = [...messages].reverse().find((message) => message.role === 'agent') || null;
-  const intakeAnswers = parseIntakeAnswersPayload(project.intake_answers);
-  const currentQuestion = intakeAnswers ? getNextIntakeQuestion(intakeAnswers) : null;
-  const totalQuestions = intakeAnswers?.questions.length || 0;
-  const answeredCount = intakeAnswers?.answers.length || 0;
-  const ready = currentQuestion
-    ? false
-    : totalQuestions > 0
-      ? true
-      : latestAgentMessage?.content.startsWith('READY:') || false;
+  const ready = latestAgentMessage?.content.startsWith('READY:') || false;
 
   return {
     project_id: projectId,
     generation_status: (project.generation_status as string | null) || 'intake',
     ready,
     agent_message: latestAgentMessage?.content || '',
-    questions: intakeAnswers?.questions || [],
-    current_question: currentQuestion,
-    current_question_index: currentQuestion ? answeredCount : Math.max(0, totalQuestions - 1),
-    total_questions: totalQuestions,
-    messages,
-    brief: {
-      ...brief,
-      summary: latestAgentMessage?.content.startsWith('READY:')
-        ? latestAgentMessage.content.replace(/^READY:\s*/, '').trim()
-        : brief.what_it_is || brief.raw_description,
-    },
+    questions: [],
+    current_question: null,
+    current_question_index: 0,
+    total_questions: 0,
   };
 }
 
@@ -1149,26 +1128,24 @@ app.post('/intake/start', async (c) => {
     toolsContext,
     conversationTurns: 0,
   });
-  const questions = await generateClarifyingQuestions({
+
+  const intakeTurn = await runProjectIntakeTurn({
     env: c.env,
     userId: c.get('uid'),
     rawDescription: description,
+    messages: await listProjectIntakeMessages(c.env, id),
     provider: providerContext,
+    conversationTurns: 1,
   });
-  const intakeAnswers = createIntakeAnswersPayload(questions);
 
-  await c.env.DB.prepare(`
-    UPDATE projects
-    SET intake_answers = ?, updated_at = datetime("now")
-    WHERE id = ? AND user_id = ?
-  `)
-    .bind(JSON.stringify(intakeAnswers), id, c.get('uid'))
-    .run();
-
-  const firstQuestion = getNextIntakeQuestion(intakeAnswers);
-  if (firstQuestion) {
-    await appendProjectIntakeMessage(c.env, id, 'agent', firstQuestion.text);
-  }
+  await appendProjectIntakeMessage(c.env, id, 'agent', intakeTurn.agentReply);
+  await upsertProjectBrief(c.env, {
+    projectId: id,
+    rawDescription: description,
+    structuredBrief: intakeTurn.structuredBrief,
+    toolsContext: intakeTurn.toolsContext,
+    conversationTurns: 1,
+  });
 
   return c.json(await buildIntakeResponse(c, id), 202);
 });
@@ -1200,84 +1177,28 @@ app.post('/intake/:id/respond', async (c) => {
     return c.json({ error: 'You need to add an AI key first.' }, 400);
   }
 
-  const brief = await getProjectBrief(c.env, projectId);
-  let intakeAnswers = parseIntakeAnswersPayload(project.intake_answers);
-  if (!intakeAnswers) {
-    const existingMessages = await listProjectIntakeMessages(c.env, projectId);
-    const fallbackQuestion = [...existingMessages]
-      .reverse()
-      .find((message) => message.role === 'agent')
-      ?.content
-      ?.replace(/^READY:\s*/, '')
-      .trim();
-    intakeAnswers = createIntakeAnswersPayload([
-      {
-        id: 'legacy-intake-context',
-        text: fallbackQuestion || 'What should this plan prioritize first?',
-        type: 'open',
-      },
-    ]);
-  }
-
-  const currentQuestion = getNextIntakeQuestion(intakeAnswers);
-  if (!currentQuestion) {
-    return c.json(await buildIntakeResponse(c, projectId));
-  }
-
   await appendProjectIntakeMessage(c.env, projectId, 'user', parsed.data.message);
-  const updatedAnswers = recordIntakeAnswer(intakeAnswers, currentQuestion, parsed.data.message);
-  const nextQuestion = getNextIntakeQuestion(updatedAnswers);
-  const rawDescription = asText(project.description, '');
+  const messages = await listProjectIntakeMessages(c.env, projectId);
+  const brief = await getProjectBrief(c.env, projectId);
+  const conversationTurns = (brief?.conversation_turns || 0) + 1;
 
-  if (nextQuestion) {
-    await appendProjectIntakeMessage(c.env, projectId, 'agent', nextQuestion.text);
-    const existingStructured = brief
-      ? {
-          what_it_is: brief.what_it_is,
-          who_its_for: brief.who_its_for,
-          problem_solved: brief.problem_solved,
-          v1_scope: brief.v1_scope,
-          stack_context: brief.stack_context,
-          definition_done: brief.definition_done,
-          constraints: brief.constraints,
-        }
-      : createFallbackStructuredBrief(rawDescription);
-    await upsertProjectBrief(c.env, {
-      projectId,
-      rawDescription,
-      structuredBrief: existingStructured,
-      toolsContext: await buildToolsContext(c.get('uid'), c.env),
-      conversationTurns: updatedAnswers.answers.length,
-      futureIdeas: brief?.future_ideas || [],
-    });
-  } else {
-    const intakeBrief = await synthesizeIntakeBrief({
-      env: c.env,
-      userId: c.get('uid'),
-      rawDescription,
-      intakeAnswers: updatedAnswers,
-      provider: providerContext,
-    });
-    updatedAnswers.completed_at = new Date().toISOString();
+  const intakeTurn = await runProjectIntakeTurn({
+    env: c.env,
+    userId: c.get('uid'),
+    rawDescription: asText(project.description, ''),
+    messages,
+    provider: providerContext,
+    conversationTurns,
+  });
 
-    await appendProjectIntakeMessage(c.env, projectId, 'agent', `READY: ${intakeBrief.summary}`);
-    await upsertProjectBrief(c.env, {
-      projectId,
-      rawDescription,
-      structuredBrief: intakeBrief.structuredBrief,
-      toolsContext: intakeBrief.toolsContext,
-      conversationTurns: updatedAnswers.answers.length,
-      futureIdeas: brief?.future_ideas || [],
-    });
-  }
-
-  await c.env.DB.prepare(`
-    UPDATE projects
-    SET intake_answers = ?, updated_at = datetime("now")
-    WHERE id = ? AND user_id = ?
-  `)
-    .bind(JSON.stringify(updatedAnswers), projectId, c.get('uid'))
-    .run();
+  await appendProjectIntakeMessage(c.env, projectId, 'agent', intakeTurn.agentReply);
+  await upsertProjectBrief(c.env, {
+    projectId,
+    rawDescription: asText(project.description, ''),
+    structuredBrief: intakeTurn.structuredBrief,
+    toolsContext: intakeTurn.toolsContext,
+    conversationTurns,
+  });
 
   return c.json(await buildIntakeResponse(c, projectId));
 });
@@ -2866,10 +2787,10 @@ app.post('/steps/:id/enrich', async (c) => {
     `Why it matters: ${stepRecord.why_it_matters || 'Not specified yet.'}`,
     `Done when: ${stepRecord.done_when || 'Not specified yet.'}`,
     `Live research context:\n${formatStepResearchPrompt(stepResearchContext)}`,
-    'ai_output rules: lead with WHERE to go, then WHAT to do, and end with WHAT to bring back to mark done. Use the builder’s actual tools by name. Maximum 3 paragraphs.',
-    'done_when must be concrete and verifiable, never subjective.',
+    'ai_output rules: Provide executable, low-level technical guidance. Lead with the file path to open, followed by the specific code snippet or command to run. Do not provide high-level summaries. For example: "In `src/lib/db.ts`, add the following interface..." or "Run `wrangler d1 migrations create ...`". End with what to bring back to mark done. Use the builder’s actual tools by name. Maximum 4 concise paragraphs.',
+    'done_when must be concrete, verifiable, and technical (e.g., "The route /api/users returns 200 OK", "The Drizzle schema includes field X").',
     'Populate navigation_links from researched docs URLs using concise labels and timing cues like "Start here" or "To verify".',
-    'Use the live documentation provided to generate specific, current guidance. Reference actual function names, hook names, and config options from the docs. If any open bugs were found, mention them in the ai_output and explain the workaround. Follow any requirements listed in the live research context exactly.',
+    'Use the live documentation provided to generate specific, current guidance. Reference actual function names, hook names, config options, and specific CLI flags derived from the docs. If any open bugs were found in the research context, mention them specifically and provide the workaround. Follow any kind-specific requirements listed in the live research context exactly.',
   ];
 
   if (editedOutput) {

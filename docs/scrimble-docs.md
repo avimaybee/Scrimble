@@ -651,13 +651,14 @@ Every project is guided through these stages (AI selects relevant ones based on 
 | instructions | **Exact instructions** — e.g. "Open [specific tool], go to [specific location], do [specific action]" |
 | tool_references | References to the user's actual connected tools by name |
 | external_links | Links to the exact page or tool the user needs to open |
+| navigation_links | **Next-action links** — tool-specific deep links (e.g. to a Stripe dashboard or GitHub issue) |
 | what_to_bring_back | What the user should have when they return to mark this done |
 | prompts | **Exact prompts** (approx. 10% of content) to paste into AI coding tools |
 | objective | What gets done here |
 | why_it_matters | What goes wrong if skipped (The "Why") |
 | checklist | Concrete items required before unlocking the next step |
 | status | waiting / working / needs review / complete / skipped |
-| research_attribution | Metadata on which tools were used to build this step guidance |
+| research_footer_meta | Metadata on which tools and versions were researched to build this step guidance |
 | is_gate | Requires your review before AI continues |
 
 ---
@@ -694,8 +695,18 @@ CREATE TABLE IF NOT EXISTS ai_providers (
   provider        TEXT NOT NULL,        -- 'openai' | 'anthropic' | 'gemini' | 'custom'
   api_key_enc     TEXT NOT NULL,        -- AES-256 encrypted API key
   base_url        TEXT,                 -- for custom providers (OpenAI-compatible)
-  model           TEXT,                 -- preferred model for this provider
   is_default      INTEGER DEFAULT 0,    -- one default per user
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- AI MODELS
+-- Individual models connected to a provider
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_models (
+  id              TEXT PRIMARY KEY,
+  provider_id     TEXT NOT NULL REFERENCES ai_providers(id) ON DELETE CASCADE,
+  name            TEXT NOT NULL,
   created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -722,6 +733,7 @@ CREATE TABLE IF NOT EXISTS projects (
   name            TEXT NOT NULL,
   description     TEXT,                 -- raw natural language description from user
   project_type    TEXT,                 -- AI-inferred: 'saas_mvp' | 'client_site' | 'internal_tool' | 'other'
+  intake_answers  TEXT,                 -- JSON payload of initial interview
   stack           TEXT,                 -- JSON: { frontend, backend, auth, deploy, ai_tools, payments }
   status          TEXT DEFAULT 'active',-- 'active' | 'completed' | 'archived'
   risk_score      INTEGER DEFAULT 0,    -- 0-100, recalculated on step changes
@@ -782,6 +794,8 @@ CREATE TABLE IF NOT EXISTS steps (
   is_ai_enriched      INTEGER DEFAULT 0,
   ai_output           TEXT,             -- generated artifact
   prompts             TEXT,             -- JSON: [{ label, content }]
+  research_footer_meta TEXT,            -- JSON: per-step research metadata
+  navigation_links     TEXT,            -- JSON: per-step navigation links
   -- Agent state
   agent_job_id        TEXT,             -- Cloudflare Queue message ID if running
   created_at          TEXT DEFAULT (datetime('now')),
@@ -904,7 +918,7 @@ POST   /api/projects/:id/resume    → Resume a failed or interrupted project
 
 Project generation now runs inside `ProjectGeneratorDO`, a standalone Cloudflare Worker Durable Object that owns every project’s pipeline turn.
 
-- **One DO per project**: Each run keeps its own `run_id`, persists batch state in D1 + R2, and streams progress events through the durable `project_generation_events` table.
+- **One DO per project**: Each run keeps its own `run_id`, persists batch state in D1 + R2, and streams progress events through the durable `project_generation_events` table. This architecture eliminates the race conditions and state-sync hurdles typical of distributed queues, ensuring the generation pipeline remains reliable and bi-directionally synchronized.
 - **Timeouts & retries**: The DO updates `projects.generation_status` as soon as each batch starts, retries transient provider/timeout errors via D1-stored alarms, and reschedules itself instead of failing the project.
 - **SSE-friendly**: Durable events are written to `project_generation_events`, and the Pages `/api/projects/:id/generation-stream` route replays history + polls D1 so the SPA receives live updates even though the runner is in a separate runtime. Reasoning deltas now flow straight from the worker as `thinking` SSE messages, so no table is required and `writer.close()` runs on all terminal events.
 - **Checkpoint durability**: Every batch writes both inline JSON and R2 payloads, so the pipeline can resume instantly after any interruption without re-running prior work.
@@ -921,7 +935,7 @@ The original `scrimble` Cloudflare Queue consumer remains as a rollback. It stil
 
 Project creation dispatches a dedicated generation run. The flow is as follows:
 
-1. **Clarifying Questions Phase (Required)**: Before generation begins, Scrimble asks the user 2-4 clarifying questions based on their initial description. These are a mix of technical and conceptual (e.g., "Real-time sync vs local storage?"). This ensures the agent makes real architectural decisions rather than generic ones.
+1. **Clarifying Questions Phase (Required)**: Before generation begins, Scrimble engages the user in a high-quality, editorial intake conversation. The agent asks 2-4 clarifying questions based on their initial description, focusing on real architectural trade-offs (e.g., "Real-time sync vs local storage?"). This ensures the agent makes deliberate decisions rather than generic assumptions.
 2. **Batch 1 (Research Stack)**: Identifies the technologies needed based on the description and answers.
 3. **Batch 2 (Fetch & Read)**: Deep research using connected tools (Context7, GitHub, Brave). Studies actual stack-specific documentation.
 4. **Batch 3 (Architect)**: Designs the system. Pauses for human approval at the **Architecture Gate**.
@@ -1023,6 +1037,7 @@ Scrimble uses a **two-model architecture** to optimize for both speed and reason
 - If both roles are configured, Scrimble automatically routes chaque task to the most appropriate model.
 - Research phases (Batch 1 & 2) and intake conversations always use the **Fast** model to keep the feeling snappy.
 - Architecture design, Plan building, and Enrichment (Batch 3, 4, 5, 6) use the **Deep** model to ensure evidence-based, high-accuracy instructions.
+- **Interactive Mid-Run Selection**: Builders can switch both Fast and Deep models at any time during project generation using the persistent model selection UI. The backend re-resolves the AI provider configuration at every batch boundary, ensuring the pipeline honors the new selection for all subsequent tasks without requiring a restart.
 
 **Provider Options:**
 - **OpenRouter** provides access to 100+ models including Claude, GPT, Llama, and DeepSeek at competitive pricing. Fully integrated with automatic model selection defaults.
@@ -1292,6 +1307,7 @@ If no AI provider is configured, `/new` blocks submission and shows a direct "Yo
 - A single-line **Currently working** row sits above the historical log. It uses a 3px paprika pulse dot and slightly brighter type to show the latest live message in real time. Streaming `thinking` deltas land here first, and when the next activity arrives the previous live line animates up into the history below.
 - A scrollable activity log (max-height 280px) streams persisted events (`activity`, `batch_complete`, `checkpoint`, `pipeline_failed`) with icons (🔍, 📦, ⚠️, 🏗️, ✅, 📝), timestamps (HH:MM:SS JetBrains Mono), and auto-scroll behavior. Each durable event carries an SSE `id:` from D1, the frontend tracks the latest seen event ID and a rendered-ID set, and reconnects after ~2 seconds with `Last-Event-ID` so replayed history never duplicates in the UI.
 - A six-dot progress indicator (connected line) mirrors the batch order. Completed dots glow emerald, the current batch glows paprika with a halo, and pending dots stay muted. Labels beneath each dot match the batch short names.
+- **Persistent AI Model Selection**: Interactive buttons for both "Fast" and "Deep" models are pinned to the generation summary area. These buttons allow the builder to view the active model (formatted as "Provider — Model") and open a selection modal to swap providers or models mid-run.
 - Estimated time remaining counts down from 12 minutes and recalculates dynamically as each `batch_complete` event reports `duration_ms`.
 - A `Stop generation` control sits inside the connection bar (XCircle icon). It fires `POST /api/projects/:id/cancel`, kills the Durable Object runner, and surfaces a cancelled banner with “Resume from checkpoint” and “Back to dashboard” actions so checkpoints are preserved after a manual halt.
 
@@ -1567,6 +1583,9 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **Formatting Utilities**: `formatStepCount`, `roundPercent` helpers for consistent number display.
 - **CSS Design System Expansion**: Extended design tokens for timeline, onboarding, and component states.
 - Natural language project intake → AI plan generation
+- **Interactive AI Model Selection**: Refined the model selection UI on the New Project page and implemented persistent, interactive selection (mid-run switching) on the Project Generation page.
+- **Intake Answer Tracking**: Restored the conversational intake style and implemented historical answer tracking to ensure the generation pipeline has full context of user decisions.
+- **Research Ledger Enhancements**: Improved the Batch 2 research manifest to prioritize tools from the Builder Profile and record detailed source metadata in a research ledger.
 - AI key management with custom provider URL hints
 - AI step enrichment ( Gemini/OpenAI integration + D1 persistence)
 - AI plan update (natural language diffing + D1 mutation)
@@ -1580,6 +1599,7 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - **Dispatch Safety & R2 Checkpoints**: Every run writes a `generation_dispatches` row before enqueuing, and the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`), multiplying the durable history without hitting D1 row limits and keeping the queue state honest.
   - **Provider Pinning & Prompt Guardrails**: The queue enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now builds a trimmed prompt payload from the richest sources so bloated payloads no longer leave AI providers stuck in “isn’t responding.”
   - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
+- **Migration History**: All schema updates from `0000_initial.sql` through `016_step_research_footer_metadata.sql` have been successfully applied and reconciled.
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
 - **SSE Streaming Overhaul**: Fully migrated AI reasoning deltas to a throttled, D1-buffered polling model. This architecture supports distributed Cloudflare Queue workers without triggering SQLite performance bottlenecks, ensuring smooth "thinking" streams for project generation, step enrichment, and plan updates.
 - **Connection Safety**: Implemented strict stream lifecycle management; `writer.close()` is now guaranteed on all terminal pipeline events and server-side cleanups.
@@ -1618,7 +1638,7 @@ These are the priority gaps between the current implementation and the stated pr
 2. **Turn-by-Turn Navigation**: Step content currently offers guidance/advice rather than exact, executable tool-specific instructions.
 3. **Node-Based Canvas**: The plan view is currently a vertical timeline placeholder instead of the intended node-based canvas.
 4. **Research Depth**: Batch 2 research is functional but does not yet consistently study documentation and issues at the depth required by the vision.
-5. **Clarifying Questions Consistency**: The questions phase is implemented but requires hardening across all project and tech stacks.
+5. **Clarifying Questions Consistency**: The high-quality editorial intake style has been restored and is functional across the primary project workflows.
 
 ---
 

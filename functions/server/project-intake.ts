@@ -2,41 +2,31 @@ import { z } from 'zod';
 import { callAIText, extractJSON } from './ai';
 import {
   buildProjectBriefSummary,
-  createFallbackStructuredBrief,
   projectBriefStructuredSchema,
   type ProjectBriefStructured,
+  type ProjectIntakeMessage,
 } from './project-briefs';
 import { loadBuilderProfileContext } from './user-tools';
 import type { Bindings, ProviderType } from './types';
 
-const intakeQuestionSchema = z.object({
-  id: z.string().trim().min(1),
-  text: z.string().trim().min(1),
-  type: z.enum(['choice', 'open']),
-  options: z.array(z.string().trim().min(1)).max(6).optional(),
-});
+function normalizeIntakeStringList(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
 
-const intakeQuestionResponseSchema = z.object({
-  questions: z.array(intakeQuestionSchema).min(2).max(4),
-});
+  return value
+    .flatMap((entry) => (typeof entry === 'string' ? [entry.trim()] : []))
+    .filter(Boolean);
+}
 
-const intakeAnswerEntrySchema = z.object({
-  question_id: z.string().trim().min(1),
-  question: z.string().trim().min(1),
-  answer: z.string().trim().min(1),
-  type: z.enum(['choice', 'open']),
-});
-
-const intakeAnswersPayloadSchema = z.object({
-  questions: z.array(intakeQuestionSchema).min(1),
-  answers: z.array(intakeAnswerEntrySchema),
-  started_at: z.string().trim().min(1),
-  completed_at: z.string().trim().optional(),
-});
-
-const intakeBriefSynthesisSchema = z.object({
+const intakeAgentResponseSchema = z.object({
+  ready: z.boolean().catch(false),
+  agent_reply: z.string().trim().min(1),
   brief: projectBriefStructuredSchema,
-  summary: z.string().trim().min(1),
+  missing_context: z.preprocess(
+    normalizeIntakeStringList,
+    z.array(z.string().trim().min(1)),
+  ),
 });
 
 type IntakeProviderContext = {
@@ -46,78 +36,10 @@ type IntakeProviderContext = {
   baseUrl?: string | null;
 };
 
-export type IntakeQuestion = z.infer<typeof intakeQuestionSchema>;
-export type IntakeAnswerEntry = z.infer<typeof intakeAnswerEntrySchema>;
-export type IntakeAnswersPayload = z.infer<typeof intakeAnswersPayloadSchema>;
-
-function normalizeQuestionId(value: string, fallbackIndex: number) {
-  const normalized = value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  return normalized || `q-${fallbackIndex + 1}`;
-}
-
-function normalizeGeneratedQuestions(questions: IntakeQuestion[]) {
-  const seen = new Set<string>();
-  const normalized: IntakeQuestion[] = [];
-
-  questions.forEach((question, index) => {
-    const idBase = normalizeQuestionId(question.id, index);
-    let id = idBase;
-    let suffix = 2;
-
-    while (seen.has(id)) {
-      id = `${idBase}-${suffix}`;
-      suffix += 1;
-    }
-
-    seen.add(id);
-    normalized.push({
-      ...question,
-      id,
-      options: question.type === 'choice'
-        ? (question.options || []).map((option) => option.trim()).filter(Boolean).slice(0, 6)
-        : undefined,
-    });
-  });
-
-  return normalized.slice(0, 4);
-}
-
-function buildFallbackQuestions(rawDescription: string): IntakeQuestion[] {
-  const normalized = rawDescription.toLowerCase();
-  const questions: IntakeQuestion[] = [
-    {
-      id: 'target-user',
-      text: 'Who is the primary user for this first version?',
-      type: 'open',
-    },
-    {
-      id: 'scope-priority',
-      text: 'Which outcome matters most for v1?',
-      type: 'open',
-    },
-  ];
-
-  if (!normalized.includes('payment') && !normalized.includes('billing') && !normalized.includes('subscription')) {
-    questions.push({
-      id: 'monetization',
-      text: 'How should this project make money in the first release?',
-      type: 'choice',
-      options: ['Subscription', 'One-time payment', 'Free for now'],
-    });
-  } else {
-    questions.push({
-      id: 'architecture-tradeoff',
-      text: 'Which tradeoff matters more right now?',
-      type: 'choice',
-      options: ['Speed to launch', 'Long-term flexibility', 'Lowest running cost'],
-    });
-  }
-
-  return questions;
+function formatTranscript(messages: ProjectIntakeMessage[]) {
+  return messages
+    .map((message) => `${message.role === 'agent' ? 'Agent' : 'Builder'}: ${message.content}`)
+    .join('\n\n');
 }
 
 function mergeProfileTools(brief: ProjectBriefStructured, toolNames: string[]) {
@@ -143,160 +65,51 @@ function mergeProfileTools(brief: ProjectBriefStructured, toolNames: string[]) {
   };
 }
 
-function formatWorkspaceProfileSummary(builderProfile: Awaited<ReturnType<typeof loadBuilderProfileContext>>) {
-  if (builderProfile.declaredTools.length === 0) {
-    return 'No workspace tools saved yet.';
+function parseIntakeAgentResponse(rawText: string) {
+  const parsedContent = JSON.parse(extractJSON(rawText));
+  const validated = intakeAgentResponseSchema.safeParse(parsedContent);
+  if (!validated.success) {
+    throw new Error(`Failed to parse intake response: ${validated.error.message}`);
   }
 
-  return builderProfile.declaredTools
-    .map((tool) => `${tool.category}: ${tool.name}`)
-    .join(', ');
+  return validated.data;
 }
 
-export function createIntakeAnswersPayload(questions: IntakeQuestion[]): IntakeAnswersPayload {
-  return {
-    questions: normalizeGeneratedQuestions(questions),
-    answers: [],
-    started_at: new Date().toISOString(),
-  };
-}
-
-export function parseIntakeAnswersPayload(input: unknown): IntakeAnswersPayload | null {
-  if (!input) {
-    return null;
-  }
-
-  let value = input;
-  if (typeof input === 'string') {
-    try {
-      value = JSON.parse(input);
-    } catch {
-      return null;
-    }
-  }
-
-  const parsed = intakeAnswersPayloadSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
-}
-
-export function getNextIntakeQuestion(payload: IntakeAnswersPayload): IntakeQuestion | null {
-  const answeredIds = new Set(payload.answers.map((entry) => entry.question_id));
-  return payload.questions.find((question) => !answeredIds.has(question.id)) || null;
-}
-
-export function recordIntakeAnswer(
-  payload: IntakeAnswersPayload,
-  question: IntakeQuestion,
-  answer: string,
-): IntakeAnswersPayload {
-  const trimmedAnswer = answer.trim();
-  const remainingAnswers = payload.answers.filter((entry) => entry.question_id !== question.id);
-
-  return {
-    ...payload,
-    answers: [
-      ...remainingAnswers,
-      {
-        question_id: question.id,
-        question: question.text,
-        answer: trimmedAnswer,
-        type: question.type,
-      },
-    ],
-  };
-}
-
-function formatIntakeAnswersForPrompt(payload: IntakeAnswersPayload) {
-  if (payload.answers.length === 0) {
-    return 'No clarifying answers yet.';
-  }
-
-  return payload.answers
-    .map((entry, index) => `${index + 1}. ${entry.question}\nAnswer: ${entry.answer}`)
-    .join('\n\n');
-}
-
-export async function generateClarifyingQuestions(options: {
+export async function runProjectIntakeTurn(options: {
   userId: string;
   env: Bindings;
   rawDescription: string;
+  messages: ProjectIntakeMessage[];
   provider: IntakeProviderContext;
+  conversationTurns: number;
   onThinking?: (delta: string) => Promise<void> | void;
+  stepId?: string;
+  projectId?: string;
 }) {
   const builderProfile = await loadBuilderProfileContext(options.userId, options.env);
-  const profileSummary = formatWorkspaceProfileSummary(builderProfile);
+  const systemPrompt = `You are Scrimble's project intake agent. Your job is to understand what the builder wants to create well enough that a research pipeline can fetch the exact right documentation, libraries, and community knowledge before building their plan.
 
-  try {
-    const { text } = await callAIText({
-      providerType: options.provider.providerType,
-      apiKey: options.provider.apiKey,
-      model: options.provider.model,
-      baseUrl: options.provider.baseUrl,
-      role: 'fast',
-      onReasoningDelta: options.onThinking,
-      system: `You are generating clarifying questions for a software project planning tool.
-Ask only what you need to know. The user is intelligent and technical - do not ask obvious things or things you can infer.
+Builder profile (what they already have):
+${builderProfile.toolsContext || 'not specified'}
 
-Return JSON only:
-{ "questions": [{ "id": string, "text": string, "type": "choice" | "open", "options"?: string[] }] }`,
-      prompt: `User's project description:
+Their initial description:
 ${options.rawDescription}
 
-User's workspace profile (tools they already use):
-${profileSummary}
+RULES:
+- Ask ONE focused question per message. Never a list of questions.
+- Each question must move toward a specific gap in your understanding.
+- Never ask about tools or stack they already have in their profile.
+- Never ask for information you can reasonably infer.
+- When you have all 7 pieces of context, respond with exactly:
+  READY: {one paragraph brief summarizing what you now understand}
+- Maximum 4 exchanges. If you still have gaps after 4, make reasonable assumptions and signal READY anyway.
+- Tone: direct, warm, curious. Like a smart colleague who genuinely wants to understand before diving in.
+- Never use bullet points. Never use forms. Just conversation.
 
-Generate 2-4 clarifying questions that would most improve the plan quality.
-
-Rules:
-- Never ask about tools they've already listed in their profile.
-- Never ask obvious questions answerable from the description.
-- Focus on: ambiguous scope, key architectural decisions with real tradeoffs, monetisation if not clear, target user if not clear.
-- Ask one thing per question.
-- Keep each question under 20 words.
-- For choice questions, include 2-4 options.`,
-    });
-
-    const parsedContent = JSON.parse(extractJSON(text));
-    const validated = intakeQuestionResponseSchema.safeParse(parsedContent);
-    if (!validated.success) {
-      throw new Error(validated.error.message);
-    }
-
-    const normalized = normalizeGeneratedQuestions(validated.data.questions);
-    if (normalized.length < 2) {
-      throw new Error('Not enough valid clarifying questions.');
-    }
-
-    return normalized;
-  } catch {
-    return buildFallbackQuestions(options.rawDescription);
-  }
-}
-
-export async function synthesizeIntakeBrief(options: {
-  userId: string;
-  env: Bindings;
-  rawDescription: string;
-  intakeAnswers: IntakeAnswersPayload;
-  provider: IntakeProviderContext;
-  onThinking?: (delta: string) => Promise<void> | void;
-}) {
-  const builderProfile = await loadBuilderProfileContext(options.userId, options.env);
-  const toolsContext = builderProfile.toolsContext;
-  const profileSummary = formatWorkspaceProfileSummary(builderProfile);
-  const intakeAnswersSummary = formatIntakeAnswersForPrompt(options.intakeAnswers);
-
-  try {
-    const { text } = await callAIText({
-      providerType: options.provider.providerType,
-      apiKey: options.provider.apiKey,
-      model: options.provider.model,
-      baseUrl: options.provider.baseUrl,
-      role: 'fast',
-      onReasoningDelta: options.onThinking,
-      system: `You are Scrimble's intake synthesizer. Convert project intake details into a structured brief.
-Return JSON only in this shape:
+Return ONLY valid JSON in this shape:
 {
+  "ready": boolean,
+  "agent_reply": string,
   "brief": {
     "what_it_is": string,
     "who_its_for": string,
@@ -317,54 +130,71 @@ Return JSON only in this shape:
       "other": string[]
     }
   },
-  "summary": string
-}`,
-      prompt: `Project description:
-${options.rawDescription}
+  "missing_context": string[]
+}
 
-Workspace profile:
-${profileSummary}
+When ready is true, agent_reply must start with "READY: ".
+When ready is false, agent_reply must be exactly one focused conversational question.`;
 
-Clarifying answers:
-${intakeAnswersSummary}
+  const prompt = `Conversation so far:
+${formatTranscript(options.messages)}
 
-Write concise, concrete brief fields. Keep assumptions explicit and practical.`,
-    });
+Current exchange count: ${options.conversationTurns} of 4.
 
-    const parsedContent = JSON.parse(extractJSON(text));
-    const validated = intakeBriefSynthesisSchema.safeParse(parsedContent);
-    if (!validated.success) {
-      throw new Error(validated.error.message);
-    }
+Update the structured brief from the full conversation, not just the last message.`;
 
-    return {
-      structuredBrief: mergeProfileTools(
-        validated.data.brief,
-        builderProfile.declaredTools.map((tool) => tool.name),
-      ),
-      summary: validated.data.summary,
-      toolsContext,
-    };
-  } catch {
-    const fallbackStructuredBrief = mergeProfileTools(
-      createFallbackStructuredBrief(options.rawDescription, {
-        existingTools: builderProfile.declaredTools.map((tool) => tool.name),
-      }),
-      builderProfile.declaredTools.map((tool) => tool.name),
-    );
+  const { text } = await callAIText({
+    providerType: options.provider.providerType,
+    apiKey: options.provider.apiKey,
+    model: options.provider.model,
+    baseUrl: options.provider.baseUrl,
+    role: 'fast',
+    system: systemPrompt,
+    prompt,
+    onReasoningDelta: options.onThinking,
+  });
 
-    return {
-      structuredBrief: fallbackStructuredBrief,
-      summary: buildProjectBriefSummary({
-        raw_description: options.rawDescription,
-        what_it_is: fallbackStructuredBrief.what_it_is,
-        who_its_for: fallbackStructuredBrief.who_its_for,
-        problem_solved: fallbackStructuredBrief.problem_solved,
-        v1_scope: fallbackStructuredBrief.v1_scope,
-        definition_done: fallbackStructuredBrief.definition_done,
-        constraints: fallbackStructuredBrief.constraints,
-      }),
-      toolsContext,
-    };
-  }
+  const parsed = parseIntakeAgentResponse(text);
+  const structuredBrief = mergeProfileTools(
+    parsed.brief,
+    builderProfile.declaredTools.map((tool) => tool.name),
+  );
+  const forcedReady = options.conversationTurns >= 4 && !parsed.ready;
+  const ready = parsed.ready || parsed.agent_reply.startsWith('READY:') || forcedReady;
+  const readySummary = buildProjectBriefSummary({
+    raw_description: options.rawDescription,
+    what_it_is: structuredBrief.what_it_is,
+    who_its_for: structuredBrief.who_its_for,
+    problem_solved: structuredBrief.problem_solved,
+    v1_scope: structuredBrief.v1_scope,
+    definition_done: structuredBrief.definition_done,
+    constraints: structuredBrief.constraints,
+  });
+
+  return {
+    ready,
+    agentReply: ready
+      ? parsed.agent_reply.startsWith('READY:')
+        ? parsed.agent_reply
+        : `READY: ${readySummary}`
+      : parsed.agent_reply,
+    structuredBrief,
+    toolsContext: builderProfile.toolsContext,
+    missingContext: parsed.missing_context,
+  };
+}
+
+export async function synthesizeFullBrief(options: {
+  userId: string;
+  env: Bindings;
+  rawDescription: string;
+  messages: ProjectIntakeMessage[];
+  provider: IntakeProviderContext;
+  onThinking?: (delta: string) => Promise<void> | void;
+}) {
+  // Minimal turn count 4 to force full brief synthesis
+  return runProjectIntakeTurn({
+    ...options,
+    conversationTurns: 4,
+  });
 }

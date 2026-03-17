@@ -113,10 +113,10 @@ function rankPriority(
   }
 
   if (isCategoryRelevant(tool.category, projectDescription)) {
-    return 'medium';
+    return 'high';
   }
 
-  return 'low';
+  return 'medium';
 }
 
 function prioritySortValue(priority: ResearchManifestPriority) {

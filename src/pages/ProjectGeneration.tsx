@@ -10,6 +10,7 @@ import {
   Hexagon,
   LoaderCircle,
   Search,
+  Sparkles,
   TriangleAlert,
   XCircle,
 } from 'lucide-react';
@@ -17,8 +18,22 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import FullscreenStatus from '../components/ui/FullscreenStatus';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog';
 import { dbService, type GenerationStreamConnectionState } from '../lib/db';
-import { getAIModelRoles, getAIProviders, type AIModelRoles, type AIProvider } from '../lib/ai';
+import {
+  getAIModelRoles,
+  getAIProviders,
+  saveAIModelRoles,
+  type AIModelRoles,
+  type AIProvider,
+} from '../lib/ai';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
@@ -379,14 +394,22 @@ function resolveModelRoleDisplay(providers: AIProvider[], modelRoles: AIModelRol
       return 'default model';
     }
 
-    return resolvedSlot.model || resolveDefaultProviderModel(resolvedSlot.provider) || 'default model';
+    const providerName = resolvedSlot.provider.id === 'openai' ? 'OpenAI' :
+                        resolvedSlot.provider.id === 'anthropic' ? 'Anthropic' :
+                        resolvedSlot.provider.id === 'google' ? 'Google' :
+                        resolvedSlot.provider.id === 'perplexity' ? 'Perplexity' :
+                        resolvedSlot.provider.id === 'locally' ? 'Local' :
+                        resolvedSlot.provider.id;
+    
+    const modelName = resolvedSlot.model || resolveDefaultProviderModel(resolvedSlot.provider) || 'default model';
+    return `${providerName} — ${modelName}`;
   };
 
   return {
     fast: resolveRoleLabel('fast'),
     deep: resolveRoleLabel('deep'),
   };
-}
+};
 
 function getResearchRelevanceTone(relevance: string | undefined) {
   switch ((relevance || '').toLowerCase()) {
@@ -424,6 +447,10 @@ export default function ProjectGeneration() {
     fast: 'default model',
     deep: 'default model',
   });
+  const [isModelModalOpen, setIsModelModalOpen] = useState(false);
+  const [modalRoleType, setModalRoleType] = useState<'fast' | 'deep'>('fast');
+  const [providers, setProviders] = useState<AIProvider[]>([]);
+  const [modelRoles, setModelRoles] = useState<AIModelRoles | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
@@ -637,26 +664,54 @@ export default function ProjectGeneration() {
   useEffect(() => {
     let cancelled = false;
 
-    void Promise.all([getAIProviders(), getAIModelRoles()])
-      .then(([providers, modelRoles]) => {
-        if (cancelled) {
-          return;
-        }
-        setModelRoleDisplay(resolveModelRoleDisplay(providers, modelRoles));
-      })
-      .catch(() => {
+    const loadModelData = async () => {
+      try {
+        const [providersData, rolesData] = await Promise.all([getAIProviders(), getAIModelRoles()]);
+        if (cancelled) return;
+        setProviders(providersData);
+        setModelRoles(rolesData);
+        setModelRoleDisplay(resolveModelRoleDisplay(providersData, rolesData));
+      } catch (err) {
         if (!cancelled) {
           setModelRoleDisplay({
             fast: 'default model',
             deep: 'default model',
           });
         }
-      });
+      }
+    };
+
+    void loadModelData();
 
     return () => {
       cancelled = true;
     };
   }, [id]);
+
+  const handleOpenModelModal = useCallback((type: 'fast' | 'deep') => {
+    setModalRoleType(type);
+    setIsModelModalOpen(true);
+  }, []);
+
+  const handleSelectModel = useCallback(async (providerId: string, modelName: string | null) => {
+    if (!modelRoles) return;
+
+    const nextRoles: AIModelRoles = {
+      ...modelRoles,
+      [modalRoleType === 'fast' ? 'fast_model_provider_id' : 'deep_model_provider_id']: providerId,
+      [modalRoleType === 'fast' ? 'fast_model_name' : 'deep_model_name']: modelName,
+    };
+
+    try {
+      const saved = await saveAIModelRoles(nextRoles);
+      setModelRoles(saved);
+      setModelRoleDisplay(resolveModelRoleDisplay(providers, saved));
+      setIsModelModalOpen(false);
+      toast.success(`Switched ${modalRoleType} model to ${modelName || 'default'}. Changes will apply to the next stage.`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to switch model.');
+    }
+  }, [modalRoleType, modelRoles, providers]);
 
   useEffect(() => {
     if (status?.is_complete) {
@@ -1711,8 +1766,34 @@ export default function ProjectGeneration() {
                   {currentBatch.heading}
                 </motion.h1>
               </AnimatePresence>
-              <div className="mb-5 font-mono text-[11px] leading-5 text-text-muted">
-                Using {modelRoleDisplay.fast} for research · {modelRoleDisplay.deep} for generation
+              <div className="mb-5 flex items-center justify-center gap-2 font-mono text-[11px] leading-5 text-text-muted">
+                <button
+                  type="button"
+                  onClick={() => handleOpenModelModal('fast')}
+                  className={cn(
+                    "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
+                    currentBatch.id.includes('research') || currentBatch.id.includes('fetch') 
+                      ? "border-accent-primary/30 bg-accent-primary/5 text-accent-soft ring-1 ring-accent-primary/10" 
+                      : ""
+                  )}
+                >
+                  <span className="opacity-60">Fast:</span>
+                  <span className="font-medium text-text-secondary group-hover:text-accent-soft">{modelRoleDisplay.fast}</span>
+                </button>
+                <span className="opacity-30">·</span>
+                <button
+                  type="button"
+                  onClick={() => handleOpenModelModal('deep')}
+                  className={cn(
+                    "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
+                    !currentBatch.id.includes('research') && !currentBatch.id.includes('fetch')
+                      ? "border-status-secure/30 bg-status-secure/5 text-status-secure-dim ring-1 ring-status-secure/10"
+                      : ""
+                  )}
+                >
+                  <span className="opacity-60">Deep:</span>
+                  <span className="font-medium text-text-secondary group-hover:text-status-secure-dim">{modelRoleDisplay.deep}</span>
+                </button>
               </div>
 
               <div className="mb-6 w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
@@ -2009,6 +2090,127 @@ export default function ProjectGeneration() {
           )}
         </AnimatePresence>
       </section>
+
+      <Dialog open={isModelModalOpen} onOpenChange={setIsModelModalOpen}>
+        <DialogContent className="max-w-[420px]">
+          <DialogHeader>
+            <DialogTitle>Switch {modalRoleType === 'fast' ? 'Fast' : 'Deep'} Model</DialogTitle>
+            <DialogDescription>
+              Select which model should handle {modalRoleType === 'fast' ? 'research and tool calls' : 'architecture and file generation'}.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="max-h-[60vh] overflow-y-auto px-6 py-2 space-y-4">
+            {providers.map((provider) => (
+              <div key={provider.id} className="space-y-2">
+                <div className="pl-1 text-xs font-semibold uppercase tracking-wider text-text-tertiary">
+                  {provider.name}
+                </div>
+                {provider.models && provider.models.length > 0 ? (
+                  provider.models.map((model) => {
+                    const isFastSlot = modelRoles?.fast_model_provider_id === provider.id && modelRoles?.fast_model_name === model.name;
+                    const isDeepSlot = modelRoles?.deep_model_provider_id === provider.id && modelRoles?.deep_model_name === model.name;
+                    const isSelected = modalRoleType === 'fast' ? isFastSlot : isDeepSlot;
+
+                    return (
+                      <button
+                        key={model.id}
+                        onClick={() => void handleSelectModel(provider.id, model.name)}
+                        className={cn(
+                          'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
+                          isSelected
+                            ? 'border-accent-border bg-accent-primary-muted'
+                            : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
+                        )}
+                      >
+                        <div className="flex items-center gap-3">
+                          <div
+                            className={cn(
+                              'flex h-8 w-8 items-center justify-center rounded-lg border transition-colors',
+                              isSelected
+                                ? 'border-accent-border bg-bg-surface text-accent-primary'
+                                : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
+                            )}
+                          >
+                            <Sparkles className="h-4 w-4" />
+                          </div>
+                          <div>
+                            <div className="text-[14px] font-medium text-text-primary">
+                              {model.name}
+                            </div>
+                            <div className="flex gap-1 mt-0.5">
+                              {isFastSlot && (
+                                <span className="text-[9px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded">Fast</span>
+                              )}
+                              {isDeepSlot && (
+                                <span className="text-[9px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded">Deep</span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        {isSelected && (
+                          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
+                            <ChevronRight className="h-3 w-3" />
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })
+                ) : (
+                  <button
+                    onClick={() => void handleSelectModel(provider.id, null)}
+                    className={cn(
+                      'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
+                      (modalRoleType === 'fast' 
+                        ? (modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name)
+                        : (modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name))
+                        ? 'border-accent-border bg-accent-primary-muted'
+                        : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
+                    )}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div
+                        className={cn(
+                          'flex h-8 w-8 items-center justify-center rounded-lg border transition-colors',
+                          (modalRoleType === 'fast' 
+                            ? (modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name)
+                            : (modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name))
+                            ? 'border-accent-border bg-bg-surface text-accent-primary'
+                            : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
+                        )}
+                      >
+                        <Sparkles className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <div className="text-[14px] font-medium text-text-primary">
+                          {provider.model || 'Default Model'}
+                        </div>
+                        <div className="flex gap-1 mt-0.5">
+                          {(modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name) && (
+                            <span className="text-[9px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded">Fast</span>
+                          )}
+                          {(modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name) && (
+                            <span className="text-[9px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded">Deep</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <DialogFooter className="border-t border-border-default bg-bg-elevated/30 p-4">
+            <button
+              onClick={() => setIsModelModalOpen(false)}
+              className="btn-ghost py-2 text-sm"
+            >
+              Cancel
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </main>
   );
 }

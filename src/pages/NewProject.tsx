@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowRight, ChevronRight, Hexagon, KeyRound, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
-import { getAIProviders } from '../lib/ai';
+import { getAIProviders, getAIModelRoles } from '../lib/ai';
 import { getMCPServers } from '../lib/mcp';
 import { cn } from '../lib/utils';
 import {
@@ -15,7 +15,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '../components/ui/dialog';
-import type { AIProvider } from '../lib/ai';
+import type { AIProvider, AIModelRoles } from '../lib/ai';
 import { ThinkingBubble } from '@/components/ui/ThinkingBubble';
 import type { GenerationPreparationState, ProjectBrief, ProjectIntakeSession } from '../types';
 
@@ -102,6 +102,7 @@ export default function NewProject() {
   const [providers, setProviders] = useState<AIProvider[]>([]);
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
   const [selectedModelName, setSelectedModelName] = useState<string | null>(null);
+  const [modelRoles, setModelRoles] = useState<AIModelRoles | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [intakeSession, setIntakeSession] = useState<ProjectIntakeSession | null>(null);
   const [screenState, setScreenState] = useState<IntakeScreenState>('initial');
@@ -170,18 +171,27 @@ export default function NewProject() {
     setError('');
 
     try {
-      const [providerList, servers, userTools] = await Promise.all([
+      const [providerList, modelRolesResult, servers, userTools] = await Promise.all([
         getAIProviders(),
+        getAIModelRoles(),
         getMCPServers(),
         dbService.getUserTools(),
       ]);
       const activeServers = servers.filter((server) => server.is_active);
 
       setProviders(providerList);
+      setModelRoles(modelRolesResult);
       setBuilderProfileCount(userTools.length);
-      const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
-      if (defaultProvider) {
-        setSelectedProviderId(defaultProvider.id);
+      
+      if (modelRolesResult?.fast_model_name && modelRolesResult?.fast_model_provider_id) {
+        setSelectedProviderId(null);
+        setSelectedModelName(null);
+      } else {
+        const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
+        if (defaultProvider) {
+          setSelectedProviderId(defaultProvider.id);
+          setSelectedModelName(null);
+        }
       }
 
       setGenerationPreparation({
@@ -537,10 +547,37 @@ export default function NewProject() {
                           : generationPreparation?.has_ai_provider
                             ? (
                               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                <span>Scrimble will use</span>
-                                <span className="inline-flex items-center gap-1 font-medium text-text-primary">
-                                  {providers.find((provider) => provider.id === selectedProviderId)?.name || 'Default key'}
-                                </span>
+                                  {modelRoles?.fast_model_name ? (
+                                    <>
+                                      <span>your preferred</span>
+                                      <span className="inline-flex items-center gap-1 font-medium text-text-primary">
+                                        {modelRoles.fast_model_name}
+                                      </span>
+                                      <span>(fast) and</span>
+                                      <span className="inline-flex items-center gap-1 font-medium text-text-primary">
+                                        {modelRoles.deep_model_name || 'default'}
+                                      </span>
+                                      <span>(deep) models</span>
+                                    </>
+                                  ) : (
+                                    selectedProviderId ? (
+                                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                        <span className="inline-flex items-center gap-1 font-medium text-text-primary">
+                                          {providers.find((p) => p.id === selectedProviderId)?.name || 'Default key'}
+                                        </span>
+                                        {selectedModelName && (
+                                          <>
+                                            <span className="text-text-tertiary">/</span>
+                                            <span className="inline-flex items-center gap-1 font-medium text-text-primary">
+                                              {selectedModelName}
+                                            </span>
+                                          </>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <span>Default key</span>
+                                    )
+                                  )}
                                 <button
                                   type="button"
                                   onClick={() => setIsModalOpen(true)}
@@ -851,6 +888,12 @@ export default function NewProject() {
                                 <div className="text-[14px] font-medium text-text-primary">
                                   {model.name}
                                 </div>
+                                {(modelRoles?.fast_model_provider_id === provider.id && modelRoles?.fast_model_name === model.name) && (
+                                  <span className="text-[10px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded ml-1">Fast</span>
+                                )}
+                                {(modelRoles?.deep_model_provider_id === provider.id && modelRoles?.deep_model_name === model.name) && (
+                                  <span className="text-[10px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded ml-1">Deep</span>
+                                )}
                               </div>
                             </div>
                             {isSelected ? (
@@ -890,6 +933,12 @@ export default function NewProject() {
                             <div className="text-[14px] font-medium text-text-primary">
                               {provider.model || 'Default Model'}
                             </div>
+                            {(modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name) && (
+                              <span className="text-[10px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded ml-1">Fast</span>
+                            )}
+                            {(modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name) && (
+                              <span className="text-[10px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded ml-1">Deep</span>
+                            )}
                           </div>
                         </div>
                         {selectedProviderId === provider.id && !selectedModelName ? (
