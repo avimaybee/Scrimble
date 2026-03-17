@@ -514,6 +514,10 @@ async function buildIntakeResponse(c: AppContext, projectId: string) {
     throw new Error('Project intake state is unavailable.');
   }
 
+  const briefContext = await loadProjectBriefContext(c.env, projectId, c.get('uid'), {
+    rawDescription: asText(project.description, ''),
+    projectStack: asText(project.stack, '{}'),
+  });
   const latestAgentMessage = [...messages].reverse().find((message) => message.role === 'agent') || null;
   const ready = latestAgentMessage?.content.startsWith('READY:') || false;
 
@@ -526,6 +530,11 @@ async function buildIntakeResponse(c: AppContext, projectId: string) {
     current_question: null,
     current_question_index: 0,
     total_questions: 0,
+    messages,
+    brief: {
+      ...briefContext.effectiveBrief,
+      summary: briefContext.summary,
+    },
   };
 }
 
