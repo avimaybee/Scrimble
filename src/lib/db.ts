@@ -6,7 +6,6 @@ import {
   Edge as AppEdge,
   GeneratedProjectFile,
   Plan,
-  PreferredIde,
   Project,
   ProjectGenerationActivity,
   ProjectGenerationBatchStartEvent,
@@ -336,20 +335,18 @@ export const dbService = {
     return fetchAPI<ArchitectureReviewResponse>(`/projects/${projectId}/architecture-review`);
   },
 
-  async approveArchitectureReview(projectId: string, feedback: string, preferredIde: PreferredIde): Promise<{
+  async approveArchitectureReview(projectId: string, feedback: string): Promise<{
     success: boolean;
     generation_status: Project['generation_status'];
     feedback_provided: boolean;
-    preferred_ide: PreferredIde;
   }> {
     return fetchAPI<{
       success: boolean;
       generation_status: Project['generation_status'];
       feedback_provided: boolean;
-      preferred_ide: PreferredIde;
     }>(`/projects/${projectId}/architecture-review`, withoutClientTimeout({
       method: 'POST',
-      body: JSON.stringify({ feedback, preferredIde }),
+      body: JSON.stringify({ feedback }),
     }));
   },
 

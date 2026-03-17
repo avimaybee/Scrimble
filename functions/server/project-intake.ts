@@ -81,7 +81,6 @@ export async function runProjectIntakeTurn(options: {
   rawDescription: string;
   messages: ProjectIntakeMessage[];
   provider: IntakeProviderContext;
-  conversationTurns: number;
   onThinking?: (delta: string) => Promise<void> | void;
   stepId?: string;
   projectId?: string;
@@ -97,12 +96,19 @@ ${options.rawDescription}
 
 RULES:
 - Ask ONE focused question per message. Never a list of questions.
-- Each question must move toward a specific gap in your understanding.
+- Each question must close a specific gap in your understanding.
 - Never ask about tools or stack they already have in their profile.
 - Never ask for information you can reasonably infer.
-- When you have all 7 pieces of context, respond with exactly:
+- Refuse to assume missing details. If the builder is vague (for example: "build an app", "create a project"), ask concrete follow-ups instead of guessing.
+- For vague descriptions, clarify in this order until the answers are concrete:
+  1) Who the user is and what context they are in.
+  2) The core user workflow and exact outcome the product must deliver.
+  3) V1 scope boundaries (must-have in scope vs explicitly out of scope).
+  4) Non-negotiable constraints (timeline, budget, existing codebase, required integrations/dependencies, compliance/security limits).
+- If the builder says "you decide" or "anything works", still ask for minimum boundaries before continuing.
+- Only mark ready when the brief is concrete enough to build without guessing.
+- When ready, respond with exactly:
   READY: {one paragraph brief summarizing what you now understand}
-- Maximum 4 exchanges. If you still have gaps after 4, make reasonable assumptions and signal READY anyway.
 - Tone: direct, warm, curious. Like a smart colleague who genuinely wants to understand before diving in.
 - Never use bullet points. Never use forms. Just conversation.
 
@@ -137,11 +143,9 @@ When ready is true, agent_reply must start with "READY: ".
 When ready is false, agent_reply must be exactly one focused conversational question.`;
 
   const prompt = `Conversation so far:
-${formatTranscript(options.messages)}
-
-Current exchange count: ${options.conversationTurns} of 4.
-
-Update the structured brief from the full conversation, not just the last message.`;
+  ${formatTranscript(options.messages)}
+  
+  Update the structured brief from the full conversation, not just the last message.`;
 
   const { text } = await callAIText({
     providerType: options.provider.providerType,
@@ -159,8 +163,7 @@ Update the structured brief from the full conversation, not just the last messag
     parsed.brief,
     builderProfile.declaredTools.map((tool) => tool.name),
   );
-  const forcedReady = options.conversationTurns >= 4 && !parsed.ready;
-  const ready = parsed.ready || parsed.agent_reply.startsWith('READY:') || forcedReady;
+  const ready = parsed.ready || parsed.agent_reply.startsWith('READY:');
   const readySummary = buildProjectBriefSummary({
     raw_description: options.rawDescription,
     what_it_is: structuredBrief.what_it_is,
@@ -192,9 +195,5 @@ export async function synthesizeFullBrief(options: {
   provider: IntakeProviderContext;
   onThinking?: (delta: string) => Promise<void> | void;
 }) {
-  // Minimal turn count 4 to force full brief synthesis
-  return runProjectIntakeTurn({
-    ...options,
-    conversationTurns: 4,
-  });
+  return runProjectIntakeTurn(options);
 }

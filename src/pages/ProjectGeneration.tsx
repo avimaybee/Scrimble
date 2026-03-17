@@ -4,6 +4,7 @@ import {
   BookOpenText,
   ChevronDown,
   ChevronUp,
+  ChevronRight,
   ExternalLink,
   Github,
   Globe,
@@ -34,12 +35,12 @@ import {
   type AIModelRoles,
   type AIProvider,
 } from '../lib/ai';
+import { resolveModelRoleDisplay } from '../lib/model-roles';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
   GenerationPreparationState,
   GenerationBatchName,
-  PreferredIde,
   Project,
   ProjectGenerationEvent,
   ProjectGenerationCheckpointEvent,
@@ -64,13 +65,6 @@ const generationBatches: Array<{
   { id: 'batch_4_plan_build', heading: 'Building your plan', shortLabel: 'Plan' },
   { id: 'batch_5_enrich_steps', heading: 'Writing step details', shortLabel: 'Steps' },
   { id: 'batch_6_generate_files', heading: 'Preparing your files', shortLabel: 'Files' },
-];
-
-const reviewIdeOptions: Array<{ id: PreferredIde; label: string; hint: string }> = [
-  { id: 'cursor', label: 'Cursor', hint: 'Workspace-ready MCP JSONC for Cursor.' },
-  { id: 'windsurf', label: 'Windsurf', hint: 'Rules and MCP instructions tuned for Windsurf.' },
-  { id: 'vscode', label: 'VS Code / Copilot', hint: 'Best fit for GitHub Copilot and VS Code MCP.' },
-  { id: 'claude_desktop', label: 'Claude Desktop', hint: 'Use when you want Claude Desktop MCP wiring.' },
 ];
 
 type ActivityFeedItem = {
@@ -344,73 +338,6 @@ function getReviewSourceToolMeta(tool: string) {
   };
 }
 
-function resolveDefaultProviderModel(provider: AIProvider | undefined) {
-  if (!provider) {
-    return '';
-  }
-
-  const deprecatedModel = (provider.model || '').trim();
-  if (deprecatedModel) {
-    return deprecatedModel;
-  }
-
-  const firstNamedModel = provider.models.find((model) => model.name.trim());
-  return firstNamedModel?.name.trim() || '';
-}
-
-function hasConfiguredRole(providerId: string | null, modelName: string | null) {
-  return Boolean(providerId?.trim() && modelName?.trim());
-}
-
-function resolveModelRoleDisplay(providers: AIProvider[], modelRoles: AIModelRoles) {
-  const providerById = new Map(providers.map((provider) => [provider.id, provider]));
-  const defaultProvider = providers.find((provider) => provider.is_default) || providers[0];
-
-  const fastSlot = hasConfiguredRole(modelRoles.fast_model_provider_id, modelRoles.fast_model_name)
-    ? {
-        provider: providerById.get(modelRoles.fast_model_provider_id || '') || defaultProvider,
-        model: (modelRoles.fast_model_name || '').trim(),
-      }
-    : null;
-  const deepSlot = hasConfiguredRole(modelRoles.deep_model_provider_id, modelRoles.deep_model_name)
-    ? {
-        provider: providerById.get(modelRoles.deep_model_provider_id || '') || defaultProvider,
-        model: (modelRoles.deep_model_name || '').trim(),
-      }
-    : null;
-  const defaultSlot = defaultProvider
-    ? {
-        provider: defaultProvider,
-        model: resolveDefaultProviderModel(defaultProvider),
-      }
-    : null;
-
-  const resolveRoleLabel = (role: 'fast' | 'deep') => {
-    const resolvedSlot = role === 'fast'
-      ? fastSlot || deepSlot || defaultSlot
-      : deepSlot || fastSlot || defaultSlot;
-
-    if (!resolvedSlot) {
-      return 'default model';
-    }
-
-    const providerName = resolvedSlot.provider.id === 'openai' ? 'OpenAI' :
-                        resolvedSlot.provider.id === 'anthropic' ? 'Anthropic' :
-                        resolvedSlot.provider.id === 'google' ? 'Google' :
-                        resolvedSlot.provider.id === 'perplexity' ? 'Perplexity' :
-                        resolvedSlot.provider.id === 'locally' ? 'Local' :
-                        resolvedSlot.provider.id;
-    
-    const modelName = resolvedSlot.model || resolveDefaultProviderModel(resolvedSlot.provider) || 'default model';
-    return `${providerName} — ${modelName}`;
-  };
-
-  return {
-    fast: resolveRoleLabel('fast'),
-    deep: resolveRoleLabel('deep'),
-  };
-};
-
 function getResearchRelevanceTone(relevance: string | undefined) {
   switch ((relevance || '').toLowerCase()) {
     case 'high':
@@ -439,7 +366,6 @@ export default function ProjectGeneration() {
   const [currentActivity, setCurrentActivity] = useState<ActivityFeedItem | null>(null);
   const [reviewData, setReviewData] = useState<ArchitectureReviewResponse | null>(null);
   const [reviewFeedback, setReviewFeedback] = useState('');
-  const [preferredIde, setPreferredIde] = useState<PreferredIde>('cursor');
   const [error, setError] = useState('');
   const [isResuming, setIsResuming] = useState(false);
   const [showResumeBadge, setShowResumeBadge] = useState(false);
@@ -455,7 +381,6 @@ export default function ProjectGeneration() {
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
   const [hasEditedReview, setHasEditedReview] = useState(false);
-  const [hasEditedPreferredIde, setHasEditedPreferredIde] = useState(false);
   const [isResearchDisclosureOpen, setIsResearchDisclosureOpen] = useState(false);
   const [showAllResearchSources, setShowAllResearchSources] = useState(false);
   const [hasPreparationCompleted, setHasPreparationCompleted] = useState(!initialPreparationState);
@@ -588,13 +513,12 @@ export default function ProjectGeneration() {
       setReviewData(review);
       reviewDataRef.current = review;
       setReviewFeedback((previous) => (hasEditedReview ? previous : review.review_feedback));
-      setPreferredIde((previous) => (hasEditedPreferredIde ? previous : review.preferred_ide));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load your review.');
     } finally {
       setIsReviewLoading(false);
     }
-  }, [hasEditedPreferredIde, hasEditedReview, id]);
+  }, [hasEditedReview, id]);
 
   const syncProjectState = useCallback(async () => {
     if (!id) {
@@ -1172,7 +1096,7 @@ export default function ProjectGeneration() {
     setIsSubmittingReview(true);
 
     try {
-      await dbService.approveArchitectureReview(id, reviewFeedback, preferredIde);
+      await dbService.approveArchitectureReview(id, reviewFeedback);
       applyStatusUpdate((previous) =>
         previous
           ? {
@@ -1190,7 +1114,7 @@ export default function ProjectGeneration() {
     } finally {
       setIsSubmittingReview(false);
     }
-  }, [applyStatusUpdate, id, preferredIde, reviewFeedback, syncProjectState]);
+  }, [applyStatusUpdate, id, reviewFeedback, syncProjectState]);
 
   const reconnectLiveFeed = useCallback(() => {
     setError('');
@@ -1683,36 +1607,6 @@ export default function ProjectGeneration() {
                               placeholder="e.g. use Drizzle instead of Prisma, remove payments for now, add Resend for email..."
                               className="mt-4 min-h-[148px] w-full resize-y rounded-[16px] border border-border-default bg-bg-base/82 px-4 py-4 font-sans text-[15px] leading-[1.7] text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
                             />
-
-                            <div className="mt-6">
-                              <div className="font-sans text-[14px] font-medium text-text-primary">
-                                Which IDE should the MCP file target?
-                              </div>
-                              <div className="mt-3 flex flex-wrap gap-2">
-                                {reviewIdeOptions.map((option) => {
-                                  const isSelected = preferredIde === option.id;
-
-                                  return (
-                                    <button
-                                      key={option.id}
-                                      type="button"
-                                      onClick={() => {
-                                        setHasEditedPreferredIde(true);
-                                        setPreferredIde(option.id);
-                                      }}
-                                      className={cn(
-                                        'inline-flex min-h-[40px] items-center rounded-full border px-4 py-2 font-sans text-[13px] transition-all',
-                                        isSelected
-                                          ? 'border-accent-primary bg-accent-primary text-text-primary shadow-[0_0_0_1px_rgba(235,94,40,0.16)]'
-                                          : 'border-border-default bg-bg-base/76 text-text-secondary hover:border-accent-primary/35 hover:text-text-primary',
-                                      )}
-                                    >
-                                      {option.label}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
                           </section>
                         </div>
                       ) : (

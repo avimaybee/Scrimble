@@ -23,9 +23,7 @@ export const GENERATION_BATCHES = [
 
 export type GenerationBatchName = (typeof GENERATION_BATCHES)[number];
 
-export const PREFERRED_IDES = ['cursor', 'windsurf', 'vscode', 'claude_desktop'] as const;
 
-export type PreferredIde = (typeof PREFERRED_IDES)[number];
 
 export type ProjectGenerationStatus =
   | GenerationBatchName

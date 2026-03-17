@@ -19,10 +19,8 @@ import {
 } from './generation-schemas';
 import {
   GENERATION_BATCHES,
-  PREFERRED_IDES,
   type Bindings,
   type GenerationBatchName,
-  type PreferredIde,
   type ProjectGenerationStatus,
   type ProviderType,
   type QueueExecutionContext,
@@ -160,7 +158,6 @@ export type ArchitectureReviewPayload = {
   gotchas: ArchitectureReviewGotcha[];
   research_sources: ArchitectureReviewResearchSource[];
   data_quality: ArchitectureReviewDataQuality;
-  preferred_ide: PreferredIde;
   review_feedback: string;
   review_feedback_provided: boolean;
 };
@@ -171,7 +168,6 @@ type ArchitectureReviewContext = {
   adr: Batch3Architect;
   reviewFeedback: string;
   reviewFeedbackProvided: boolean;
-  preferredIde: PreferredIde;
   providerId?: string;
 };
 
@@ -382,12 +378,6 @@ function serializeJson(value: unknown): string | null {
   }
 
   return typeof value === 'string' ? value : JSON.stringify(value);
-}
-
-function normalizePreferredIde(value: unknown): PreferredIde {
-  return typeof value === 'string' && PREFERRED_IDES.includes(value as PreferredIde)
-    ? (value as PreferredIde)
-    : 'cursor';
 }
 
 function parseJsonObject(value: string | null): Record<string, unknown> {
@@ -1402,7 +1392,6 @@ function buildArchitectureReviewPayload(
 
   const reviewFeedback = optionalText(input.review_feedback) || '';
   const reviewFeedbackProvided = toBoolean(input.review_feedback_provided) || reviewFeedback.length > 0;
-  const preferredIde = normalizePreferredIde(input.preferred_ide);
 
   return {
     project_id: projectId,
@@ -1425,7 +1414,6 @@ function buildArchitectureReviewPayload(
     gotchas: adr.gotchas,
     research_sources: research.sources,
     data_quality: research.data_quality,
-    preferred_ide: preferredIde,
     review_feedback: reviewFeedback,
     review_feedback_provided: reviewFeedbackProvided,
   };
@@ -1433,20 +1421,6 @@ function buildArchitectureReviewPayload(
 
 function countPlanSteps(plan: Batch4PlanBuild) {
   return plan.stages.reduce((total, stage) => total + stage.steps.length, 0);
-}
-
-function formatPreferredIdeLabel(preferredIde: PreferredIde) {
-  switch (preferredIde) {
-    case 'windsurf':
-      return 'Windsurf';
-    case 'vscode':
-      return 'VS Code / GitHub Copilot';
-    case 'claude_desktop':
-      return 'Claude Desktop';
-    case 'cursor':
-    default:
-      return 'Cursor';
-  }
 }
 
 function mergePlanWithEnrichments(plan: Batch4PlanBuild, enrichments: Batch5EnrichSteps['enrichments']): EnrichedPlan {
@@ -2488,7 +2462,6 @@ async function loadArchitectureReviewContext(env: Bindings, projectId: string): 
     adr: validatedAdr.data,
     reviewFeedback,
     reviewFeedbackProvided: toBoolean(parsedInput.review_feedback_provided) || reviewFeedback.length > 0,
-    preferredIde: normalizePreferredIde(parsedInput.preferred_ide),
     providerId: optionalText(parsedInput.provider_id) || undefined,
   };
 }
@@ -2503,15 +2476,12 @@ export async function saveArchitectureReviewApproval(
   env: Bindings,
   projectId: string,
   feedback: string,
-  preferredIde: PreferredIde,
 ) {
   const timestamp = new Date().toISOString();
-  console.log(`[APPROVAL_TRACE] ${timestamp} saveArchitectureReviewApproval started for project: ${projectId}`);
   const context = await loadArchitectureReviewContext(env, projectId);
   const trimmedFeedback = feedback.trim();
   const nextInput = {
     ...context.input,
-    preferred_ide: preferredIde,
     review_feedback: trimmedFeedback,
     review_feedback_provided: trimmedFeedback.length > 0,
     review_feedback_updated_at: timestamp,
@@ -2522,16 +2492,7 @@ export async function saveArchitectureReviewApproval(
     .bind(JSON.stringify(nextInput), context.runId)
     .run();
 
-  console.log(`[APPROVAL_TRACE] ${timestamp} Setting project status to 'approved'`);
-  await updateProjectGenerationStatus(env, projectId, 'approved', {
-    generationError: null,
-    markStarted: true,
-  });
-
   return {
-    feedback: trimmedFeedback,
-    feedbackProvided: trimmedFeedback.length > 0,
-    preferredIde,
     providerId: context.providerId,
   };
 }
@@ -3828,7 +3789,6 @@ async function executeBatch3(
   const input = {
     project_description: projectBrief.summary || project.description || '',
     provider_id: provider.providerId,
-    preferred_ide: 'cursor',
     research: batch2.research,
     review_feedback: '',
     review_feedback_provided: false,
@@ -4362,7 +4322,6 @@ async function executeBatch6(
     enriched_plan: enrichedPlan,
     review_feedback: reviewContext.reviewFeedback,
     review_feedback_provided: reviewContext.reviewFeedbackProvided,
-    preferred_ide: reviewContext.preferredIde,
     current_step: currentActiveStep,
   };
 

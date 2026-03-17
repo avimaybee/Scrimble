@@ -66,14 +66,12 @@ import {
 import { WorkflowBriefDriftError, processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
 import {
   GENERATION_BATCHES,
-  PREFERRED_IDES,
   type AppContext,
   type AppEnv,
   type Bindings,
   type GenerationBatchName,
   type ProjectGenerationBackend,
   type ProjectGenerationStatus,
-  type PreferredIde,
 } from './types';
 
 export const app = new Hono<AppEnv>().basePath('/api');
@@ -147,7 +145,6 @@ const modelRolesSchema = z.object({
 
 const architectureReviewApprovalSchema = z.object({
   feedback: z.string().optional().default(''),
-  preferredIde: z.enum(PREFERRED_IDES).optional().default('cursor'),
 });
 
 const userToolSchema = z.object({
@@ -1135,7 +1132,6 @@ app.post('/intake/start', async (c) => {
     rawDescription: description,
     messages: await listProjectIntakeMessages(c.env, id),
     provider: providerContext,
-    conversationTurns: 1,
   });
 
   await appendProjectIntakeMessage(c.env, id, 'agent', intakeTurn.agentReply);
@@ -1188,7 +1184,6 @@ app.post('/intake/:id/respond', async (c) => {
     rawDescription: asText(project.description, ''),
     messages,
     provider: providerContext,
-    conversationTurns,
   });
 
   await appendProjectIntakeMessage(c.env, projectId, 'agent', intakeTurn.agentReply);
@@ -1505,13 +1500,12 @@ app.post('/projects/:id/architecture-review', async (c) => {
   }
 
   const feedback = parsed.data.feedback?.trim() || '';
-  const preferredIde = parsed.data.preferredIde as PreferredIde;
   let providerId: string | undefined;
   const runId = crypto.randomUUID();
   const generationGuardBindings = getProjectGenerationGuardBindings(project);
 
   try {
-    const approval = await saveArchitectureReviewApproval(c.env, projectId, feedback, preferredIde);
+    const approval = await saveArchitectureReviewApproval(c.env, projectId, feedback);
     providerId = approval.providerId || (project.generation_provider_id as string | null) || undefined;
     if (!providerId) {
       throw new Error('No AI provider is configured for this project anymore.');
@@ -1595,7 +1589,6 @@ app.post('/projects/:id/architecture-review', async (c) => {
     success: true,
     generation_status: 'approved',
     feedback_provided: feedback.length > 0,
-    preferred_ide: preferredIde,
   });
 });
 

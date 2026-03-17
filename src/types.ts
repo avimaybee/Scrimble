@@ -8,7 +8,6 @@ export type GenerationBatchName =
   | 'batch_4_plan_build'
   | 'batch_5_enrich_steps'
   | 'batch_6_generate_files';
-export type PreferredIde = 'cursor' | 'windsurf' | 'vscode' | 'claude_desktop';
 export type GenerationStatus =
   | GenerationBatchName
   | 'intake'
@@ -376,7 +375,6 @@ export interface ArchitectureReviewResponse {
   gotchas: ArchitectureReviewGotcha[];
   research_sources: ArchitectureReviewResearchSource[];
   data_quality: ArchitectureReviewDataQuality;
-  preferred_ide: PreferredIde;
   review_feedback: string;
   review_feedback_provided: boolean;
 }

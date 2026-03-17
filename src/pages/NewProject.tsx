@@ -4,8 +4,9 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowRight, ChevronRight, Hexagon, KeyRound, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
-import { getAIProviders, getAIModelRoles } from '../lib/ai';
+import { getAIProviders, getAIModelRoles, saveAIModelRoles } from '../lib/ai';
 import { getMCPServers } from '../lib/mcp';
+import { hasConfiguredRole, resolveModelRoleDisplay } from '../lib/model-roles';
 import { cn } from '../lib/utils';
 import {
   Dialog,
@@ -103,7 +104,12 @@ export default function NewProject() {
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
   const [selectedModelName, setSelectedModelName] = useState<string | null>(null);
   const [modelRoles, setModelRoles] = useState<AIModelRoles | null>(null);
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modelRoleDisplay, setModelRoleDisplay] = useState<{ fast: string; deep: string }>({
+    fast: 'default model',
+    deep: 'default model',
+  });
+  const [isModelModalOpen, setIsModelModalOpen] = useState(false);
+  const [modalRoleType, setModalRoleType] = useState<'fast' | 'deep'>('fast');
   const [intakeSession, setIntakeSession] = useState<ProjectIntakeSession | null>(null);
   const [screenState, setScreenState] = useState<IntakeScreenState>('initial');
   const [isStartingIntake, setIsStartingIntake] = useState(false);
@@ -181,9 +187,14 @@ export default function NewProject() {
 
       setProviders(providerList);
       setModelRoles(modelRolesResult);
+      setModelRoleDisplay(resolveModelRoleDisplay(providerList, modelRolesResult));
       setBuilderProfileCount(userTools.length);
-      
-      if (modelRolesResult?.fast_model_name && modelRolesResult?.fast_model_provider_id) {
+
+      const hasRoleOverride =
+        hasConfiguredRole(modelRolesResult.fast_model_provider_id, modelRolesResult.fast_model_name)
+        || hasConfiguredRole(modelRolesResult.deep_model_provider_id, modelRolesResult.deep_model_name);
+
+      if (hasRoleOverride) {
         setSelectedProviderId(null);
         setSelectedModelName(null);
       } else {
@@ -204,6 +215,10 @@ export default function NewProject() {
     } catch (fetchError) {
       console.error('Failed to load generation preparation state:', fetchError);
       setGenerationPreparation(null);
+      setModelRoleDisplay({
+        fast: 'default model',
+        deep: 'default model',
+      });
       setError('Could not load your saved settings. Reload and try again.');
     } finally {
       setIsPreparationLoading(false);
@@ -405,6 +420,36 @@ export default function NewProject() {
     }
   };
 
+  const handleOpenModelModal = useCallback((type: 'fast' | 'deep') => {
+    setModalRoleType(type);
+    setIsModelModalOpen(true);
+  }, []);
+
+  const handleSelectModelRole = useCallback(async (providerId: string, modelName: string | null) => {
+    if (!modelRoles) {
+      return;
+    }
+
+    const nextRoles: AIModelRoles = {
+      ...modelRoles,
+      [modalRoleType === 'fast' ? 'fast_model_provider_id' : 'deep_model_provider_id']: providerId,
+      [modalRoleType === 'fast' ? 'fast_model_name' : 'deep_model_name']: modelName,
+    };
+
+    try {
+      const savedRoles = await saveAIModelRoles(nextRoles);
+      setModelRoles(savedRoles);
+      setModelRoleDisplay(resolveModelRoleDisplay(providers, savedRoles));
+      setSelectedProviderId(null);
+      setSelectedModelName(null);
+      setIsModelModalOpen(false);
+      setError('');
+    } catch (saveError) {
+      console.error('Failed to save model role settings:', saveError);
+      setError(saveError instanceof Error ? saveError.message : 'Could not save model role settings.');
+    }
+  }, [modalRoleType, modelRoles, providers]);
+
   const detailRows = intakeSession
     ? [
         { label: 'What it is', value: intakeSession.brief.what_it_is || 'Not locked yet.', key: 'what_it_is' },
@@ -546,45 +591,30 @@ export default function NewProject() {
                           ? 'Checking your saved AI and research settings...'
                           : generationPreparation?.has_ai_provider
                             ? (
-                              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                  {modelRoles?.fast_model_name ? (
-                                    <>
-                                      <span>your preferred</span>
-                                      <span className="inline-flex items-center gap-1 font-medium text-text-primary">
-                                        {modelRoles.fast_model_name}
-                                      </span>
-                                      <span>(fast) and</span>
-                                      <span className="inline-flex items-center gap-1 font-medium text-text-primary">
-                                        {modelRoles.deep_model_name || 'default'}
-                                      </span>
-                                      <span>(deep) models</span>
-                                    </>
-                                  ) : (
-                                    selectedProviderId ? (
-                                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                        <span className="inline-flex items-center gap-1 font-medium text-text-primary">
-                                          {providers.find((p) => p.id === selectedProviderId)?.name || 'Default key'}
-                                        </span>
-                                        {selectedModelName && (
-                                          <>
-                                            <span className="text-text-tertiary">/</span>
-                                            <span className="inline-flex items-center gap-1 font-medium text-text-primary">
-                                              {selectedModelName}
-                                            </span>
-                                          </>
-                                        )}
-                                      </div>
-                                    ) : (
-                                      <span>Default key</span>
-                                    )
-                                  )}
-                                <button
-                                  type="button"
-                                  onClick={() => setIsModalOpen(true)}
-                                  className="inline-flex items-center gap-0.5 font-medium text-accent-primary transition-colors hover:text-accent-primary-hover"
-                                >
-                                  (Change)
-                                </button>
+                              <div className="flex flex-col gap-2">
+                                <span>Review which model slot handles intake vs deep generation.</span>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenModelModal('fast')}
+                                    className="group inline-flex items-center gap-1.5 rounded-full border border-border-default/60 bg-bg-surface/40 px-3 py-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted transition-colors hover:border-accent-primary/45 hover:bg-bg-surface/60"
+                                  >
+                                    <span className="opacity-70">Fast:</span>
+                                    <span className="normal-case tracking-normal font-sans text-[12px] font-medium text-text-secondary group-hover:text-accent-soft">
+                                      {modelRoleDisplay.fast}
+                                    </span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenModelModal('deep')}
+                                    className="group inline-flex items-center gap-1.5 rounded-full border border-border-default/60 bg-bg-surface/40 px-3 py-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted transition-colors hover:border-status-secure/45 hover:bg-bg-surface/60"
+                                  >
+                                    <span className="opacity-70">Deep:</span>
+                                    <span className="normal-case tracking-normal font-sans text-[12px] font-medium text-text-secondary group-hover:text-status-secure-dim">
+                                      {modelRoleDisplay.deep}
+                                    </span>
+                                  </button>
+                                </div>
                               </div>
                             )
                             : 'You need to add an AI key first.'}
@@ -840,12 +870,14 @@ export default function NewProject() {
             </motion.div>
           ) : null}
 
-          <Dialog open={isModalOpen} onOpenChange={setIsModalOpen}>
+          <Dialog open={isModelModalOpen} onOpenChange={setIsModelModalOpen}>
             <DialogContent className="max-w-[420px]">
               <DialogHeader>
-                <DialogTitle>Choose your AI</DialogTitle>
+                <DialogTitle>Switch {modalRoleType === 'fast' ? 'Fast' : 'Deep'} Model</DialogTitle>
                 <DialogDescription>
-                  Select which model should run the intake conversation and build this project plan.
+                  Select which model should handle {modalRoleType === 'fast'
+                    ? 'the intake conversation and quick clarifications'
+                    : 'architecture, plan synthesis, and final file generation'}.
                 </DialogDescription>
               </DialogHeader>
 
@@ -857,15 +889,14 @@ export default function NewProject() {
                     </div>
                     {provider.models && provider.models.length > 0 ? (
                       provider.models.map((model) => {
-                        const isSelected = selectedProviderId === provider.id && selectedModelName === model.name;
+                        const isFastSlot = modelRoles?.fast_model_provider_id === provider.id && modelRoles?.fast_model_name === model.name;
+                        const isDeepSlot = modelRoles?.deep_model_provider_id === provider.id && modelRoles?.deep_model_name === model.name;
+                        const isSelected = modalRoleType === 'fast' ? isFastSlot : isDeepSlot;
+
                         return (
                           <button
                             key={model.id}
-                            onClick={() => {
-                              setSelectedProviderId(provider.id);
-                              setSelectedModelName(model.name);
-                              setIsModalOpen(false);
-                            }}
+                            onClick={() => void handleSelectModelRole(provider.id, model.name)}
                             className={cn(
                               'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
                               isSelected
@@ -888,12 +919,14 @@ export default function NewProject() {
                                 <div className="text-[14px] font-medium text-text-primary">
                                   {model.name}
                                 </div>
-                                {(modelRoles?.fast_model_provider_id === provider.id && modelRoles?.fast_model_name === model.name) && (
-                                  <span className="text-[10px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded ml-1">Fast</span>
-                                )}
-                                {(modelRoles?.deep_model_provider_id === provider.id && modelRoles?.deep_model_name === model.name) && (
-                                  <span className="text-[10px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded ml-1">Deep</span>
-                                )}
+                                <div className="flex gap-1 mt-0.5">
+                                  {isFastSlot && (
+                                    <span className="text-[9px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded">Fast</span>
+                                  )}
+                                  {isDeepSlot && (
+                                    <span className="text-[9px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded">Deep</span>
+                                  )}
+                                </div>
                               </div>
                             </div>
                             {isSelected ? (
@@ -906,14 +939,12 @@ export default function NewProject() {
                       })
                     ) : (
                       <button
-                        onClick={() => {
-                          setSelectedProviderId(provider.id);
-                          setSelectedModelName(null);
-                          setIsModalOpen(false);
-                        }}
+                        onClick={() => void handleSelectModelRole(provider.id, null)}
                         className={cn(
                           'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
-                          selectedProviderId === provider.id && !selectedModelName
+                          (modalRoleType === 'fast'
+                            ? (modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name)
+                            : (modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name))
                             ? 'border-accent-border bg-accent-primary-muted'
                             : 'border-border-default bg-bg-elevated/40 hover:border-border-strong hover:bg-bg-elevated/60',
                         )}
@@ -922,7 +953,9 @@ export default function NewProject() {
                           <div
                             className={cn(
                               'flex h-8 w-8 items-center justify-center rounded-lg border transition-colors',
-                              selectedProviderId === provider.id && !selectedModelName
+                              (modalRoleType === 'fast'
+                                ? (modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name)
+                                : (modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name))
                                 ? 'border-accent-border bg-bg-surface text-accent-primary'
                                 : 'border-border-default bg-bg-surface text-text-tertiary group-hover:text-text-secondary',
                             )}
@@ -933,15 +966,19 @@ export default function NewProject() {
                             <div className="text-[14px] font-medium text-text-primary">
                               {provider.model || 'Default Model'}
                             </div>
-                            {(modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name) && (
-                              <span className="text-[10px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded ml-1">Fast</span>
-                            )}
-                            {(modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name) && (
-                              <span className="text-[10px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded ml-1">Deep</span>
-                            )}
+                            <div className="flex gap-1 mt-0.5">
+                              {(modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name) && (
+                                <span className="text-[9px] font-mono text-accent-primary uppercase tracking-wider bg-accent-primary-muted px-1.5 py-0.5 rounded">Fast</span>
+                              )}
+                              {(modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name) && (
+                                <span className="text-[9px] font-mono text-status-secure-dim uppercase tracking-wider bg-status-secure/10 px-1.5 py-0.5 rounded">Deep</span>
+                              )}
+                            </div>
                           </div>
                         </div>
-                        {selectedProviderId === provider.id && !selectedModelName ? (
+                        {(modalRoleType === 'fast'
+                          ? (modelRoles?.fast_model_provider_id === provider.id && !modelRoles?.fast_model_name)
+                          : (modelRoles?.deep_model_provider_id === provider.id && !modelRoles?.deep_model_name)) ? (
                           <div className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-primary text-white">
                             <ChevronRight className="h-3 w-3" />
                           </div>
@@ -954,10 +991,10 @@ export default function NewProject() {
 
               <DialogFooter className="border-t border-border-default bg-bg-elevated/30 p-4">
                 <button
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={() => setIsModelModalOpen(false)}
                   className="btn-ghost py-2 text-sm"
                 >
-                  Close
+                  Cancel
                 </button>
               </DialogFooter>
             </DialogContent>
