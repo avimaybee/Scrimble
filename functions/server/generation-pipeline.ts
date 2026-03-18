@@ -36,16 +36,13 @@ import {
   resetGenerationThinkingState,
 } from './generation-events';
 import {
-  calculateResearchBudget,
   callAIText,
   containsReasoningMarkers,
   containsStreamTransportMarkers,
   extractJSON,
-  getModelContextWindow,
   getProvider,
   PipelineQuotaExceededError,
   RetryableAIError,
-  trimToLimit,
 } from './ai';
 import {
   deleteJsonPayload,
@@ -197,6 +194,20 @@ type FetchedCommunitySource = {
   content: string;
 };
 
+type CollectedResearchSource = {
+  content: string;
+  url: string;
+  tool: string;
+  technology: string;
+};
+
+type ResearchChunk = {
+  content: string;
+  source: string;
+  tool: string;
+  technology: string;
+};
+
 type SearchResult = {
   title: string;
   url: string;
@@ -276,12 +287,12 @@ type BatchExecutionResult = 'complete' | 'checkpointed';
 type Batch2CheckpointData = {
   researchTargets: ResearchTechnologyTarget[];
   fetchedSources: FetchedTechnologyResearch[];
+  collectedSources: CollectedResearchSource[];
   researchSourceLedger?: Batch2FetchAndRead['sources'];
   issuesFound: number;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
   subrequestCounter: number;
   totalCandidateTargets?: number;
-  truncationApplied?: boolean;
 };
 
 type Batch5ResearchStep = Pick<
@@ -320,9 +331,15 @@ export const MAX_PROJECT_GENERATION_RETRY_ATTEMPTS = 3;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
-const BATCH2_SOURCE_TARGETS_SMALL_CONTEXT = 5;
-const BATCH2_SOURCE_TARGETS_MEDIUM_CONTEXT = 10;
-const BATCH2_SOURCE_TARGETS_LARGE_CONTEXT = 20;
+const BATCH2_SOURCE_TARGET_COUNT = 10;
+const BATCH2_SEARCH_RESULT_LIMIT = 3;
+const RESEARCH_CHUNK_SIZE_CHARS = 1_600;
+const RESEARCH_CHUNK_OVERLAP_CHARS = 200;
+const RESEARCH_CHUNK_WARN_THRESHOLD = 10_000;
+const RESEARCH_CONTEXT_TOP_K_DEFAULT = 8;
+const RESEARCH_CONTEXT_TOKEN_TARGET = 8_000;
+const RESEARCH_CONTEXT_TOKEN_HARD_LIMIT = 10_000;
+const RESEARCH_CHARS_PER_TOKEN_ESTIMATE = 4;
 const lastHeartbeatTouchByProject = new Map<string, number>();
 
 const batchCompletionMessages: Record<GenerationBatchName, string> = {
@@ -664,6 +681,24 @@ function dedupeSearchResults(results: SearchResult[]) {
   });
 }
 
+function dedupeResearchResults(results: ResearchResult[]) {
+  const seen = new Set<string>();
+
+  return results.filter((result) => {
+    if (result.tool === 'failed') {
+      return true;
+    }
+
+    const key = result.source.trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
 function normalizeStoredSearchResults(results: Array<Partial<SearchResult>> | undefined) {
   return dedupeSearchResults(
     (results || [])
@@ -786,28 +821,12 @@ function limitBatch1Technologies(technologies: Batch1ResearchStack['technologies
   }));
 }
 
-function resolveBatch2SourceTargetCount(contextWindow: number) {
-  if (contextWindow < 64_000) {
-    return BATCH2_SOURCE_TARGETS_SMALL_CONTEXT;
-  }
-
-  if (contextWindow <= 256_000) {
-    return BATCH2_SOURCE_TARGETS_MEDIUM_CONTEXT;
-  }
-
-  return BATCH2_SOURCE_TARGETS_LARGE_CONTEXT;
+function resolveBatch2SourceTargetCount() {
+  return BATCH2_SOURCE_TARGET_COUNT;
 }
 
-function resolveBatch2SearchResultLimit(contextWindow: number) {
-  if (contextWindow < 64_000) {
-    return 2;
-  }
-
-  if (contextWindow <= 256_000) {
-    return 4;
-  }
-
-  return 6;
+function resolveBatch2SearchResultLimit() {
+  return BATCH2_SEARCH_RESULT_LIMIT;
 }
 
 function getResearchTargetPriorityValue(priority: ResearchTechnologyTarget['priority']) {
@@ -1000,63 +1019,439 @@ function pushPartialFailure(
   }
 }
 
-const MIN_BATCH2_PROMPT_CHARS = 120_000;
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-function resolveBatch2PromptCharLimit(researchBudget: ReturnType<typeof calculateResearchBudget>) {
-  return Math.max(MIN_BATCH2_PROMPT_CHARS, Math.floor(researchBudget.totalBudgetChars));
+function estimateTokenCount(value: string) {
+  if (!value.trim()) {
+    return 0;
+  }
+
+  return Math.max(1, Math.ceil(value.length / RESEARCH_CHARS_PER_TOKEN_ESTIMATE));
+}
+
+function chunkText(
+  text: string,
+  chunkSize = RESEARCH_CHUNK_SIZE_CHARS,
+  overlap = RESEARCH_CHUNK_OVERLAP_CHARS,
+): string[] {
+  const normalized = text.replace(/\r\n/g, '\n').trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const separators = ['\n\n', '\n', '. ', ' '];
+  const splitRecursively = (value: string, separatorIndex: number): string[] => {
+    if (value.length <= chunkSize) {
+      return [value];
+    }
+
+    if (separatorIndex >= separators.length) {
+      const slices: string[] = [];
+      for (let index = 0; index < value.length; index += chunkSize) {
+        slices.push(value.slice(index, index + chunkSize));
+      }
+      return slices;
+    }
+
+    const separator = separators[separatorIndex];
+    const parts = value.split(separator);
+    if (parts.length <= 1) {
+      return splitRecursively(value, separatorIndex + 1);
+    }
+
+    const chunks: string[] = [];
+    let current = '';
+    for (const part of parts) {
+      const nextCandidate = current ? `${current}${separator}${part}` : part;
+      if (nextCandidate.length <= chunkSize) {
+        current = nextCandidate;
+        continue;
+      }
+
+      if (current) {
+        chunks.push(current);
+        current = '';
+      }
+
+      if (part.length > chunkSize) {
+        chunks.push(...splitRecursively(part, separatorIndex + 1));
+      } else {
+        current = part;
+      }
+    }
+
+    if (current) {
+      chunks.push(current);
+    }
+
+    return chunks;
+  };
+
+  const rawChunks = splitRecursively(normalized, 0)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean);
+  const chunks: string[] = [];
+  const safeOverlap = Math.max(0, overlap);
+
+  for (let index = 0; index < rawChunks.length; index += 1) {
+    const previousTail = index > 0 ? rawChunks[index - 1].slice(-safeOverlap) : '';
+    const combined = `${previousTail}${rawChunks[index]}`.trim();
+    if (combined) {
+      chunks.push(combined);
+    }
+  }
+
+  return chunks;
+}
+
+function dedupeCollectedSources(sources: CollectedResearchSource[]) {
+  const seen = new Set<string>();
+
+  return sources.filter((source) => {
+    const key = `${source.tool}::${source.url}::${source.technology}`.toLowerCase();
+    if (!source.url || !source.content.trim() || seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeResearchChunks(chunks: ResearchChunk[]) {
+  const seen = new Set<string>();
+
+  return chunks.filter((chunk) => {
+    const key = `${chunk.source}::${chunk.tool}::${chunk.technology}::${chunk.content.slice(0, 120)}`.toLowerCase();
+    if (!chunk.content.trim() || seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildResearchChunkStore(collectedSources: CollectedResearchSource[]) {
+  const chunkStore: ResearchChunk[] = [];
+
+  for (const source of dedupeCollectedSources(collectedSources)) {
+    const chunks = chunkText(source.content);
+    for (const chunk of chunks) {
+      chunkStore.push({
+        content: chunk,
+        source: source.url,
+        tool: source.tool,
+        technology: source.technology,
+      });
+    }
+  }
+
+  return dedupeResearchChunks(chunkStore);
+}
+
+function retrieveRelevantChunks(
+  query: string,
+  chunks: ResearchChunk[],
+  topK = RESEARCH_CONTEXT_TOP_K_DEFAULT,
+): ResearchChunk[] {
+  if (chunks.length === 0) {
+    return [];
+  }
+
+  const queryTerms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter((term) => term.length > 3);
+
+  if (queryTerms.length === 0) {
+    return chunks.slice(0, Math.max(1, topK));
+  }
+
+  const documentFrequency = new Map<string, number>();
+  for (const term of queryTerms) {
+    const count = chunks.reduce((total, chunk) =>
+      total + (chunk.content.toLowerCase().includes(term) ? 1 : 0), 0);
+    documentFrequency.set(term, count);
+  }
+
+  const scored = chunks.map((chunk) => {
+    const text = chunk.content.toLowerCase();
+    let score = 0;
+
+    for (const term of queryTerms) {
+      const occurrences = (text.match(new RegExp(escapeRegExp(term), 'g')) || []).length;
+      const firstPos = text.indexOf(term);
+      const posScore = firstPos === -1 ? 0 : 1 - (firstPos / Math.max(1, text.length));
+      const idf = Math.log((chunks.length + 1) / ((documentFrequency.get(term) || 0) + 1)) + 1;
+      score += (occurrences * 0.7 + posScore * 0.3) * idf;
+    }
+
+    return { chunk, score };
+  });
+
+  return scored
+    .sort((left, right) => right.score - left.score)
+    .slice(0, Math.max(1, topK))
+    .map((entry) => entry.chunk);
+}
+
+type RetrievedResearchSlice = {
+  context: string;
+  chunkCount: number;
+  totalChunks: number;
+  estimatedTokens: number;
+};
+
+function retrieveResearchSlice(
+  query: string,
+  chunkStore: ResearchChunk[],
+  topK = RESEARCH_CONTEXT_TOP_K_DEFAULT,
+  maxTokens = RESEARCH_CONTEXT_TOKEN_TARGET,
+): RetrievedResearchSlice {
+  const retrieved = retrieveRelevantChunks(query, chunkStore, topK);
+  if (retrieved.length === 0) {
+    return {
+      context: '',
+      chunkCount: 0,
+      totalChunks: chunkStore.length,
+      estimatedTokens: 0,
+    };
+  }
+
+  const tokenLimit = Math.min(Math.max(1, Math.floor(maxTokens)), RESEARCH_CONTEXT_TOKEN_HARD_LIMIT);
+  const sections: string[] = [];
+  let estimatedTokens = 0;
+  let chunkCount = 0;
+
+  for (const chunk of retrieved) {
+    const block = `[${chunk.technology} via ${chunk.tool}]\n${chunk.content}`;
+    const blockTokens = estimateTokenCount(block);
+    if (chunkCount > 0 && estimatedTokens + blockTokens > tokenLimit) {
+      continue;
+    }
+
+    sections.push(block);
+    estimatedTokens += blockTokens;
+    chunkCount += 1;
+
+    if (estimatedTokens >= tokenLimit) {
+      break;
+    }
+  }
+
+  return {
+    context: sections.join('\n\n---\n\n'),
+    chunkCount,
+    totalChunks: chunkStore.length,
+    estimatedTokens,
+  };
+}
+
+function retrieveStepResearchSlice(
+  steps: Batch5ResearchStep[],
+  projectStack: string,
+  chunkStore: ResearchChunk[],
+  topKPerStep = 5,
+  maxTokens = RESEARCH_CONTEXT_TOKEN_TARGET,
+): RetrievedResearchSlice {
+  const candidates: Array<{ stepTitle: string; chunk: ResearchChunk }> = [];
+
+  for (const step of steps) {
+    const stepChunks = retrieveRelevantChunks(
+      `${step.title} ${step.category} ${projectStack}`,
+      chunkStore,
+      topKPerStep,
+    );
+    for (const chunk of stepChunks) {
+      candidates.push({ stepTitle: step.title, chunk });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return {
+      context: '',
+      chunkCount: 0,
+      totalChunks: chunkStore.length,
+      estimatedTokens: 0,
+    };
+  }
+
+  const tokenLimit = Math.min(Math.max(1, Math.floor(maxTokens)), RESEARCH_CONTEXT_TOKEN_HARD_LIMIT);
+  const sections: string[] = [];
+  const seen = new Set<string>();
+  let estimatedTokens = 0;
+
+  for (const candidate of candidates) {
+    const key =
+      `${candidate.stepTitle}::${candidate.chunk.source}::${candidate.chunk.tool}::${candidate.chunk.content.slice(0, 120)}`
+        .toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    const block =
+      `Step: ${candidate.stepTitle}\n` +
+      `[${candidate.chunk.technology} via ${candidate.chunk.tool}]\n` +
+      candidate.chunk.content;
+    const blockTokens = estimateTokenCount(block);
+    if (sections.length > 0 && estimatedTokens + blockTokens > tokenLimit) {
+      continue;
+    }
+
+    sections.push(block);
+    seen.add(key);
+    estimatedTokens += blockTokens;
+
+    if (estimatedTokens >= tokenLimit) {
+      break;
+    }
+  }
+
+  return {
+    context: sections.join('\n\n---\n\n'),
+    chunkCount: seen.size,
+    totalChunks: chunkStore.length,
+    estimatedTokens,
+  };
+}
+
+function buildInferredFeatureNeed(projectDescription: string) {
+  const normalized = projectDescription.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return 'implementation';
+  }
+
+  const firstSentence = normalized
+    .split(/[.!?]/)
+    .map((sentence) => sentence.trim())
+    .find(Boolean);
+  return (firstSentence || normalized).split(/\s+/).slice(0, 8).join(' ');
+}
+
+function buildBatch2FanOutQueries(toolName: string, projectStack: string, inferredFeatureNeed: string) {
+  const normalizedStack = projectStack.replace(/\s+/g, ' ').trim() || 'web app';
+  const normalizedFeatureNeed = inferredFeatureNeed.replace(/\s+/g, ' ').trim() || 'implementation';
+
+  return [
+    `${toolName} documentation ${normalizedStack} setup`,
+    `${toolName} common errors problems 2025 2026`,
+    `${toolName} ${normalizedFeatureNeed} example`,
+  ];
 }
 
 function buildBatch2PromptPayload(
   fetchedSources: FetchedTechnologyResearch[],
   dataQuality: Batch2FetchAndRead['data_quality'],
-  researchBudget: ReturnType<typeof calculateResearchBudget>,
+  chunkStore: ResearchChunk[],
+  projectDescription: string,
 ) {
-  const maxRepoHealthSummaryChars = Math.max(1_200, Math.floor(researchBudget.perIssueChars * 0.35));
-  const maxCommunitySentimentChars = Math.max(2_000, Math.floor(researchBudget.perIssueChars * 0.8));
-  const maxBugDigestChars = Math.max(2_000, Math.floor(researchBudget.perIssueChars * 0.7));
+  const retrievalQuery = `${projectDescription} ${fetchedSources.map((source) => source.technology).join(' ')} setup migration compatibility breaking changes`;
+  const retrievedSlice = retrieveResearchSlice(retrievalQuery, chunkStore, 10, RESEARCH_CONTEXT_TOKEN_TARGET);
 
   return {
-    fetchedSources: fetchedSources.map((source) => ({
-      technology: source.technology,
-      docs_content: trimToLimit(source.docs_content, researchBudget.perDocChars),
-      github_readme: trimToLimit(source.github_readme, researchBudget.perReadmeChars),
-      latest_version: source.latest_version,
-      last_commit_date: source.last_commit_date,
-      open_issues_count: source.open_issues_count,
-      recent_breaking_changes: trimToLimit(source.recent_breaking_changes, researchBudget.perIssueChars),
-      repo_health_summary: trimToLimit(source.repo_health_summary, maxRepoHealthSummaryChars),
-      community_sentiment: trimToLimit(source.community_sentiment, maxCommunitySentimentChars),
-      bug_report_digest: trimToLimit(source.bug_report_digest, maxBugDigestChars),
-      sources: source.source_ledger.slice(0, 8).map((entry) => ({
-        technology: entry.technology,
-        url: entry.url,
-        tool: entry.tool,
-        title: trimToLimit(entry.title, 120),
-        summary: trimToLimit(entry.summary, 360),
-        insight: trimToLimit(entry.insight || entry.summary, 220),
-        chars_read: entry.chars_read,
-        relevance: entry.relevance,
+    payload: {
+      fetchedSources: fetchedSources.map((source) => ({
+        technology: source.technology,
+        latest_version: source.latest_version,
+        last_commit_date: source.last_commit_date,
+        open_issues_count: source.open_issues_count,
+        recent_breaking_changes: source.recent_breaking_changes,
+        repo_health_summary: source.repo_health_summary,
+        community_sentiment: source.community_sentiment,
+        bug_report_digest: source.bug_report_digest,
+        sources: source.source_ledger.slice(0, 8).map((entry) => ({
+          technology: entry.technology,
+          url: entry.url,
+          tool: entry.tool,
+          title: entry.title,
+          summary: entry.summary,
+          insight: entry.insight,
+          chars_read: entry.chars_read,
+          relevance: entry.relevance,
+        })),
       })),
-    })),
-    dataQuality,
+      retrieved_research_context: retrievedSlice.context,
+      retrieved_chunk_count: retrievedSlice.chunkCount,
+      retrieved_context_estimated_tokens: retrievedSlice.estimatedTokens,
+      dataQuality,
+    },
+    retrievedSlice,
   };
 }
 
-function stringifyBatch2PromptPayload(
-  fetchedSources: FetchedTechnologyResearch[],
-  dataQuality: Batch2FetchAndRead['data_quality'],
-  researchBudget: ReturnType<typeof calculateResearchBudget>,
-) {
-  const payload = buildBatch2PromptPayload(fetchedSources, dataQuality, researchBudget);
-  const serialized = JSON.stringify(payload, null, 2);
-  const maxPromptChars = resolveBatch2PromptCharLimit(researchBudget);
-  if (serialized.length > maxPromptChars) {
-    throw new GenerationPipelineError(
-      `Batch 2 research payload exceeded the prompt budget (${serialized.length} chars > ${maxPromptChars} chars). Reduce fetched sources or use a higher-context model.`,
-    );
+function normalizeChunkStoreEntries(chunks: Batch2FetchAndRead['chunk_store']) {
+  return dedupeResearchChunks(
+    chunks
+      .map((chunk) => ({
+        content: chunk.content.trim(),
+        source: chunk.source.trim(),
+        tool: chunk.tool.trim(),
+        technology: chunk.technology.trim(),
+      }))
+      .filter((chunk) => chunk.content && chunk.source && chunk.tool && chunk.technology),
+  );
+}
+
+function resolveChunkStoreFromBatch2(batch2: Batch2FetchAndRead) {
+  const storedChunks = normalizeChunkStoreEntries(batch2.chunk_store || []);
+  if (storedChunks.length > 0) {
+    return storedChunks;
   }
 
-  return serialized;
+  const fallbackCollectedSources: CollectedResearchSource[] = [];
+  for (const entry of batch2.research) {
+    const primarySource = entry.sources.find((source) => source.url)?.url || `batch2://research/${entry.technology}`;
+    const githubSource =
+      entry.sources.find((source) => source.url && source.url.toLowerCase().includes('github.com'))?.url
+      || primarySource;
+
+    if (entry.docs_content.trim()) {
+      fallbackCollectedSources.push({
+        content: entry.docs_content,
+        url: primarySource,
+        tool: 'batch2_docs',
+        technology: entry.technology,
+      });
+    }
+    if (entry.github_readme.trim()) {
+      fallbackCollectedSources.push({
+        content: entry.github_readme,
+        url: githubSource,
+        tool: 'batch2_github',
+        technology: entry.technology,
+      });
+    }
+    if (entry.recent_breaking_changes.trim()) {
+      fallbackCollectedSources.push({
+        content: entry.recent_breaking_changes,
+        url: primarySource,
+        tool: 'batch2_breaking_changes',
+        technology: entry.technology,
+      });
+    }
+    if (entry.community_sentiment.trim()) {
+      fallbackCollectedSources.push({
+        content: entry.community_sentiment,
+        url: primarySource,
+        tool: 'batch2_community',
+        technology: entry.technology,
+      });
+    }
+    if (entry.bug_report_digest.trim()) {
+      fallbackCollectedSources.push({
+        content: entry.bug_report_digest,
+        url: primarySource,
+        tool: 'batch2_bugs',
+        technology: entry.technology,
+      });
+    }
+  }
+
+  return buildResearchChunkStore(fallbackCollectedSources);
 }
 
 function buildMatchTokens(...values: Array<string | null | undefined>) {
@@ -3326,10 +3721,8 @@ async function executeBatch2(
     ? MAX_SUBREQUEST_BUDGET_DO
     : MAX_SUBREQUEST_BUDGET_QUEUE;
   const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
-  const deepModelContextWindow = getModelContextWindow(deepProvider.providerType, deepProvider.model);
-  const sourceTargetCount = resolveBatch2SourceTargetCount(deepModelContextWindow);
-  const searchResultLimit = resolveBatch2SearchResultLimit(deepModelContextWindow);
-  const researchBudget = calculateResearchBudget(deepModelContextWindow, sourceTargetCount);
+  const sourceTargetCount = resolveBatch2SourceTargetCount();
+  const searchResultLimit = resolveBatch2SearchResultLimit();
   const targetSelection = buildResearchTargets(
     batch1.technologies,
     builderProfile,
@@ -3348,15 +3741,23 @@ async function executeBatch2(
   const fetchedSources: FetchedTechnologyResearch[] = checkpoint?.data.fetchedSources
     ? [...checkpoint.data.fetchedSources]
     : [];
+  const collectedSources: CollectedResearchSource[] = checkpoint?.data.collectedSources
+    ? [...checkpoint.data.collectedSources]
+    : [];
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   const briefResearchCount = researchTargets.filter((target) => target.source === 'brief').length;
   const profileResearchCount = researchTargets.filter((target) => target.source === 'profile').length;
   let issuesFound = checkpoint?.data.issuesFound ?? 0;
   const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
-  let truncationApplied = checkpoint?.data.truncationApplied ?? totalCandidateTargets > researchTargets.length;
   let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
+  const projectStackHint = [project.stack || '', projectBrief.summary || project.description || '']
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    || 'web app';
+  const inferredFeatureNeed = buildInferredFeatureNeed(projectBrief.summary || project.description || '');
   const researchService = createResearchService({
     env,
     userId: project.user_id,
@@ -3391,7 +3792,7 @@ async function executeBatch2(
     projectId,
     batchName: 'batch_2_fetch_and_read',
     kind: 'system',
-    message: `Context-aware depth enabled from ${deepProvider.model} (${deepModelContextWindow.toLocaleString()} tokens): target tier ${sourceTargetCount} with docs/readme/issue caps ${researchBudget.perDocChars.toLocaleString()}/${researchBudget.perReadmeChars.toLocaleString()}/${researchBudget.perIssueChars.toLocaleString()} chars.`,
+    message: `RAG retrieval mode enabled with ${deepProvider.model}: researching up to ${sourceTargetCount} technologies, using 3-way query fan-out per tool, and assembling prompts from retrieved chunks only.`,
   });
 
   if (checkpoint) {
@@ -3427,7 +3828,7 @@ async function executeBatch2(
         partialFailures,
         subrequestCounter,
         totalCandidateTargets,
-        truncationApplied,
+        collectedSources,
       });
       await logActivity(env, {
         projectId,
@@ -3441,23 +3842,24 @@ async function executeBatch2(
     const mappedDocs = resolveToolDocsEntry(technology.name);
     const docsUrl = (technology.docs_url || '').trim() || mappedDocs?.docs || '';
     const githubRepository = resolveResearchRepository(technology.github_url || '', mappedDocs?.github);
-    const githubUrl = githubRepository
+      const githubUrl = githubRepository
       ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
       : (technology.github_url || '').trim();
-    const changelogUrl = (technology.changelog_url || '').trim();
-    const searchQuery = technology.search_query || buildBatch2SearchQuery(technology.name);
+      const changelogUrl = (technology.changelog_url || '').trim();
 
-    const [docsResult, githubResult, webResearchResults] = await Promise.all([
+    const fanOutQueries = buildBatch2FanOutQueries(technology.name, projectStackHint, inferredFeatureNeed);
+    const [docsResult, githubResult, fanOutSearchResults] = await Promise.all([
       docsUrl
         ? researchService.fetchDoc(docsUrl)
         : Promise.resolve(emptyResearchResult('', `No docs URL found for ${technology.name}.`)),
       githubRepository
         ? researchService.fetchGitHubRepo(githubRepository.owner, githubRepository.repo)
         : Promise.resolve(emptyResearchResult('', `No GitHub repo found for ${technology.name}.`)),
-      researchService.searchWeb(searchQuery, searchResultLimit),
+      Promise.all(fanOutQueries.map((query) => researchService.searchWeb(query, searchResultLimit))),
     ]);
+    const flattenedWebResearchResults = dedupeResearchResults(fanOutSearchResults.flat());
 
-    subrequestCounter += (docsUrl ? 1 : 0) + (githubRepository ? 1 : 0) + 1;
+    subrequestCounter += (docsUrl ? 1 : 0) + (githubRepository ? 1 : 0) + fanOutQueries.length;
 
     if (docsUrl && docsResult.tool === 'failed') {
       await recordPartialFailure(
@@ -3485,7 +3887,7 @@ async function executeBatch2(
       );
     }
 
-    const failedSearch = webResearchResults.find((entry) => entry.tool === 'failed');
+    const failedSearch = fanOutSearchResults.flat().find((entry) => entry.tool === 'failed');
     if (failedSearch) {
       await recordPartialFailure(
         'Jina Search',
@@ -3495,7 +3897,7 @@ async function executeBatch2(
     }
 
     const searchResults = dedupeSearchResults([
-      ...webResearchResults
+      ...flattenedWebResearchResults
         .map((entry) => toSearchResultFromResearch(entry))
         .filter((entry): entry is SearchResult => Boolean(entry)),
       ...technology.community_search_results,
@@ -3562,7 +3964,7 @@ async function executeBatch2(
     }
 
     const repoHealthSummary = githubResult.content
-      ? trimToLimit(githubResult.content, 1_600)
+      ? summarizeSnippet(githubResult.content, 1_600)
       : 'GitHub repository data unavailable.';
     const releaseSignal = formatSearchResults(
       searchResults.filter((result) => /release|changelog|deprecat|breaking|migration/i.test(`${result.title} ${result.description}`)),
@@ -3571,19 +3973,9 @@ async function executeBatch2(
       searchResults.filter((result) => /bug|issue|regression|incident|outage/i.test(`${result.title} ${result.description}`)),
     );
     const communitySentiment = communityPages
-      .map((page) => `${page.title}: ${trimToLimit(page.content || page.description, 2_000)} (${page.url})`)
+      .map((page) => `${page.title}: ${summarizeSnippet(page.content || page.description, 1_200)} (${page.url})`)
       .join('\n\n');
     const recentBreakingChangesRaw = releaseSignal || 'Release notes unavailable.';
-    const docsContentTrimmed = trimToLimit(docsResult.content, researchBudget.perDocChars);
-    const githubReadmeTrimmed = trimToLimit(githubResult.content, researchBudget.perReadmeChars);
-    const recentBreakingChangesTrimmed = trimToLimit(recentBreakingChangesRaw, researchBudget.perIssueChars);
-    if (
-      docsResult.content.length > researchBudget.perDocChars
-      || githubResult.content.length > researchBudget.perReadmeChars
-      || recentBreakingChangesRaw.length > researchBudget.perIssueChars
-    ) {
-      truncationApplied = true;
-    }
     const latestVersion = parseLatestVersionFromText(githubResult.content, releaseSignal);
     const lastCommitDate = parseLastCommitDateFromText(githubResult.content);
     const openIssuesCount = parseOpenIssuesCount(githubResult.content);
@@ -3630,22 +4022,51 @@ async function executeBatch2(
         ),
       ),
     ]);
+    if (docsResult.content) {
+      collectedSources.push({
+        content: docsResult.content,
+        url: docsUrl || docsResult.source,
+        tool: toolLabelFromDocTool(docsResult.tool),
+        technology: technology.name,
+      });
+    }
+    if (githubResult.content) {
+      collectedSources.push({
+        content: githubResult.content,
+        url: githubResult.source || githubUrl,
+        tool: toolLabelFromGithubTool(githubResult.tool),
+        technology: technology.name,
+      });
+    }
+    for (const page of communityPages) {
+      const content = (page.content || page.description || '').trim();
+      if (!content) {
+        continue;
+      }
+
+      collectedSources.push({
+        content,
+        url: page.url,
+        tool: 'jina_search',
+        technology: technology.name,
+      });
+    }
 
     fetchedSources.push({
       technology: technology.name,
       docs_url: docsUrl,
       github_url: githubUrl,
       changelog_url: changelogUrl,
-      docs_content: docsContentTrimmed || 'Documentation source unavailable.',
-      github_readme: githubReadmeTrimmed || 'GitHub repository data unavailable.',
+      docs_content: docsResult.content || 'Documentation source unavailable.',
+      github_readme: githubResult.content || 'GitHub repository data unavailable.',
       latest_version: latestVersion,
       last_commit_date: lastCommitDate,
       open_issues_count: openIssuesCount,
-      recent_breaking_changes: recentBreakingChangesTrimmed,
+      recent_breaking_changes: recentBreakingChangesRaw,
       repo_health_summary: repoHealthSummary,
       community_sentiment:
-        trimToLimit(communitySentiment || formatSearchResults(searchResults), 5_000) || 'Community sentiment unavailable.',
-      bug_report_digest: trimToLimit(bugSignal || 'No recent bug reports found.', 4_000),
+        (communitySentiment || formatSearchResults(searchResults)).trim() || 'Community sentiment unavailable.',
+      bug_report_digest: (bugSignal || 'No recent bug reports found.').trim(),
       source_ledger: technologySources,
       community_pages: communityPages,
     });
@@ -3665,7 +4086,7 @@ async function executeBatch2(
         partialFailures,
         subrequestCounter,
         totalCandidateTargets,
-        truncationApplied,
+        collectedSources,
       });
       await logActivity(env, {
         projectId,
@@ -3678,6 +4099,15 @@ async function executeBatch2(
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
+  const chunkStore = buildResearchChunkStore(collectedSources);
+  if (chunkStore.length > RESEARCH_CHUNK_WARN_THRESHOLD) {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_2_fetch_and_read',
+      kind: 'warning',
+      message: `Chunk store is large (${chunkStore.length.toLocaleString()} chunks). Retrieval will continue with top-ranked subsets.`,
+    });
+  }
   const dataQuality: Batch2FetchAndRead['data_quality'] = {
     has_brave_search: connectedTools.has_brave_search,
     has_github_token: connectedTools.has_github_token,
@@ -3687,10 +4117,10 @@ async function executeBatch2(
     issues_found: issuesFound,
     degraded_tools: Array.from(degradedTools),
     partial_failures: partialFailures,
-    model_context_window: deepModelContextWindow,
+    model_context_window: RESEARCH_CONTEXT_TOKEN_HARD_LIMIT,
     source_target_count: sourceTargetCount,
-    used_full_context_window: !truncationApplied && sourceLedger.length >= sourceTargetCount,
-    truncated_to_fit_context: truncationApplied,
+    used_full_context_window: false,
+    truncated_to_fit_context: false,
   };
 
   const input = {
@@ -3705,17 +4135,29 @@ async function executeBatch2(
       source: target.source,
     })),
     fetched_sources: fetchedSources,
+    chunk_store_count: chunkStore.length,
     data_quality: dataQuality,
   };
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s technical research analyst. Turn fetched docs, readmes, metadata, and changelog snippets into a structured research corpus. Keep the important technical details concrete. Return only valid JSON.',
+    'You are Scrimble’s technical research analyst. Turn fetched docs, metadata, and retrieved research chunks into a structured research corpus. Keep technical details concrete and current. Return only valid JSON.',
     projectBrief.promptContext,
   );
-  const promptPayload = stringifyBatch2PromptPayload(fetchedSources, dataQuality, researchBudget);
+  const { payload: promptPayload, retrievedSlice } = buildBatch2PromptPayload(
+    fetchedSources,
+    dataQuality,
+    chunkStore,
+    projectBrief.summary || project.description || '',
+  );
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_2_fetch_and_read',
+    kind: 'system',
+    message: `Retrieved ${retrievedSlice.chunkCount} chunks from ${retrievedSlice.totalChunks} total (estimated ${retrievedSlice.estimatedTokens.toLocaleString()} tokens) for batch 2 prompt assembly.`,
+  });
   const prompt = `Research the following fetched technology materials and convert them into a structured corpus.
 
-${promptPayload}
+${JSON.stringify(promptPayload, null, 2)}
 
 For each technology, return:
 - technology
@@ -3792,12 +4234,14 @@ Preserve specific version and compatibility details.`;
     const finalDataQuality: Batch2FetchAndRead['data_quality'] = {
       ...dataQuality,
       urls_fetched: finalSourceLedger.length,
-      used_full_context_window: !truncationApplied && finalSourceLedger.length >= sourceTargetCount,
+      used_full_context_window: false,
+      truncated_to_fit_context: false,
     };
     const finalOutput: Batch2FetchAndRead = {
       research: finalResearch,
       sources: finalSourceLedger,
       data_quality: finalDataQuality,
+      chunk_store: chunkStore,
     };
 
     await clearGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read');
@@ -3857,10 +4301,26 @@ async function executeBatch3(
 ) {
   const startedAt = Date.now();
   const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const projectDescription = projectBrief.summary || project.description || '';
+  const chunkStore = resolveChunkStoreFromBatch2(batch2);
+  const architectureResearchSlice = retrieveResearchSlice(
+    `${projectDescription} database schema auth system architecture infrastructure`,
+    chunkStore,
+    8,
+    RESEARCH_CONTEXT_TOKEN_TARGET,
+  );
+  const researchCatalog = batch2.research.map((entry) => ({
+    technology: entry.technology,
+    latest_version: entry.latest_version,
+    open_issues_count: entry.open_issues_count,
+    sources: entry.sources.slice(0, 3).map((source) => source.url),
+  }));
   const input = {
-    project_description: projectBrief.summary || project.description || '',
+    project_description: projectDescription,
     provider_id: provider.providerId,
-    research: batch2.research,
+    research_catalog: researchCatalog,
+    chunk_store_count: chunkStore.length,
+    retrieved_chunk_count: architectureResearchSlice.chunkCount,
     review_feedback: '',
     review_feedback_provided: false,
   };
@@ -3872,16 +4332,25 @@ async function executeBatch3(
     kind: 'architecture',
     message: 'Designing your data model...',
   });
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_3_architect',
+    kind: 'system',
+    message: `Retrieved ${architectureResearchSlice.chunkCount} chunks from ${architectureResearchSlice.totalChunks} total (estimated ${architectureResearchSlice.estimatedTokens.toLocaleString()} tokens) for architecture prompt assembly.`,
+  });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
     'You are Scrimble’s staff engineer architect. Use the research corpus to produce a clear architecture decision record with explicit package and service choices. Every recommendation must be grounded in the provided research data. Return only valid JSON.',
     projectBrief.promptContext,
   );
   const prompt = `Project description:
-${projectBrief.summary || project.description || 'No description provided.'}
+${projectDescription || 'No description provided.'}
 
-Research corpus:
-${JSON.stringify(batch2.research, null, 2)}
+Researched technologies and source coverage:
+${JSON.stringify(researchCatalog, null, 2)}
+
+Retrieved research context:
+${architectureResearchSlice.context || 'No retrieved research chunks were available for this architecture pass.'}
 
 Produce a structured Architecture Decision Record (ADR):
 - project_name: A concise, catchy name.
@@ -3978,8 +4447,19 @@ async function executeBatch4(
 ) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
+  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const chunkStore = resolveChunkStoreFromBatch2(batch2);
+  const projectDescription = projectBrief.summary || '';
+  const planResearchSlice = retrieveResearchSlice(
+    `${projectDescription} implementation steps setup configuration`,
+    chunkStore,
+    8,
+    RESEARCH_CONTEXT_TOKEN_TARGET,
+  );
   const input = {
     architecture: reviewContext.adr,
+    chunk_store_count: chunkStore.length,
+    retrieved_chunk_count: planResearchSlice.chunkCount,
     review_feedback: reviewContext.reviewFeedback,
     review_feedback_provided: reviewContext.reviewFeedbackProvided,
   };
@@ -3991,6 +4471,12 @@ async function executeBatch4(
     kind: 'architecture',
     message: 'Building your execution plan...',
   });
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_4_plan_build',
+    kind: 'system',
+    message: `Retrieved ${planResearchSlice.chunkCount} chunks from ${planResearchSlice.totalChunks} total (estimated ${planResearchSlice.estimatedTokens.toLocaleString()} tokens) for plan prompt assembly.`,
+  });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
     'You are Scrimble’s Product Lead and Build Architect. Your goal is to produce two authoritative outputs: 1) A comprehensive Product Requirements Document (plan.md) and 2) A derived implementation plan (JSON stages/steps). The document is the source of truth; the JSON plan must strictly reflect the MVP scope defined within it. Return only valid JSON.',
@@ -4001,6 +4487,9 @@ ${JSON.stringify(reviewContext.adr, null, 2)}
 
 Human review feedback:
 ${reviewContext.reviewFeedbackProvided ? reviewContext.reviewFeedback : 'No changes requested. Continue with the approved architecture as written.'}
+
+Retrieved research context:
+${planResearchSlice.context || 'No retrieved research chunks were available for this plan pass.'}
 
 STEP 1: Generate the authoritative plan.md PRD content.
 This must be a highly detailed, 600-1000 line document using EXACTLY this structure:
@@ -4150,6 +4639,12 @@ async function executeBatch5(
   const adr = await loadBatchOutput(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
   const research = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const chunkStore = resolveChunkStoreFromBatch2(research);
+  const projectStack = [project.stack || '', projectBrief.summary || project.description || '']
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    || 'web app';
   const checkpoint = await loadGenerationCheckpoint<Batch5CheckpointData>(
     env,
     projectId,
@@ -4255,9 +4750,24 @@ async function executeBatch5(
       return 'checkpointed';
     }
   }
+  const stepResearchSlice = retrieveStepResearchSlice(
+    planSteps,
+    projectStack,
+    chunkStore,
+    5,
+    RESEARCH_CONTEXT_TOKEN_TARGET,
+  );
+  const researchCatalog = research.research.map((entry) => ({
+    technology: entry.technology,
+    latest_version: entry.latest_version,
+    open_issues_count: entry.open_issues_count,
+    sources: entry.sources.slice(0, 2).map((source) => source.url),
+  }));
   const input = {
     plan,
-    research,
+    research_catalog: researchCatalog,
+    chunk_store_count: chunkStore.length,
+    retrieved_chunk_count: stepResearchSlice.chunkCount,
     step_research: stepResearchContexts,
   };
 
@@ -4269,6 +4779,12 @@ async function executeBatch5(
     kind: 'writing',
     message: 'Writing step details for every part of the plan...',
   });
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_5_enrich_steps',
+    kind: 'system',
+    message: `Retrieved ${stepResearchSlice.chunkCount} chunks from ${stepResearchSlice.totalChunks} total (estimated ${stepResearchSlice.estimatedTokens.toLocaleString()} tokens) for step enrichment prompt assembly.`,
+  });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
     'You are Scrimble’s step enrichment agent. Enrich every step in one pass using turn-by-turn navigation guidance. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.',
@@ -4277,8 +4793,11 @@ async function executeBatch5(
   const prompt = `Plan:
 ${JSON.stringify(plan, null, 2)}
 
-Research:
-${JSON.stringify(research.research, null, 2)}
+Researched technology catalog:
+${JSON.stringify(researchCatalog, null, 2)}
+
+Retrieved step-targeted research context:
+${stepResearchSlice.context || 'No retrieved chunks were available for the current step set.'}
 
 Live step research:
 ${stepResearchContexts.map((context) => formatStepResearchPrompt(context)).join('\n\n')}
@@ -4384,13 +4903,23 @@ async function executeBatch6(
 ) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
+  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
   const enrichments = await loadBatchOutput(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
+  const chunkStore = resolveChunkStoreFromBatch2(batch2);
+  const fileResearchSlice = retrieveResearchSlice(
+    `${projectBrief.summary || ''} final delivery plan markdown build steps launch`,
+    chunkStore,
+    8,
+    RESEARCH_CONTEXT_TOKEN_TARGET,
+  );
   const enrichedPlan = mergePlanWithEnrichments(plan, enrichments.enrichments);
   const currentActiveStep = await loadCurrentActiveStep(env, projectId);
   const input = {
     architecture: reviewContext.adr,
     enriched_plan: enrichedPlan,
+    chunk_store_count: chunkStore.length,
+    retrieved_chunk_count: fileResearchSlice.chunkCount,
     review_feedback: reviewContext.reviewFeedback,
     review_feedback_provided: reviewContext.reviewFeedbackProvided,
     current_step: currentActiveStep,
@@ -4402,6 +4931,12 @@ async function executeBatch6(
     batchName: 'batch_6_generate_files',
     kind: 'writing',
     message: 'Preparing your downloadable files...',
+  });
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_6_generate_files',
+    kind: 'system',
+    message: `Retrieved ${fileResearchSlice.chunkCount} chunks from ${fileResearchSlice.totalChunks} total (estimated ${fileResearchSlice.estimatedTokens.toLocaleString()} tokens) for file-generation prompt assembly.`,
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
@@ -4420,6 +4955,9 @@ ${JSON.stringify(enrichedPlan, null, 2)}
 
 Human Review Feedback:
 ${reviewContext.reviewFeedbackProvided ? reviewContext.reviewFeedback : 'No review adjustments were requested.'}
+
+Retrieved research context:
+${fileResearchSlice.context || 'No retrieved chunks were available for this final generation pass.'}
 
 Generate the final "plan.md". This is a comprehensive Product Requirements Document. 
 Keep the exact structure and content from the Batch 4 PRD, but ENSURE the "Build plan" section is exhaustive and uses the detail from the Enriched Implementation Plan (JSON) including objectives, suggested tools, and current statuses (e.g., [Active], [Locked], [Complete]).

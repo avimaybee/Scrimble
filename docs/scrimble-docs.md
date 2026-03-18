@@ -949,14 +949,14 @@ Each batch executes in order with **Smart Caps** to ensure extreme thoroughness 
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
 - **AI Patience**: 10-minute timeout per AI provider call (managed via AbortController).
 - **Research Liberty**: 2-minute timeout for documentation fetches; up to 100,000 tokens processed per document.
-- **Token Guardrails**: Aggressive truncation on all research fields (Docs: 15k chars, Readme: 10k chars, Issues: 8k chars) ensures prompts stay within model sweet spots and avoids execution timeouts.
+- **In-memory RAG context control**: Batch 2 now chunks fetched materials and downstream batches retrieve only the most relevant chunks (top-k) per prompt, keeping research context targeted and under ~10k estimated tokens without model-specific prompt caps.
 - **Output Freedom**: Up to 16,384 tokens per AI response to provide headroom for models with extensive reasoning/thinking blocks (e.g., GLM-5, DeepSeek-R1).
 - **Thought-Only Guard**: If a model exhausts its output window with reasoning but provides no JSON content, the system automatically triggers a single "JSON-only" retry.
 
 Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved. The review payload (including feedback and preferred IDE) is stored and forwarded to batches 4‑6 so every subsequent step honors the builder’s choices.
 
 ### Resume & Retry Flow
-The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or budget limit), it enters a `failed` state.
+The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or transient fetch/tool failure), it enters a `failed` state.
 1. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches even `failed` projects, picking up from the last incomplete batch through the active backend.
 2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend resume request, reconnecting the SSE stream only after the run is scheduled again.
 3. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints now rebuild their updates as compare-and-set statements against the four `generation_*` columns (run id, provider, heartbeat, completed). If another agent already flipped the status, the request returns `409` so the UI can refresh instead of scheduling another overlapping run.
@@ -1066,7 +1066,7 @@ interface AIProvider {
 
 The DO keeps running even if all tabs are closed: it stores checkpoints in D1, writes reasoning deltas through the throttled emitter, uses alarms/`waitUntil()` to retry transient failures, and only marks a run as `failed` when retries are exhausted. This is the default path; the Cloudflare Queue consumer wakes only when the DO binding is missing or a manual rollback is required, and it follows the same stale-`run_id` guard and checkpoint writing strategy.
 
-Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. **Token Guardrails** (aggressive truncation of raw research data) prevent prompt-size failures. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
+Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. The research layer now uses lightweight in-memory RAG: fetched content is chunked, stored in `chunk_store`, and downstream prompts consume retrieved top-k slices instead of full/truncated blobs. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
 
 **Resilience Features**:
 - **Reasoning-Only Guard**: Models with high-effort reasoning (GLM-5, DeepSeek-R1) can sometimes exhaust their output limit with thought alone. If the stream closes with reasoning but an empty JSON body, the system triggers a single retry with a "JSON-only, no reasoning" system prompt override.
@@ -1077,15 +1077,30 @@ Step enrichment is now deeper too: auth steps fetch security/session docs plus r
 
 Batch 2 also records a `research_sources` ledger (tool, source URL, one-line summary) and a `data_quality` object (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`) so the architecture checkpoint can explain which tools were consulted, how deep the research went, and which sources the agent actually read.
 
+### Research architecture comparison
+
+| # | Area | Current Scrimble | What Big Players Do | Proposed Change | Complexity |
+|---|---|---|---|---|---|
+| 1 | Research architecture | Fetch docs then dump/truncate into prompts | Fetch broad, chunk, retrieve only relevant slices per call | Lightweight in-memory RAG in Batch 2 with reusable `chunk_store` | Medium |
+| 2 | Context limits | Model-specific char caps | Relevance-first budgets, model-agnostic | Remove model lookup/caps; target retrieved research slices around 6-8k tokens | Low |
+| 3 | Search strategy | Single search query per tool | Query fan-out by subtopic | Run 3 parallel queries per tool (`setup`, `common errors`, `feature example`) and merge | Low |
+| 4 | Source selection | Fetch everything then trim | Rank relevance earlier | Score/merge candidate results before inclusion in the fetch corpus | Low |
+| 5 | Parallel fetching | Partially parallel | Fully parallel | Keep docs/github/search fan-out concurrent per tool and across tools | Low |
+| 6 | Chunking strategy | Character truncation | Recursive split with overlap | Recursive chunking over `['\n\n', '\n', '. ', ' ']` with overlap and dedupe | Low |
+| 7 | Relevance retrieval | Broad context in every prompt | Similarity-based selective retrieval | Keyword + TF-IDF-style retrieval (no embeddings API) for fast, zero-cost ranking | Medium |
+| 8 | Per-batch assembly | Shared broad research blob | Batch-specific slices | Batch 3/4/5/6 each retrieve task-specific chunk slices | Medium |
+| 9 | Model context detection | Hardcoded lookup table | Not needed with focused retrieval | Remove model context window lookup for research budgeting | Low |
+| 10 | Research quality signal | Tool badges only | Inline evidence with relevance | Persist chunk-level context and surface retrieval counts in activity logs | Low |
+
 The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, the historical activity log, progress dots, ETA counter, and review gate. The `/api/projects/:id/generation-stream` route always replays missed durable events first using `Last-Event-ID`, then polls D1 for new rows every ~1 second so background-written updates still flow even though the browser and background runner live in separate runtimes. Provider reasoning chunks are streamed separately as transient `thinking` events: the active background runner updates the per-project live-state relay as they arrive, and the SSE route forwards only the latest delta to the browser while continuing to replay the durable history from D1. This split lets Scrimble stream live model thinking without polluting the long-term audit trail or waiting for the entire provider response to finish.
 
 ### Durable Checkpoints & Dispatch Safety
 
 Every generation run now records a `run_id` on the project before work starts. The API also logs a `generation_dispatches` entry before dispatching either to `ProjectGeneratorDO` or the queue fallback; if the dispatch fails the API rolls back the project status so no ghost `queued` state sticks around. The queue fallback still processes exactly one batch per invocation and refuses to work on stale payloads whose `run_id` no longer matches the active run. The Durable Object path preserves the same stale-run guard while looping through the next turn immediately.
 
-The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, truncated prompts, partial responses—into the Cloudflare R2 bucket named `scrimble` via the S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`. This hybrid D1+R2 strategy keeps row sizes manageable, captures the full history for any restart, and makes sure Batch 2 resumes from the same research graph without rerunning every tool.
+The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, chunk stores, partial responses—into the Cloudflare R2 bucket named `scrimble` via the S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`. This hybrid D1+R2 strategy keeps row sizes manageable, captures the full history for any restart, and makes sure Batch 2 resumes from the same research graph without rerunning every tool.
 
-Batch 1 now checkpoints deliberately before the runtime budget edge so Batch 2 can pick up the same state, and provider pinning enforces the original BYOK entry: if that provider disappears the worker fails fast with `provider_unavailable` instead of silently switching to a different key. Batch 2 also enforces stricter prompt budgets—only the richest sources make it into the payload sent to the AI provider—so we finally avoid the “AI provider isn’t responding” symptom caused by bloated prompts.
+Batch 1 now checkpoints deliberately before the runtime budget edge so Batch 2 can pick up the same state, and provider pinning enforces the original BYOK entry: if that provider disappears the worker fails fast with `provider_unavailable` instead of silently switching to a different key. Batch 2 now assembles prompts from retrieved chunk subsets instead of hard prompt-budget truncation, so provider calls stay focused and stable even as the fetched corpus grows.
 
 Every research tool wrapper now raises `ToolExecutionError`, emits an `activity` SSE event, and saves structured `degraded_tools`/`partial_failures` metadata with the checkpoint. The architecture review UI surfaces those fields beside the research depth badges so builders instantly know if Brave Search, Context7, or GitHub tooling degraded during collection.
 
@@ -1591,13 +1606,13 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - AI plan update (natural language diffing + D1 mutation)
 - Sequential 6-batch generation pipeline (research stack → fetch/read → architect → plan build → enrich → file generation) with single-AI-call batches, Zod validation, `agent_runs` auditing, and SSE event persistence so the frontend always knows what the agent is doing.
 - **Robustness & Privacy (Latest Updates)**:
-  - **Token Guardrails**: Aggressive truncation in Batch 2 (15k docs, 10k readme) to ensure prompts stay within model sweet spots.
+  - **Lightweight RAG Retrieval**: Batch 2 chunks fetched research into a reusable in-memory corpus and downstream batches pull top-k relevant chunks instead of truncating large blobs.
   - **Reasoning Guards**: Automatic JSON-only retry if a model emits only thoughts and no content (GLM-5/DeepSeek protection).
   - **Privacy Purge**: Reasoning data is physically deleted from D1 on batch/pipeline completion or project deletion.
   - **Pipeline Fallthrough Prevention**: Individual `executeBatch` functions now propagate errors by throwing a `GenerationPipelineError`. This prevents the pipeline from falling through to subsequent batches and masking the root cause with "Missing output" errors.
   - **Improved Retry Flow**: Backend `/resume` resets the project status to `queued` and clears error flags, allowing the worker to re-run the failed batch. Frontend "Try again" triggers a real re-enqueue.
   - **Dispatch Safety & R2 Checkpoints**: Every run writes a `generation_dispatches` row before enqueuing, and the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`), multiplying the durable history without hitting D1 row limits and keeping the queue state honest.
-  - **Provider Pinning & Prompt Guardrails**: The queue enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now builds a trimmed prompt payload from the richest sources so bloated payloads no longer leave AI providers stuck in “isn’t responding.”
+  - **Provider Pinning & Retrieval Assembly**: The queue enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now assembles provider prompts from retrieved chunk subsets so large research corpora remain stable without prompt-budget overflow failures.
   - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
 - **Migration History**: All schema updates from `0000_initial.sql` through `016_step_research_footer_metadata.sql` have been successfully applied and reconciled.
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
