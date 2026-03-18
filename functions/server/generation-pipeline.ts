@@ -43,7 +43,6 @@ import {
   extractJSON,
   getModelContextWindow,
   getProvider,
-  type ModelRole,
   PipelineQuotaExceededError,
   RetryableAIError,
   trimToLimit,
@@ -85,6 +84,8 @@ type ProviderConfig = {
   baseUrl: string | null;
   apiKey: string;
 };
+
+type GenerationModelRole = 'fast' | 'deep';
 
 type ProjectRecord = {
   id: string;
@@ -2596,8 +2597,8 @@ async function resolveProviderConfiguration(
   env: Bindings,
   projectId: string,
   userId: string,
+  role: GenerationModelRole,
   providerId?: string,
-  role: ModelRole = 'default',
 ): Promise<ProviderConfig> {
   const provider = await getProvider(env, userId, { providerId, role });
   if (!provider) {
@@ -2615,6 +2616,16 @@ async function resolveProviderConfiguration(
   });
 
   return provider;
+}
+
+function formatSchemaCorrectionPrompt(previousResponse: string, schemaDescription: string) {
+  // Truncate previous response if it's too long to avoid context limit issues
+  const truncatedResponse = previousResponse.length > 4000 
+    ? previousResponse.slice(0, 2000) + '\n... [truncated] ...\n' + previousResponse.slice(-2000)
+    : previousResponse;
+
+  return `The previous response had a schema error. Return ONLY the corrected JSON object with no other text. Schema: ${schemaDescription}
+Previous response: ${truncatedResponse}`;
 }
 
 function formatValidationRetryPrompt(basePrompt: string, previousResponse: string, schemaDescription: string) {
@@ -2676,7 +2687,7 @@ async function callValidatedBatch<T>(
     projectId: string;
     runId: string;
     runType: GenerationBatchName;
-    role: ModelRole;
+    role: GenerationModelRole;
     systemPrompt: string;
     prompt: string;
     schema: ZodType<T>;
@@ -2748,7 +2759,9 @@ async function callValidatedBatch<T>(
           } else {
             prompt = containsStreamTransportMarkers(text)
               ? formatTransportRetryPrompt(options.prompt, options.schemaDescription)
-              : formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
+              : options.role === 'fast'
+                ? formatSchemaCorrectionPrompt(cleanedText, options.schemaDescription)
+                : formatValidationRetryPrompt(options.prompt, cleanedText, options.schemaDescription);
           }
           continue;
         }
@@ -2768,16 +2781,18 @@ async function callValidatedBatch<T>(
       const validationError = validated.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ');
       lastError = `Validation failed for ${options.runType}: ${validationError}`;
       logBatchResponseFailure(options.runType, 'schema', cleanedText);
-      
       if (attempt === 1) {
-          await logActivity(options.env, {
-            projectId: options.projectId,
-            batchName: options.runType,
-            kind: 'warning',
-            message: `The first model reply had a schema error, so I'm asking for a correction.`,
-          });
-          prompt = formatValidationRetryPrompt(options.prompt, cleanedText, `${options.schemaDescription}\n\nERROR TO FIX: ${validationError}`);
-          continue;
+        await logActivity(options.env, {
+          projectId: options.projectId,
+          batchName: options.runType,
+          kind: 'warning',
+          message: `The first model reply had a schema error, so I'm asking for a correction.`,
+        });
+        const correctionSchema = `${options.schemaDescription}\n\nERROR TO FIX: ${validationError}`;
+        prompt = options.role === 'fast'
+          ? formatSchemaCorrectionPrompt(cleanedText, correctionSchema)
+          : formatValidationRetryPrompt(options.prompt, cleanedText, correctionSchema);
+        continue;
       }
 
       throw new GenerationPipelineError(`${lastError} Please retry.`);
@@ -3196,7 +3211,7 @@ async function executeBatch1(
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s stack research scout. Infer every technology, library, framework, hosted service, and infrastructure tool implied by the project description. Return only valid JSON.',
+    'You are Scrimble’s stack research scout. Infer every technology, library, framework, hosted service, and infrastructure tool implied by the project description. Return only valid JSON. Return ONLY a raw JSON object. No markdown. No backticks. No explanation. Start your response with { and end with }',
     projectBrief.promptContext,
   );
   const prompt = `Project description:
@@ -4689,26 +4704,19 @@ async function processProjectGenerationTurn(
     );
   }
 
-  const defaultProvider = await resolveProviderConfiguration(
-    env,
-    project.id,
-    message.userId,
-    pinnedProviderId,
-    'default',
-  );
   const fastProvider = await resolveProviderConfiguration(
     env,
     project.id,
     message.userId,
-    pinnedProviderId,
     'fast',
+    pinnedProviderId,
   );
   const deepProvider = await resolveProviderConfiguration(
     env,
     project.id,
     message.userId,
-    pinnedProviderId,
     'deep',
+    pinnedProviderId,
   );
   const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
   const statusToRun = await resolvePipelineStatusToRun(env, project.id, currentStatus, completed);
@@ -4720,7 +4728,7 @@ async function processProjectGenerationTurn(
     clearCompletedAt: true,
     touchHeartbeat: true,
     generationRunId: activeRunId,
-    generationProviderId: defaultProvider.providerId,
+    generationProviderId: pinnedProviderId,
     expectedRunId: activeRunId,
   });
   if (primingChanges === 0) {
@@ -4735,7 +4743,7 @@ async function processProjectGenerationTurn(
       clearCompletedAt: true,
       touchHeartbeat: true,
       generationRunId: activeRunId,
-      generationProviderId: defaultProvider.providerId,
+      generationProviderId: pinnedProviderId,
       expectedRunId: activeRunId,
     });
     if (queuedChanges === 0) {
@@ -4768,7 +4776,7 @@ async function processProjectGenerationTurn(
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: defaultProvider.providerId,
+            providerId: pinnedProviderId,
             runId: activeRunId,
             targetStatus: 'queued',
           });
@@ -4783,7 +4791,7 @@ async function processProjectGenerationTurn(
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: defaultProvider.providerId,
+            providerId: pinnedProviderId,
             runId: activeRunId,
             targetStatus: 'batch_1_research_stack',
           });
@@ -4807,7 +4815,7 @@ async function processProjectGenerationTurn(
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: defaultProvider.providerId,
+            providerId: pinnedProviderId,
             runId: activeRunId,
             targetStatus: 'approved',
           });
@@ -4822,7 +4830,7 @@ async function processProjectGenerationTurn(
           await enqueueProjectGeneration(env, {
             projectId: project.id,
             userId: message.userId,
-            providerId: defaultProvider.providerId,
+            providerId: pinnedProviderId,
             runId: activeRunId,
             targetStatus: 'batch_4_plan_build',
           });
