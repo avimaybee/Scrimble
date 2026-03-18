@@ -79,6 +79,7 @@ import {
 
 type ProviderConfig = {
   providerId: string;
+  providerName: string;
   providerType: ProviderType;
   model: string;
   baseUrl: string | null;
@@ -571,6 +572,40 @@ function toolLabelFromGithubTool(tool: ResearchResult['tool']) {
   }
 
   return 'gitmcp';
+}
+
+function humanDocToolLabel(tool: ResearchResult['tool']) {
+  if (tool === 'cf_scrape') {
+    return 'Cloudflare Scrape';
+  }
+
+  if (tool === 'jina_reader') {
+    return 'Jina Reader';
+  }
+
+  return 'Documentation fetch';
+}
+
+function humanGithubToolLabel(tool: ResearchResult['tool']) {
+  if (tool === 'github_api') {
+    return 'GitHub API fallback';
+  }
+
+  if (tool === 'gitmcp') {
+    return 'GitMCP';
+  }
+
+  return 'GitHub fetch';
+}
+
+function formatCharCount(chars: number | undefined, fallback: number) {
+  let value = fallback;
+  if (typeof chars === 'number' && Number.isFinite(chars)) {
+    value = chars;
+  }
+
+  const normalized = Math.max(0, Math.round(value));
+  return `${normalized.toLocaleString()} chars`;
 }
 
 function parseOpenIssuesCount(content: string) {
@@ -2559,6 +2594,7 @@ function isHeartbeatOlderThan(
 
 async function resolveProviderConfiguration(
   env: Bindings,
+  projectId: string,
   userId: string,
   providerId?: string,
   role: ModelRole = 'default',
@@ -2567,6 +2603,16 @@ async function resolveProviderConfiguration(
   if (!provider) {
     throw new GenerationPipelineError('No AI provider is configured yet. Add one in Settings first.');
   }
+
+  await persistGenerationStreamEvent(env, {
+    projectId,
+    event: {
+      type: 'activity',
+      icon: '⚡',
+      message: `[MODEL_RESOLUTION] Role: ${role} → Provider: ${provider.providerName} Model: ${provider.model}`,
+      timestamp: new Date().toISOString(),
+    },
+  });
 
   return provider;
 }
@@ -3406,6 +3452,16 @@ async function executeBatch2(
       );
     }
 
+    if (docsUrl && docsResult.tool !== 'failed' && docsResult.content) {
+      const charCount = formatCharCount(docsResult.chars, docsResult.content.length);
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        kind: 'fetch',
+        message: `${humanDocToolLabel(docsResult.tool)}: read ${charCount} from ${technology.name} docs.`,
+      });
+    }
+
     if (githubRepository && githubResult.tool === 'failed') {
       await recordPartialFailure(
         'GitMCP',
@@ -3465,12 +3521,12 @@ async function executeBatch2(
         message: `Could not inspect ${technology.name} on GitHub — continuing with the rest of the sources.`,
       });
     } else {
-      const sourceLabel = githubResult.tool === 'gitmcp' ? 'GitMCP' : 'GitHub API fallback';
+      const charCount = formatCharCount(githubResult.chars, githubResult.content.length);
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'github',
-        message: `Fetched ${githubRepository.owner}/${githubRepository.repo} via ${sourceLabel}.`,
+        message: `${humanGithubToolLabel(githubResult.tool)}: read ${charCount} from ${githubRepository.owner}/${githubRepository.repo}.`,
       });
     }
 
@@ -4635,18 +4691,21 @@ async function processProjectGenerationTurn(
 
   const defaultProvider = await resolveProviderConfiguration(
     env,
+    project.id,
     message.userId,
     pinnedProviderId,
     'default',
   );
   const fastProvider = await resolveProviderConfiguration(
     env,
+    project.id,
     message.userId,
     pinnedProviderId,
     'fast',
   );
   const deepProvider = await resolveProviderConfiguration(
     env,
+    project.id,
     message.userId,
     pinnedProviderId,
     'deep',

@@ -122,8 +122,6 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 -- INDEXES
 CREATE INDEX IF NOT EXISTS idx_projects_user      ON projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_plans_project      ON plans(project_id);
-CREATE INDEX IF NOT EXISTS idx_stages_project     ON stages(project_id);
-CREATE INDEX IF NOT EXISTS idx_steps_project      ON steps(project_id);
 CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project_id);

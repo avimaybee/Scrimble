@@ -9,6 +9,7 @@ export type ModelRole = 'fast' | 'deep' | 'default';
 
 export type ResolvedProvider = {
   providerId: string;
+  providerName: string;
   providerType: ProviderType;
   apiKey: string;
   model: string;
@@ -17,6 +18,7 @@ export type ResolvedProvider = {
 
 type ProviderRow = {
   id: string;
+  name: string;
   provider: string;
   api_key_enc: string;
   model: string | null;
@@ -62,15 +64,29 @@ async function loadDefaultProviderRow(env: Bindings, userId: string) {
     .first() as Promise<ProviderRow | null>;
 }
 
-async function loadResolvedProviderFromRow(env: Bindings, row: ProviderRow, modelOverride?: string | null) {
+async function loadResolvedProviderFromRow(
+  env: Bindings,
+  row: ProviderRow,
+  role: ModelRole,
+  modelOverride?: string | null,
+) {
   const providerType = row.provider as ProviderType;
   const apiKey = await decrypt(row.api_key_enc, env.ENCRYPTION_KEY);
+  const overrideModel = optionalTrimmedText(modelOverride);
+  const storedModel = optionalTrimmedText(row.model);
+  const fallbackModel = role === 'default' ? defaultModelForProvider(providerType) : null;
+  const resolvedModel = overrideModel || storedModel || fallbackModel;
+
+  if (!resolvedModel) {
+    throw new Error(`No model configured for role: ${role}. Please set your models in Settings.`);
+  }
 
   return {
     providerId: row.id,
+    providerName: optionalTrimmedText(row.name) || row.provider,
     providerType,
     apiKey,
-    model: optionalTrimmedText(modelOverride) || optionalTrimmedText(row.model) || defaultModelForProvider(providerType),
+    model: resolvedModel,
     baseUrl: optionalTrimmedText(row.base_url),
   } satisfies ResolvedProvider;
 }
@@ -119,30 +135,31 @@ export async function getProvider(
       return null;
     }
 
-    return loadResolvedProviderFromRow(env, defaultRow);
+    return loadResolvedProviderFromRow(env, defaultRow, role);
   }
 
   const slots = await loadProfileRoleSlots(env, userId);
-  const primarySlot = role === 'fast' ? slots.fast : slots.deep;
-  const secondarySlot = role === 'fast' ? slots.deep : slots.fast;
-  const selectedSlot = isConfiguredRoleSlot(primarySlot)
-    ? primarySlot
-    : isConfiguredRoleSlot(secondarySlot)
-      ? secondarySlot
-      : null;
+  const roleSlot = role === 'fast' ? slots.fast : slots.deep;
+  const missingModelMessage = `No model configured for role: ${role}. Please set your models in Settings.`;
 
-  if (selectedSlot?.providerId) {
-    const slotProviderRow = await loadProviderRowById(env, userId, selectedSlot.providerId);
-    if (slotProviderRow) {
-      return loadResolvedProviderFromRow(env, slotProviderRow, selectedSlot.modelName);
+  if (roleSlot.providerId || roleSlot.modelName) {
+    if (!isConfiguredRoleSlot(roleSlot)) {
+      throw new Error(missingModelMessage);
     }
+
+    const slotProviderRow = await loadProviderRowById(env, userId, roleSlot.providerId);
+    if (!slotProviderRow) {
+      throw new Error(missingModelMessage);
+    }
+
+    return loadResolvedProviderFromRow(env, slotProviderRow, role, roleSlot.modelName);
   }
 
   if (!defaultRow) {
     return null;
   }
 
-  return loadResolvedProviderFromRow(env, defaultRow);
+  return loadResolvedProviderFromRow(env, defaultRow, role);
 }
 
 export function extractJSON(raw: string): string {

@@ -1627,6 +1627,8 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - The architecture review disclosure ("What I read") renders that ledger directly, including character counts and relevance labels for each source.
   - Architecture review now surfaces an amber limited-research notice when fewer than 3 sources are fetched successfully.
   - The generation screen now shows model-role transparency under the batch heading: `Using [fast model] for research · [deep model] for generation`.
+
+++  - The pipeline now adds a `[MODEL_RESOLUTION] Role: …` activity line so the transcript shows exactly which provider/model resolved before each batch, and it surfaces the `No model configured for role: {role}. Please set your models in Settings.` error instead of silently defaulting to GLM when a fast/deep slot is missing.
   - Step enrichment now stores per-step research footer metadata and the step detail drawer renders a dedicated JetBrains Mono footer from metadata instead of appending footer text into `ai_output`.
   - Migration added: `016_step_research_footer_metadata.sql` (`steps.research_footer_meta`).
 

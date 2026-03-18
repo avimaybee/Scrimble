@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS workflows (
 CREATE TABLE IF NOT EXISTS stages (
   id              TEXT PRIMARY KEY,
   workflow_id     TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  project_id      TEXT REFERENCES projects(id) ON DELETE CASCADE,
   title           TEXT NOT NULL,
   type            TEXT NOT NULL,        -- 'understand' | 'document' | ... (see stage types)
   position_x      REAL DEFAULT 0,
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS stages (
 CREATE TABLE IF NOT EXISTS steps (
   id                  TEXT PRIMARY KEY,
   workflow_id         TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  project_id          TEXT REFERENCES projects(id) ON DELETE CASCADE,
   stage_id            TEXT REFERENCES stages(id),
   title               TEXT NOT NULL,
   type                TEXT NOT NULL,    -- 'task' | 'decision' | 'review' | 'ai_output'
@@ -125,6 +127,7 @@ CREATE TABLE IF NOT EXISTS steps (
 CREATE TABLE IF NOT EXISTS edges (
   id              TEXT PRIMARY KEY,
   workflow_id     TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  project_id      TEXT REFERENCES projects(id) ON DELETE CASCADE,
   source_step_id  TEXT REFERENCES steps(id) ON DELETE CASCADE,
   target_step_id  TEXT REFERENCES steps(id) ON DELETE CASCADE,
   edge_type       TEXT DEFAULT 'default', -- 'default' | 'conditional'
@@ -220,6 +223,8 @@ CREATE TABLE IF NOT EXISTS project_generation_live_state (
 -- ────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_projects_user      ON projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_workflows_project  ON workflows(project_id);
+CREATE INDEX IF NOT EXISTS idx_stages_project     ON stages(project_id);
+CREATE INDEX IF NOT EXISTS idx_steps_project      ON steps(project_id);
 CREATE INDEX IF NOT EXISTS idx_stages_workflow    ON stages(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_workflow     ON steps(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
