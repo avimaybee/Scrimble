@@ -1,4 +1,4 @@
-import { fetchAndParse, type GitHubResearchResult } from '../utils/fetch-url';
+import { fetchAndParse, type GitHubResearchResult, type SubrequestTracker } from '../utils/fetch-url';
 import { persistGenerationStreamEvent } from './generation-events';
 import { getActiveMCPServer } from './mcp-servers';
 import type { Bindings, GenerationBatchName } from './types';
@@ -16,6 +16,9 @@ export type ToolDocsEntry = {
   docs: string;
   github?: string;
 };
+
+export const RESEARCH_SUBREQUEST_LIMIT = 35;
+export type ResearchSubrequestTracker = SubrequestTracker;
 
 export const TOOL_DOCS_MAP: Record<string, ToolDocsEntry> = {
   supabase: { docs: 'https://supabase.com/docs', github: 'supabase/supabase' },
@@ -73,6 +76,7 @@ type ResearchServiceContext = {
   userId?: string;
   projectId?: string;
   batchName?: GenerationBatchName;
+  subrequestTracker?: ResearchSubrequestTracker;
 };
 
 type ResearchService = {
@@ -81,6 +85,30 @@ type ResearchService = {
   fetchGitHubRepo: (owner: string, repo: string) => Promise<ResearchResult>;
   fetchMultiple: (urls: string[], options?: { maxConcurrent?: number }) => Promise<ResearchResult[]>;
 };
+
+export function createResearchSubrequestTracker(
+  options: { initialCount?: number; limit?: number } = {},
+): ResearchSubrequestTracker {
+  return {
+    count: Math.max(0, Math.floor(options.initialCount || 0)),
+    limit: Math.max(1, Math.floor(options.limit || RESEARCH_SUBREQUEST_LIMIT)),
+  };
+}
+
+export async function fetchSequentially<T>(
+  tasks: Array<() => Promise<T>>,
+  maxConcurrent = 1,
+): Promise<T[]> {
+  if (maxConcurrent !== 1) {
+    console.warn(`[research] fetchSequentially forcing maxConcurrent=1 (received ${maxConcurrent}).`);
+  }
+
+  const results: T[] = [];
+  for (const task of tasks) {
+    results.push(await task());
+  }
+  return results;
+}
 
 function normalizeToolKey(value: string) {
   return value
@@ -156,10 +184,24 @@ function extractContentFromUnknown(payload: unknown, depth = 0): string {
 }
 
 async function fetchText(
+  context: ResearchServiceContext,
   url: string,
   init: RequestInit = {},
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<{ ok: boolean; status: number; text: string; error?: string }> {
+  const tracker = context.subrequestTracker;
+  if (tracker) {
+    if (tracker.count >= tracker.limit) {
+      return {
+        ok: false,
+        status: 0,
+        text: '',
+        error: `Subrequest limit reached (${tracker.limit}).`,
+      };
+    }
+    tracker.count += 1;
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -313,7 +355,7 @@ export function createResearchService(context: ResearchServiceContext): Research
 
     await emitActivity(`Fetching documentation from ${targetUrl}...`, '📚');
     const jinaUrl = `https://r.jina.ai/${targetUrl}`;
-    const jinaAttempt = await fetchText(jinaUrl);
+    const jinaAttempt = await fetchText(context, jinaUrl);
     if (jinaAttempt.ok && jinaAttempt.text.trim()) {
       const content = jinaAttempt.text.trim();
       await emitActivity(`Fetched docs via Jina Reader (${content.length.toLocaleString()} chars).`, '✅');
@@ -349,7 +391,7 @@ export function createResearchService(context: ResearchServiceContext): Research
 
     const fallbackErrors: string[] = [];
     for (const payload of payloadCandidates) {
-      const cfAttempt = await fetchText(CF_SCRAPE_ENDPOINT, {
+      const cfAttempt = await fetchText(context, CF_SCRAPE_ENDPOINT, {
         method: 'POST',
         headers: cfHeaders,
         body: JSON.stringify(payload),
@@ -408,7 +450,7 @@ export function createResearchService(context: ResearchServiceContext): Research
 
     await emitActivity(`Searching the web with Jina Search for "${normalizedQuery}"...`, '🔎');
     const searchUrl = `https://s.jina.ai/${encodeURIComponent(normalizedQuery)}`;
-    const searchAttempt = await fetchText(searchUrl);
+    const searchAttempt = await fetchText(context, searchUrl);
     if (!searchAttempt.ok) {
       const errorMessage = searchAttempt.error || `Jina Search failed with status ${searchAttempt.status}`;
       await emitActivity(`Jina Search failed for "${normalizedQuery}".`, '⚠️');
@@ -450,7 +492,7 @@ export function createResearchService(context: ResearchServiceContext): Research
 
     await emitActivity(`Fetching repository context for ${normalizedOwner}/${normalizedRepo} via GitMCP...`, '📦');
     const gitMcpUrl = `https://gitmcp.io/${normalizedOwner}/${normalizedRepo}`;
-    const gitMcpAttempt = await fetchText(gitMcpUrl);
+    const gitMcpAttempt = await fetchText(context, gitMcpUrl);
     if (gitMcpAttempt.ok && gitMcpAttempt.text.trim()) {
       const content = gitMcpAttempt.text.trim();
       await emitActivity(`Fetched ${normalizedOwner}/${normalizedRepo} via GitMCP (${content.length.toLocaleString()} chars).`, '✅');
@@ -469,7 +511,10 @@ export function createResearchService(context: ResearchServiceContext): Research
         ? await getActiveMCPServer(context.env, context.userId, 'github')
         : null;
       const githubToken = githubServer?.config.token || undefined;
-      const fallback = await fetchAndParse(sourceUrl, { githubToken });
+      const fallback = await fetchAndParse(sourceUrl, {
+        githubToken,
+        subrequestTracker: context.subrequestTracker,
+      });
 
       if (fallback.kind === 'github_repo') {
         const content = extractGithubContent(fallback);
@@ -522,26 +567,12 @@ export function createResearchService(context: ResearchServiceContext): Research
       return [];
     }
 
-    const maxConcurrent = Math.max(1, Math.min(options.maxConcurrent || 3, 8));
+    const maxConcurrent = Math.max(1, Math.min(options.maxConcurrent || 1, 8));
     await emitActivity(`Fetching ${targets.length} documentation source${targets.length === 1 ? '' : 's'}...`, '📚');
-
-    const results: ResearchResult[] = new Array(targets.length);
-    let currentIndex = 0;
-
-    const worker = async () => {
-      while (true) {
-        const index = currentIndex;
-        currentIndex += 1;
-        if (index >= targets.length) {
-          return;
-        }
-
-        results[index] = await fetchDoc(targets[index]);
-      }
-    };
-
-    const workerCount = Math.min(maxConcurrent, targets.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    const results = await fetchSequentially(
+      targets.map((target) => () => fetchDoc(target)),
+      maxConcurrent,
+    );
     await emitActivity(`Finished multi-fetch pass across ${targets.length} source${targets.length === 1 ? '' : 's'}.`, '✅');
     return results;
   };

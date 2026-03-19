@@ -949,6 +949,8 @@ Each batch executes in order with **Smart Caps** to ensure extreme thoroughness 
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
 - **AI Patience**: 10-minute timeout per AI provider call (managed via AbortController).
 - **Research Liberty**: 2-minute timeout for documentation fetches; up to 100,000 tokens processed per document.
+- **Subrequest Guardrail**: Research fetching now runs through a strict sequential queue (one fetch at a time) and stops at 35 subrequests to preserve headroom under Cloudflare’s 50-subrequest worker limit.
+- **Stack-Only Research Scope**: Batch 2 now researches only technologies inferred from Batch 1 stack output. Workspace profile IDE + AI assistant choices are excluded from documentation fetches and are used only for step/file personalization later in the pipeline.
 - **In-memory RAG context control**: Batch 2 now chunks fetched materials and downstream batches retrieve only the most relevant chunks (top-k) per prompt, keeping research context targeted and under ~10k estimated tokens without model-specific prompt caps.
 - **Output Freedom**: Up to 16,384 tokens per AI response to provide headroom for models with extensive reasoning/thinking blocks (e.g., GLM-5, DeepSeek-R1).
 - **Thought-Only Guard**: If a model exhausts its output window with reasoning but provides no JSON content, the system automatically triggers a single "JSON-only" retry.
@@ -1083,9 +1085,9 @@ Batch 2 also records a `research_sources` ledger (tool, source URL, one-line sum
 |---|---|---|---|---|---|
 | 1 | Research architecture | Fetch docs then dump/truncate into prompts | Fetch broad, chunk, retrieve only relevant slices per call | Lightweight in-memory RAG in Batch 2 with reusable `chunk_store` | Medium |
 | 2 | Context limits | Model-specific char caps | Relevance-first budgets, model-agnostic | Remove model lookup/caps; target retrieved research slices around 6-8k tokens | Low |
-| 3 | Search strategy | Single search query per tool | Query fan-out by subtopic | Run 3 parallel queries per tool (`setup`, `common errors`, `feature example`) and merge | Low |
+| 3 | Search strategy | Single targeted search query per tool | Query fan-out by subtopic | Keep exactly 1 targeted query per tool using `technology + (setup/errors/changelog) + year`, max 8 words | Low |
 | 4 | Source selection | Fetch everything then trim | Rank relevance earlier | Score/merge candidate results before inclusion in the fetch corpus | Low |
-| 5 | Parallel fetching | Partially parallel | Fully parallel | Keep docs/github/search fan-out concurrent per tool and across tools | Low |
+| 5 | Fetch orchestration | Partially parallel | Fully parallel | Enforce strict sequential fetches across docs/github/search (no cross-tool Promise.all) | Low |
 | 6 | Chunking strategy | Character truncation | Recursive split with overlap | Recursive chunking over `['\n\n', '\n', '. ', ' ']` with overlap and dedupe | Low |
 | 7 | Relevance retrieval | Broad context in every prompt | Similarity-based selective retrieval | Keyword + TF-IDF-style retrieval (no embeddings API) for fast, zero-cost ranking | Medium |
 | 8 | Per-batch assembly | Shared broad research blob | Batch-specific slices | Batch 3/4/5/6 each retrieve task-specific chunk slices | Medium |
@@ -1614,6 +1616,7 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - **Dispatch Safety & R2 Checkpoints**: Every run writes a `generation_dispatches` row before enqueuing, and the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`), multiplying the durable history without hitting D1 row limits and keeping the queue state honest.
   - **Provider Pinning & Retrieval Assembly**: The queue enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now assembles provider prompts from retrieved chunk subsets so large research corpora remain stable without prompt-budget overflow failures.
   - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
+  - **Query Hygiene + Scope Guardrails**: Research-layer search queries are now sanitized, short (≤8 words), and category-based (`setup` / `errors` / `changelog` with year), with no raw project-description interpolation. Batch 2 additionally excludes workspace profile IDE/AI tools from documentation fetch targets.
 - **Migration History**: All schema updates from `0000_initial.sql` through `016_step_research_footer_metadata.sql` have been successfully applied and reconciled.
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
 - **SSE Streaming Overhaul**: Fully migrated AI reasoning deltas to a throttled, D1-buffered polling model. This architecture supports distributed Cloudflare Queue workers without triggering SQLite performance bottlenecks, ensuring smooth "thinking" streams for project generation, step enrichment, and plan updates.

@@ -55,7 +55,14 @@ import { sendGenerationDispatch } from './generation-dispatch';
 
 import { extractGitHubRepository } from '../utils/fetch-url';
 import { buildResearchManifest } from './research-manifest';
-import { createResearchService, resolveToolDocsEntry, type ResearchResult } from './research';
+import {
+  createResearchService,
+  createResearchSubrequestTracker,
+  fetchSequentially,
+  RESEARCH_SUBREQUEST_LIMIT,
+  resolveToolDocsEntry,
+  type ResearchResult,
+} from './research';
 import {
   getBuilderProfileDocsTopic,
   getBuilderProfileResearchUrls,
@@ -332,7 +339,7 @@ const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
 const BATCH2_SOURCE_TARGET_COUNT = 10;
-const BATCH2_SEARCH_RESULT_LIMIT = 3;
+const BATCH2_SEARCH_RESULT_LIMIT = 1;
 const RESEARCH_CHUNK_SIZE_CHARS = 1_600;
 const RESEARCH_CHUNK_OVERLAP_CHARS = 200;
 const RESEARCH_CHUNK_WARN_THRESHOLD = 10_000;
@@ -554,9 +561,39 @@ function resolveResearchRepository(githubUrl: string, fallbackGithubSlug?: strin
 }
 
 function buildBatch2SearchQuery(technologyName: string) {
-  const versionMatch = technologyName.match(/\bv?\d+(?:\.\d+){0,2}\b/i);
-  const versionHint = versionMatch?.[0] || 'latest';
-  return `${technologyName} ${versionHint} changelog 2025`;
+  return buildCategorySearchQuery(technologyName, 'changelog');
+}
+
+function buildBatch2SetupQuery(technologyName: string) {
+  return `${technologyName} setup 2025`;
+}
+
+function truncateQueryWords(query: string, maxWords = 8) {
+  return query
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .slice(0, maxWords)
+    .join(' ');
+}
+
+function buildCategorySearchQuery(
+  technologyName: string,
+  category: 'setup' | 'errors' | 'changelog',
+) {
+  const normalizedTechnology =
+    normalizeBuilderProfileName(technologyName).replace(/[^a-z0-9@.+#\-/ ]/g, '') || 'technology';
+  const rawQuery =
+    category === 'setup'
+      ? buildBatch2SetupQuery(normalizedTechnology)
+      : category === 'errors'
+        ? `${normalizedTechnology} errors 2025`
+        : `${normalizedTechnology} changelog 2026`;
+  return truncateQueryWords(rawQuery, 8);
+}
+
+function isNonStackWorkspaceToolCategory(category: string) {
+  return category === 'coding_environment' || category === 'ai_assistants';
 }
 
 function toSearchResultFromResearch(entry: ResearchResult): SearchResult | null {
@@ -924,24 +961,41 @@ function buildResearchTargets(
   projectBrief: LoadedProjectBriefContext,
   maxTargets: number,
 ) {
+  const nonStackWorkspaceToolKeys = new Set(
+    builderProfile.tools
+      .filter((tool) => isNonStackWorkspaceToolCategory(tool.category))
+      .map((tool) => normalizeBuilderProfileName(tool.name))
+      .filter(Boolean),
+  );
+  const stackInferredTechnologies = inferredTechnologies.filter((technology) => {
+    const normalized = normalizeBuilderProfileName(technology.name || '');
+    return Boolean(normalized) && !nonStackWorkspaceToolKeys.has(normalized);
+  });
+  const inferredTechnologyKeys = new Set(
+    stackInferredTechnologies
+      .map((technology) => normalizeBuilderProfileName(technology.name || ''))
+      .filter(Boolean),
+  );
   const manifest = buildResearchManifest(
     builderProfile,
-    projectBrief.summary || inferredTechnologies.map((technology) => technology.name).join(' '),
+    projectBrief.summary || stackInferredTechnologies.map((technology) => technology.name).join(' '),
   );
-  const manifestTargets: ResearchTechnologyTarget[] = manifest.tools.map((tool) => ({
-    name: tool.name,
-    docs_url: tool.docsUrl,
-    github_url: tool.githubRepo ? `https://github.com/${tool.githubRepo}` : '',
-    changelog_url: '',
-    docs_topic: tool.docsTopic,
-    search_query: tool.searchQuery,
-    priority: tool.priority,
-    community_search_results: [],
-    breaking_change_search_results: [],
-    source: mapPriorityToResearchSource(tool.priority),
-  }));
+  const manifestTargets: ResearchTechnologyTarget[] = manifest.tools
+    .filter((tool) => inferredTechnologyKeys.has(normalizeBuilderProfileName(tool.name)))
+    .map((tool) => ({
+      name: tool.name,
+      docs_url: tool.docsUrl,
+      github_url: tool.githubRepo ? `https://github.com/${tool.githubRepo}` : '',
+      changelog_url: '',
+      docs_topic: tool.docsTopic,
+      search_query: buildBatch2SearchQuery(tool.name),
+      priority: tool.priority,
+      community_search_results: [],
+      breaking_change_search_results: [],
+      source: mapPriorityToResearchSource(tool.priority),
+    }));
 
-  const inferredTargets: ResearchTechnologyTarget[] = inferredTechnologies.map((technology) =>
+  const inferredTargets: ResearchTechnologyTarget[] = stackInferredTechnologies.map((technology) =>
     toResearchTechnologyTarget(
       technology,
       'inferred',
@@ -950,26 +1004,33 @@ function buildResearchTargets(
     ),
   );
 
-  const briefTargets: ResearchTechnologyTarget[] = projectBrief.confirmedStackTools.map((technology) => {
-    const researchUrls = getBuilderProfileResearchUrls(technology);
-    return {
-      name: technology,
-      docs_url: researchUrls.docsUrl,
-      github_url: researchUrls.githubUrl,
-      changelog_url: researchUrls.changelogUrl,
-      docs_topic:
-        researchUrls.docsUrl || researchUrls.githubUrl || researchUrls.changelogUrl
-          ? getBuilderProfileDocsTopic('frontend', technology)
-          : 'installation, migration, compatibility, breaking changes, best practices',
-      search_query: buildBatch2SearchQuery(technology),
-      priority: 'high',
-      community_search_results: [],
-      breaking_change_search_results: [],
-      source: 'brief',
-    };
-  });
+  const briefTargets: ResearchTechnologyTarget[] = projectBrief.confirmedStackTools
+    .filter((technology) => inferredTechnologyKeys.has(normalizeBuilderProfileName(technology)))
+    .map((technology) => {
+      const researchUrls = getBuilderProfileResearchUrls(technology);
+      return {
+        name: technology,
+        docs_url: researchUrls.docsUrl,
+        github_url: researchUrls.githubUrl,
+        changelog_url: researchUrls.changelogUrl,
+        docs_topic:
+          researchUrls.docsUrl || researchUrls.githubUrl || researchUrls.changelogUrl
+            ? getBuilderProfileDocsTopic('frontend', technology)
+            : 'installation, migration, compatibility, breaking changes, best practices',
+        search_query: buildBatch2SearchQuery(technology),
+        priority: 'high',
+        community_search_results: [],
+        breaking_change_search_results: [],
+        source: 'brief',
+      };
+    });
 
-  return limitResearchTargets([...briefTargets, ...manifestTargets, ...inferredTargets], projectBrief, maxTargets);
+  const stackOnlyTargets = [...briefTargets, ...manifestTargets, ...inferredTargets].filter((target) =>
+    inferredTechnologyKeys.has(normalizeBuilderProfileName(target.name)),
+  );
+  const limitedTargets = limitResearchTargets(stackOnlyTargets, projectBrief, maxTargets);
+  const fallbackTargets = limitResearchTargets(inferredTargets, projectBrief, maxTargets);
+  return limitedTargets.targets.length > 0 ? limitedTargets : fallbackTargets;
 }
 
 function createResearchSource(
@@ -1319,28 +1380,8 @@ function retrieveStepResearchSlice(
   };
 }
 
-function buildInferredFeatureNeed(projectDescription: string) {
-  const normalized = projectDescription.replace(/\s+/g, ' ').trim();
-  if (!normalized) {
-    return 'implementation';
-  }
-
-  const firstSentence = normalized
-    .split(/[.!?]/)
-    .map((sentence) => sentence.trim())
-    .find(Boolean);
-  return (firstSentence || normalized).split(/\s+/).slice(0, 8).join(' ');
-}
-
-function buildBatch2FanOutQueries(toolName: string, projectStack: string, inferredFeatureNeed: string) {
-  const normalizedStack = projectStack.replace(/\s+/g, ' ').trim() || 'web app';
-  const normalizedFeatureNeed = inferredFeatureNeed.replace(/\s+/g, ' ').trim() || 'implementation';
-
-  return [
-    `${toolName} documentation ${normalizedStack} setup`,
-    `${toolName} common errors problems 2025 2026`,
-    `${toolName} ${normalizedFeatureNeed} example`,
-  ];
+function buildBatch2FanOutQueries(toolName: string) {
+  return [buildCategorySearchQuery(toolName, 'setup')];
 }
 
 function buildBatch2PromptPayload(
@@ -3699,11 +3740,8 @@ Identify the stack implied by the idea. For each technology, provide:
   }
 }
 
-// Leave headroom for D1 writes, queue continuation dispatches, and stream events in the same invocation.
-// Queue consumers have tight subrequest budgets; DOs do not.
-const MAX_SUBREQUEST_BUDGET_QUEUE = 20;
-const MAX_SUBREQUEST_BUDGET_DO = 500;
-const SUBREQUEST_RESERVE = 3;
+// Cloudflare hard-limits Workers to 50 subrequests. Stop research at 35 to preserve headroom.
+const SUBREQUEST_RESERVE = 0;
 
 async function executeBatch2(
   env: Bindings,
@@ -3717,9 +3755,7 @@ async function executeBatch2(
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const projectId = project.id;
-  const maxSubrequestBudget = continuationMode === 'inline'
-    ? MAX_SUBREQUEST_BUDGET_DO
-    : MAX_SUBREQUEST_BUDGET_QUEUE;
+  const maxSubrequestBudget = RESEARCH_SUBREQUEST_LIMIT;
   const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
   const sourceTargetCount = resolveBatch2SourceTargetCount();
   const searchResultLimit = resolveBatch2SearchResultLimit();
@@ -3752,17 +3788,16 @@ async function executeBatch2(
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
   let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
-  const projectStackHint = [project.stack || '', projectBrief.summary || project.description || '']
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    || 'web app';
-  const inferredFeatureNeed = buildInferredFeatureNeed(projectBrief.summary || project.description || '');
+  const subrequestTracker = createResearchSubrequestTracker({
+    initialCount: subrequestCounter,
+    limit: maxSubrequestBudget,
+  });
   const researchService = createResearchService({
     env,
     userId: project.user_id,
     projectId,
     batchName: 'batch_2_fetch_and_read',
+    subrequestTracker,
   });
 
   const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
@@ -3792,7 +3827,7 @@ async function executeBatch2(
     projectId,
     batchName: 'batch_2_fetch_and_read',
     kind: 'system',
-    message: `RAG retrieval mode enabled with ${deepProvider.model}: researching up to ${sourceTargetCount} technologies, using 3-way query fan-out per tool, and assembling prompts from retrieved chunks only.`,
+    message: `RAG retrieval mode enabled with ${deepProvider.model}: researching up to ${sourceTargetCount} technologies, using strict sequential fetches and one targeted search query per tool, and assembling prompts from retrieved chunks only.`,
   });
 
   if (checkpoint) {
@@ -3847,19 +3882,19 @@ async function executeBatch2(
       : (technology.github_url || '').trim();
       const changelogUrl = (technology.changelog_url || '').trim();
 
-    const fanOutQueries = buildBatch2FanOutQueries(technology.name, projectStackHint, inferredFeatureNeed);
-    const [docsResult, githubResult, fanOutSearchResults] = await Promise.all([
-      docsUrl
-        ? researchService.fetchDoc(docsUrl)
-        : Promise.resolve(emptyResearchResult('', `No docs URL found for ${technology.name}.`)),
-      githubRepository
-        ? researchService.fetchGitHubRepo(githubRepository.owner, githubRepository.repo)
-        : Promise.resolve(emptyResearchResult('', `No GitHub repo found for ${technology.name}.`)),
-      Promise.all(fanOutQueries.map((query) => researchService.searchWeb(query, searchResultLimit))),
-    ]);
+    const fanOutQueries = buildBatch2FanOutQueries(technology.name);
+    const [docsResult] = docsUrl
+      ? await fetchSequentially([() => researchService.fetchDoc(docsUrl)])
+      : [emptyResearchResult('', `No docs URL found for ${technology.name}.`)];
+    const [githubResult] = githubRepository
+      ? await fetchSequentially([() => researchService.fetchGitHubRepo(githubRepository.owner, githubRepository.repo)])
+      : [emptyResearchResult('', `No GitHub repo found for ${technology.name}.`)];
+    const fanOutSearchResults = await fetchSequentially(
+      fanOutQueries.map((query) => () => researchService.searchWeb(query, searchResultLimit)),
+    );
     const flattenedWebResearchResults = dedupeResearchResults(fanOutSearchResults.flat());
 
-    subrequestCounter += (docsUrl ? 1 : 0) + (githubRepository ? 1 : 0) + fanOutQueries.length;
+    subrequestCounter = subrequestTracker.count;
 
     if (docsUrl && docsResult.tool === 'failed') {
       await recordPartialFailure(

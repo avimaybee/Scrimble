@@ -167,7 +167,14 @@ function dedupeManifestTools(tools: ResearchManifestTool[]) {
 }
 
 function buildToolSearchQuery(toolName: string) {
-  return `${toolName} changelog 2025`;
+  return normalizeBuilderProfileName(toolName)
+    .replace(/[^a-z0-9@.+#\-/ ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .slice(0, 5)
+    .join(' ')
+    .concat(' changelog 2026');
 }
 
 export function buildResearchManifest(

@@ -1,5 +1,4 @@
 import {
-  analyzeGithubRepo,
   fetchUrl,
   getLibraryDocs,
   getLibraryIssues,
@@ -11,7 +10,7 @@ import {
 import type { Batch2FetchAndRead, Batch3Architect } from './generation-schemas';
 import { getConnectedResearchTools } from './mcp-servers';
 import { selectManifestToolsForStep, type ResearchManifest } from './research-manifest';
-import { createResearchService } from './research';
+import { createResearchService, fetchSequentially } from './research';
 import type { Bindings, GenerationBatchName } from './types';
 
 type ConnectedResearchTools = Awaited<ReturnType<typeof getConnectedResearchTools>>;
@@ -499,6 +498,49 @@ function getFrameworkLabel(adr: Batch3Architect) {
     .join(' + ');
 }
 
+function getPrimaryDocsTopic(stepKind: StepResearchKind, stepTitle: string) {
+  switch (stepKind) {
+    case 'auth':
+      return `${stepTitle} security best practices`;
+    case 'database':
+      return `${stepTitle} schema migrations`;
+    case 'deployment':
+      return `${stepTitle} deployment`;
+    case 'payment':
+      return `${stepTitle} checkout webhook verification`;
+    default:
+      return stepTitle;
+  }
+}
+
+function getPrimarySearchQuery(args: {
+  stepKind: StepResearchKind;
+  packageName: string;
+  year: number;
+}) {
+  const packageName = normalizeToken(args.packageName).replace(/[^a-z0-9@.+#\-/]/g, '');
+  const truncate = (value: string) =>
+    value
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .slice(0, 8)
+      .join(' ');
+
+  switch (args.stepKind) {
+    case 'auth':
+      return truncate(`${packageName} errors ${args.year}`);
+    case 'database':
+      return truncate(`${packageName} changelog ${args.year}`);
+    case 'deployment':
+      return truncate(`${packageName} setup ${args.year}`);
+    case 'payment':
+      return truncate(`stripe errors ${args.year}`);
+    default:
+      return truncate(`${packageName} setup ${args.year}`);
+  }
+}
+
 function prioritizeLibrariesForStepKind(stepKind: StepResearchKind, libraries: RelevantLibrary[]) {
   const priorityTokens: Record<Exclude<StepResearchKind, 'general'>, string[]> = {
     auth: ['auth', 'authentication', 'session', 'clerk', 'supabase', 'auth0', 'lucia'],
@@ -626,45 +668,23 @@ export async function collectStepResearchContext({
       continue;
     }
 
-    const docsTopics = new Set<string>([stepTitle]);
-    if (stepKind === 'auth') {
-      docsTopics.add('security best practices');
-      docsTopics.add('session management');
-    }
-    if (stepKind === 'database') {
-      docsTopics.add('schema migrations');
-      docsTopics.add('relationships');
-    }
-    if (stepKind === 'deployment') {
-      docsTopics.add('deployment');
-    }
-    if (stepKind === 'payment') {
-      docsTopics.add('checkout');
-    }
-
-    const searchQueries: string[] = [];
-    if (resolvedConnectedTools.has_brave_search) {
-      searchQueries.push(`${library.packageName} ${stepTitle} ${currentYear} tutorial`);
-      if (stepKind === 'auth') {
-        searchQueries.push(`${library.packageName} security vulnerabilities ${currentYear}`);
-      }
-      if (stepKind === 'deployment') {
-        searchQueries.push(`${library.packageName} production checklist ${currentYear}`);
-      }
-      if (stepKind === 'payment') {
-        searchQueries.push(`Stripe webhook verification ${frameworkLabel} ${currentYear}`);
-      }
-    }
-
-    const docsPromise = Promise.all(
-      Array.from(docsTopics).map((topic) => getLibraryDocs(docsLibraryName, topic, userId, toolEnv)),
-    );
-    const issuesPromise = library.repo
-      ? getLibraryIssues(library.repo.owner, library.repo.repo, ['bug'], 90, userId, toolEnv)
-      : Promise.resolve([]);
-    const searchPromise = Promise.all(searchQueries.map((query) => searchWeb(query, userId, toolEnv)));
-
-    const [docsResults, rawIssues, searchResultSets] = await Promise.all([docsPromise, issuesPromise, searchPromise]);
+    const docsTopic = getPrimaryDocsTopic(stepKind, stepTitle);
+    const docsResults = await fetchSequentially([
+      () => getLibraryDocs(docsLibraryName, docsTopic, userId, toolEnv),
+    ]);
+    const rawIssues = library.repo
+      ? await getLibraryIssues(library.repo.owner, library.repo.repo, ['bug'], 90, userId, toolEnv)
+      : [];
+    const searchQuery = resolvedConnectedTools.has_brave_search
+      ? getPrimarySearchQuery({
+          stepKind,
+          packageName: library.packageName,
+          year: currentYear,
+        })
+      : '';
+    const searchResultSets = searchQuery
+      ? await fetchSequentially([() => searchWeb(searchQuery, userId, toolEnv)])
+      : [];
     const docsResultsWithContent = docsResults.filter((result) => result.content.trim().length > 0);
     const searchResults = searchResultSets.flat();
     let docsContent = docsResultsWithContent

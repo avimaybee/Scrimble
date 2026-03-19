@@ -23,6 +23,7 @@ import {
   upsertProjectBrief,
   type StoredProjectBrief,
 } from './project-briefs';
+import { fetchSequentially } from './research';
 import { buildResearchManifest, type ResearchManifest } from './research-manifest';
 import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
 import { loadBuilderProfileContext } from './user-tools';
@@ -239,6 +240,15 @@ function formatReleaseDigest(releases: GithubRepoAnalysis['releases']) {
     .join('\n\n');
 }
 
+function getWorkflowUpdatePrimarySearchQuery(baseQuery: string, currentYear: number) {
+  const technology = normalizeTechKey(baseQuery).replace(/[^a-z0-9@.+#\-/]/g, '') || 'technology';
+  if (!technology) {
+    return '';
+  }
+
+  return `${technology} errors ${currentYear}`;
+}
+
 function parseGitHubRepoUrl(url: string) {
   try {
     const parsedUrl = new URL(url);
@@ -402,9 +412,7 @@ function resolveResearchHints(
     docsTopic: change.docs_topic || knownProfile?.docsTopic || 'getting started',
     githubOwner: change.github_owner || githubSource?.owner || knownProfile?.githubOwner || '',
     githubRepo: change.github_repo || githubSource?.repo || knownProfile?.githubRepo || '',
-    searchQuery:
-      change.search_query ||
-      `${knownProfile?.searchHint || change.technology} ${adr.project_type || adr.project_name} ${new Date().getFullYear()}`,
+    searchQuery: knownProfile?.searchHint || change.technology,
     packageName: integrationMatch?.package_name || change.technology,
   };
 }
@@ -432,29 +440,27 @@ async function runMiniResearch(options: {
       message: `Reading ${change.technology} documentation...`,
     });
 
-    const [docs, githubAnalysis, webResults] = await Promise.all([
-      getLibraryDocs(change.technology, hints.docsTopic, options.userId, toolEnv),
-      hints.githubOwner && hints.githubRepo
-        ? analyzeGithubRepo(hints.githubOwner, hints.githubRepo, options.userId, toolEnv)
-        : Promise.resolve({
-            owner: '',
-            repo: '',
-            stars: 0,
-            forks: 0,
-            openIssues: 0,
-            lastPush: 'Unknown',
-            latestRelease: 'Unknown',
-            readme: '',
-            summary: '',
-            releases: [],
-            recentIssues: [],
-          }),
-      searchWeb(
-        hints.searchQuery.includes(`${currentYear}`) ? hints.searchQuery : `${hints.searchQuery} ${currentYear}`,
-        options.userId,
-        toolEnv,
-      ),
-    ]);
+    const docs = await getLibraryDocs(change.technology, hints.docsTopic, options.userId, toolEnv);
+    const githubAnalysis = hints.githubOwner && hints.githubRepo
+      ? await analyzeGithubRepo(hints.githubOwner, hints.githubRepo, options.userId, toolEnv)
+      : {
+          owner: '',
+          repo: '',
+          stars: 0,
+          forks: 0,
+          openIssues: 0,
+          lastPush: 'Unknown',
+          latestRelease: 'Unknown',
+          readme: '',
+          summary: '',
+          releases: [],
+          recentIssues: [],
+        };
+    const searchQuery = getWorkflowUpdatePrimarySearchQuery(hints.searchQuery, currentYear);
+    const webResultSets = searchQuery
+      ? await fetchSequentially([() => searchWeb(searchQuery, options.userId, toolEnv)])
+      : [];
+    const webResults = webResultSets.flat();
 
     const repoUrl =
       hints.githubOwner && hints.githubRepo

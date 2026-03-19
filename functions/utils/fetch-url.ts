@@ -78,6 +78,12 @@ export type ResearchResult = DocumentResearchResult | GitHubResearchResult | Res
 type FetchAndParseOptions = {
   githubToken?: string | null;
   onLog?: (attempt: FetchAttemptLog) => Promise<void> | void;
+  subrequestTracker?: SubrequestTracker;
+};
+
+export type SubrequestTracker = {
+  count: number;
+  limit: number;
 };
 
 type TimedFetchSuccess = {
@@ -305,6 +311,19 @@ async function timedFetch(
   source: FetchAttemptLog['source'],
   options: FetchAndParseOptions,
 ): Promise<TimedFetchSuccess | TimedFetchFailure> {
+  const tracker = options.subrequestTracker;
+  if (tracker) {
+    if (tracker.count >= tracker.limit) {
+      return {
+        ok: false,
+        durationMs: 0,
+        status: 'fetch_error',
+        message: `Subrequest limit reached (${tracker.limit})`,
+      };
+    }
+    tracker.count += 1;
+  }
+
   const controller = new AbortController();
   const startedAt = Date.now();
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -400,32 +419,30 @@ async function fetchGitHubResearch(
   const repoData = await metadataResult.response.json() as GitHubRepositoryMetadataResponse;
   const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
 
-  const [readmeResult, releasesResult, bugIssuesResult, breakingChangeIssuesResult] = await Promise.all([
-    timedFetch(
-      `${repoUrl}/readme`,
-      { headers: buildGitHubHeaders(githubToken) },
-      'github_readme',
-      options,
-    ),
-    timedFetch(
-      `${repoUrl}/releases?per_page=${RELEASE_LIMIT}`,
-      { headers: buildGitHubHeaders(githubToken) },
-      'github_releases',
-      options,
-    ),
-    timedFetch(
-      `${repoUrl}/issues?labels=bug&state=open&since=${encodeURIComponent(ninetyDaysAgo)}&per_page=${ISSUE_LIMIT}`,
-      { headers: buildGitHubHeaders(githubToken) },
-      'github_issues_bug',
-      options,
-    ),
-    timedFetch(
-      `${repoUrl}/issues?labels=breaking-change&state=open&since=${encodeURIComponent(ninetyDaysAgo)}&per_page=${ISSUE_LIMIT}`,
-      { headers: buildGitHubHeaders(githubToken) },
-      'github_issues_breaking_change',
-      options,
-    ),
-  ]);
+  const readmeResult = await timedFetch(
+    `${repoUrl}/readme`,
+    { headers: buildGitHubHeaders(githubToken) },
+    'github_readme',
+    options,
+  );
+  const releasesResult = await timedFetch(
+    `${repoUrl}/releases?per_page=${RELEASE_LIMIT}`,
+    { headers: buildGitHubHeaders(githubToken) },
+    'github_releases',
+    options,
+  );
+  const bugIssuesResult = await timedFetch(
+    `${repoUrl}/issues?labels=bug&state=open&since=${encodeURIComponent(ninetyDaysAgo)}&per_page=${ISSUE_LIMIT}`,
+    { headers: buildGitHubHeaders(githubToken) },
+    'github_issues_bug',
+    options,
+  );
+  const breakingChangeIssuesResult = await timedFetch(
+    `${repoUrl}/issues?labels=breaking-change&state=open&since=${encodeURIComponent(ninetyDaysAgo)}&per_page=${ISSUE_LIMIT}`,
+    { headers: buildGitHubHeaders(githubToken) },
+    'github_issues_breaking_change',
+    options,
+  );
 
   const partialErrors: Array<Omit<ResearchFailure, 'kind'>> = [];
 
