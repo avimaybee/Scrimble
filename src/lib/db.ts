@@ -335,7 +335,7 @@ export const dbService = {
     return fetchAPI<ArchitectureReviewResponse>(`/projects/${projectId}/architecture-review`);
   },
 
-  async approveArchitectureReview(projectId: string, feedback: string): Promise<{
+  async approveArchitectureReview(projectId: string, feedback: string, preferredIde = ''): Promise<{
     success: boolean;
     generation_status: Project['generation_status'];
     feedback_provided: boolean;
@@ -344,9 +344,9 @@ export const dbService = {
       success: boolean;
       generation_status: Project['generation_status'];
       feedback_provided: boolean;
-    }>(`/projects/${projectId}/architecture-review`, withoutClientTimeout({
+    }>(`/projects/${projectId}/approve`, withoutClientTimeout({
       method: 'POST',
-      body: JSON.stringify({ feedback }),
+      body: JSON.stringify({ feedback, preferredIde }),
     }));
   },
 

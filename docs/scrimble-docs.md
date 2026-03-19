@@ -169,13 +169,13 @@ npm run deploy:consumer  # uses wrangler and wrangler.consumer.toml
 npm run deploy:all
 ```
 
-Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that hosts the primary `ProjectGeneratorDO` runtime.
+Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that hosts the primary `GenerationWorkflow` runtime.
 
 ### Backend
 | Concern | Choice | Notes |
 |---|---|---|
-| Runtime | Cloudflare Pages Functions | Edge serverless — owns the API, chooses DO vs queue fallback, and streams generation state |
-| Background Jobs | Cloudflare Workers (Standalone) | Hosts `ProjectGeneratorDO` for the primary pipeline; enqueues jobs and manages generation state |
+| Runtime | Cloudflare Pages Functions | Edge serverless — owns the API, dispatches workflow events, and streams generation state |
+| Background Jobs | Cloudflare Workflows (in standalone Worker) | Hosts `GenerationWorkflow` as the primary pipeline runtime; each `step.do()` gets isolated retries/timeouts/subrequest budgets |
 | Database | Cloudflare D1 (SQLite) | Relational, edge-native, shared between environments |
 | Auth | Firebase Auth (auth only) | Google OAuth + email/password — JWT verification in Functions |
 | AI Routing | Function-side proxy | All AI calls proxied through Functions or Background Worker |
@@ -905,6 +905,7 @@ DELETE /api/settings/mcp-servers/:id → Remove research tool connection
 
 POST   /api/ai/proxy               → Proxied AI call (uses user's stored key)
 POST   /api/projects/:id/resume    → Resume a failed or interrupted project
+POST   /api/projects/:id/approve   → Send architecture approval event to active workflow instance
 
 > [!IMPORTANT]
 > **Routing Gotcha**: Hono is configured with `.basePath('/api')`. When defining new routes, **do not** start the route string with `/api/`. 
@@ -914,21 +915,21 @@ POST   /api/projects/:id/resume    → Resume a failed or interrupted project
 ```
 
 
-### Cloudflare Durable Object Primary Runtime
+### Cloudflare Workflow Primary Runtime
 
-Project generation now runs inside `ProjectGeneratorDO`, a standalone Cloudflare Worker Durable Object that owns every project’s pipeline turn.
+Project generation now runs inside `GenerationWorkflow`, a Cloudflare Workflow class hosted in the standalone consumer worker.
 
-- **One DO per project**: Each run keeps its own `run_id`, persists batch state in D1 + R2, and streams progress events through the durable `project_generation_events` table. This architecture eliminates the race conditions and state-sync hurdles typical of distributed queues, ensuring the generation pipeline remains reliable and bi-directionally synchronized.
-- **Timeouts & retries**: The DO updates `projects.generation_status` as soon as each batch starts, retries transient provider/timeout errors via D1-stored alarms, and reschedules itself instead of failing the project.
-- **SSE-friendly**: Durable events are written to `project_generation_events`, and the Pages `/api/projects/:id/generation-stream` route replays history + polls D1 so the SPA receives live updates even though the runner is in a separate runtime. Reasoning deltas now flow straight from the worker as `thinking` SSE messages, so no table is required and `writer.close()` runs on all terminal events.
-- **Checkpoint durability**: Every batch writes both inline JSON and R2 payloads, so the pipeline can resume instantly after any interruption without re-running prior work.
-- **Fallback safety**: Pages always records a `generation_dispatches` row before handing work to the DO; if something fails before the DO takes over, the dispatch rollbacks the project status so no “ghost queued” runs appear.
+- **One workflow instance per run**: Each run uses `generation-${projectId}-${runId}` as the workflow instance ID and persists progress through D1 + R2.
+- **Per-step budgets and retries**: The pipeline is split across `step.do(...)` units so each step gets its own retry policy, timeout, and fresh subrequest budget.
+- **1MB step-state safe**: Large artifacts (Batch outputs, chunk store, architecture, plan) are written to R2 under `workflows/{projectId}/{runId}/*.json`; steps return only compact R2 keys.
+- **SSE-friendly**: Durable events are written to `project_generation_events`, and `/api/projects/:id/generation-stream` replays history + polls D1 to keep the SPA live while workflow steps run in the background worker.
+- **Fallback safety**: Pages records a `generation_dispatches` row before dispatching to Workflow/DO/Queue, and rolls status back if dispatch fails so no ghost `queued` runs remain.
 
 ### Queue Fallback (Legacy Rollback)
 
 The original `scrimble` Cloudflare Queue consumer remains as a rollback. It still processes one batch per invocation, honours the same `run_id` guard, and writes checkpoints through the same worker, but it no longer drives normal generation flow. Use it only when:
 
-- the DO binding is missing or misconfigured
+- the Workflow binding is missing or misconfigured
 - a previous run crashed without leaving a retriable alarm (very rare)
 
 ### Sequential Generation Pipeline
@@ -943,7 +944,7 @@ Project creation dispatches a dedicated generation run. The flow is as follows:
 6. **Batch 5 (Enrich)**: Populates steps with turn-by-turn navigation, tool-specific instructions, and prompts.
 7. **Batch 6 (File Generation)**: Generates the skill files for IDE implementation.
 
-The Cloudflare Queue consumer remains only as an emergency rollback. It still exists to process a single batch when the DO binding is unavailable, but it no longer drives the default flow.
+The Cloudflare Queue consumer remains only as an emergency rollback. It still exists to process a single batch when the Workflow binding is unavailable, but it no longer drives the default flow.
 
 Each batch executes in order with **Smart Caps** to ensure extreme thoroughness without reckless resource usage:
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
@@ -955,14 +956,14 @@ Each batch executes in order with **Smart Caps** to ensure extreme thoroughness 
 - **Output Freedom**: Up to 16,384 tokens per AI response to provide headroom for models with extensive reasoning/thinking blocks (e.g., GLM-5, DeepSeek-R1).
 - **Thought-Only Guard**: If a model exhausts its output window with reasoning but provides no JSON content, the system automatically triggers a single "JSON-only" retry.
 
-Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved. The review payload (including feedback and preferred IDE) is stored and forwarded to batches 4‑6 so every subsequent step honors the builder’s choices.
+Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved using `step.waitForEvent(...)`. The review payload (including feedback and preferred IDE) is stored and forwarded to batches 4‑6 so every subsequent step honors the builder’s choices.
 
 ### Resume & Retry Flow
 The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or transient fetch/tool failure), it enters a `failed` state.
 1. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches even `failed` projects, picking up from the last incomplete batch through the active backend.
 2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend resume request, reconnecting the SSE stream only after the run is scheduled again.
 3. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints now rebuild their updates as compare-and-set statements against the four `generation_*` columns (run id, provider, heartbeat, completed). If another agent already flipped the status, the request returns `409` so the UI can refresh instead of scheduling another overlapping run.
-4. **Manual stop / kill switch**: The generation screen’s `Stop generation` button posts to `/api/projects/:id/cancel`, which calls the Durable Object’s `cancelPipeline()` helper to clear alarms, resolve the queued `pipelineChain`, and mark the run as `cancelled`. Checkpoints remain intact and the cancelled UI invites the builder to resume from the latest completed batch or return to the dashboard, letting you kill runaway runs without losing work.
+4. **Manual stop / kill switch**: The generation screen’s `Stop generation` button posts to `/api/projects/:id/cancel`, which marks the run `cancelled` in D1 and terminates the active workflow instance when available. Checkpoints remain intact and the cancelled UI invites the builder to resume from the latest completed batch or return to the dashboard.
 
 
 ### Professional Icon System
@@ -977,6 +978,13 @@ The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`.
 That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate background worker runtime. 
 
 To handle the high-frequency nature of AI reasoning deltas from distributed global isolates, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`). This utility buffers incoming reasoning tokens in memory and performs a single `ON CONFLICT DO UPDATE` write to the `project_generation_live_state` table every **150ms**. This prevents D1 row-locking congestion while maintaining a fluid user experience. The faster flush interval (reduced from 1000ms) ensures the UI receives updates in near-real-time while still gently buffering to avoid overloading the browser.
+
+> [!IMPORTANT]
+> Cloudflare Workflow limits shape pipeline structure:
+> - Free plan supports **50 subrequests per `step.do()` invocation** (fresh budget per step).
+> - Free plan supports **1,024 workflow steps** total.
+> - Step return payloads are constrained, so Scrimble stores large state in R2 and returns R2 keys only.
+> - Architecture review uses `step.waitForEvent(...)` rather than polling D1.
 
 On terminal events (`pipeline_complete`, `pipeline_failed`), the system explicitly calls `writer.close()` after the final flush to ensure the browser strictly severs the connection and doesn't leave "ghost" streams polling the edge.
 
@@ -1057,7 +1065,7 @@ interface AIProvider {
 
 ### Agentic Generation Pipeline
 
-`ProjectGeneratorDO` now executes every generation run in one continuous Durable Object turn. Each of the six batches:
+`GenerationWorkflow` now executes every generation run as explicit Workflow steps. Each of the six batches:
 
 1. Reads the previous batch output from `agent_runs`.
 2. Dispatches a single BYOK AI call (streaming reasoning tokens into `thinking` events).
@@ -1066,7 +1074,7 @@ interface AIProvider {
 5. Touches `projects.generation_status` as soon as the batch starts so status polling stays truthful.
 6. Emits a durable SSE event (`batch_start`, `activity`, `batch_complete`, etc.) so `/api/projects/:id/generation-stream` can replay history + stream real-time deltas.
 
-The DO keeps running even if all tabs are closed: it stores checkpoints in D1, writes reasoning deltas through the throttled emitter, uses alarms/`waitUntil()` to retry transient failures, and only marks a run as `failed` when retries are exhausted. This is the default path; the Cloudflare Queue consumer wakes only when the DO binding is missing or a manual rollback is required, and it follows the same stale-`run_id` guard and checkpoint writing strategy.
+The workflow keeps running even if all tabs are closed: it stores checkpoints in D1, persists large payloads to R2, and resumes deterministically with step-level retries/timeouts. This is the default path; the Cloudflare Queue consumer wakes only when the Workflow binding is missing or a manual rollback is required, and it follows the same stale-`run_id` guard and checkpoint strategy.
 
 Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. The research layer now uses lightweight in-memory RAG: fetched content is chunked, stored in `chunk_store`, and downstream prompts consume retrieved top-k slices instead of full/truncated blobs. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
 
@@ -1098,9 +1106,11 @@ The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoi
 
 ### Durable Checkpoints & Dispatch Safety
 
-Every generation run now records a `run_id` on the project before work starts. The API also logs a `generation_dispatches` entry before dispatching either to `ProjectGeneratorDO` or the queue fallback; if the dispatch fails the API rolls back the project status so no ghost `queued` state sticks around. The queue fallback still processes exactly one batch per invocation and refuses to work on stale payloads whose `run_id` no longer matches the active run. The Durable Object path preserves the same stale-run guard while looping through the next turn immediately.
+Every generation run now records a `run_id` on the project before work starts. The API also logs a `generation_dispatches` entry before dispatching either to Workflows, Durable Objects, or queue fallback; if dispatch fails the API rolls back status so no ghost `queued` state sticks around. Queue fallback still processes exactly one batch per invocation and refuses stale payloads whose `run_id` no longer matches the active run.
 
-The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, chunk stores, partial responses—into the Cloudflare R2 bucket named `scrimble` via the S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`. This hybrid D1+R2 strategy keeps row sizes manageable, captures the full history for any restart, and makes sure Batch 2 resumes from the same research graph without rerunning every tool.
+Workflow dispatch now uses `run_id` as the workflow instance ID and persists it in `projects.workflow_instance_id`. Approval requests (`POST /api/projects/:id/approve`) resolve that instance and call `instance.sendEvent({ type: 'architecture-approved', payload })`, which immediately resumes the paused `step.waitForEvent(...)` gate.
+
+The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, chunk stores, partial responses—into the Cloudflare R2 bucket named `scrimble`. Workflow steps return R2 keys so each step payload stays comfortably under Cloudflare’s 1MB state cap.
 
 Batch 1 now checkpoints deliberately before the runtime budget edge so Batch 2 can pick up the same state, and provider pinning enforces the original BYOK entry: if that provider disappears the worker fails fast with `provider_unavailable` instead of silently switching to a different key. Batch 2 now assembles prompts from retrieved chunk subsets instead of hard prompt-budget truncation, so provider calls stay focused and stable even as the fetched corpus grows.
 
@@ -1326,7 +1336,7 @@ If no AI provider is configured, `/new` blocks submission and shows a direct "Yo
 - A six-dot progress indicator (connected line) mirrors the batch order. Completed dots glow emerald, the current batch glows paprika with a halo, and pending dots stay muted. Labels beneath each dot match the batch short names.
 - **Persistent AI Model Selection**: Interactive buttons for both "Fast" and "Deep" models are pinned to the generation summary area. These buttons allow the builder to view the active model (formatted as "Provider — Model") and open a selection modal to swap providers or models mid-run.
 - Estimated time remaining counts down from 12 minutes and recalculates dynamically as each `batch_complete` event reports `duration_ms`.
-- A `Stop generation` control sits inside the connection bar (XCircle icon). It fires `POST /api/projects/:id/cancel`, kills the Durable Object runner, and surfaces a cancelled banner with “Resume from checkpoint” and “Back to dashboard” actions so checkpoints are preserved after a manual halt.
+- A `Stop generation` control sits inside the connection bar (XCircle icon). It fires `POST /api/projects/:id/cancel`, cancels the run in D1, attempts to terminate the active workflow instance, and surfaces a cancelled banner with “Resume from checkpoint” and “Back to dashboard” actions so checkpoints are preserved after a manual halt.
 
 When a run is cancelled via the stop control the generation screen switches into the “Generation stopped” banner state: a muted XCircle explains that checkpoints remain intact, offers to resume or exit to the dashboard, and quietly marks the run `cancelled` so the backend can reject duplicate runners while the frontend keeps the builder in control.
 - If a builder returns to `/project/:id` while generation is still running (or while the architecture checkpoint is waiting), the canvas route redirects them back to `/project/:id/generating`, the screen reloads `projects.generation_status`, reconnects to the SSE stream, and reconstructs the full generation state from replayed D1 events before resuming live updates.
@@ -1624,6 +1634,7 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **UI Transparency**: Introduced `Skeleton` and `ThinkingBubble` components across the dashboard and project canvas to maintain transparency during agent work.
 - Research depth badges and the "Researched {date} using {tools}" footer inject transparency into the detail panel and architecture review, highlighting when Context7, Brave Search, or GitHub were used and nudging builders to connect any missing tools for deeper next-time results.
 - Live generation screen now streams durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_failed` events plus transient `thinking` deltas: animated batch headings, a dedicated “Currently working” live line, icon-coded history entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
+- Frontend tab-close resilience now uses `localStorage['scrimble_active_generation']`: generation pages set it while a run is active, and Dashboard auto-redirects back to `/project/:id/generating` if that run is still in progress or awaiting review.
 - Canvas sidebar exposes a "Download AI files" button with download icon, hint text ("Paste these into your IDE…"), and tooltip-disabled state until the files are ready.
 - Human-in-the-loop review panel (Approve/Reject gates)
 - Tiered Export system (Markdown + JSON)
@@ -1631,8 +1642,8 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - Agent working states (sweep animations) and needs-review states (amber pulse)
 - First-time user guide (contextual tooltips)
 - Project renaming and archiving
-- **Manual stop & resume**: The generation screen now exposes a `Stop generation` button that calls `/api/projects/:id/cancel` and invokes the Durable Object’s `cancelPipeline()` helper.
-- **Durable Infrastructure**: Fully migrated the generation runner to Cloudflare Durable Objects, eliminating queue-based race conditions and enabling real-time bi-directional state synchronization.
+- **Manual stop & resume**: The generation screen now exposes a `Stop generation` button that calls `/api/projects/:id/cancel`, marks the run cancelled, and terminates the active workflow instance when available.
+- **Workflow Infrastructure**: The primary generation runtime now runs on Cloudflare Workflows with step-level retries/timeouts, `step.waitForEvent` review gating, and R2-backed large-state indirection.
 - **Provider Management**: Implemented AI provider removal with confirmation dialogs and active-check safety guards.
 - **Provider Test Connection**: Added a "Test" button to each AI provider card in Settings that validates the API key works before saving, with inline error display using `InlineError` component and retry capability.
 - **Schema reconciliation**: Migration `010_schema_reconciliation.sql` adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, adds `last_error` to `generation_dispatches`, and drops the erstwhile `project_generation_live_state` table.
@@ -1684,7 +1695,7 @@ Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
 - `functions/server/project-generator-do.ts`: Added broadcast logging for event reception and client connection state
 - `functions/server/generation-events.ts`: Added logging in `publish()`, `emitTransientGenerationStreamEvent()`, and `createThrottledThinkingEmitter()`
 - `functions/server/ai.ts`: Added logging when reasoning/thinking is extracted from provider responses
-- `functions/server/app.ts`: Improved DO proxy error handling with better logging
+- `functions/server/app.ts`: Improved generation stream proxy/fallback logging
 - Frontend (`src/lib/db.ts`, `src/pages/ProjectGeneration.tsx`): Added thinking event debug logs
 
 **Expected Log Flow (for debugging):**
@@ -1694,14 +1705,14 @@ Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
 [THINKING_EMITTER] Flushing X chars                   # Thinking emitted
 [GENERATION_EVENTS] Emitting thinking event           # Event being published
 [GENERATION_EVENTS] Publishing to N subscriber(s)     # Subscribers receive
-[PROJECT_GENERATOR_DO] Event received                 # DO receives event
-[PROJECT_GENERATOR_DO] broadcasting to N writer(s)     # DO broadcasts to frontend
+[GENERATION_EVENTS] Emitting thinking event           # Event emitted by background runtime
+[STREAM] Forwarding thinking delta                     # SSE route forwards transient delta
 [STREAM] Received thinking event                      # Frontend receives
 [SSE_EVENT] onThinking received                        # Frontend processes
 ```
 
 **Proposed Solutions (under evaluation):**
-- Option A: Use Durable Objects for long-running AI calls (DO has higher timeout limits)
+- Option A: Keep long-running execution in Workflows with tighter step boundaries
 - Option B: Implement periodic heartbeat chunks during AI streaming to prevent idle gaps
 - Option C: Checkpoint and resume from partial reasoning when timeout occurs
 

@@ -16,7 +16,10 @@ import { createGenerationSseStream, persistGenerationStreamEvent } from './gener
 import {
   hasProjectGenerationBackendBinding,
   resolveProjectGenerationBackend,
+  sendWorkflowDispatchEvent,
   sendGenerationDispatch,
+  WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+  workflowInstanceIdFor,
 } from './generation-dispatch';
 import {
   callAIWithRetry,
@@ -145,6 +148,7 @@ const modelRolesSchema = z.object({
 
 const architectureReviewApprovalSchema = z.object({
   feedback: z.string().optional().default(''),
+  preferredIde: z.string().trim().optional().default(''),
 });
 
 const userToolSchema = z.object({
@@ -202,6 +206,9 @@ function jsonError(message: string, status: number, details?: unknown) {
 function generationBackendConfigurationError(c: AppContext, backend: ProjectGenerationBackend) {
   return c.json({
     error:
+      backend === 'workflow'
+        ? 'Project generation workflow is not configured.'
+        :
       backend === 'durable_object'
         ? 'Project generation durable object is not configured.'
         : 'Project generation queue is not configured.',
@@ -396,6 +403,7 @@ function mapProjectRow(row: any) {
     generation_started_at: row.generation_started_at || undefined,
     generation_completed_at: row.generation_completed_at || undefined,
     generation_run_id: row.generation_run_id || undefined,
+    workflow_instance_id: row.workflow_instance_id || undefined,
     generation_provider_id: row.generation_provider_id || undefined,
     generation_heartbeat_at: row.generation_heartbeat_at || undefined,
     intake_answers: row.intake_answers || undefined,
@@ -1302,6 +1310,7 @@ app.post('/intake/:id/confirm', async (c) => {
           generation_status = 'intake',
           generation_error = ?,
           generation_run_id = NULL,
+          workflow_instance_id = NULL,
           generation_provider_id = NULL,
           generation_heartbeat_at = NULL,
           generation_completed_at = NULL,
@@ -1391,6 +1400,7 @@ app.post('/projects', async (c) => {
       UPDATE projects
       SET generation_status = 'failed',
           generation_error = ?,
+          workflow_instance_id = NULL,
           generation_completed_at = datetime("now"),
           updated_at = datetime("now")
       WHERE id = ? AND user_id = ? AND generation_status = 'queued' AND generation_run_id = ?
@@ -1455,6 +1465,7 @@ app.get('/projects/:id/status', async (c) => {
     generation_status: generationStatus,
     generation_error: project.generation_error || null,
     generation_run_id: project.generation_run_id || null,
+    workflow_instance_id: project.workflow_instance_id || null,
     generation_provider_id: project.generation_provider_id || null,
     generation_heartbeat_at: generationHeartbeat,
     completed_batches: completedBatches,
@@ -1487,7 +1498,7 @@ app.get('/projects/:id/architecture-review', async (c) => {
   }
 });
 
-app.post('/projects/:id/architecture-review', async (c) => {
+const handleProjectArchitectureApproval = async (c: AppContext) => {
   const projectId = c.req.param('id');
   const project = await getOwnedProject(c, projectId);
   if (!project) {
@@ -1509,9 +1520,22 @@ app.post('/projects/:id/architecture-review', async (c) => {
   }
 
   const feedback = parsed.data.feedback?.trim() || '';
+  const preferredIde = parsed.data.preferredIde?.trim() || '';
   let providerId: string | undefined;
-  const runId = crypto.randomUUID();
+  const previousRunId = (project.generation_run_id as string | null) || null;
+  const workflowInstanceId = (project.workflow_instance_id as string | null) || null;
+  const runId = generationBackend === 'workflow'
+    ? previousRunId
+    : crypto.randomUUID();
   const generationGuardBindings = getProjectGenerationGuardBindings(project);
+
+  if (!runId || !runId.trim()) {
+    return c.json({ error: 'This generation run has no active run ID. Resume it and try approval again.' }, 409);
+  }
+
+  if (generationBackend === 'workflow' && !((workflowInstanceId && workflowInstanceId.trim()) || runId.trim())) {
+    return c.json({ error: 'Workflow instance ID is missing for this generation run.' }, 409);
+  }
 
   try {
     const approval = await saveArchitectureReviewApproval(c.env, projectId, feedback);
@@ -1524,6 +1548,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
       SET generation_status = 'approved',
           generation_error = NULL,
           generation_run_id = ?,
+          workflow_instance_id = ?,
           generation_provider_id = ?,
           generation_heartbeat_at = datetime("now"),
           generation_completed_at = NULL,
@@ -1534,22 +1559,40 @@ app.post('/projects/:id/architecture-review', async (c) => {
         AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
         AND ${sqlNullableColumnMatch('generation_completed_at')}
     `)
-      .bind(runId, providerId || null, projectId, c.get('uid'), ...generationGuardBindings)
+      .bind(runId, workflowInstanceId, providerId || null, projectId, c.get('uid'), ...generationGuardBindings)
       .run();
 
     if (asNumber((approvalUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
       return c.json({ error: 'This review already changed. Reload to see the latest state.' }, 409);
     }
 
-    await sendGenerationDispatch(c.env, {
-      projectId,
-      userId: c.get('uid'),
-      providerId,
-      runId,
-      kind: 'architecture_approval',
-      previousStatus: 'awaiting_review',
-      targetStatus: 'approved',
-    }, { backend: generationBackend });
+    if (generationBackend === 'workflow') {
+      const resolvedWorkflowInstanceId = (workflowInstanceId && workflowInstanceId.trim())
+        ? workflowInstanceId
+        : workflowInstanceIdFor(projectId, runId);
+
+      await sendWorkflowDispatchEvent(c.env, {
+        workflowInstanceId: resolvedWorkflowInstanceId,
+        eventType: WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+        eventPayload: {
+          approved: true,
+          feedback,
+          preferredIde,
+        },
+      });
+    } else {
+      await sendGenerationDispatch(c.env, {
+        projectId,
+        userId: c.get('uid'),
+        providerId,
+        runId,
+        kind: 'architecture_approval',
+        previousStatus: 'awaiting_review',
+        targetStatus: 'approved',
+        reviewFeedback: feedback,
+        preferredIde,
+      }, { backend: generationBackend });
+    }
 
     if (project.generation_run_id) {
       await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
@@ -1561,6 +1604,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
       SET generation_status = 'awaiting_review',
           generation_error = NULL,
           generation_run_id = ?,
+          workflow_instance_id = ?,
           generation_provider_id = ?,
           generation_heartbeat_at = ?,
           generation_completed_at = ?,
@@ -1569,6 +1613,7 @@ app.post('/projects/:id/architecture-review', async (c) => {
     `)
       .bind(
         (project.generation_run_id as string | null) || null,
+        (project.workflow_instance_id as string | null) || null,
         (project.generation_provider_id as string | null) || null,
         (project.generation_heartbeat_at as string | null) || null,
         (project.generation_completed_at as string | null) || null,
@@ -1599,7 +1644,10 @@ app.post('/projects/:id/architecture-review', async (c) => {
     generation_status: 'approved',
     feedback_provided: feedback.length > 0,
   });
-});
+};
+
+app.post('/projects/:id/approve', handleProjectArchitectureApproval);
+app.post('/projects/:id/architecture-review', handleProjectArchitectureApproval);
 
 app.post('/projects/:id/resume', async (c) => {
   const projectId = c.req.param('id');
@@ -1894,6 +1942,23 @@ app.post('/projects/:id/cancel', async (c) => {
     }
   }
 
+  if (generationBackend === 'workflow' && c.env.GENERATION_WORKFLOW && project.generation_run_id) {
+    try {
+      const workflowInstanceId = (project.workflow_instance_id as string | null)
+        || workflowInstanceIdFor(projectId, project.generation_run_id as string);
+      const instance = await c.env.GENERATION_WORKFLOW.get(
+        workflowInstanceId,
+      );
+      await instance.terminate();
+    } catch (error) {
+      console.warn('[CANCEL] Workflow terminate failed, falling back to D1-only cancel.', {
+        projectId,
+        runId: project.generation_run_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   // Always update D1 directly as the source of truth
   const cancelledRunId = crypto.randomUUID();
   await c.env.DB.prepare(`
@@ -1901,6 +1966,7 @@ app.post('/projects/:id/cancel', async (c) => {
     SET generation_status = 'cancelled',
         generation_error = 'Generation cancelled by user.',
         generation_run_id = ?,
+        workflow_instance_id = NULL,
         generation_completed_at = datetime("now"),
         generation_heartbeat_at = datetime("now"),
         updated_at = datetime("now")

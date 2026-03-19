@@ -53,6 +53,7 @@ const MAX_VISIBLE_RESEARCH_SOURCES = 5;
 const RUNNER_WAITING_LABEL_THRESHOLD_MS = 60_000;
 const MANUAL_RUNNER_CHECK_THRESHOLD_MS = 10 * 60_000;
 const automaticRecoveryAttempts = new Set<string>();
+const ACTIVE_GENERATION_STORAGE_KEY = 'scrimble_active_generation';
 
 const generationBatches: Array<{
   id: GenerationBatchName;
@@ -821,6 +822,11 @@ export default function ProjectGeneration() {
                 }
               : previous,
           );
+          try {
+            localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors.
+          }
           void syncProjectState().finally(() => scheduleProjectNavigation());
         },
         onFailed: (message) => {
@@ -838,6 +844,11 @@ export default function ProjectGeneration() {
                 }
               : previous,
           );
+          try {
+            localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors.
+          }
           void syncProjectState();
         },
         onConnectionStateChange: (nextState) => {
@@ -1115,6 +1126,38 @@ export default function ProjectGeneration() {
       setIsSubmittingReview(false);
     }
   }, [applyStatusUpdate, id, reviewFeedback, syncProjectState]);
+
+  useEffect(() => {
+    if (!id) {
+      return;
+    }
+
+    const activeStatuses = new Set([
+      'queued',
+      'batch_1_research_stack',
+      'batch_2_fetch_and_read',
+      'batch_3_architect',
+      'batch_4_plan_build',
+      'batch_5_enrich_steps',
+      'batch_6_generate_files',
+      'awaiting_review',
+      'approved',
+    ]);
+    const generationStatus = status?.generation_status;
+
+    try {
+      if (generationStatus && activeStatuses.has(generationStatus)) {
+        localStorage.setItem(ACTIVE_GENERATION_STORAGE_KEY, id);
+      } else {
+        const storedProjectId = localStorage.getItem(ACTIVE_GENERATION_STORAGE_KEY);
+        if (storedProjectId === id) {
+          localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+        }
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [id, status?.generation_status]);
 
   const reconnectLiveFeed = useCallback(() => {
     setError('');

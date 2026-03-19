@@ -59,6 +59,7 @@ const itemVariants = {
 };
 
 const WORKSPACE_NUDGE_DISMISSED_KEY = 'scrimble-workspace-nudge-dismissed';
+const ACTIVE_GENERATION_STORAGE_KEY = 'scrimble_active_generation';
 
 type ProjectCardData = {
   project: Project;
@@ -206,6 +207,64 @@ export default function Dashboard() {
   useEffect(() => {
     void loadDashboard();
   }, [loadDashboard]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const resumeActiveGeneration = async () => {
+      let activeGeneration: string | null = null;
+      try {
+        activeGeneration = localStorage.getItem(ACTIVE_GENERATION_STORAGE_KEY);
+      } catch {
+        return;
+      }
+
+      if (!activeGeneration) {
+        return;
+      }
+
+      try {
+        const status = await dbService.getProjectGenerationStatus(activeGeneration);
+        if (cancelled) {
+          return;
+        }
+
+        const activeStatuses = new Set([
+          'queued',
+          'batch_1_research_stack',
+          'batch_2_fetch_and_read',
+          'batch_3_architect',
+          'batch_4_plan_build',
+          'batch_5_enrich_steps',
+          'batch_6_generate_files',
+          'awaiting_review',
+          'approved',
+        ]);
+
+        if (activeStatuses.has(status.generation_status)) {
+          navigate(`/project/${activeGeneration}/generating`, { replace: true });
+        } else {
+          try {
+            localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors.
+          }
+        }
+      } catch {
+        try {
+          localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+        } catch {
+          // Ignore storage errors.
+        }
+      }
+    };
+
+    void resumeActiveGeneration();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [navigate]);
 
   useEffect(() => {
     try {

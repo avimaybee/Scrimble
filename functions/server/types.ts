@@ -12,6 +12,15 @@ export interface R2Object {
 
 export type ProviderType = 'anthropic' | 'gemini' | 'openai' | 'custom' | 'openrouter' | 'groq';
 
+export type ResolvedGenerationProviderConfig = {
+  providerId: string;
+  providerName: string;
+  providerType: ProviderType;
+  model: string;
+  baseUrl: string | null;
+  apiKey: string;
+};
+
 export const GENERATION_BATCHES = [
   'batch_1_research_stack',
   'batch_2_fetch_and_read',
@@ -35,7 +44,7 @@ export type ProjectGenerationStatus =
   | 'failed'
   | 'cancelled';
 
-export type ProjectGenerationBackend = 'queue' | 'durable_object';
+export type ProjectGenerationBackend = 'queue' | 'workflow' | 'durable_object';
 
 export type DurableObjectIdLike = {
   toString(): string;
@@ -48,6 +57,36 @@ export type DurableObjectStubLike = {
 export type DurableObjectNamespaceLike = {
   idFromName(name: string): DurableObjectIdLike;
   get(id: DurableObjectIdLike): DurableObjectStubLike;
+};
+
+export type WorkflowInstanceStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'errored'
+  | 'terminated'
+  | 'complete'
+  | 'waiting'
+  | 'waitingForPause'
+  | 'unknown';
+
+export type WorkflowInstanceLike = {
+  id: string;
+  status(): Promise<{
+    status: WorkflowInstanceStatus;
+    error?: { name: string; message: string };
+    output?: unknown;
+  }>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  restart(): Promise<void>;
+  terminate(): Promise<void>;
+  sendEvent(options: { type: string; payload?: unknown }): Promise<void>;
+};
+
+export type WorkflowBindingLike<TParams = unknown> = {
+  create(options?: { id?: string; params?: TParams }): Promise<WorkflowInstanceLike>;
+  get(id: string): Promise<WorkflowInstanceLike>;
 };
 
 export type DurableObjectStorageLike = {
@@ -80,12 +119,26 @@ export type Bindings = {
     send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
   };
   PROJECT_GENERATOR?: DurableObjectNamespaceLike;
+  GENERATION_WORKFLOW?: WorkflowBindingLike;
   CHECKPOINT_BUCKET: {
     put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
     get(key: string): Promise<R2Object | null>;
     delete(key: string): Promise<void>;
   };
+  SCRIMBLE_BUCKET?: {
+    put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
+    get(key: string): Promise<R2Object | null>;
+    delete(key: string): Promise<void>;
+  };
   R2?: any;
+};
+
+export type ProjectRecordForWorkflowDispatch = {
+  id: string;
+  user_id: string;
+  description: string | null;
+  intake_answers: string | null;
+  workflow_instance_id: string | null;
 };
 
 export type GenerationEventType =

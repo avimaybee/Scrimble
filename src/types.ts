@@ -39,6 +39,7 @@ export interface Project {
   generation_started_at?: string;
   generation_completed_at?: string;
   generation_run_id?: string;
+  workflow_instance_id?: string;
   generation_provider_id?: string;
   generation_heartbeat_at?: string;
   intake_answers?: string;
@@ -187,6 +188,7 @@ export interface ProjectGenerationStatusResponse {
   generation_status: GenerationStatus;
   generation_error: string | null;
   generation_run_id: string | null;
+  workflow_instance_id: string | null;
   generation_provider_id: string | null;
   generation_heartbeat_at: string | null;
   completed_batches: ProjectGenerationEvent[];

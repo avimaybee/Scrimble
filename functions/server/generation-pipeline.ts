@@ -80,7 +80,7 @@ import {
   loadBuilderProfileContext,
 } from './user-tools';
 
-type ProviderConfig = {
+export type ProviderConfig = {
   providerId: string;
   providerName: string;
   providerType: ProviderType;
@@ -91,7 +91,7 @@ type ProviderConfig = {
 
 type GenerationModelRole = 'fast' | 'deep';
 
-type ProjectRecord = {
+export type ProjectRecord = {
   id: string;
   user_id: string;
   name: string;
@@ -3054,6 +3054,16 @@ async function resolveProviderConfiguration(
   return provider;
 }
 
+export async function resolveGenerationProviderConfiguration(
+  env: Bindings,
+  projectId: string,
+  userId: string,
+  role: GenerationModelRole,
+  providerId?: string,
+): Promise<ProviderConfig> {
+  return resolveProviderConfiguration(env, projectId, userId, role, providerId);
+}
+
 function formatSchemaCorrectionPrompt(previousResponse: string, schemaDescription: string) {
   // Truncate previous response if it's too long to avoid context limit issues
   const truncatedResponse = previousResponse.length > 4000 
@@ -3622,7 +3632,7 @@ function formatStoredIntakeAnswers(value: string | null | undefined) {
     .join('\n\n');
 }
 
-async function executeBatch1(
+export async function executeBatch1(
   env: Bindings,
   project: ProjectRecord,
   provider: ProviderConfig,
@@ -3743,7 +3753,7 @@ Identify the stack implied by the idea. For each technology, provide:
 // Cloudflare hard-limits Workers to 50 subrequests. Stop research at 35 to preserve headroom.
 const SUBREQUEST_RESERVE = 0;
 
-async function executeBatch2(
+export async function executeBatch2(
   env: Bindings,
   project: ProjectRecord,
   provider: ProviderConfig,
@@ -3752,6 +3762,7 @@ async function executeBatch2(
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
   continuationMode: GenerationContinuationMode = 'queue',
+  checkpointItemInterval = GENERATION_CHECKPOINT_ITEM_INTERVAL,
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const projectId = project.id;
@@ -4108,9 +4119,10 @@ async function executeBatch2(
 
     const hasMoreWork = index + 1 < researchTargets.length;
     const processedCount = index + 1;
+    const normalizedCheckpointItemInterval = Math.max(1, checkpointItemInterval);
     if (
       hasMoreWork &&
-      (processedCount % GENERATION_CHECKPOINT_ITEM_INTERVAL === 0
+      (processedCount % normalizedCheckpointItemInterval === 0
         || subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE)
     ) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
@@ -4325,7 +4337,7 @@ Preserve specific version and compatibility details.`;
   }
 }
 
-async function executeBatch3(
+export async function executeBatch3(
   env: Bindings,
   projectId: string,
   runId: string,
@@ -4472,7 +4484,7 @@ Base every single recommendation on the provided research corpus. If a technolog
   }
 }
 
-async function executeBatch4(
+export async function executeBatch4(
   env: Bindings,
   projectId: string,
   runId: string,
@@ -4657,13 +4669,14 @@ Rules:
   }
 }
 
-async function executeBatch5(
+export async function executeBatch5(
   env: Bindings,
   projectId: string,
   provider: ProviderConfig,
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
+  checkpointStepInterval = 3,
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const project = await getProjectById(env, projectId);
@@ -4765,8 +4778,9 @@ async function executeBatch5(
     const maxSubrequestBudget = 40; // Cloudflare standard limit is 50
     const SUB_RESERVE = 8;
 
+    const normalizedCheckpointStepInterval = Math.max(1, checkpointStepInterval);
     const shouldCheckpoint = (index + 1 < planSteps.length) && (
-      (index + 1 - startIndex) >= 3 || // Every 3 steps within this turn to stay under 30s wall-clock limit
+      (index + 1 - startIndex) >= normalizedCheckpointStepInterval || // Process groups safely within one turn
       subrequestCounter >= (maxSubrequestBudget - SUB_RESERVE) // Or when near subrequest limit
     );
 
@@ -4928,7 +4942,7 @@ Populate navigation_links from the researched docs URLs so the user can click di
   }
 }
 
-async function executeBatch6(
+export async function executeBatch6(
   env: Bindings,
   projectId: string,
   runId: string,
@@ -5065,7 +5079,7 @@ Rules:
   }
 }
 
-async function pauseForArchitectureReview(env: Bindings, projectId: string, runId: string) {
+export async function pauseForArchitectureReview(env: Bindings, projectId: string, runId: string) {
   const timestamp = new Date().toISOString();
   console.log(`[PIPELINE_TRACE] ${timestamp} pauseForArchitectureReview called for project: ${projectId}, runId: ${runId}`);
   
@@ -5107,7 +5121,7 @@ async function pauseForArchitectureReview(env: Bindings, projectId: string, runI
   });
 }
 
-async function finalizeProjectGeneration(env: Bindings, projectId: string, runId: string) {
+export async function finalizeProjectGeneration(env: Bindings, projectId: string, runId: string) {
   const statusChanges = await updateProjectGenerationStatus(env, projectId, 'complete', {
     generationError: null,
     markStarted: true,

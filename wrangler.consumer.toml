@@ -11,6 +11,10 @@ database_id = "d3b8a50c-89ff-47a8-9aaa-58802343bd73"
 binding = "CHECKPOINT_BUCKET"
 bucket_name = "scrimble"
 
+[[r2_buckets]]
+binding = "SCRIMBLE_BUCKET"
+bucket_name = "scrimble"
+
 [vars]
 ENVIRONMENT = "production"
 FIREBASE_PROJECT_ID = "scrimble-auth"
@@ -18,6 +22,11 @@ FIREBASE_PROJECT_ID = "scrimble-auth"
 [[durable_objects.bindings]]
 name = "PROJECT_GENERATOR"
 class_name = "ProjectGeneratorDO"
+
+[[workflows]]
+name = "scrimble-generation"
+binding = "GENERATION_WORKFLOW"
+class_name = "GenerationWorkflow"
 
 [[queues.producers]]
 binding = "AGENT_QUEUE"
@@ -31,6 +40,9 @@ max_batch_timeout = 60
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProjectGeneratorDO"]
+
+[limits]
+subrequests = 1000
 
 [observability]
 enabled = true
