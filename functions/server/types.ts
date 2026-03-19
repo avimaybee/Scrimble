@@ -89,6 +89,30 @@ export type WorkflowBindingLike<TParams = unknown> = {
   get(id: string): Promise<WorkflowInstanceLike>;
 };
 
+export type GenerationWorkflowPayload = {
+  projectId: string;
+  userId: string;
+  runId: string;
+  description: string;
+  intakeAnswers: Record<string, string>;
+  fastProvider: ResolvedGenerationProviderConfig;
+  deepProvider: ResolvedGenerationProviderConfig;
+  stackTechnologies: Array<{ name: string; docsUrl?: string; githubRepo?: string }>;
+};
+
+export type WorkflowApprovalPayload = {
+  feedback: string;
+  preferredIde: string;
+  approved: boolean;
+};
+
+export type WorkflowServiceBindingLike = {
+  createGeneration(payload: GenerationWorkflowPayload): Promise<{ instanceId: string }>;
+  sendApproval(instanceId: string, approvalPayload: WorkflowApprovalPayload): Promise<void>;
+  cancelGeneration(instanceId: string): Promise<void>;
+  getStatus(instanceId: string): Promise<{ status: string; output: unknown }>;
+};
+
 export type DurableObjectStorageLike = {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put<T = unknown>(key: string, value: T): Promise<void>;
@@ -119,7 +143,8 @@ export type Bindings = {
     send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
   };
   PROJECT_GENERATOR?: DurableObjectNamespaceLike;
-  GENERATION_WORKFLOW?: WorkflowBindingLike;
+  WORKFLOW_SERVICE?: WorkflowServiceBindingLike;
+  GENERATION_WORKFLOW?: WorkflowBindingLike<GenerationWorkflowPayload>;
   CHECKPOINT_BUCKET: {
     put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
     get(key: string): Promise<R2Object | null>;
@@ -154,8 +179,10 @@ export type Variables = {
   uid: string;
 };
 
+export type PagesBindings = Omit<Bindings, 'GENERATION_WORKFLOW'>;
+
 export type AppEnv = {
-  Bindings: Bindings;
+  Bindings: PagesBindings;
   Variables: Variables;
 };
 

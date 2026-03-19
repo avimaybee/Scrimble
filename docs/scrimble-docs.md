@@ -169,7 +169,7 @@ npm run deploy:consumer  # uses wrangler and wrangler.consumer.toml
 npm run deploy:all
 ```
 
-Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that hosts the primary `GenerationWorkflow` runtime.
+Note: the project is deployed to Cloudflare Pages for the frontend + Pages Functions API; background generation runs in a separate Cloudflare Worker (see `wrangler.consumer.toml`) that hosts the primary `GenerationWorkflow` runtime. Pages calls that worker through a Service Binding (`WORKFLOW_SERVICE`) defined in `wrangler.toml`, which is the source of truth for the Pages deployment.
 
 ### Backend
 | Concern | Choice | Notes |
@@ -919,7 +919,14 @@ POST   /api/projects/:id/approve   → Send architecture approval event to activ
 
 Project generation now runs inside `GenerationWorkflow`, a Cloudflare Workflow class hosted in the standalone consumer worker.
 
-- **One workflow instance per run**: Each run uses `generation-${projectId}-${runId}` as the workflow instance ID and persists progress through D1 + R2.
+Architecture path:
+
+- Browser → Pages Functions (`wrangler.toml`)
+- Pages Functions → Service Binding `WORKFLOW_SERVICE` (`service = "scrimble-consumer"`)
+- Consumer Worker → Workflow binding `GENERATION_WORKFLOW`
+- Workflow executes `GenerationWorkflow`
+
+- **One workflow instance per run**: Each run uses `run_id` as the workflow instance ID and persists progress through D1 + R2.
 - **Per-step budgets and retries**: The pipeline is split across `step.do(...)` units so each step gets its own retry policy, timeout, and fresh subrequest budget.
 - **1MB step-state safe**: Large artifacts (Batch outputs, chunk store, architecture, plan) are written to R2 under `workflows/{projectId}/{runId}/*.json`; steps return only compact R2 keys.
 - **SSE-friendly**: Durable events are written to `project_generation_events`, and `/api/projects/:id/generation-stream` replays history + polls D1 to keep the SPA live while workflow steps run in the background worker.
@@ -1108,7 +1115,7 @@ The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoi
 
 Every generation run now records a `run_id` on the project before work starts. The API also logs a `generation_dispatches` entry before dispatching either to Workflows, Durable Objects, or queue fallback; if dispatch fails the API rolls back status so no ghost `queued` state sticks around. Queue fallback still processes exactly one batch per invocation and refuses stale payloads whose `run_id` no longer matches the active run.
 
-Workflow dispatch now uses `run_id` as the workflow instance ID and persists it in `projects.workflow_instance_id`. Approval requests (`POST /api/projects/:id/approve`) resolve that instance and call `instance.sendEvent({ type: 'architecture-approved', payload })`, which immediately resumes the paused `step.waitForEvent(...)` gate.
+Workflow dispatch now uses `run_id` as the workflow instance ID and persists it in `projects.workflow_instance_id`. Pages Functions do not call the workflow binding directly; they call `env.WORKFLOW_SERVICE`. The consumer worker entrypoint then creates instances and sends approval events (`architecture-approved`), which immediately resume the paused `step.waitForEvent(...)` gate.
 
 The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, chunk stores, partial responses—into the Cloudflare R2 bucket named `scrimble`. Workflow steps return R2 keys so each step payload stays comfortably under Cloudflare’s 1MB state cap.
 

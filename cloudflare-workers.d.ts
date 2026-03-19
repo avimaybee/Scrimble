@@ -1,4 +1,10 @@
 declare module 'cloudflare:workers' {
+  export class WorkerEntrypoint<Env = unknown> {
+    protected readonly env: Env;
+    protected readonly ctx: { waitUntil(promise: Promise<unknown>): void };
+    fetch(request: Request): Response | Promise<Response>;
+  }
+
   export type WorkflowBackoff = 'constant' | 'linear' | 'exponential';
 
   export type WorkflowStepConfig = {

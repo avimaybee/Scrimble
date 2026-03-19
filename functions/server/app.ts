@@ -1942,14 +1942,11 @@ app.post('/projects/:id/cancel', async (c) => {
     }
   }
 
-  if (generationBackend === 'workflow' && c.env.GENERATION_WORKFLOW && project.generation_run_id) {
+  if (generationBackend === 'workflow' && c.env.WORKFLOW_SERVICE && project.generation_run_id) {
     try {
       const workflowInstanceId = (project.workflow_instance_id as string | null)
         || workflowInstanceIdFor(projectId, project.generation_run_id as string);
-      const instance = await c.env.GENERATION_WORKFLOW.get(
-        workflowInstanceId,
-      );
-      await instance.terminate();
+      await c.env.WORKFLOW_SERVICE.cancelGeneration(workflowInstanceId);
     } catch (error) {
       console.warn('[CANCEL] Workflow terminate failed, falling back to D1-only cancel.', {
         projectId,

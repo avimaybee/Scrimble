@@ -21,11 +21,9 @@ PROJECT_GENERATION_RUNTIME = "workflow"
 binding = "AGENT_QUEUE"
 queue = "scrimble"
 
-[[workflows]]
-name = "scrimble-generation"
-binding = "GENERATION_WORKFLOW"
-class_name = "GenerationWorkflow"
-script_name = "scrimble-consumer"
+[[services]]
+binding = "WORKFLOW_SERVICE"
+service = "scrimble-consumer"
 
 [[durable_objects.bindings]]
 name = "PROJECT_GENERATOR"

@@ -1,6 +1,7 @@
 import { getProvider } from './ai';
 import type {
   Bindings,
+  GenerationWorkflowPayload,
   ProjectGenerationBackend,
   ProjectGenerationStatus,
   QueueMessageBody,
@@ -45,17 +46,6 @@ type StoredIntakeAnswerEntry = {
 
 type StoredIntakeAnswersPayload = {
   answers: StoredIntakeAnswerEntry[];
-};
-
-type WorkflowGenerationPayload = {
-  projectId: string;
-  userId: string;
-  runId: string;
-  description: string;
-  intakeAnswers: Record<string, string>;
-  fastProvider: ResolvedGenerationProviderConfig;
-  deepProvider: ResolvedGenerationProviderConfig;
-  stackTechnologies: Array<{ name: string; docsUrl?: string; githubRepo?: string }>;
 };
 
 function durableObjectDispatchPathForKind(kind: GenerationDispatchKind) {
@@ -192,7 +182,7 @@ async function resolveProvidersForWorkflow(
 async function buildWorkflowPayload(
   env: Bindings,
   payload: DispatchPayload,
-): Promise<WorkflowGenerationPayload> {
+): Promise<GenerationWorkflowPayload> {
   const project = await loadProjectDispatchContext(env, payload.projectId, payload.userId);
   const providers = await resolveProvidersForWorkflow(env, payload.userId, payload.providerId);
   return {
@@ -250,7 +240,7 @@ export function resolveProjectGenerationBackend(request: Request, env: Pick<Bind
 }
 
 export function hasProjectGenerationBackendBinding(
-  env: Pick<Bindings, 'AGENT_QUEUE' | 'PROJECT_GENERATOR' | 'GENERATION_WORKFLOW'>,
+  env: Pick<Bindings, 'AGENT_QUEUE' | 'PROJECT_GENERATOR' | 'WORKFLOW_SERVICE'>,
   backend: ProjectGenerationBackend,
 ) {
   if (backend === 'durable_object') {
@@ -258,7 +248,7 @@ export function hasProjectGenerationBackendBinding(
   }
 
   if (backend === 'workflow') {
-    return !!env.GENERATION_WORKFLOW;
+    return !!env.WORKFLOW_SERVICE;
   }
 
   return !!env.AGENT_QUEUE;
@@ -278,7 +268,7 @@ async function readDurableObjectDispatchError(response: Response) {
 }
 
 export async function sendWorkflowDispatchEvent(
-  env: Pick<Bindings, 'GENERATION_WORKFLOW'>,
+  env: Pick<Bindings, 'WORKFLOW_SERVICE'>,
   payload: {
     projectId?: string;
     runId?: string;
@@ -287,7 +277,7 @@ export async function sendWorkflowDispatchEvent(
     eventPayload?: unknown;
   },
 ) {
-  if (!env.GENERATION_WORKFLOW) {
+  if (!env.WORKFLOW_SERVICE) {
     throw new Error('Project generation workflow is not configured.');
   }
 
@@ -297,10 +287,20 @@ export async function sendWorkflowDispatchEvent(
     throw new Error('Workflow instance ID is required to send workflow events.');
   }
 
-  const instance = await env.GENERATION_WORKFLOW.get(instanceId);
-  await instance.sendEvent({
-    type: payload.eventType,
-    payload: payload.eventPayload,
+  if (payload.eventType !== WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED) {
+    throw new Error(`Unsupported workflow event type: ${payload.eventType}`);
+  }
+
+  const approvalPayload = (payload.eventPayload || {}) as {
+    feedback?: string;
+    preferredIde?: string;
+    approved?: boolean;
+  };
+
+  await env.WORKFLOW_SERVICE.sendApproval(instanceId, {
+    feedback: approvalPayload.feedback || '',
+    preferredIde: approvalPayload.preferredIde || '',
+    approved: approvalPayload.approved ?? true,
   });
 }
 
@@ -340,7 +340,7 @@ export async function sendGenerationDispatch(
 
   try {
     if (backend === 'workflow') {
-      if (!env.GENERATION_WORKFLOW) {
+      if (!env.WORKFLOW_SERVICE) {
         throw new Error('Project generation workflow is not configured.');
       }
 
@@ -361,18 +361,14 @@ export async function sendGenerationDispatch(
         );
       } else {
         const workflowPayload = await buildWorkflowPayload(env, payload);
-        const workflowCreateId = payload.workflowInstanceId?.trim() || workflowInstanceIdFor(payload.projectId, payload.runId);
-        const instance = await env.GENERATION_WORKFLOW.create({
-          id: workflowCreateId,
-          params: workflowPayload,
-        });
+        const instance = await env.WORKFLOW_SERVICE.createGeneration(workflowPayload);
         await env.DB.prepare(`
           UPDATE projects
           SET workflow_instance_id = ?,
               updated_at = datetime("now")
           WHERE id = ?
         `)
-          .bind(instance.id, payload.projectId)
+          .bind(instance.instanceId, payload.projectId)
           .run();
       }
     } else if (backend === 'durable_object') {
