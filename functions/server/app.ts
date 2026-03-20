@@ -708,15 +708,30 @@ app.use('*', async (c, next) => {
     return jsonError('Missing or invalid Authorization header', 401);
   }
 
+  const firebaseProjectId = optionalText(c.env.FIREBASE_PROJECT_ID) || 'scrimble-auth';
+  if (!optionalText(c.env.FIREBASE_PROJECT_ID)) {
+    console.warn('[auth-config-fallback]', { key: 'FIREBASE_PROJECT_ID', using: firebaseProjectId });
+  }
+
+  let uid: string;
   try {
-    const uid = await verifyFirebaseToken(authHeader.slice(7), c.env.FIREBASE_PROJECT_ID);
-    c.set('uid', uid);
-    await ensureProfile(c, uid);
-    await next();
+    uid = await verifyFirebaseToken(authHeader.slice(7), firebaseProjectId);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Authentication failed';
     return jsonError(`Auth failed: ${message}`, 401);
   }
+
+  c.set('uid', uid);
+
+  try {
+    await ensureProfile(c, uid);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Profile initialization failed';
+    console.error('[auth-profile-sync-failed]', { uid, message });
+    return jsonError(`Failed to initialize your profile: ${message}`, 500);
+  }
+
+  await next();
 });
 
 app.get('/ai/providers', async (c) => {

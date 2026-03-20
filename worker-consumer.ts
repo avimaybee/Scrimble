@@ -1,4 +1,4 @@
-import { WorkerEntrypoint, DurableObject } from 'cloudflare:workers';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import { GenerationWorkflow } from './functions/server/generation-workflow';
 import { WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED } from './functions/server/generation-dispatch';
 import type {
@@ -8,16 +8,6 @@ import type {
 } from './functions/server/types';
 
 export { GenerationWorkflow };
-
-export class ProjectGeneratorDO extends DurableObject {
-  constructor(state: unknown, env: Bindings) {
-    super(state as any, env);
-  }
-
-  async fetch() {
-    return new Response(null, { status: 404 });
-  }
-}
 
 export default class WorkflowService extends WorkerEntrypoint<Bindings> {
   async fetch() {
