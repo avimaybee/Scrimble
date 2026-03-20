@@ -217,9 +217,8 @@ function shouldReplayPersistedEvent(event: PersistedGenerationEvent, replayConte
   );
 }
 
-// In-memory live listeners removed: the pipeline runs in a separate Worker
-// (scrimble-consumer / Durable Object) so in-memory pub/sub never reaches
-// the Pages SSE endpoint.  All event delivery now goes through D1 polling.
+// In-memory listeners are runtime-local only. Pages SSE delivery is driven by
+// persisted D1 events because generation runs in a separate worker runtime.
 
 function formatSseEvent(event: LiveGenerationEventEnvelope) {
   const idLine = event.id === null ? '' : `id: ${event.id}\n`;
@@ -258,25 +257,6 @@ export async function appendGenerationThinkingDelta(
   // No-op: thinking deltas are no longer persisted to D1.
 }
 
-type Subscriber = (projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) => void;
-const subscribers = new Set<Subscriber>();
-
-export function subscribeToGenerationEvents(fn: Subscriber) {
-  subscribers.add(fn);
-  return () => subscribers.delete(fn);
-}
-
-function publish(projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) {
-  console.log(`[GENERATION_EVENTS] Publishing to ${subscribers.size} subscriber(s): type=${eventEnvelope.event.type}, projectId=${projectId}`);
-  for (const sub of subscribers) {
-    try {
-      sub(projectId, eventEnvelope);
-    } catch (e) {
-      console.error('[GENERATION_EVENTS] Error in subscriber', e);
-    }
-  }
-}
-
 export async function persistGenerationStreamEvent(
   env: Bindings,
   payload: {
@@ -297,17 +277,13 @@ export async function persistGenerationStreamEvent(
     )
     .run();
 
-  const persisted = {
+  return {
     id: asNumber(result.meta?.last_row_id),
     projectId: payload.projectId,
     batchName: payload.batchName || null,
     createdAt: new Date().toISOString(),
     event: payload.event,
   } satisfies PersistedGenerationEvent;
-  
-  publish(payload.projectId, persisted);
-
-  return persisted;
 }
 
 export function emitTransientGenerationStreamEvent(payload: {
@@ -316,7 +292,6 @@ export function emitTransientGenerationStreamEvent(payload: {
   event: Extract<GenerationStreamEvent, { type: 'thinking' }>;
 }) {
   console.log(`[GENERATION_EVENTS] Emitting thinking event for ${payload.projectId}: ${payload.event.content.slice(0, 100)}...`);
-  publish(payload.projectId, { id: null, event: payload.event });
 }
 
 export function createThrottledThinkingEmitter(

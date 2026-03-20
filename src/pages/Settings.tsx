@@ -506,7 +506,6 @@ export default function Settings() {
         apiKey,
         model: model || undefined,
         baseUrl: form.provider === 'custom' ? baseUrl : undefined,
-        isDefault: providers.length === 0,
       });
 
       await loadProviders(true);
@@ -947,11 +946,6 @@ export default function Settings() {
                       <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
                         {providerLabels[provider.provider]}
                       </h3>
-                      {provider.is_default ? (
-                        <span className="rounded-[6px] border border-accent-border bg-accent-primary-muted px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-accent-primary">
-                          Default
-                        </span>
-                      ) : null}
                     </div>
                     <p className="mb-3 text-sm text-text-secondary">{getProviderSummary(provider)}</p>
 

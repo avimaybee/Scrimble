@@ -133,7 +133,7 @@ export default function DetailPanel({
     try {
       const providerList = await getAIProviders();
       setProviders(providerList);
-      const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
+      const defaultProvider = providerList[0];
       setSelectedProviderId((current) => {
         if (current && providerList.some((provider) => provider.id === current)) {
           return current;

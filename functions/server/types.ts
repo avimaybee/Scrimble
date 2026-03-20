@@ -32,8 +32,6 @@ export const GENERATION_BATCHES = [
 
 export type GenerationBatchName = (typeof GENERATION_BATCHES)[number];
 
-
-
 export type ProjectGenerationStatus =
   | GenerationBatchName
   | 'intake'
@@ -43,21 +41,6 @@ export type ProjectGenerationStatus =
   | 'complete'
   | 'failed'
   | 'cancelled';
-
-export type ProjectGenerationBackend = 'queue' | 'workflow' | 'durable_object';
-
-export type DurableObjectIdLike = {
-  toString(): string;
-};
-
-export type DurableObjectStubLike = {
-  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
-};
-
-export type DurableObjectNamespaceLike = {
-  idFromName(name: string): DurableObjectIdLike;
-  get(id: DurableObjectIdLike): DurableObjectStubLike;
-};
 
 export type WorkflowInstanceStatus =
   | 'queued'
@@ -113,36 +96,11 @@ export type WorkflowServiceBindingLike = {
   getStatus(instanceId: string): Promise<{ status: string; output: unknown }>;
 };
 
-export type DurableObjectStorageLike = {
-  get<T = unknown>(key: string): Promise<T | undefined>;
-  put<T = unknown>(key: string, value: T): Promise<void>;
-  delete(key: string): Promise<void>;
-  getAlarm(): Promise<number | null>;
-  setAlarm(scheduledTimeMs: number): Promise<void> | void;
-  deleteAlarm(): Promise<void> | void;
-};
-
-export type DurableObjectAlarmInfoLike = {
-  retryCount?: number;
-  isRetry?: boolean;
-};
-
-export type DurableObjectStateLike = {
-  waitUntil(promise: Promise<unknown>): void;
-  blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
-  storage: DurableObjectStorageLike;
-};
-
 export type Bindings = {
   DB: any;
   ENVIRONMENT: string;
   FIREBASE_PROJECT_ID: string;
   ENCRYPTION_KEY: string;
-  PROJECT_GENERATION_RUNTIME?: string;
-  AGENT_QUEUE?: {
-    send(body: unknown, options?: { contentType?: 'json' | 'text' | 'bytes' | 'v8'; delaySeconds?: number }): Promise<void>;
-  };
-  PROJECT_GENERATOR?: DurableObjectNamespaceLike;
   WORKFLOW_SERVICE?: WorkflowServiceBindingLike;
   GENERATION_WORKFLOW?: WorkflowBindingLike<GenerationWorkflowPayload>;
   CHECKPOINT_BUCKET: {
@@ -187,27 +145,3 @@ export type AppEnv = {
 };
 
 export type AppContext = Context<AppEnv>;
-
-export type QueueExecutionContext = {
-  waitUntil(promise: Promise<unknown>): void;
-};
-
-export type QueueMessageBody = {
-  type: 'generate_project';
-  projectId: string;
-  userId: string;
-  providerId?: string;
-  runId?: string;
-};
-
-export type QueueMessage<T = QueueMessageBody> = {
-  id: string;
-  body: T;
-  attempts: number;
-  ack(): void;
-  retry(options?: { delaySeconds?: number }): void;
-};
-
-export type QueueMessageBatch<T = QueueMessageBody> = {
-  messages: readonly QueueMessage<T>[];
-};

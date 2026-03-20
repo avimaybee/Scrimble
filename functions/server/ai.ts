@@ -5,7 +5,7 @@ type StreamCallbacks = {
   onReasoningDelta?: (delta: string) => void;
 };
 
-export type ModelRole = 'fast' | 'deep' | 'default';
+export type ModelRole = 'fast' | 'deep';
 
 export type ResolvedProvider = {
   providerId: string;
@@ -37,6 +37,18 @@ type ProviderRoleSlot = {
   modelName: string | null;
 };
 
+function roleSlotColumns(role: ModelRole) {
+  return role === 'fast'
+    ? {
+        providerColumn: 'fast_model_provider_id',
+        modelColumn: 'fast_model_name',
+      }
+    : {
+        providerColumn: 'deep_model_provider_id',
+        modelColumn: 'deep_model_name',
+      };
+}
+
 function optionalTrimmedText(value: unknown): string | null {
   if (typeof value !== 'string') {
     return null;
@@ -58,10 +70,24 @@ async function loadProviderRowById(env: Bindings, userId: string, providerId: st
 
 async function loadDefaultProviderRow(env: Bindings, userId: string) {
   return env.DB.prepare(
-    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC LIMIT 1',
+    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY created_at ASC LIMIT 1',
   )
     .bind(userId)
     .first() as Promise<ProviderRow | null>;
+}
+
+async function loadFirstProviderModelName(env: Bindings, providerId: string) {
+  const row = await env.DB.prepare(`
+    SELECT name
+    FROM ai_models
+    WHERE provider_id = ?
+    ORDER BY created_at ASC
+    LIMIT 1
+  `)
+    .bind(providerId)
+    .first() as { name?: string | null } | null;
+
+  return optionalTrimmedText(row?.name);
 }
 
 async function loadResolvedProviderFromRow(
@@ -74,8 +100,9 @@ async function loadResolvedProviderFromRow(
   const apiKey = await decrypt(row.api_key_enc, env.ENCRYPTION_KEY);
   const overrideModel = optionalTrimmedText(modelOverride);
   const storedModel = optionalTrimmedText(row.model);
-  const fallbackModel = role === 'default' ? defaultModelForProvider(providerType) : null;
-  const resolvedModel = overrideModel || storedModel || fallbackModel;
+  const firstProviderModel = await loadFirstProviderModelName(env, row.id);
+  const fallbackModel = defaultModelForProvider(providerType);
+  const resolvedModel = overrideModel || storedModel || firstProviderModel || fallbackModel;
 
   if (!resolvedModel) {
     throw new Error(`No model configured for role: ${role}. Please set your models in Settings.`);
@@ -117,6 +144,19 @@ async function loadProfileRoleSlots(env: Bindings, userId: string) {
   };
 }
 
+async function clearRoleSlot(env: Bindings, userId: string, role: ModelRole) {
+  const { providerColumn, modelColumn } = roleSlotColumns(role);
+  await env.DB.prepare(`
+    UPDATE profiles
+    SET ${providerColumn} = NULL,
+        ${modelColumn} = NULL,
+        updated_at = datetime("now")
+    WHERE id = ?
+  `)
+    .bind(userId)
+    .run();
+}
+
 export async function getProvider(
   env: Bindings,
   userId: string,
@@ -125,41 +165,50 @@ export async function getProvider(
     role?: ModelRole;
   } = {},
 ): Promise<ResolvedProvider | null> {
-  const role = options.role || 'default';
-  const defaultRow = options.providerId
+  const role = options.role || 'fast';
+  const fallbackRow = options.providerId
     ? await loadProviderRowById(env, userId, options.providerId)
     : await loadDefaultProviderRow(env, userId);
 
-  if (role === 'default') {
-    if (!defaultRow) {
-      return null;
-    }
-
-    return loadResolvedProviderFromRow(env, defaultRow, role);
-  }
-
   const slots = await loadProfileRoleSlots(env, userId);
   const roleSlot = role === 'fast' ? slots.fast : slots.deep;
-  const missingModelMessage = `No model configured for role: ${role}. Please set your models in Settings.`;
+  const fastSlot = slots.fast;
 
   if (roleSlot.providerId || roleSlot.modelName) {
     if (!isConfiguredRoleSlot(roleSlot)) {
-      throw new Error(missingModelMessage);
+      await clearRoleSlot(env, userId, role);
+      if (!fallbackRow) {
+        return null;
+      }
+      return loadResolvedProviderFromRow(env, fallbackRow, role);
     }
 
     const slotProviderRow = await loadProviderRowById(env, userId, roleSlot.providerId);
     if (!slotProviderRow) {
-      throw new Error(missingModelMessage);
+      await clearRoleSlot(env, userId, role);
+      if (!fallbackRow) {
+        return null;
+      }
+      return loadResolvedProviderFromRow(env, fallbackRow, role);
     }
 
     return loadResolvedProviderFromRow(env, slotProviderRow, role, roleSlot.modelName);
   }
 
-  if (!defaultRow) {
+  if (role === 'deep' && isConfiguredRoleSlot(fastSlot)) {
+    const fastProviderRow = await loadProviderRowById(env, userId, fastSlot.providerId);
+    if (!fastProviderRow) {
+      await clearRoleSlot(env, userId, 'fast');
+    } else {
+      return loadResolvedProviderFromRow(env, fastProviderRow, role, fastSlot.modelName);
+    }
+  }
+
+  if (!fallbackRow) {
     return null;
   }
 
-  return loadResolvedProviderFromRow(env, defaultRow, role);
+  return loadResolvedProviderFromRow(env, fallbackRow, role);
 }
 
 export function extractJSON(raw: string): string {

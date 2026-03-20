@@ -14,8 +14,6 @@ import {
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
 import {
-  hasProjectGenerationBackendBinding,
-  resolveProjectGenerationBackend,
   sendWorkflowDispatchEvent,
   sendGenerationDispatch,
   WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
@@ -73,7 +71,6 @@ import {
   type AppEnv,
   type Bindings,
   type GenerationBatchName,
-  type ProjectGenerationBackend,
   type ProjectGenerationStatus,
 } from './types';
 
@@ -105,7 +102,6 @@ const providerSchema = z.object({
   apiKey: z.string().trim().min(1),
   baseUrl: z.string().trim().optional(),
   model: z.string().trim().optional(),
-  isDefault: z.boolean().optional(),
 });
 
 const enrichSchema = z.object({
@@ -203,16 +199,9 @@ function jsonError(message: string, status: number, details?: unknown) {
   return Response.json(details ? { error: message, details } : { error: message }, { status });
 }
 
-function generationBackendConfigurationError(c: AppContext, backend: ProjectGenerationBackend) {
+function generationWorkflowConfigurationError(c: AppContext) {
   return c.json({
-    error:
-      backend === 'workflow'
-        ? 'Project generation workflow is not configured.'
-        :
-      backend === 'durable_object'
-        ? 'Project generation durable object is not configured.'
-        : 'Project generation queue is not configured.',
-    backend,
+    error: 'Project generation workflow is not configured.',
     envKeys: Object.keys(c.env || {}),
   }, 500);
 }
@@ -364,7 +353,6 @@ function mapProviderRow(row: any) {
     base_url: row.base_url || undefined,
     model: row.model || undefined,
     models: row.models || [],
-    is_default: toBoolean(row.is_default),
     masked_key: row.masked_key || undefined,
   };
 }
@@ -666,7 +654,7 @@ async function resolveProvider(c: AppContext, providerId?: string) {
   }
 
   return c.env.DB.prepare(
-    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC LIMIT 1'
+    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY created_at ASC LIMIT 1'
   )
     .bind(uid)
     .first();
@@ -675,7 +663,7 @@ async function resolveProvider(c: AppContext, providerId?: string) {
 async function resolveProviderContext(
   c: AppContext,
   providerId?: string,
-  role: 'fast' | 'deep' | 'default' = 'default',
+  role: 'fast' | 'deep' = 'fast',
 ) {
   return getProvider(c.env, c.get('uid'), { providerId, role });
 }
@@ -733,7 +721,7 @@ app.use('*', async (c, next) => {
 
 app.get('/ai/providers', async (c) => {
   const providers = await c.env.DB.prepare(
-    'SELECT id, name, provider, base_url, model, is_default, api_key_enc FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC'
+    'SELECT id, name, provider, base_url, model, api_key_enc FROM ai_providers WHERE user_id = ? ORDER BY created_at ASC'
   )
     .bind(c.get('uid'))
     .all();
@@ -781,7 +769,6 @@ app.post('/ai/providers', async (c) => {
   const { name, provider, apiKey } = parsed.data;
   const baseUrl = parsed.data.baseUrl?.trim() || null;
   const model = parsed.data.model?.trim() || defaultModelForProvider(provider);
-  const isDefault = parsed.data.isDefault ?? false;
 
   if (provider === 'custom' && !baseUrl) {
     return c.json({ error: 'A base URL is required for custom providers.' }, 400);
@@ -791,15 +778,11 @@ app.post('/ai/providers', async (c) => {
   const encryptedKey = await encrypt(apiKey, c.env.ENCRYPTION_KEY);
   const id = crypto.randomUUID();
 
-  if (isDefault) {
-    await c.env.DB.prepare('UPDATE ai_providers SET is_default = 0 WHERE user_id = ?').bind(c.get('uid')).run();
-  }
-
   const stmts = [
     c.env.DB.prepare(`
-      INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model, is_default)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model, isDefault ? 1 : 0)
+      INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model)
   ];
 
   if (model) {
@@ -870,7 +853,19 @@ app.delete('/ai/providers/:id', async (c) => {
     return c.json({ error: 'Provider not found' }, 404);
   }
 
-  await c.env.DB.prepare('DELETE FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, c.get('uid')).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`
+      UPDATE profiles
+      SET
+        fast_model_provider_id = CASE WHEN fast_model_provider_id = ? THEN NULL ELSE fast_model_provider_id END,
+        fast_model_name = CASE WHEN fast_model_provider_id = ? THEN NULL ELSE fast_model_name END,
+        deep_model_provider_id = CASE WHEN deep_model_provider_id = ? THEN NULL ELSE deep_model_provider_id END,
+        deep_model_name = CASE WHEN deep_model_provider_id = ? THEN NULL ELSE deep_model_name END,
+        updated_at = datetime("now")
+      WHERE id = ?
+    `).bind(providerId, providerId, providerId, providerId, c.get('uid')),
+    c.env.DB.prepare('DELETE FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, c.get('uid')),
+  ]);
   return c.json({ success: true });
 });
 
@@ -1226,9 +1221,8 @@ app.post('/intake/:id/confirm', async (c) => {
     return c.json({ error: 'This project has already moved past intake.' }, 409);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const parsed = intakeConfirmSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1301,7 +1295,7 @@ app.post('/intake/:id/confirm', async (c) => {
       kind: 'intake_confirm',
       previousStatus: 'intake',
       targetStatus: 'queued',
-    }, { backend: generationBackend });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
     await c.env.DB.prepare(`
@@ -1344,9 +1338,8 @@ app.post('/projects', async (c) => {
     return c.json({ error: 'A project description is required.', details: parsed.error.format() }, 400);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const providerRecord = await resolveProvider(c, parsed.data.providerId);
@@ -1393,7 +1386,7 @@ app.post('/projects', async (c) => {
       kind: 'direct_create',
       previousStatus: null,
       targetStatus: 'queued',
-    }, { backend: generationBackend });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
     await c.env.DB.prepare(`
@@ -1505,9 +1498,8 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const parsed = architectureReviewApprovalSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1524,16 +1516,14 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
   let providerId: string | undefined;
   const previousRunId = (project.generation_run_id as string | null) || null;
   const workflowInstanceId = (project.workflow_instance_id as string | null) || null;
-  const runId = generationBackend === 'workflow'
-    ? previousRunId
-    : crypto.randomUUID();
+  const runId = previousRunId;
   const generationGuardBindings = getProjectGenerationGuardBindings(project);
 
   if (!runId || !runId.trim()) {
     return c.json({ error: 'This generation run has no active run ID. Resume it and try approval again.' }, 409);
   }
 
-  if (generationBackend === 'workflow' && !((workflowInstanceId && workflowInstanceId.trim()) || runId.trim())) {
+  if (!((workflowInstanceId && workflowInstanceId.trim()) || runId.trim())) {
     return c.json({ error: 'Workflow instance ID is missing for this generation run.' }, 409);
   }
 
@@ -1566,33 +1556,19 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
       return c.json({ error: 'This review already changed. Reload to see the latest state.' }, 409);
     }
 
-    if (generationBackend === 'workflow') {
-      const resolvedWorkflowInstanceId = (workflowInstanceId && workflowInstanceId.trim())
-        ? workflowInstanceId
-        : workflowInstanceIdFor(projectId, runId);
+    const resolvedWorkflowInstanceId = (workflowInstanceId && workflowInstanceId.trim())
+      ? workflowInstanceId
+      : workflowInstanceIdFor(projectId, runId);
 
-      await sendWorkflowDispatchEvent(c.env, {
-        workflowInstanceId: resolvedWorkflowInstanceId,
-        eventType: WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
-        eventPayload: {
-          approved: true,
-          feedback,
-          preferredIde,
-        },
-      });
-    } else {
-      await sendGenerationDispatch(c.env, {
-        projectId,
-        userId: c.get('uid'),
-        providerId,
-        runId,
-        kind: 'architecture_approval',
-        previousStatus: 'awaiting_review',
-        targetStatus: 'approved',
-        reviewFeedback: feedback,
+    await sendWorkflowDispatchEvent(c.env, {
+      workflowInstanceId: resolvedWorkflowInstanceId,
+      eventType: WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+      eventPayload: {
+        approved: true,
+        feedback,
         preferredIde,
-      }, { backend: generationBackend });
-    }
+      },
+    });
 
     if (project.generation_run_id) {
       await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
@@ -1656,9 +1632,8 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const status = project.generation_status || 'queued';
@@ -1754,7 +1729,7 @@ app.post('/projects/:id/resume', async (c) => {
       kind: 'resume',
       previousStatus: status,
       targetStatus: resumeStatus,
-    }, { backend: generationBackend });
+    });
 
     if (project.generation_run_id) {
       await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
@@ -1802,9 +1777,8 @@ app.post('/projects/:id/nudge', async (c) => {
     return c.json({ error: 'Project not found' }, 404);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const status = project.generation_status || 'queued';
@@ -1886,7 +1860,7 @@ app.post('/projects/:id/nudge', async (c) => {
       kind: 'continuation',
       previousStatus: status,
       targetStatus,
-    }, { backend: generationBackend });
+    });
 
     return c.json({
       success: true,
@@ -1922,27 +1896,7 @@ app.post('/projects/:id/cancel', async (c) => {
     return c.json({ error: 'This project is still in intake and has not started generating yet.' }, 409);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-
-  // If using DO, tell it to cancel (clears alarms and resets pipeline chain)
-  if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
-    try {
-      const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
-      const stub = c.env.PROJECT_GENERATOR.get(objectId);
-      await stub.fetch('https://project-generator/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId }),
-      });
-    } catch (error) {
-      console.warn('[CANCEL] DO cancel call failed, falling back to D1-only cancel.', {
-        projectId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  if (generationBackend === 'workflow' && c.env.WORKFLOW_SERVICE && project.generation_run_id) {
+  if (c.env.WORKFLOW_SERVICE && project.generation_run_id) {
     try {
       const workflowInstanceId = (project.workflow_instance_id as string | null)
         || workflowInstanceIdFor(projectId, project.generation_run_id as string);
@@ -1995,49 +1949,6 @@ app.get('/projects/:id/generation-stream', async (c) => {
   }
 
   const lastEventId = asNumber(c.req.header('Last-Event-ID'), 0);
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  
-  // Try proxying to Durable Object if configured
-  if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
-    const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
-    const stub = c.env.PROJECT_GENERATOR.get(objectId);
-    const proxyUrl = 'http://do/stream?projectId=' + encodeURIComponent(projectId) + '&lastEventId=' + lastEventId;
-
-    const proxyHeaders = new Headers(c.req.raw.headers);
-    proxyHeaders.delete('host');
-    proxyHeaders.delete('cf-ray');
-    proxyHeaders.delete('cf-visitor');
-    proxyHeaders.delete('cf-connecting-ip');
-    proxyHeaders.delete('cf-ipcountry');
-    proxyHeaders.delete('x-forwarded-for');
-    proxyHeaders.delete('x-forwarded-proto');
-    proxyHeaders.delete('x-real-ip');
-
-    console.log(`[STREAM_PROXY] Proxying SSE request to Durable Object: ${proxyUrl}`);
-    const request = new Request(proxyUrl, {
-      method: 'GET',
-      headers: proxyHeaders,
-      signal: c.req.raw.signal,
-    });
-
-    try {
-      const resp = await stub.fetch(request);
-      console.log(`[STREAM_PROXY] DO response status: ${resp.status}, ok: ${resp.ok}`);
-      
-      if (resp.ok) {
-        console.log(`[STREAM_PROXY] Returning DO stream response for ${projectId}`);
-        return resp;
-      }
-      
-      if (resp.status === 404 || resp.status === 405) {
-        console.warn(`[STREAM_PROXY] DO returned ${resp.status}, falling back to local SSE.`);
-      } else {
-        console.warn(`[STREAM_PROXY] DO returned non-ok status ${resp.status}, falling back to local SSE.`);
-      }
-    } catch (error) {
-      console.error(`[STREAM_PROXY] DO proxy failed for ${projectId}, falling back to local SSE:`, error);
-    }
-  }
 
   const stream = createGenerationSseStream(c.env, {
     projectId,
@@ -2672,13 +2583,12 @@ app.post('/workflows/:id/update', async (c) => {
     return c.json({ error: 'Invalid workflow update payload', details: parsed.error.format() }, 400);
   }
 
-  const [defaultProviderContext, fastProviderContext, deepProviderContext] = await Promise.all([
-    resolveProviderContext(c, parsed.data.providerId, 'default'),
+  const [fastProviderContext, deepProviderContext] = await Promise.all([
     resolveProviderContext(c, parsed.data.providerId, 'fast'),
     resolveProviderContext(c, parsed.data.providerId, 'deep'),
   ]);
 
-  if (!defaultProviderContext || !fastProviderContext || !deepProviderContext) {
+  if (!fastProviderContext || !deepProviderContext) {
     return c.json({ error: 'You need to add an AI key first.' }, 400);
   }
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
@@ -2698,7 +2608,6 @@ app.post('/workflows/:id/update', async (c) => {
             stack: optionalText(workflowRecord.stack),
           },
           providers: {
-            default: defaultProviderContext,
             fast: fastProviderContext,
             deep: deepProviderContext,
           },
@@ -2995,7 +2904,7 @@ app.post('/ai/proxy', async (c) => {
 
   let providerContext;
   try {
-    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'default');
+    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'fast');
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'Failed to decrypt API key' }, 500);
   }
@@ -3023,7 +2932,7 @@ app.post('/ai/proxy', async (c) => {
       baseUrl,
       system: parsed.data.system || null,
       prompt: parsed.data.prompt,
-      role: 'default',
+      role: 'fast',
     });
 
     if (!response.ok) {

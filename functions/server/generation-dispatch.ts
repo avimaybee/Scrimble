@@ -2,9 +2,7 @@ import { getProvider } from './ai';
 import type {
   Bindings,
   GenerationWorkflowPayload,
-  ProjectGenerationBackend,
   ProjectGenerationStatus,
-  QueueMessageBody,
   ResolvedGenerationProviderConfig,
 } from './types';
 
@@ -24,9 +22,8 @@ type DispatchPayload = {
   runId: string;
   workflowInstanceId?: string;
   kind: GenerationDispatchKind;
-  previousStatus?: string | null;
+  previousStatus?: ProjectGenerationStatus | null;
   targetStatus: ProjectGenerationStatus;
-  delaySeconds?: number;
   reviewFeedback?: string;
   preferredIde?: string;
 };
@@ -47,20 +44,6 @@ type StoredIntakeAnswerEntry = {
 type StoredIntakeAnswersPayload = {
   answers: StoredIntakeAnswerEntry[];
 };
-
-function durableObjectDispatchPathForKind(kind: GenerationDispatchKind) {
-  switch (kind) {
-    case 'direct_create':
-    case 'intake_confirm':
-      return '/start';
-    case 'architecture_approval':
-      return '/approve';
-    case 'resume':
-      return '/resume';
-    case 'continuation':
-      return '/nudge';
-  }
-}
 
 export function workflowInstanceIdFor(projectId: string, runId: string) {
   void projectId;
@@ -197,76 +180,6 @@ async function buildWorkflowPayload(
   };
 }
 
-export function normalizeProjectGenerationBackend(value: unknown): ProjectGenerationBackend {
-  if (typeof value !== 'string') {
-    return 'workflow';
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (normalized === 'workflow' || normalized === 'workflows' || normalized === 'wf') {
-    return 'workflow';
-  }
-
-  if (normalized === 'durable_object' || normalized === 'durable-object' || normalized === 'do') {
-    return 'durable_object';
-  }
-
-  return 'queue';
-}
-
-export function resolveProjectGenerationBackend(request: Request, env: Pick<Bindings, 'PROJECT_GENERATION_RUNTIME'>) {
-  const params = new URL(request.url).searchParams;
-
-  const workflowOverride = params.get('useWorkflow');
-  if (workflowOverride === '1' || workflowOverride === 'true') {
-    return 'workflow' as const;
-  }
-
-  const queueOverride = params.get('useQueue');
-  if (queueOverride === '1' || queueOverride === 'true') {
-    return 'queue' as const;
-  }
-
-  const doOverride = params.get('useDO');
-  if (doOverride === '1' || doOverride === 'true') {
-    return 'durable_object' as const;
-  }
-
-  if (doOverride === '0' || doOverride === 'false') {
-    return 'workflow' as const;
-  }
-
-  return normalizeProjectGenerationBackend(env.PROJECT_GENERATION_RUNTIME);
-}
-
-export function hasProjectGenerationBackendBinding(
-  env: Pick<Bindings, 'AGENT_QUEUE' | 'PROJECT_GENERATOR' | 'WORKFLOW_SERVICE'>,
-  backend: ProjectGenerationBackend,
-) {
-  if (backend === 'durable_object') {
-    return !!env.PROJECT_GENERATOR;
-  }
-
-  if (backend === 'workflow') {
-    return !!env.WORKFLOW_SERVICE;
-  }
-
-  return !!env.AGENT_QUEUE;
-}
-
-async function readDurableObjectDispatchError(response: Response) {
-  try {
-    const payload = await response.json() as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.trim()) {
-      return payload.error.trim();
-    }
-  } catch {
-    // Fall through to the generic message.
-  }
-
-  return 'Failed to start project generation.';
-}
-
 export async function sendWorkflowDispatchEvent(
   env: Pick<Bindings, 'WORKFLOW_SERVICE'>,
   payload: {
@@ -307,127 +220,37 @@ export async function sendWorkflowDispatchEvent(
 export async function sendGenerationDispatch(
   env: Bindings,
   payload: DispatchPayload,
-  options?: {
-    backend?: ProjectGenerationBackend;
-  },
 ) {
-  const backend = options?.backend || 'queue';
-
-  const dispatchId = crypto.randomUUID();
-  const queueBody: QueueMessageBody = {
-    type: 'generate_project' as const,
-    projectId: payload.projectId,
-    userId: payload.userId,
-    providerId: payload.providerId,
-    runId: payload.runId,
-  };
-
-  await env.DB.prepare(`
-    INSERT INTO generation_dispatches (
-      id, project_id, run_id, dispatch_kind, previous_status, target_status, queue_body, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-  `)
-    .bind(
-      dispatchId,
-      payload.projectId,
-      payload.runId,
-      payload.kind,
-      payload.previousStatus || null,
-      payload.targetStatus,
-      JSON.stringify(queueBody),
-    )
-    .run();
-
-  try {
-    if (backend === 'workflow') {
-      if (!env.WORKFLOW_SERVICE) {
-        throw new Error('Project generation workflow is not configured.');
-      }
-
-      if (payload.kind === 'architecture_approval') {
-        await sendWorkflowDispatchEvent(
-          env,
-          {
-            projectId: payload.projectId,
-            runId: payload.runId,
-            workflowInstanceId: payload.workflowInstanceId,
-            eventType: WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
-            eventPayload: {
-              approved: true,
-              feedback: payload.reviewFeedback || '',
-              preferredIde: payload.preferredIde || '',
-            },
-          },
-        );
-      } else {
-        const workflowPayload = await buildWorkflowPayload(env, payload);
-        const instance = await env.WORKFLOW_SERVICE.createGeneration(workflowPayload);
-        await env.DB.prepare(`
-          UPDATE projects
-          SET workflow_instance_id = ?,
-              updated_at = datetime("now")
-          WHERE id = ?
-        `)
-          .bind(instance.instanceId, payload.projectId)
-          .run();
-      }
-    } else if (backend === 'durable_object') {
-      if (!env.PROJECT_GENERATOR) {
-        throw new Error('Project generation durable object is not configured.');
-      }
-
-      const objectId = env.PROJECT_GENERATOR.idFromName(payload.projectId);
-      const stub = env.PROJECT_GENERATOR.get(objectId);
-      const response = await stub.fetch(`https://project-generator${durableObjectDispatchPathForKind(payload.kind)}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...queueBody,
-          kind: payload.kind,
-          previousStatus: payload.previousStatus || null,
-          targetStatus: payload.targetStatus,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(await readDurableObjectDispatchError(response));
-      }
-    } else {
-      if (!env.AGENT_QUEUE) {
-        throw new Error('Project generation queue is not configured.');
-      }
-
-      await env.AGENT_QUEUE.send(
-        queueBody,
-        payload.delaySeconds ? { delaySeconds: payload.delaySeconds } : undefined,
-      );
-    }
-
-    await env.DB.prepare(`
-      UPDATE generation_dispatches
-      SET status = 'sent',
-          updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(dispatchId)
-      .run();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to enqueue project generation.';
-
-    await env.DB.prepare(`
-      UPDATE generation_dispatches
-      SET status = 'failed',
-          last_error = ?,
-          updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(message, dispatchId)
-      .run();
-
-    throw error;
+  if (!env.WORKFLOW_SERVICE) {
+    throw new Error('Project generation workflow is not configured.');
   }
 
-  return dispatchId;
+  if (payload.kind === 'architecture_approval') {
+    await sendWorkflowDispatchEvent(env, {
+      projectId: payload.projectId,
+      runId: payload.runId,
+      workflowInstanceId: payload.workflowInstanceId,
+      eventType: WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+      eventPayload: {
+        approved: true,
+        feedback: payload.reviewFeedback || '',
+        preferredIde: payload.preferredIde || '',
+      },
+    });
+    return payload.workflowInstanceId || workflowInstanceIdFor(payload.projectId, payload.runId);
+  }
+
+  const workflowPayload = await buildWorkflowPayload(env, payload);
+  const instance = await env.WORKFLOW_SERVICE.createGeneration(workflowPayload);
+
+  await env.DB.prepare(`
+    UPDATE projects
+    SET workflow_instance_id = ?,
+        updated_at = datetime("now")
+    WHERE id = ?
+  `)
+    .bind(instance.instanceId, payload.projectId)
+    .run();
+
+  return instance.instanceId;
 }

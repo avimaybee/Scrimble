@@ -198,7 +198,7 @@ export default function NewProject() {
         setSelectedProviderId(null);
         setSelectedModelName(null);
       } else {
-        const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
+        const defaultProvider = providerList[0];
         if (defaultProvider) {
           setSelectedProviderId(defaultProvider.id);
           setSelectedModelName(null);

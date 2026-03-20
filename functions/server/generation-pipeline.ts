@@ -23,9 +23,6 @@ import {
   type GenerationBatchName,
   type ProjectGenerationStatus,
   type ProviderType,
-  type QueueExecutionContext,
-  type QueueMessageBatch,
-  type QueueMessageBody,
 } from './types';
 import {
   createThrottledThinkingEmitter,
@@ -41,7 +38,6 @@ import {
   containsStreamTransportMarkers,
   extractJSON,
   getProvider,
-  PipelineQuotaExceededError,
   RetryableAIError,
 } from './ai';
 import {
@@ -50,7 +46,6 @@ import {
   loadJsonPayloadText,
   storeJsonPayload,
 } from './checkpoint-storage';
-import { sendGenerationDispatch } from './generation-dispatch';
 
 
 import { extractGitHubRepository } from '../utils/fetch-url';
@@ -334,7 +329,6 @@ const ACTIVE_GENERATION_HEARTBEAT_STATUSES = Array.from(ACTIVE_GENERATION_STATUS
 
 export const GENERATION_STALE_MS = 15 * 60 * 1000;
 export const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
-export const MAX_PROJECT_GENERATION_RETRY_ATTEMPTS = 3;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
@@ -2835,23 +2829,6 @@ async function callAITextWithHeartbeat(
   }
 }
 
-function emitThinking(env: Bindings, projectId: string, batchName: GenerationBatchName, content: string) {
-  // Provided for backwards compatibility or single-shot emits.
-  const trimmed = content.trim();
-  if (!trimmed) {
-    return;
-  }
-
-  emitTransientGenerationStreamEvent({
-    projectId,
-    batchName,
-    event: {
-      type: 'thinking',
-      content,
-    },
-  });
-}
-
 async function loadBatchRunRecord(env: Bindings, projectId: string, runType: GenerationBatchName) {
   const record = await env.DB.prepare(`
     SELECT id, input, output, output_r2_key
@@ -3761,7 +3738,6 @@ export async function executeBatch2(
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
-  continuationMode: GenerationContinuationMode = 'queue',
   checkpointItemInterval = GENERATION_CHECKPOINT_ITEM_INTERVAL,
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
@@ -5210,353 +5186,3 @@ export async function resolvePipelineStatusToRun(
   return 'complete';
 }
 
-async function enqueueProjectGeneration(
-  env: Bindings,
-  payload: {
-    projectId: string;
-    userId: string;
-    providerId: string;
-    runId: string;
-    targetStatus: ProjectGenerationStatus;
-    delaySeconds?: number;
-  },
-) {
-  if (!env.AGENT_QUEUE) {
-    throw new GenerationPipelineError('Project generation queue is not configured.');
-  }
-
-  await sendGenerationDispatch(env, {
-    projectId: payload.projectId,
-    userId: payload.userId,
-    providerId: payload.providerId,
-    runId: payload.runId,
-    kind: 'continuation',
-    previousStatus: payload.targetStatus,
-    targetStatus: payload.targetStatus,
-    delaySeconds: payload.delaySeconds,
-  });
-}
-
-const PIPELINE_VERSION = '1.2.0-heartbeat-safe';
-const INLINE_GENERATION_TURN_LIMIT = 256;
-
-type GenerationContinuationMode = 'queue' | 'inline';
-
-type ProcessProjectGenerationOptions = {
-  continuationMode?: GenerationContinuationMode;
-  maxInlineTurns?: number;
-};
-
-async function processProjectGenerationTurn(
-  env: Bindings,
-  message: QueueMessageBody,
-  continuationMode: GenerationContinuationMode,
-) {
-  const timestamp = new Date().toISOString();
-  console.log(`[PIPELINE_TRACE] ${timestamp} processProjectGenerationTurn started for project: ${message.projectId}, runId: ${message.runId}`);
-  const project = await getProjectById(env, message.projectId);
-  if (!project) {
-    throw new GenerationPipelineError('The queued project no longer exists.');
-  }
-
-  if (message.runId && project.generation_run_id && message.runId !== project.generation_run_id) {
-    console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: runId mismatch. Message runId=${message.runId}, Project runId=${project.generation_run_id}`);
-    return false;
-  }
-
-  const currentStatus = (project.generation_status || 'queued') as ProjectGenerationStatus;
-  console.log(`[PIPELINE_TRACE] ${timestamp} currentStatus: ${currentStatus}`);
-  
-  if (
-    currentStatus === 'complete'
-    || currentStatus === 'failed'
-    || currentStatus === 'awaiting_review'
-    || currentStatus === 'cancelled'
-  ) {
-    console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: currentStatus ${currentStatus} is terminal or awaiting review`);
-    return false;
-  }
-
-  const completed = await getCompletedBatches(message.projectId, env);
-  console.log(`[PIPELINE_TRACE] ${timestamp} completed batches: ${completed.join(', ')}`);
-
-  if (message.providerId && project.generation_provider_id && message.providerId !== project.generation_provider_id) {
-    throw new GenerationPipelineError('Queued generation provider does not match the project’s pinned provider.');
-  }
-
-  const pinnedProviderId = message.providerId || project.generation_provider_id;
-  if (!pinnedProviderId) {
-    throw new GenerationPipelineError(
-      'The original AI provider for this generation run is missing. Start a new generation with an explicit provider.',
-    );
-  }
-
-  const fastProvider = await resolveProviderConfiguration(
-    env,
-    project.id,
-    message.userId,
-    'fast',
-    pinnedProviderId,
-  );
-  const deepProvider = await resolveProviderConfiguration(
-    env,
-    project.id,
-    message.userId,
-    'deep',
-    pinnedProviderId,
-  );
-  const activeRunId = project.generation_run_id || message.runId || crypto.randomUUID();
-  const statusToRun = await resolvePipelineStatusToRun(env, project.id, currentStatus, completed);
-  console.log(`[PIPELINE_TRACE] ${timestamp} activeRunId: ${activeRunId}, statusToRun: ${statusToRun}`);
-
-  const primingChanges = await updateProjectGenerationStatus(env, project.id, currentStatus, {
-    generationError: null,
-    markStarted: true,
-    clearCompletedAt: true,
-    touchHeartbeat: true,
-    generationRunId: activeRunId,
-    generationProviderId: pinnedProviderId,
-    expectedRunId: activeRunId,
-  });
-  if (primingChanges === 0) {
-    console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: failed to prime project status update`);
-    return false;
-  }
-
-  if (statusToRun === 'queued' && !completed.includes('batch_1_research_stack')) {
-    const queuedChanges = await updateProjectGenerationStatus(env, project.id, 'queued', {
-      generationError: null,
-      markStarted: true,
-      clearCompletedAt: true,
-      touchHeartbeat: true,
-      generationRunId: activeRunId,
-      generationProviderId: pinnedProviderId,
-      expectedRunId: activeRunId,
-    });
-    if (queuedChanges === 0) {
-      console.log(`[PIPELINE_TRACE] ${timestamp} ABORT: failed to update project status to 'queued'`);
-      return false;
-    }
-    await logActivity(env, {
-      projectId: project.id,
-      batchName: 'batch_1_research_stack',
-      kind: 'system',
-      message: 'Agent picked up your brief and is starting the research sequence.',
-    });
-  }
-
-  const builderProfile = await loadBuilderProfileContext(message.userId, env);
-  const projectBrief = await loadProjectBriefContext(env, message.projectId, message.userId, {
-    rawDescription: project.description || '',
-    projectStack: project.stack,
-    existingTools: builderProfile.declaredTools.map((tool) => tool.name),
-  });
-
-  console.log(`[PIPELINE_TRACE] ${timestamp} Executing turn for status: ${statusToRun}`);
-  switch (statusToRun) {
-    case 'intake':
-      return false;
-    case 'queued':
-      if (!completed.includes('batch_1_research_stack')) {
-        await executeBatch1(env, project, fastProvider, activeRunId, builderProfile, projectBrief);
-        if (continuationMode === 'queue') {
-          await enqueueProjectGeneration(env, {
-            projectId: project.id,
-            userId: message.userId,
-            providerId: pinnedProviderId,
-            runId: activeRunId,
-            targetStatus: 'queued',
-          });
-        }
-        return true;
-      }
-      return false;
-    case 'batch_1_research_stack':
-      if (!completed.includes('batch_2_fetch_and_read')) {
-        await executeBatch2(env, project, fastProvider, deepProvider, activeRunId, builderProfile, projectBrief, continuationMode);
-        if (continuationMode === 'queue') {
-          await enqueueProjectGeneration(env, {
-            projectId: project.id,
-            userId: message.userId,
-            providerId: pinnedProviderId,
-            runId: activeRunId,
-            targetStatus: 'batch_1_research_stack',
-          });
-        }
-        return true;
-      }
-      return false;
-    case 'batch_2_fetch_and_read':
-      if (!completed.includes('batch_3_architect')) {
-        await executeBatch3(env, project.id, activeRunId, deepProvider, project, builderProfile, projectBrief);
-      }
-      await pauseForArchitectureReview(env, project.id, activeRunId);
-      return false;
-    case 'batch_3_architect':
-      await pauseForArchitectureReview(env, project.id, activeRunId);
-      return false;
-    case 'approved':
-      if (!completed.includes('batch_4_plan_build')) {
-        await executeBatch4(env, project.id, activeRunId, deepProvider, builderProfile, projectBrief);
-        if (continuationMode === 'queue') {
-          await enqueueProjectGeneration(env, {
-            projectId: project.id,
-            userId: message.userId,
-            providerId: pinnedProviderId,
-            runId: activeRunId,
-            targetStatus: 'approved',
-          });
-        }
-        return true;
-      }
-      return false;
-    case 'batch_4_plan_build':
-      if (!completed.includes('batch_5_enrich_steps')) {
-        await executeBatch5(env, project.id, deepProvider, activeRunId, builderProfile, projectBrief);
-        if (continuationMode === 'queue') {
-          await enqueueProjectGeneration(env, {
-            projectId: project.id,
-            userId: message.userId,
-            providerId: pinnedProviderId,
-            runId: activeRunId,
-            targetStatus: 'batch_4_plan_build',
-          });
-        }
-        return true;
-      }
-      return false;
-    case 'batch_5_enrich_steps':
-      if (!completed.includes('batch_6_generate_files')) {
-        await executeBatch6(env, project.id, activeRunId, deepProvider, builderProfile, projectBrief);
-      }
-      await finalizeProjectGeneration(env, project.id, activeRunId);
-      return false;
-    case 'batch_6_generate_files':
-      await finalizeProjectGeneration(env, project.id, activeRunId);
-      return false;
-    default:
-      return false;
-  }
-}
-
-export async function processProjectGeneration(
-  env: Bindings,
-  message: QueueMessageBody,
-  options: ProcessProjectGenerationOptions = {},
-) {
-  const continuationMode = options.continuationMode || 'queue';
-  const maxInlineTurns = options.maxInlineTurns || INLINE_GENERATION_TURN_LIMIT;
-
-  try {
-    if (continuationMode === 'inline') {
-      let turnCount = 0;
-      while (turnCount < maxInlineTurns) {
-        turnCount += 1;
-        const shouldContinue = await processProjectGenerationTurn(env, message, continuationMode);
-        if (!shouldContinue) {
-          return;
-        }
-      }
-
-      throw new GenerationPipelineError(
-        'Project generation exceeded the Durable Object turn limit. Resume to continue from the latest checkpoint.',
-      );
-    }
-
-    await processProjectGenerationTurn(env, message, continuationMode);
-  } catch (error) {
-    if (error instanceof RetryableGenerationPipelineError) {
-      throw error;
-    }
-
-    if (error instanceof GenerationPipelineError && error.alreadyPersisted) {
-      throw error;
-    }
-
-    // Convert quota/runtime-limit errors into retryable errors so the DO
-    // can checkpoint and resume instead of killing the whole pipeline.
-    if (error instanceof PipelineQuotaExceededError) {
-      throw new RetryableGenerationPipelineError(error.message, 30);
-    }
-
-    const messageText =
-      error instanceof Error ? error.message : 'Project generation failed before the pipeline could finish.';
-
-    await updateProjectGenerationStatus(env, message.projectId, 'failed', {
-      generationError: messageText,
-      markStarted: true,
-      markCompleted: true,
-      touchHeartbeat: true,
-    });
-    await insertGenerationEvent(env, {
-      projectId: message.projectId,
-      eventType: 'generation_failed',
-      body: {
-        error: messageText,
-        generation_status: 'failed',
-        project_id: message.projectId,
-      },
-    });
-
-    throw new GenerationPipelineError(messageText, true);
-  }
-}
-
-export async function handleProjectGenerationQueue(
-  batch: QueueMessageBatch,
-  env: Bindings,
-  ctx: QueueExecutionContext,
-) {
-  for (const message of batch.messages) {
-    if (message.body?.type !== 'generate_project') {
-      message.ack();
-      continue;
-    }
-
-    try {
-      const job = processProjectGeneration(env, message.body);
-      ctx.waitUntil(job);
-      await job;
-      message.ack();
-    } catch (error) {
-      const projectId = message.body.projectId;
-      const fallbackMessage =
-        error instanceof Error ? error.message : 'Project generation failed unexpectedly.';
-
-      if (error instanceof RetryableGenerationPipelineError && message.attempts < MAX_PROJECT_GENERATION_RETRY_ATTEMPTS) {
-        if (projectId) {
-          await touchGenerationHeartbeat(env, projectId, message.body.runId || null);
-        }
-
-        console.warn(`Retrying project ${projectId} after transient failure: ${fallbackMessage}`);
-        message.retry({ delaySeconds: error.delaySeconds });
-        continue;
-      }
-
-      if (error instanceof GenerationPipelineError && error.alreadyPersisted) {
-        message.ack();
-        continue;
-      }
-
-      if (projectId) {
-        await updateProjectGenerationStatus(env, projectId, 'failed', {
-          generationError: fallbackMessage,
-          markStarted: true,
-          markCompleted: true,
-          touchHeartbeat: true,
-        });
-        await insertGenerationEvent(env, {
-          projectId,
-          eventType: 'generation_failed',
-          body: {
-            error: fallbackMessage,
-            generation_status: 'failed',
-            project_id: projectId,
-          },
-        });
-      }
-
-      message.ack();
-    }
-  }
-}

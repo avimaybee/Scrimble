@@ -429,7 +429,6 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
                 runId,
                 builderProfile,
                 projectBrief,
-                'inline',
                 WORKFLOW_BATCH2_CHECKPOINT_INTERVAL,
               );
 

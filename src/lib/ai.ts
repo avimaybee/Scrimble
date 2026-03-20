@@ -17,7 +17,6 @@ export interface AIProvider {
   base_url?: string;
   model?: string; // deprecated, keeping for backward compatibility in some views if needed
   models: AIModel[];
-  is_default: boolean;
   masked_key?: string;
 }
 
@@ -90,7 +89,6 @@ export async function saveAIProvider(data: {
   apiKey: string;
   baseUrl?: string;
   model?: string;
-  isDefault?: boolean;
 }) {
   const user = auth.currentUser;
   if (!user) throw new Error('User not authenticated');

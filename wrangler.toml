@@ -15,17 +15,7 @@ bucket_name = "scrimble"
 [vars]
 ENVIRONMENT = "production"
 FIREBASE_PROJECT_ID = "scrimble-auth"
-PROJECT_GENERATION_RUNTIME = "workflow"
-
-[[queues.producers]]
-binding = "AGENT_QUEUE"
-queue = "scrimble"
 
 [[services]]
 binding = "WORKFLOW_SERVICE"
 service = "scrimble-consumer"
-
-[[durable_objects.bindings]]
-name = "PROJECT_GENERATOR"
-class_name = "ProjectGeneratorDO"
-script_name = "scrimble-consumer"

@@ -19,30 +19,18 @@ bucket_name = "scrimble"
 ENVIRONMENT = "production"
 FIREBASE_PROJECT_ID = "scrimble-auth"
 
-[[durable_objects.bindings]]
-name = "PROJECT_GENERATOR"
-class_name = "ProjectGeneratorDO"
-
 [[workflows]]
 name = "scrimble-generation"
 binding = "GENERATION_WORKFLOW"
 class_name = "GenerationWorkflow"
 
-[[queues.producers]]
-binding = "AGENT_QUEUE"
-queue = "scrimble"
-
-[[queues.consumers]]
-queue = "scrimble"
-max_batch_size = 1
-max_batch_timeout = 60
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProjectGeneratorDO"]
 
-[limits]
-subrequests = 1000
+[[migrations]]
+tag = "workflow-only-cleanup-20260320"
+deleted_classes = ["ProjectGeneratorDO"]
 
 [observability]
 enabled = true

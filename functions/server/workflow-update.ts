@@ -39,7 +39,6 @@ type WorkflowUpdateProviderContext = {
 };
 
 type WorkflowUpdateProviders = {
-  default: WorkflowUpdateProviderContext;
   fast: WorkflowUpdateProviderContext;
   deep: WorkflowUpdateProviderContext;
 };
