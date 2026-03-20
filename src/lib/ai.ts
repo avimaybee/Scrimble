@@ -255,8 +255,8 @@ export async function callAIProxy(params: {
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ error: "Your AI provider isn't responding. Try again shortly." }));
-    const message = err.error || "Your AI provider isn't responding. Try again shortly.";
+    const err = await response.json().catch(() => ({ message: "Your AI provider isn't responding. Try again shortly." }));
+    const message = err.message || err.error || "Your AI provider isn't responding. Try again shortly.";
     toast.error(message);
     throw new Error(message);
   }

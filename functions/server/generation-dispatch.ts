@@ -4,6 +4,7 @@ import type {
   GenerationWorkflowPayload,
   ProjectGenerationStatus,
   ResolvedGenerationProviderConfig,
+  WorkflowApprovalPayload,
 } from './types';
 
 export type GenerationDispatchKind =
@@ -48,6 +49,129 @@ type StoredIntakeAnswersPayload = {
 export function workflowInstanceIdFor(projectId: string, runId: string) {
   void projectId;
   return runId;
+}
+
+type WorkflowServiceFetchBinding = {
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+};
+
+function hasMethod<T extends string>(
+  value: unknown,
+  methodName: T,
+): value is Record<T, (...args: unknown[]) => unknown> {
+  return typeof value === 'object'
+    && value !== null
+    && typeof (value as Record<string, unknown>)[methodName] === 'function';
+}
+
+function hasFetchBinding(value: unknown): value is WorkflowServiceFetchBinding {
+  return hasMethod(value, 'fetch');
+}
+
+function requireWorkflowService(env: Pick<Bindings, 'WORKFLOW_SERVICE'>) {
+  const service = env.WORKFLOW_SERVICE as unknown;
+  if (!service) {
+    throw new Error('Project generation workflow is not configured.');
+  }
+  return service;
+}
+
+async function callWorkflowServiceViaFetch<TResponse = Record<string, unknown>>(
+  service: WorkflowServiceFetchBinding,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<TResponse> {
+  const response = await service.fetch(`https://workflow.internal${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { error?: string; message?: string };
+    throw new Error(payload.message || payload.error || `Workflow service call failed (${response.status}).`);
+  }
+
+  if (response.status === 204) {
+    return {} as TResponse;
+  }
+
+  return response.json() as Promise<TResponse>;
+}
+
+async function createWorkflowGeneration(
+  env: Pick<Bindings, 'WORKFLOW_SERVICE'>,
+  workflowPayload: GenerationWorkflowPayload,
+) {
+  const service = requireWorkflowService(env);
+  if (hasMethod(service, 'createGeneration')) {
+    const result = await service.createGeneration(workflowPayload) as { instanceId: string };
+    if (!result?.instanceId) {
+      throw new Error('Workflow createGeneration returned no instance ID.');
+    }
+    return result;
+  }
+
+  if (hasFetchBinding(service)) {
+    return callWorkflowServiceViaFetch<{ instanceId: string }>(service, '/generation/create', {
+      payload: workflowPayload,
+    });
+  }
+
+  throw new Error('Workflow service binding does not support generation dispatch.');
+}
+
+async function sendWorkflowApproval(
+  env: Pick<Bindings, 'WORKFLOW_SERVICE'>,
+  instanceId: string,
+  approvalPayload: WorkflowApprovalPayload,
+) {
+  const service = requireWorkflowService(env);
+  if (hasMethod(service, 'sendApproval')) {
+    await service.sendApproval(instanceId, approvalPayload);
+    return;
+  }
+
+  if (hasFetchBinding(service)) {
+    await callWorkflowServiceViaFetch(service, '/generation/approve', {
+      instanceId,
+      approvalPayload,
+    });
+    return;
+  }
+
+  throw new Error('Workflow service binding does not support approval events.');
+}
+
+export async function cancelWorkflowGeneration(
+  env: Pick<Bindings, 'WORKFLOW_SERVICE'>,
+  payload: {
+    projectId?: string;
+    runId?: string;
+    workflowInstanceId?: string;
+  },
+) {
+  const service = requireWorkflowService(env);
+  const instanceId = payload.workflowInstanceId?.trim()
+    || (payload.runId ? workflowInstanceIdFor(payload.projectId || '', payload.runId) : '');
+
+  if (!instanceId) {
+    throw new Error('Workflow instance ID is required to cancel generation.');
+  }
+
+  if (hasMethod(service, 'cancelGeneration')) {
+    await service.cancelGeneration(instanceId);
+    return;
+  }
+
+  if (hasFetchBinding(service)) {
+    await callWorkflowServiceViaFetch(service, '/generation/cancel', { instanceId });
+    return;
+  }
+
+  throw new Error('Workflow service binding does not support cancellation.');
 }
 
 function normalizeProviderForWorkflow(provider: {
@@ -190,9 +314,7 @@ export async function sendWorkflowDispatchEvent(
     eventPayload?: unknown;
   },
 ) {
-  if (!env.WORKFLOW_SERVICE) {
-    throw new Error('Project generation workflow is not configured.');
-  }
+  requireWorkflowService(env);
 
   const instanceId = payload.workflowInstanceId?.trim()
     || (payload.runId ? workflowInstanceIdFor(payload.projectId || '', payload.runId) : '');
@@ -210,7 +332,7 @@ export async function sendWorkflowDispatchEvent(
     approved?: boolean;
   };
 
-  await env.WORKFLOW_SERVICE.sendApproval(instanceId, {
+  await sendWorkflowApproval(env, instanceId, {
     feedback: approvalPayload.feedback || '',
     preferredIde: approvalPayload.preferredIde || '',
     approved: approvalPayload.approved ?? true,
@@ -221,9 +343,7 @@ export async function sendGenerationDispatch(
   env: Bindings,
   payload: DispatchPayload,
 ) {
-  if (!env.WORKFLOW_SERVICE) {
-    throw new Error('Project generation workflow is not configured.');
-  }
+  requireWorkflowService(env);
 
   if (payload.kind === 'architecture_approval') {
     await sendWorkflowDispatchEvent(env, {
@@ -241,7 +361,7 @@ export async function sendGenerationDispatch(
   }
 
   const workflowPayload = await buildWorkflowPayload(env, payload);
-  const instance = await env.WORKFLOW_SERVICE.createGeneration(workflowPayload);
+  const instance = await createWorkflowGeneration(env, workflowPayload);
 
   await env.DB.prepare(`
     UPDATE projects

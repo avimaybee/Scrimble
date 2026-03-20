@@ -318,7 +318,7 @@ export function defaultModelForProvider(provider: ProviderType): string {
     case 'gemini':
       return 'gemini-2.0-flash';
     case 'openrouter':
-      return 'anthropic/claude-3.5-sonnet';
+      return 'openrouter/auto';
     case 'groq':
       return 'llama-3.3-70b-versatile';
     case 'custom':
@@ -858,10 +858,24 @@ async function readAIErrorPayload(response: Response) {
   const clone = response.clone();
 
   try {
-    const parsed = await clone.json() as { error?: string; message?: string };
+    const parsed = await clone.json() as {
+      error?: string | { message?: string; code?: string };
+      message?: string;
+      detail?: string;
+    };
+    const nestedError = typeof parsed.error === 'object' && parsed.error !== null
+      ? parsed.error
+      : null;
+    const message = parsed.message
+      || nestedError?.message
+      || parsed.detail
+      || undefined;
+    const errorCode = typeof parsed.error === 'string'
+      ? parsed.error
+      : nestedError?.code;
     return {
-      error: parsed.error,
-      message: parsed.message,
+      error: errorCode,
+      message,
       rawText: '',
     };
   } catch {
@@ -1027,6 +1041,21 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
 
       if (isRuntimeBudgetError(diagnosticText)) {
         return createAIErrorResponse(503, PIPELINE_QUOTA_EXCEEDED, RUNTIME_BUDGET_MESSAGE);
+      }
+
+      if (response.status >= 400 && response.status < 500) {
+        const fallbackClientError = response.status === 402
+          ? 'Your AI provider requires billing/credits before requests can run.'
+          : response.status === 403
+            ? 'Your AI provider denied this request. Verify model permissions and account access.'
+            : response.status === 404
+              ? 'Selected model was not found on your AI provider. Choose another model in Settings.'
+              : 'Your AI provider rejected this request. Check model name and provider settings.';
+        return createAIErrorResponse(
+          response.status,
+          errorPayload.error || 'provider_request_error',
+          errorPayload.message || fallbackClientError,
+        );
       }
 
       if (attempt < maxRetries && (response.status >= 500 || response.status === 0 || response.status === 408)) {

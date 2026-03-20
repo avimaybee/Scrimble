@@ -14,6 +14,7 @@ import {
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
 import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
 import {
+  cancelWorkflowGeneration,
   sendWorkflowDispatchEvent,
   sendGenerationDispatch,
   WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
@@ -1913,9 +1914,11 @@ app.post('/projects/:id/cancel', async (c) => {
 
   if (c.env.WORKFLOW_SERVICE && project.generation_run_id) {
     try {
-      const workflowInstanceId = (project.workflow_instance_id as string | null)
-        || workflowInstanceIdFor(projectId, project.generation_run_id as string);
-      await c.env.WORKFLOW_SERVICE.cancelGeneration(workflowInstanceId);
+      await cancelWorkflowGeneration(c.env, {
+        projectId,
+        runId: project.generation_run_id as string,
+        workflowInstanceId: (project.workflow_instance_id as string | null) || undefined,
+      });
     } catch (error) {
       console.warn('[CANCEL] Workflow terminate failed, falling back to D1-only cancel.', {
         projectId,
