@@ -715,7 +715,10 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
 
       state = await resolveCurrentStatusToRun(this.env, projectId);
 
-      if (state.statusToRun === 'batch_6_generate_files') {
+      if (
+        state.statusToRun === 'batch_6_generate_files'
+        || (state.statusToRun === 'complete' && state.currentStatus !== 'complete')
+      ) {
         await step.do('finalise', async () => {
           await assertActiveRun(this.env, projectId, runId);
           await finalizeProjectGeneration(this.env, projectId, runId);

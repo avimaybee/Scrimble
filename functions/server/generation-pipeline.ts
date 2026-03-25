@@ -293,7 +293,6 @@ type Batch2CheckpointData = {
   researchSourceLedger?: Batch2FetchAndRead['sources'];
   issuesFound: number;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
-  subrequestCounter: number;
   totalCandidateTargets?: number;
 };
 
@@ -305,7 +304,6 @@ type Batch5ResearchStep = Pick<
 type Batch5CheckpointData = {
   steps: Batch5ResearchStep[];
   stepResearchContexts: StepResearchContext[];
-  subrequestCounter: number;
 };
 
 type GenerationCheckpointRecord = {
@@ -3773,9 +3771,8 @@ export async function executeBatch2(
   let issuesFound = checkpoint?.data.issuesFound ?? 0;
   const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
-  // IMPORTANT: Each workflow step is a fresh worker invocation with a reset subrequest budget.
-  // We don't restore the old counter from checkpoint - it would cause immediate budget exhaustion
-  // on resume and create an infinite checkpoint loop.
+  // IMPORTANT: Checkpoints store durable logical progress (index + fetched data), not transient
+  // per-invocation counters. A resumed workflow step starts with a fresh subrequest budget.
   let subrequestCounter = 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
   let processedThisInvocation = 0;
@@ -3854,7 +3851,6 @@ export async function executeBatch2(
         researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
         issuesFound,
         partialFailures,
-        subrequestCounter,
         totalCandidateTargets,
         collectedSources,
       });
@@ -4115,7 +4111,6 @@ export async function executeBatch2(
         researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
         issuesFound,
         partialFailures,
-        subrequestCounter,
         totalCandidateTargets,
         collectedSources,
       });
@@ -4693,8 +4688,8 @@ export async function executeBatch5(
     ? [...checkpoint.data.stepResearchContexts]
     : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
-  // Each workflow step is a fresh worker invocation - reset counter to avoid
-  // immediate budget exhaustion on resume.
+  // Keep only durable logical progress in checkpoints; this per-invocation counter must
+  // reset on resume so checkpointed iterations can advance safely.
   let subrequestCounter = 0;
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
@@ -4774,7 +4769,6 @@ export async function executeBatch5(
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
         steps: planSteps,
         stepResearchContexts,
-        subrequestCounter,
       });
       await logActivity(env, {
         projectId,
