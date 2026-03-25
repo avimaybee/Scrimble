@@ -3773,10 +3773,14 @@ export async function executeBatch2(
   let issuesFound = checkpoint?.data.issuesFound ?? 0;
   const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
   const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
-  let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
+  // IMPORTANT: Each workflow step is a fresh worker invocation with a reset subrequest budget.
+  // We don't restore the old counter from checkpoint - it would cause immediate budget exhaustion
+  // on resume and create an infinite checkpoint loop.
+  let subrequestCounter = 0;
   const startIndex = checkpoint?.currentIndex ?? 0;
+  let processedThisInvocation = 0;
   const subrequestTracker = createResearchSubrequestTracker({
-    initialCount: subrequestCounter,
+    initialCount: 0,
     limit: maxSubrequestBudget,
   });
   const researchService = createResearchService({
@@ -3840,8 +3844,10 @@ export async function executeBatch2(
           : `Researching ${technology.name} with every source you've connected...`,
     });
 
-    // Check budget before starting research for this technology
-    if (subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE) {
+    // Check budget before starting research for this technology.
+    // This guard prevents runaway fetching if something goes wrong with tracking.
+    // With proper counter reset on resume, this should rarely trigger.
+    if (processedThisInvocation > 0 && subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index, {
         researchTargets,
         fetchedSources,
@@ -3856,7 +3862,7 @@ export async function executeBatch2(
         projectId,
         batchName: 'batch_2_fetch_and_read',
         kind: 'system',
-        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
+        message: `Approaching subrequest budget limit — saved checkpoint at technology ${index + 1} of ${researchTargets.length}. Resuming from the next workflow step...`,
       });
       return 'checkpointed';
     }
@@ -4092,6 +4098,8 @@ export async function executeBatch2(
       source_ledger: technologySources,
       community_pages: communityPages,
     });
+
+    processedThisInvocation += 1;
 
     const hasMoreWork = index + 1 < researchTargets.length;
     const processedCount = index + 1;
@@ -4685,7 +4693,9 @@ export async function executeBatch5(
     ? [...checkpoint.data.stepResearchContexts]
     : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
-  let subrequestCounter = checkpoint?.data.subrequestCounter ?? 0;
+  // Each workflow step is a fresh worker invocation - reset counter to avoid
+  // immediate budget exhaustion on resume.
+  let subrequestCounter = 0;
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
   await logActivity(env, {
