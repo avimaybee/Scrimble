@@ -79,7 +79,7 @@ CRITICAL INSTRUCTIONS based on this profile:
 - Never suggest alternatives to tools they already have — they have these, use them
 - For tools marked as "learning", add extra context and beginner gotchas
 - For tools marked as "expert", skip the basics and go straight to the advanced patterns
-- Use infrastructure preferences (${infra.slice(0, 4).map((tool) => tool.name).join(', ') || 'declared infra tools'}) to tailor step wording and generated files, but batch 2 research must follow inferred stack technologies only.
+- Research and step content MUST be tailored to their declared infrastructure (${infra.slice(0, 4).map((tool) => tool.name).join(', ') || 'declared infra tools'}) — these are hard inputs, not suggestions
 `.trim();
 }
 

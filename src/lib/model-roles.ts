@@ -44,7 +44,7 @@ export function hasConfiguredRole(providerId: string | null, modelName: string |
 }
 
 export function resolveModelRoleDisplay(providers: AIProvider[], modelRoles: AIModelRoles) {
-  const defaultProvider = providers.find((provider) => provider.is_default) || providers[0];
+  const defaultProvider = providers[0];
   if (!defaultProvider) {
     return {
       fast: DEFAULT_MODEL_LABEL,

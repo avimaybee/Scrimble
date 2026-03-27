@@ -2,7 +2,15 @@ import React, { useState, useRef, useEffect } from 'react';
 import { cn } from '../../lib/utils';
 import { AnimatePresence, motion } from 'framer-motion';
 
-const DropdownMenuContext = React.createContext<{ open: boolean, setOpen: (open: boolean) => void }>({ open: false, setOpen: () => {} });
+type DropdownMenuContextValue = {
+  open: boolean;
+  setOpen: (open: boolean) => void;
+};
+
+const DropdownMenuContext = React.createContext<DropdownMenuContextValue>({
+  open: false,
+  setOpen: () => {},
+});
 
 export function DropdownMenu({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -14,9 +22,9 @@ export function DropdownMenu({ children }: { children: React.ReactNode }) {
         setOpen(false);
       }
     }
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [ref]);
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   return (
     <DropdownMenuContext.Provider value={{ open, setOpen }}>
@@ -27,84 +35,134 @@ export function DropdownMenu({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function DropdownMenuTrigger({ children, className, onClick, asChild }: { children: React.ReactNode, className?: string, onClick?: (e: React.MouseEvent) => void, asChild?: boolean }) {
+type DropdownMenuTriggerProps = {
+  children: React.ReactNode;
+  className?: string;
+  onClick?: (event: React.MouseEvent) => void;
+  asChild?: boolean;
+};
+
+type TriggerChildProps = {
+  className?: string;
+  onClick?: (event: React.MouseEvent) => void;
+  'aria-haspopup'?: 'menu';
+  'aria-expanded'?: boolean;
+};
+
+export function DropdownMenuTrigger({
+  children,
+  className,
+  onClick,
+  asChild,
+}: DropdownMenuTriggerProps) {
   const { open, setOpen } = React.useContext(DropdownMenuContext);
-  
-  const handleClick = (e: React.MouseEvent) => {
-    onClick?.(e);
+
+  const handleClick = (event: React.MouseEvent) => {
+    onClick?.(event);
     setOpen(!open);
   };
 
   if (asChild && React.isValidElement(children)) {
-    return React.cloneElement(children as React.ReactElement<any>, {
-      className: cn(className, (children as React.ReactElement<any>).props.className),
-      onClick: (e: React.MouseEvent) => {
-        (children as React.ReactElement<any>).props.onClick?.(e);
-        handleClick(e);
-      }
+    const child = children as React.ReactElement<TriggerChildProps>;
+    return React.cloneElement(child, {
+      className: cn(className, child.props.className),
+      'aria-haspopup': 'menu',
+      'aria-expanded': open,
+      onClick: (event: React.MouseEvent) => {
+        child.props.onClick?.(event);
+        handleClick(event);
+      },
     });
   }
 
   return (
-    <div className={className} onClick={handleClick} role="button" tabIndex={0}>
+    <button
+      type="button"
+      className={className}
+      onClick={handleClick}
+      aria-haspopup="menu"
+      aria-expanded={open}
+    >
       {children}
-    </div>
+    </button>
   );
 }
 
-export function DropdownMenuContent({ children, className, align = 'start' }: { children: React.ReactNode, className?: string, align?: 'start' | 'end' }) {
+export function DropdownMenuContent({
+  children,
+  className,
+  align = 'start',
+}: {
+  children: React.ReactNode;
+  className?: string;
+  align?: 'start' | 'end';
+}) {
   const { open } = React.useContext(DropdownMenuContext);
 
   const alignClass = align === 'end' ? 'right-0' : 'left-0';
 
   return (
     <AnimatePresence>
-      {open && (
+      {open ? (
         <motion.div
           initial={{ opacity: 0, y: -5, scale: 0.95 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: -5, scale: 0.95 }}
           transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+          role="menu"
+          aria-orientation="vertical"
           className={cn(
-            "absolute z-50 mt-2 min-w-[180px] py-1.5 bg-bg-overlay border border-border-default rounded-[16px] shadow-panel focus:outline-none",
+            'absolute z-50 mt-2 min-w-[180px] rounded-[16px] border border-border-default bg-bg-overlay py-1.5 shadow-panel focus:outline-none',
             alignClass,
-            className
+            className,
           )}
         >
           {children}
         </motion.div>
-      )}
+      ) : null}
     </AnimatePresence>
   );
 }
 
-export function DropdownMenuLabel({ children, className }: { children: React.ReactNode, className?: string }) {
-  return <div className={cn("px-4 py-2 text-sm font-semibold text-text-primary", className)}>{children}</div>;
+export function DropdownMenuLabel({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return <div className={cn('px-4 py-2 text-sm font-semibold text-text-primary', className)}>{children}</div>;
 }
 
 export function DropdownMenuSeparator({ className }: { className?: string }) {
-  return <div className={cn("h-px bg-border-subtle my-1 mx-2", className)} />;
+  return <div className={cn('mx-2 my-1 h-px bg-border-subtle', className)} />;
 }
 
-export function DropdownMenuItem({ children, className, onClick }: { children: React.ReactNode, className?: string, onClick?: (e: React.MouseEvent) => void }) {
+export function DropdownMenuItem({
+  children,
+  className,
+  onClick,
+}: {
+  children: React.ReactNode;
+  className?: string;
+  onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
   const { setOpen } = React.useContext(DropdownMenuContext);
+
   return (
-    <div
-      className={cn("mx-2 flex cursor-pointer items-center rounded-[10px] px-4 py-2.5 text-sm text-text-secondary outline-none transition-colors hover:bg-bg-elevated hover:text-text-primary", className)}
-      onClick={(e) => {
-        onClick?.(e);
-        setOpen(false);
-      }}
+    <button
+      type="button"
       role="menuitem"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          onClick?.(e as any);
-          setOpen(false);
-        }
+      className={cn(
+        'mx-2 flex w-[calc(100%-1rem)] items-center rounded-[10px] px-4 py-2.5 text-sm text-text-secondary outline-none transition-colors hover:bg-bg-elevated hover:text-text-primary',
+        className,
+      )}
+      onClick={(event) => {
+        onClick?.(event);
+        setOpen(false);
       }}
     >
       {children}
-    </div>
+    </button>
   );
 }

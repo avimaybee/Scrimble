@@ -6,9 +6,9 @@ INSERT INTO profiles (id, name, email) VALUES
 ('user_456', 'Jane Smith', 'jane@example.com');
 
 -- 2. AI Providers
-INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, is_default) VALUES
-('provider_1', 'user_123', 'OpenAI Pro', 'openai', 'enc_key_abc', 1),
-('provider_2', 'user_123', 'Anthropic Key', 'anthropic', 'enc_key_def', 0);
+INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc) VALUES
+('provider_1', 'user_123', 'OpenAI Pro', 'openai', 'enc_key_abc'),
+('provider_2', 'user_123', 'Anthropic Key', 'anthropic', 'enc_key_def');
 
 -- 3. Projects
 INSERT INTO projects (id, user_id, name, description, project_type, status) VALUES

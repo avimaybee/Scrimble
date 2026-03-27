@@ -36,6 +36,12 @@ import {
   type AIProvider,
 } from '../lib/ai';
 import { resolveModelRoleDisplay } from '../lib/model-roles';
+import {
+  buildGenerationSessionViewModel,
+  GENERATION_BATCHES,
+  isGenerationBatchName,
+} from '../lib/generation-session';
+import { UI_COPY } from '../lib/ui-copy';
 import { cn } from '../lib/utils';
 import type {
   ArchitectureReviewResponse,
@@ -53,19 +59,7 @@ const MAX_VISIBLE_RESEARCH_SOURCES = 5;
 const RUNNER_WAITING_LABEL_THRESHOLD_MS = 60_000;
 const MANUAL_RUNNER_CHECK_THRESHOLD_MS = 10 * 60_000;
 const automaticRecoveryAttempts = new Set<string>();
-
-const generationBatches: Array<{
-  id: GenerationBatchName;
-  heading: string;
-  shortLabel: string;
-}> = [
-  { id: 'batch_1_research_stack', heading: 'Identifying your stack', shortLabel: 'Stack' },
-  { id: 'batch_2_fetch_and_read', heading: 'Reading the docs', shortLabel: 'Docs' },
-  { id: 'batch_3_architect', heading: "Planning how it's built", shortLabel: 'Build' },
-  { id: 'batch_4_plan_build', heading: 'Building your plan', shortLabel: 'Plan' },
-  { id: 'batch_5_enrich_steps', heading: 'Writing step details', shortLabel: 'Steps' },
-  { id: 'batch_6_generate_files', heading: 'Preparing your files', shortLabel: 'Files' },
-];
+const ACTIVE_GENERATION_STORAGE_KEY = 'scrimble_active_generation';
 
 type ActivityFeedItem = {
   key: string;
@@ -85,25 +79,6 @@ function formatFeedMessage(entry: ActivityFeedItem, options?: { prefixThinking?:
   }
 
   return entry.message;
-}
-
-function mergeCompletedEvents(
-  status: ProjectGenerationStatusResponse | null,
-  streamEvents: ProjectGenerationEvent[],
-): ProjectGenerationEvent[] {
-  const eventMap = new Map<GenerationBatchName, ProjectGenerationEvent>();
-
-  for (const event of status?.completed_batches || []) {
-    eventMap.set(event.batch, event);
-  }
-
-  for (const event of streamEvents) {
-    eventMap.set(event.batch, event);
-  }
-
-  return generationBatches
-    .map((batch) => eventMap.get(batch.id))
-    .filter((event): event is ProjectGenerationEvent => Boolean(event));
 }
 
 function formatTimestamp(value: string) {
@@ -205,26 +180,6 @@ function getConnectionMeta(
 }
 
 
-function isGenerationBatchName(value: string | null | undefined): value is GenerationBatchName {
-  return generationBatches.some((batch) => batch.id === value);
-}
-
-function isApprovedOrLaterStatus(status: ProjectGenerationStatusResponse | null | undefined) {
-  if (!status) {
-    return false;
-  }
-
-  if (status.generation_status === 'approved' || status.is_approved || status.is_complete) {
-    return true;
-  }
-
-  if (!isGenerationBatchName(status.generation_status)) {
-    return false;
-  }
-
-  return generationBatches.findIndex((batch) => batch.id === status.generation_status) >= 3;
-}
-
 function getActivityToneClass(icon: ActivityFeedItem['icon']) {
   switch (icon) {
     case '⚠️':
@@ -243,14 +198,14 @@ function getActivityToneClass(icon: ActivityFeedItem['icon']) {
 }
 
 function getPlaceholderMessage(status: ProjectGenerationStatusResponse | null, currentBatch: GenerationBatchName) {
-  switch (status?.generation_status) {
+  switch (status?.generation_runtime?.lifecycleStatus) {
+    case 'intake':
+      return 'Waiting for your intake confirmation...';
     case 'queued':
       return 'Waiting for the agent to pick up your brief...';
     case 'approved':
       return 'Review approved — queuing the next planning batch...';
-    case 'batch_4_plan_build':
-    case 'batch_5_enrich_steps':
-    case 'batch_6_generate_files':
+    case 'running':
       return `Continuing ${currentBatch.replace(/_/g, ' ')}...`;
     default:
       return 'Connecting to the live activity feed...';
@@ -514,7 +469,7 @@ export default function ProjectGeneration() {
       reviewDataRef.current = review;
       setReviewFeedback((previous) => (hasEditedReview ? previous : review.review_feedback));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load your review.');
+      setError(err instanceof Error ? err.message : UI_COPY.generation.reviewLoadFailed);
     } finally {
       setIsReviewLoading(false);
     }
@@ -532,47 +487,37 @@ export default function ProjectGeneration() {
     const currentStatus = statusRef.current;
     const currentReviewData = reviewDataRef.current;
 
-    console.log(`[FRONTEND_STATUS] syncProjectState: status=${statusData.generation_status}, is_review_required=${statusData.is_review_required}`);
-
     if (!projectData) {
       throw new Error('Project not found.');
     }
 
-    if (projectData.generation_status === 'intake') {
+    if (projectData.generation_runtime?.lifecycleStatus === 'intake') {
       navigate(`/new?intake=${id}`, { replace: true });
-      return;
-    }
-
-    const isFurtherThanReview = isApprovedOrLaterStatus(currentStatus);
-
-    if (statusData.generation_status === 'awaiting_review' && isFurtherThanReview) {
-      console.log(`[FRONTEND_STATUS] Ignoring status regression from ${currentStatus?.generation_status} to awaiting_review`);
-      setProject(projectData);
       return;
     }
 
     setProject(projectData);
     applyStatusUpdate(statusData);
-    noteProgressTimestamp(statusData.generation_heartbeat_at || projectData.generation_started_at || projectData.updated_at);
+    noteProgressTimestamp(statusData.generation_runtime?.heartbeatAt || projectData.updated_at);
 
-    setShowResumeBadge(statusData.can_resume && statusData.execution_stale);
+    setShowResumeBadge(statusData.generation_runtime?.canResume === true && statusData.execution_stale);
 
-    if (isGenerationBatchName(statusData.generation_status)) {
-      setActiveBatch(statusData.generation_status);
+    if (isGenerationBatchName(statusData.generation_runtime?.currentBatch)) {
+      setActiveBatch(statusData.generation_runtime.currentBatch);
     }
 
-    if (statusData.is_review_required && (!currentReviewData || currentReviewData.project_id !== id)) {
-      console.log(`[FRONTEND_STATUS] Loading review data because statusData.is_review_required is true`);
+    if ((statusData.generation_runtime?.isReviewRequired ?? false) && (!currentReviewData || currentReviewData.project_id !== id)) {
       void loadReviewData();
     }
 
-    if (statusData.is_failed && statusData.generation_error) {
+    const isFailed = statusData.generation_runtime?.lifecycleStatus === 'failed';
+    if (isFailed && statusData.generation_error) {
       setError(statusData.generation_error);
-    } else if (!statusData.is_failed) {
+    } else if (!isFailed) {
       setError('');
     }
 
-    if (statusData.is_complete) {
+    if (statusData.generation_runtime?.lifecycleStatus === 'complete') {
       scheduleProjectNavigation();
     }
   }, [applyStatusUpdate, id, loadReviewData, noteProgressTimestamp, scheduleProjectNavigation]);
@@ -633,12 +578,12 @@ export default function ProjectGeneration() {
       setIsModelModalOpen(false);
       toast.success(`Switched ${modalRoleType} model to ${modelName || 'default'}. Changes will apply to the next stage.`);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to switch model.');
+      toast.error(err instanceof Error ? err.message : UI_COPY.generation.switchModelFailed);
     }
   }, [modalRoleType, modelRoles, providers]);
 
   useEffect(() => {
-    if (status?.is_complete) {
+    if (status?.generation_runtime?.lifecycleStatus === 'complete') {
       return;
     }
 
@@ -647,7 +592,7 @@ export default function ProjectGeneration() {
     }, 1_000);
 
     return () => window.clearInterval(intervalId);
-  }, [status?.is_complete]);
+  }, [status?.generation_runtime?.lifecycleStatus]);
 
   useEffect(() => {
     if (!generationPreparation) {
@@ -685,7 +630,7 @@ export default function ProjectGeneration() {
           return;
         }
 
-        setError(err instanceof Error ? err.message : 'Failed to load generation status.');
+      setError(err instanceof Error ? err.message : UI_COPY.generation.loadFailed);
       })
       .finally(() => {
         if (isMounted) {
@@ -704,7 +649,7 @@ export default function ProjectGeneration() {
           return;
         }
 
-        setError(err instanceof Error ? err.message : 'Failed to refresh generation status.');
+        setError(err instanceof Error ? err.message : UI_COPY.generation.loadFailed);
       });
     }, 3000);
 
@@ -725,7 +670,6 @@ export default function ProjectGeneration() {
       .streamProjectGeneration(id, {
         signal: controller.signal,
         onBatchStart: (event) => {
-          console.log(`[SSE_EVENT] onBatchStart: ${event.batch}`);
           replaceCurrentActivity(null);
           setActiveBatch(event.batch);
           setError('');
@@ -735,7 +679,16 @@ export default function ProjectGeneration() {
             previous
               ? {
                   ...previous,
-                  generation_status: event.batch,
+                  generation_runtime: previous.generation_runtime
+                    ? {
+                      ...previous.generation_runtime,
+                      lifecycleStatus: 'running',
+                      currentBatch: event.batch,
+                      isTerminal: false,
+                      isReviewRequired: false,
+                      failureClass: null,
+                    }
+                    : previous.generation_runtime,
                   is_review_required: false,
                   is_approved: false,
                   is_failed: false,
@@ -760,12 +713,10 @@ export default function ProjectGeneration() {
           });
         },
         onThinking: (event: ProjectGenerationThinking) => {
-          console.log(`[SSE_EVENT] onThinking received: ${event.content.slice(0, 100)}...`);
           noteProgressTimestamp(event.timestamp);
           appendThinkingActivity(event.content, event.timestamp);
         },
         onBatchCompleted: (event) => {
-          console.log(`[SSE_EVENT] onBatchCompleted: ${event.batch}`);
           noteProgressTimestamp(event.completed_at || new Date().toISOString());
           setStreamEvents((previous) => {
             const next = previous.filter((item) => item.batch !== event.batch);
@@ -776,17 +727,12 @@ export default function ProjectGeneration() {
         onCheckpoint: (event: ProjectGenerationCheckpointEvent) => {
           const currentStatus = statusRef.current;
           if (!currentStatus) {
-            console.log('[SSE_EVENT] onCheckpoint ignored before status bootstrap completed');
             return;
           }
 
-          const currentRunId = currentStatus?.generation_run_id || null;
+          const currentRunId = currentStatus?.generation_runtime?.runId || null;
           const isStaleRun = Boolean(event.run_id && currentRunId && event.run_id !== currentRunId);
-          const shouldIgnore = isStaleRun || isApprovedOrLaterStatus(currentStatus);
-
-          console.log(
-            `[SSE_EVENT] onCheckpoint (review_required) run_id=${event.run_id ?? 'none'} current_run_id=${currentRunId ?? 'none'} ignored=${shouldIgnore}`,
-          );
+          const shouldIgnore = isStaleRun;
 
           if (shouldIgnore) {
             return;
@@ -798,7 +744,16 @@ export default function ProjectGeneration() {
             previous
               ? {
                   ...previous,
-                  generation_status: 'awaiting_review',
+                  generation_runtime: previous.generation_runtime
+                    ? {
+                      ...previous.generation_runtime,
+                      lifecycleStatus: 'awaiting_review',
+                      currentBatch: null,
+                      isTerminal: false,
+                      isReviewRequired: true,
+                      failureClass: null,
+                    }
+                    : previous.generation_runtime,
                   is_review_required: true,
                   is_approved: false,
                 }
@@ -807,24 +762,36 @@ export default function ProjectGeneration() {
           void loadReviewData();
         },
         onComplete: () => {
-          console.log(`[SSE_EVENT] onComplete`);
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
           applyStatusUpdate((previous) =>
             previous
               ? {
                   ...previous,
-                  generation_status: 'complete',
+                  generation_runtime: previous.generation_runtime
+                    ? {
+                      ...previous.generation_runtime,
+                      lifecycleStatus: 'complete',
+                      currentBatch: null,
+                      isTerminal: true,
+                      isReviewRequired: false,
+                      failureClass: null,
+                    }
+                    : previous.generation_runtime,
                   is_complete: true,
                   is_failed: false,
                   generation_error: null,
                 }
               : previous,
           );
+          try {
+            localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors.
+          }
           void syncProjectState().finally(() => scheduleProjectNavigation());
         },
         onFailed: (message) => {
-          console.log(`[SSE_EVENT] onFailed: ${message}`);
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
           setError(message);
@@ -832,12 +799,26 @@ export default function ProjectGeneration() {
             previous
               ? {
                   ...previous,
-                  generation_status: 'failed',
+                  generation_runtime: previous.generation_runtime
+                    ? {
+                      ...previous.generation_runtime,
+                      lifecycleStatus: 'failed',
+                      currentBatch: null,
+                      isTerminal: true,
+                      isReviewRequired: false,
+                      failureClass: 'run_failed',
+                    }
+                    : previous.generation_runtime,
                   is_failed: true,
                   generation_error: message,
                 }
               : previous,
           );
+          try {
+            localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors.
+          }
           void syncProjectState();
         },
         onConnectionStateChange: (nextState) => {
@@ -849,7 +830,7 @@ export default function ProjectGeneration() {
           return;
         }
 
-        setError(err instanceof Error ? err.message : 'Failed to connect to the generation stream.');
+        setError(err instanceof Error ? err.message : UI_COPY.generation.streamFailed);
       });
 
     return () => controller.abort();
@@ -875,29 +856,26 @@ export default function ProjectGeneration() {
     container.scrollTop = container.scrollHeight;
   }, [activityFeed]);
 
-  const completedEvents = useMemo(
-    () => mergeCompletedEvents(status, streamEvents),
-    [status, streamEvents],
+  const session = useMemo(
+    () => buildGenerationSessionViewModel(status, { streamEvents, preferredBatch: activeBatch }),
+    [activeBatch, status, streamEvents],
   );
 
-  const completedBatchCount = completedEvents.length;
-  const fallbackBatchIndex = status?.is_complete
-    ? generationBatches.length - 1
-    : Math.min(completedBatchCount, generationBatches.length - 1);
-  const currentBatchId = status?.is_complete
-    ? generationBatches[generationBatches.length - 1].id
-    : status?.generation_status === 'approved'
-      ? generationBatches[fallbackBatchIndex]?.id ?? generationBatches[0].id
-      : activeBatch ?? (isGenerationBatchName(status?.generation_status) ? status.generation_status : null) ?? generationBatches[fallbackBatchIndex]?.id ?? generationBatches[0].id;
-  const currentBatchIndex = generationBatches.findIndex((batch) => batch.id === currentBatchId);
-  const resolvedCurrentBatchIndex = currentBatchIndex >= 0 ? currentBatchIndex : fallbackBatchIndex;
-  const currentBatch = generationBatches[resolvedCurrentBatchIndex] || generationBatches[0];
-  const showReviewPanel = Boolean(status?.is_review_required && !status?.is_complete && !status?.is_failed);
+  const runtime = session.runtime;
+  const lifecycleStatus = session.lifecycleStatus;
+  const isFailed = session.isFailed;
+  const isCancelled = session.isCancelled;
+  const isComplete = session.isComplete;
+  const isReviewRequired = session.isReviewRequired;
+  const completedBatchCount = session.completedBatchCount;
+  const resolvedCurrentBatchIndex = session.currentBatchIndex;
+  const currentBatch = GENERATION_BATCHES[resolvedCurrentBatchIndex] || GENERATION_BATCHES[0];
+  const showReviewPanel = Boolean(isReviewRequired && !isComplete && !isFailed);
   const showPreparationScreen = Boolean(generationPreparation && !hasPreparationCompleted);
   const latestProgressTimestamp = pickLatestTimestamp(
     lastProgressAt,
-    status?.generation_heartbeat_at,
-    project?.generation_started_at,
+    status?.generation_runtime?.heartbeatAt,
+    project?.updated_at,
   );
   const quietDurationMs = latestProgressTimestamp
     ? Math.max(0, clockNow - (toTimestampMs(latestProgressTimestamp) || clockNow))
@@ -905,45 +883,39 @@ export default function ProjectGeneration() {
   const connectionMeta = getConnectionMeta(streamConnectionState, isAutoRecovering);
   const showManualCheckIn =
     quietDurationMs >= MANUAL_RUNNER_CHECK_THRESHOLD_MS &&
-    !status?.is_failed &&
+    !isFailed &&
     !showReviewPanel &&
-    !status?.is_complete &&
+    !isComplete &&
     streamConnectionState === 'live' &&
     !showResumeBadge &&
     !isAutoRecovering;
   const showReconnectFeed =
     streamConnectionState !== 'live' &&
-    !status?.is_failed &&
+    !isFailed &&
     !showReviewPanel &&
-    !status?.is_complete &&
+    !isComplete &&
     !isAutoRecovering;
   const canCancelGeneration = Boolean(
     status &&
-      !status.is_complete &&
-      !status.is_failed &&
-      status.generation_status !== ('cancelled' as string) &&
-      status.generation_status !== ('intake' as string),
+      !isComplete &&
+      !isFailed &&
+      !isCancelled &&
+      lifecycleStatus !== 'intake',
   );
-  const autoRecoveryKey = `${id ?? 'unknown'}:${status?.generation_run_id ?? status?.generation_status ?? 'pending'}:${completedBatchCount}`;
+  const autoRecoveryKey = `${id ?? 'unknown'}:${runtime?.runId ?? lifecycleStatus ?? 'pending'}:${completedBatchCount}`;
 
 
 
-  const liveActivity = currentActivity ?? {
-    key: `live-placeholder-${status?.generation_status ?? currentBatch.id}`,
-    kind: 'activity' as const,
-    icon: '•',
-    message: getPlaceholderMessage(status, currentBatch.id),
-    timestamp: project?.generation_started_at ?? new Date(0).toISOString(),
-  };
+  const liveActivity = currentActivity;
   const quietDurationLabel = quietDurationMs > 0 ? formatDurationShort(quietDurationMs) : null;
-  const stageCounterLabel = status?.is_complete
-    ? `${generationBatches.length} of ${generationBatches.length} stages complete`
-    : `${completedBatchCount} of ${generationBatches.length} stages complete`;
+  const stageCounterLabel = isComplete
+    ? `${GENERATION_BATCHES.length} of ${GENERATION_BATCHES.length} stages complete`
+    : `${completedBatchCount} of ${GENERATION_BATCHES.length} stages complete`;
   const runnerStatusHeadline = showReviewPanel
     ? 'Waiting for your review'
-    : status?.is_complete
+    : isComplete
       ? 'Generation finished'
-      : status?.is_failed
+      : isFailed
         ? 'Runner needs attention'
         : isAutoRecovering
           ? 'Requesting a checkpoint resume'
@@ -953,14 +925,14 @@ export default function ProjectGeneration() {
               ? 'Connecting to live runner events'
               : streamConnectionState === 'closed'
                 ? 'Live runner feed paused'
-                : liveActivity.kind === 'thinking'
+                : liveActivity?.kind === 'thinking'
                   ? 'Receiving model reasoning'
-                  : quietDurationMs >= RUNNER_WAITING_LABEL_THRESHOLD_MS
-                    ? 'Waiting on the current model or tool call'
-                    : `Stage ${Math.min(resolvedCurrentBatchIndex + 1, generationBatches.length)} is actively running`;
+                    : quietDurationMs >= RUNNER_WAITING_LABEL_THRESHOLD_MS
+                      ? 'Waiting on the current model or tool call'
+                    : `Stage ${Math.min(resolvedCurrentBatchIndex + 1, GENERATION_BATCHES.length)} is actively running`;
   const runnerStatusDetail = showReviewPanel
     ? 'Approve the architecture when it looks right, then Scrimble will continue immediately.'
-    : status?.is_complete
+    : isComplete
       ? 'All generation stages are done and the final project handoff is ready.'
       : quietDurationMs >= RUNNER_WAITING_LABEL_THRESHOLD_MS && streamConnectionState === 'live'
         ? `No fixed ETA while this call is in flight${quietDurationLabel ? ` · last runner signal ${quietDurationLabel} ago` : ''}.`
@@ -1101,7 +1073,16 @@ export default function ProjectGeneration() {
         previous
           ? {
               ...previous,
-              generation_status: 'approved',
+              generation_runtime: previous.generation_runtime
+                ? {
+                  ...previous.generation_runtime,
+                  lifecycleStatus: 'approved',
+                  currentBatch: null,
+                  isTerminal: false,
+                  isReviewRequired: false,
+                  failureClass: null,
+                }
+                : previous.generation_runtime,
               is_review_required: false,
               is_approved: true,
             }
@@ -1110,11 +1091,37 @@ export default function ProjectGeneration() {
       setActiveBatch('batch_4_plan_build');
       void syncProjectState();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to approve your review.');
+      setError(err instanceof Error ? err.message : UI_COPY.generation.approveReviewFailed);
     } finally {
       setIsSubmittingReview(false);
     }
   }, [applyStatusUpdate, id, reviewFeedback, syncProjectState]);
+
+  useEffect(() => {
+    if (!id) {
+      return;
+    }
+
+    const runtimeState = status?.generation_runtime;
+    const hasActiveGeneration = Boolean(
+      runtimeState
+        ? runtimeState.lifecycleStatus !== 'intake' && !runtimeState.isTerminal
+        : false,
+    );
+
+    try {
+      if (hasActiveGeneration) {
+        localStorage.setItem(ACTIVE_GENERATION_STORAGE_KEY, id);
+      } else {
+        const storedProjectId = localStorage.getItem(ACTIVE_GENERATION_STORAGE_KEY);
+        if (storedProjectId === id) {
+          localStorage.removeItem(ACTIVE_GENERATION_STORAGE_KEY);
+        }
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [id, status?.generation_runtime]);
 
   const reconnectLiveFeed = useCallback(() => {
     setError('');
@@ -1137,6 +1144,24 @@ export default function ProjectGeneration() {
     try {
       await dbService.resumeProjectGeneration(id);
       setShowResumeBadge(false);
+      applyStatusUpdate((previous) =>
+        previous
+          ? {
+            ...previous,
+            generation_runtime: previous.generation_runtime
+              ? {
+                ...previous.generation_runtime,
+                lifecycleStatus: 'queued',
+                currentBatch: null,
+                isTerminal: false,
+                canResume: false,
+                isReviewRequired: false,
+                failureClass: null,
+              }
+              : previous.generation_runtime,
+          }
+          : previous,
+      );
       noteProgressTimestamp(new Date().toISOString());
       toast.success(
         mode === 'automatic'
@@ -1147,7 +1172,7 @@ export default function ProjectGeneration() {
       setStreamConnectionKey((prev) => prev + 1);
       void syncProjectState();
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to resume project generation.';
+      const message = err instanceof Error ? err.message : UI_COPY.generation.resumeFailed;
       setError(message);
       if (mode === 'automatic') {
         setAutoRecoveryFailed(true);
@@ -1166,6 +1191,8 @@ export default function ProjectGeneration() {
 
   const [isNudging, setIsNudging] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+
+  const isRunningLifecycle = session.isRunningLifecycle;
   const handleCheckIn = useCallback(async () => {
     if (!id || isNudging) {
       return;
@@ -1179,7 +1206,7 @@ export default function ProjectGeneration() {
       toast.success(result.message || 'I asked the background runner to check back in.');
       setStreamConnectionKey((prev) => prev + 1);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Failed to nudge.';
+      const errMsg = err instanceof Error ? err.message : UI_COPY.generation.nudgeFailed;
       if (errMsg.includes('still active')) {
         reconnectLiveFeed();
         toast.info('The runner is still active. I refreshed the live feed instead of restarting anything.');
@@ -1198,10 +1225,25 @@ export default function ProjectGeneration() {
       const result = await dbService.cancelProjectGeneration(id);
       if (result.success) {
         toast.success('Generation cancelled.');
-        applyStatusUpdate((prev) => (prev ? { ...prev, generation_status: 'cancelled', is_failed: true } : prev));
+        applyStatusUpdate((prev) => (prev
+          ? {
+            ...prev,
+            generation_runtime: prev.generation_runtime
+              ? {
+                ...prev.generation_runtime,
+                lifecycleStatus: 'cancelled',
+                currentBatch: null,
+                isTerminal: true,
+                isReviewRequired: false,
+                failureClass: 'cancelled',
+              }
+              : prev.generation_runtime,
+            is_failed: true,
+          }
+          : prev));
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to cancel generation.');
+      toast.error(err instanceof Error ? err.message : UI_COPY.generation.cancelFailed);
     } finally {
       setIsCancelling(false);
     }
@@ -1709,20 +1751,20 @@ export default function ProjectGeneration() {
                   <div className="rounded-[12px] border border-border-subtle bg-bg-base/60 px-3 py-2 text-right">
                     <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Current stage</div>
                     <div className="mt-1 font-sans text-[13px] font-medium text-text-primary">
-                      {status?.is_complete ? 'Complete' : `${Math.min(resolvedCurrentBatchIndex + 1, generationBatches.length)} / ${generationBatches.length}`}
+                      {isComplete ? 'Complete' : `${Math.min(resolvedCurrentBatchIndex + 1, GENERATION_BATCHES.length)} / ${GENERATION_BATCHES.length}`}
                     </div>
                   </div>
                 </div>
 
                 <div className="mt-4 grid grid-cols-6 gap-2">
-                  {generationBatches.map((batch, index) => {
-                    const isComplete = index < completedBatchCount || status?.is_complete;
-                    const isCurrent = !isComplete && index === resolvedCurrentBatchIndex && !status?.is_failed;
+                  {GENERATION_BATCHES.map((batch, index) => {
+                    const isStageComplete = index < completedBatchCount || isComplete;
+                    const isCurrent = !isStageComplete && index === resolvedCurrentBatchIndex && !isFailed && isRunningLifecycle;
 
                     return (
                       <div key={`progress-${batch.id}`} className="space-y-2">
                         <div className="relative h-2 overflow-hidden rounded-full bg-bg-base">
-                          {isComplete ? (
+                          {isStageComplete ? (
                             <div className="h-full w-full rounded-full bg-status-secure" />
                           ) : isCurrent ? (
                             <motion.div
@@ -1741,7 +1783,7 @@ export default function ProjectGeneration() {
                 </div>
               </div>
 
-              {status?.generation_status === ('cancelled' as string) ? (
+              {isCancelled ? (
                 <div className="w-full rounded-[16px] border border-border-default/70 bg-bg-surface/60 p-6 text-left shadow-panel backdrop-blur-sm">
                   <div className="flex items-start gap-3">
                     <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-text-muted" />
@@ -1770,7 +1812,7 @@ export default function ProjectGeneration() {
                     </button>
                   </div>
                 </div>
-              ) : status?.is_failed && !isAutoRecovering ? (
+              ) : isFailed && !isAutoRecovering ? (
                 <div className="w-full rounded-[16px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
                   <div className="flex items-start gap-3">
                     <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
@@ -1812,32 +1854,38 @@ export default function ProjectGeneration() {
                         Live transcript
                       </div>
                       <AnimatePresence mode="wait" initial={false}>
-                        <motion.div
-                          key={liveActivity.key}
-                          initial={{ opacity: 0, y: 8 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: -8 }}
-                          transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
-                          className="flex items-start gap-3"
-                        >
-                          <motion.span
-                            aria-hidden="true"
-                            className="mt-[10px] h-[3px] w-[3px] shrink-0 rounded-full bg-accent-primary"
-                            animate={{ opacity: [0.45, 1, 0.45], scale: [1, 1.8, 1] }}
-                            transition={{ duration: 1.4, ease: 'easeInOut', repeat: Infinity }}
-                          />
-                          <span
-                            title={formatFeedMessage(liveActivity, { prefixThinking: false })}
-                            className={cn(
-                              'block min-w-0 flex-1 whitespace-pre-wrap break-words text-[14px] leading-6 text-text-primary',
-                              liveActivity.kind === 'thinking'
-                                ? 'max-h-[168px] overflow-y-auto rounded-[12px] bg-bg-base/52 px-3 py-3 font-mono text-[13px] text-text-primary/92'
-                                : 'font-sans font-medium tracking-[-0.01em]',
-                            )}
+                        {liveActivity ? (
+                          <motion.div
+                            key={liveActivity.key}
+                            initial={{ opacity: 0, y: 8 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -8 }}
+                            transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
+                            className="flex items-start gap-3"
                           >
-                            {formatFeedMessage(liveActivity, { prefixThinking: false })}
-                          </span>
-                        </motion.div>
+                            <motion.span
+                              aria-hidden="true"
+                              className="mt-[10px] h-[3px] w-[3px] shrink-0 rounded-full bg-accent-primary"
+                              animate={{ opacity: [0.45, 1, 0.45], scale: [1, 1.8, 1] }}
+                              transition={{ duration: 1.4, ease: 'easeInOut', repeat: Infinity }}
+                            />
+                            <span
+                              title={formatFeedMessage(liveActivity, { prefixThinking: false })}
+                              className={cn(
+                                'block min-w-0 flex-1 whitespace-pre-wrap break-words text-[14px] leading-6 text-text-primary',
+                                liveActivity.kind === 'thinking'
+                                  ? 'max-h-[168px] overflow-y-auto rounded-[12px] bg-bg-base/52 px-3 py-3 font-mono text-[13px] text-text-primary/92'
+                                  : 'font-sans font-medium tracking-[-0.01em]',
+                              )}
+                            >
+                              {formatFeedMessage(liveActivity, { prefixThinking: false })}
+                            </span>
+                          </motion.div>
+                        ) : (
+                          <div className="rounded-[12px] border border-border-subtle bg-bg-base/42 px-3 py-3 text-[13px] text-text-muted">
+                            {getPlaceholderMessage(status, currentBatch.id)}
+                          </div>
+                        )}
                       </AnimatePresence>
                     </div>
 
@@ -1967,9 +2015,10 @@ export default function ProjectGeneration() {
                     >
                       <div className="flex items-center gap-2 font-sans text-[13px] text-text-secondary">
                         <TriangleAlert className="h-4 w-4 text-accent-primary" />
-                        <span>{status?.is_failed ? 'The runner stopped before finishing.' : 'The runner stayed quiet for too long.'}</span>
+                        <span>{isFailed ? 'The runner stopped before finishing.' : 'The runner stayed quiet for too long.'}</span>
                       </div>
                       <button
+                        type="button"
                         onClick={handleResume}
                         disabled={isResuming}
                         className="btn-primary px-4 py-2 text-[13px]"
@@ -2009,6 +2058,7 @@ export default function ProjectGeneration() {
                     return (
                       <button
                         key={model.id}
+                        type="button"
                         onClick={() => void handleSelectModel(provider.id, model.name)}
                         className={cn(
                           'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
@@ -2052,6 +2102,7 @@ export default function ProjectGeneration() {
                   })
                 ) : (
                   <button
+                    type="button"
                     onClick={() => void handleSelectModel(provider.id, null)}
                     className={cn(
                       'group flex w-full items-center justify-between rounded-xl border p-3 text-left transition-all duration-200',
@@ -2097,6 +2148,7 @@ export default function ProjectGeneration() {
 
           <DialogFooter className="border-t border-border-default bg-bg-elevated/30 p-4">
             <button
+              type="button"
               onClick={() => setIsModelModalOpen(false)}
               className="btn-ghost py-2 text-sm"
             >

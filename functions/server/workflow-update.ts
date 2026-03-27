@@ -1,12 +1,4 @@
 import { z } from 'zod';
-import {
-  analyzeGithubRepo,
-  getLibraryDocs,
-  searchWeb,
-  type Env as ToolEnv,
-  type GithubRepoAnalysis,
-  type SearchResult,
-} from '../../workers/tools';
 import { callAIText, extractJSON } from './ai';
 import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
 import {
@@ -23,10 +15,18 @@ import {
   upsertProjectBrief,
   type StoredProjectBrief,
 } from './project-briefs';
-import { fetchSequentially } from './research';
 import { buildResearchManifest, type ResearchManifest } from './research-manifest';
+import { buildResearchQuery, type ResearchQueryFamily } from './research-query-policy';
 import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
 import { loadBuilderProfileContext } from './user-tools';
+import { getConnectedResearchTools } from './mcp-servers';
+import { 
+  fetchLibraryDocs, 
+  analyzeGitHubRepo as facadeAnalyzeGitHubRepo, 
+  searchWeb as facadeSearchWeb,
+  type GitHubAnalysisResponse,
+  type WebSearchResult,
+} from './research-facade';
 import type { PlanDiff } from '../types/diff';
 import { diffSchema } from '../types/diff';
 import type { Bindings, ProviderType } from './types';
@@ -39,7 +39,6 @@ type WorkflowUpdateProviderContext = {
 };
 
 type WorkflowUpdateProviders = {
-  default: WorkflowUpdateProviderContext;
   fast: WorkflowUpdateProviderContext;
   deep: WorkflowUpdateProviderContext;
 };
@@ -156,55 +155,55 @@ const stepDetailSchema = z.object({
 
 const KNOWN_TECH_PROFILES: Record<
   string,
-  { githubOwner: string; githubRepo: string; docsTopic: string; searchHint: string }
+  { githubOwner: string; githubRepo: string; docsTopic: string; queryFamily: ResearchQueryFamily }
 > = {
   railway: {
     githubOwner: 'railwayapp',
     githubRepo: 'cli',
     docsTopic: 'deployment',
-    searchHint: 'Railway deployment',
+    queryFamily: 'deployment',
   },
   resend: {
     githubOwner: 'resend',
     githubRepo: 'resend-node',
     docsTopic: 'email delivery',
-    searchHint: 'Resend email integration',
+    queryFamily: 'setup',
   },
   stripe: {
     githubOwner: 'stripe',
     githubRepo: 'stripe-node',
     docsTopic: 'checkout',
-    searchHint: 'Stripe webhook verification',
+    queryFamily: 'errors',
   },
   clerk: {
     githubOwner: 'clerk',
     githubRepo: 'javascript',
     docsTopic: 'authentication',
-    searchHint: 'Clerk authentication',
+    queryFamily: 'errors',
   },
   drizzle: {
     githubOwner: 'drizzle-team',
     githubRepo: 'drizzle-orm',
     docsTopic: 'schema migrations',
-    searchHint: 'Drizzle ORM migrations',
+    queryFamily: 'release_notes',
   },
   prisma: {
     githubOwner: 'prisma',
     githubRepo: 'prisma',
     docsTopic: 'schema migrations',
-    searchHint: 'Prisma schema migrations',
+    queryFamily: 'release_notes',
   },
   supabase: {
     githubOwner: 'supabase',
     githubRepo: 'supabase-js',
     docsTopic: 'getting started',
-    searchHint: 'Supabase Next.js',
+    queryFamily: 'setup',
   },
   vercel: {
     githubOwner: 'vercel',
     githubRepo: 'next.js',
     docsTopic: 'deployment',
-    searchHint: 'Vercel deployment',
+    queryFamily: 'deployment',
   },
 };
 
@@ -229,24 +228,35 @@ function summarizeText(value: string, maxLength = 220) {
   return collapsed.length <= maxLength ? collapsed : `${collapsed.slice(0, maxLength)}...`;
 }
 
-function formatSearchDigest(results: SearchResult[]) {
+function formatSearchDigest(results: WebSearchResult[]) {
   return results.map((result) => `${result.title}: ${result.description} (${result.url})`).join('\n');
 }
 
-function formatReleaseDigest(releases: GithubRepoAnalysis['releases']) {
+function formatReleaseDigest(releases: GitHubAnalysisResponse['releases']) {
   return releases
     .slice(0, 3)
     .map((release) => `${release.tagName} (${release.publishedAt}): ${release.body}`)
     .join('\n\n');
 }
 
-function getWorkflowUpdatePrimarySearchQuery(baseQuery: string, currentYear: number) {
-  const technology = normalizeTechKey(baseQuery).replace(/[^a-z0-9@.+#\-/]/g, '') || 'technology';
-  if (!technology) {
-    return '';
+function queryFamilyFromChange(
+  change: WorkflowUpdateIntent['changes'][number],
+): ResearchQueryFamily {
+  const context = `${change.docs_topic} ${change.technology}`.toLowerCase();
+
+  if (change.action === 'update' || /\b(changelog|release|migration|breaking)\b/.test(context)) {
+    return 'release_notes';
   }
 
-  return `${technology} errors ${currentYear}`;
+  if (/\b(deploy|deployment|production|hosting|railway|vercel|cloudflare)\b/.test(context)) {
+    return 'deployment';
+  }
+
+  if (/\b(error|troubleshoot|debug|failure|fix|incident|webhook)\b/.test(context)) {
+    return 'errors';
+  }
+
+  return 'setup';
 }
 
 function parseGitHubRepoUrl(url: string) {
@@ -412,7 +422,7 @@ function resolveResearchHints(
     docsTopic: change.docs_topic || knownProfile?.docsTopic || 'getting started',
     githubOwner: change.github_owner || githubSource?.owner || knownProfile?.githubOwner || '',
     githubRepo: change.github_repo || githubSource?.repo || knownProfile?.githubRepo || '',
-    searchQuery: knownProfile?.searchHint || change.technology,
+    queryFamily: knownProfile?.queryFamily || queryFamilyFromChange(change),
     packageName: integrationMatch?.package_name || change.technology,
   };
 }
@@ -425,9 +435,8 @@ async function runMiniResearch(options: {
   intent: WorkflowUpdateIntent;
   onProgress?: (progress: WorkflowUpdateProgress) => Promise<void> | void;
 }) {
-  const currentYear = new Date().getFullYear();
   const miniResearch: WorkflowMiniResearchItem[] = [];
-  const toolEnv: ToolEnv = options.env;
+  const resolvedConnectedTools = await getConnectedResearchTools(options.env, options.userId);
 
   for (const change of options.intent.changes) {
     if (!change.technology || (!change.is_new_technology && change.action === 'remove')) {
@@ -440,9 +449,17 @@ async function runMiniResearch(options: {
       message: `Reading ${change.technology} documentation...`,
     });
 
-    const docs = await getLibraryDocs(change.technology, hints.docsTopic, options.userId, toolEnv);
+    const facadeContext = { env: options.env, userId: options.userId };
+    
+    // Find existing docs URL if available
+    const researchMatch = options.research.research.find(r => normalizeTechKey(r.technology) === normalizeTechKey(change.technology));
+    const existingDocsUrl = researchMatch?.sources.find(s => s.tool === 'Live docs' || s.tool === 'Context7')?.url;
+    
+    // Phase 2: Use Facade for research
+    const docs = await fetchLibraryDocs(facadeContext, change.technology, hints.docsTopic, existingDocsUrl || undefined);
+    
     const githubAnalysis = hints.githubOwner && hints.githubRepo
-      ? await analyzeGithubRepo(hints.githubOwner, hints.githubRepo, options.userId, toolEnv)
+      ? await facadeAnalyzeGitHubRepo(facadeContext, hints.githubOwner, hints.githubRepo)
       : {
           owner: '',
           repo: '',
@@ -455,24 +472,33 @@ async function runMiniResearch(options: {
           summary: '',
           releases: [],
           recentIssues: [],
+          metadata: { quality: 'failed' } as any,
         };
-    const searchQuery = getWorkflowUpdatePrimarySearchQuery(hints.searchQuery, currentYear);
-    const webResultSets = searchQuery
-      ? await fetchSequentially([() => searchWeb(searchQuery, options.userId, toolEnv)])
-      : [];
-    const webResults = webResultSets.flat();
+        
+    const searchQuery = resolvedConnectedTools.has_brave_search
+      ? buildResearchQuery({
+          technology: change.technology || hints.packageName,
+          family: hints.queryFamily,
+          intent: hints.docsTopic,
+        })
+      : '';
+    const searchResponse = searchQuery
+      ? await facadeSearchWeb(facadeContext, searchQuery, 5)
+      : { results: [], metadata: { quality: 'failed' } as any };
+    const webResults = searchResponse.results;
 
     const repoUrl =
       hints.githubOwner && hints.githubRepo
         ? `https://github.com/${hints.githubOwner}/${hints.githubRepo}`
         : '';
+        
     const sources: Batch2FetchAndRead['sources'] = [
       ...(docs.content
         ? [
             {
               technology: change.technology,
               tool: docs.source === 'Context7' ? 'Context7' : 'Live docs',
-              url: docs.source.startsWith('http') ? docs.source : `https://docs.example.com/${change.technology}`,
+              url: docs.source.startsWith('http') ? docs.source : (existingDocsUrl || ''),
               title: `${change.technology} docs`,
               summary: summarizeText(docs.content),
             },
@@ -874,6 +900,10 @@ export async function processWorkflowUpdate(options: {
   const researchManifest = buildResearchManifest(
     builderProfile,
     projectBriefContext.summary || options.project.description || '',
+    {
+      confirmedStackTools: projectBriefContext.confirmedStackTools,
+      inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean),
+    },
   );
 
   const miniResearch = await runMiniResearch({

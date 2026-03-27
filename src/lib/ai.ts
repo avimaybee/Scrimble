@@ -17,7 +17,6 @@ export interface AIProvider {
   base_url?: string;
   model?: string; // deprecated, keeping for backward compatibility in some views if needed
   models: AIModel[];
-  is_default: boolean;
   masked_key?: string;
 }
 
@@ -90,7 +89,6 @@ export async function saveAIProvider(data: {
   apiKey: string;
   baseUrl?: string;
   model?: string;
-  isDefault?: boolean;
 }) {
   const user = auth.currentUser;
   if (!user) throw new Error('User not authenticated');
@@ -257,8 +255,8 @@ export async function callAIProxy(params: {
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ error: "Your AI provider isn't responding. Try again shortly." }));
-    const message = err.error || "Your AI provider isn't responding. Try again shortly.";
+    const err = await response.json().catch(() => ({ message: "Your AI provider isn't responding. Try again shortly." }));
+    const message = err.message || err.error || "Your AI provider isn't responding. Try again shortly.";
     toast.error(message);
     throw new Error(message);
   }

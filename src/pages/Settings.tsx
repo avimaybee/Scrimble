@@ -21,6 +21,8 @@ import { cn } from '../lib/utils';
 import { useAuthStore } from '../store/authStore';
 import { logout } from '../lib/firebase';
 import { InlineError } from '../components/ui/InlineError';
+import { deriveWorkspaceReadiness } from '../lib/workspace-readiness';
+import { UI_COPY } from '../lib/ui-copy';
 import {
   AIModelRoles,
   AIProvider,
@@ -376,6 +378,7 @@ function getToolStatusClasses(server: MCPServer) {
 export default function Settings() {
   const { user } = useAuthStore();
   const mcpSectionRef = useRef<HTMLElement | null>(null);
+  const [builderProfileCount, setBuilderProfileCount] = useState(0);
 
   const [providers, setProviders] = useState<AIProvider[]>([]);
   const [mcpServers, setMCPServers] = useState<MCPServer[]>([]);
@@ -400,6 +403,7 @@ export default function Settings() {
   const [providerErrors, setProviderErrors] = useState<Record<string, string>>({});
   const [removingMCPId, setRemovingMCPId] = useState<string | null>(null);
   const [togglingMCPId, setTogglingMCPId] = useState<string | null>(null);
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false);
 
   const selectedProvider =
     providerOptions.find((option) => option.value === form.provider) ?? providerOptions[0];
@@ -415,7 +419,13 @@ export default function Settings() {
   const optionalResearchToolCount = mcpServers.filter((server) => server.is_active).length;
   const activeResearchToolCount = alwaysOnResearchCards.length + optionalResearchToolCount;
   const aiProviderCount = providers.length;
-  const isWorkspaceReady = aiProviderCount > 0;
+  const workspaceReadiness = deriveWorkspaceReadiness({
+    aiProviderCount,
+    builderProfileCount,
+    alwaysOnResearchToolCount: alwaysOnResearchCards.length,
+    optionalResearchToolCount,
+  });
+  const isWorkspaceReady = workspaceReadiness.overallReadiness === 'ready';
 
   const loadProviders = async (silent = false) => {
     setIsLoadingProviders(true);
@@ -426,7 +436,7 @@ export default function Settings() {
       setProviders(result);
     } catch (error: unknown) {
       const message =
-        error instanceof Error ? error.message : 'Could not load your AI keys right now.';
+        error instanceof Error ? error.message : UI_COPY.settings.loadAi;
       setProviderLoadError(message);
       if (!silent) {
         toast.error(message);
@@ -445,7 +455,7 @@ export default function Settings() {
       setModelRoleForm(mapRolesToFormState(result));
     } catch (error: unknown) {
       const message =
-        error instanceof Error ? error.message : 'Could not load your model role preferences right now.';
+        error instanceof Error ? error.message : UI_COPY.settings.loadModelRoles;
       setModelRoleLoadError(message);
       if (!silent) {
         toast.error(message);
@@ -466,7 +476,7 @@ export default function Settings() {
       const message =
         error instanceof Error
           ? error.message
-          : 'Could not load your research tools right now.';
+          : UI_COPY.settings.loadResearch;
       setMCPLoadError(message);
       if (!silent) {
         toast.error(message);
@@ -506,7 +516,6 @@ export default function Settings() {
         apiKey,
         model: model || undefined,
         baseUrl: form.provider === 'custom' ? baseUrl : undefined,
-        isDefault: providers.length === 0,
       });
 
       await loadProviders(true);
@@ -516,7 +525,7 @@ export default function Settings() {
       }));
       toast.success('Keys saved.');
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not save your AI key.');
+      toast.error(error instanceof Error ? error.message : UI_COPY.settings.saveAiKey);
     } finally {
       setIsSaving(false);
     }
@@ -530,7 +539,7 @@ export default function Settings() {
       await Promise.all([loadProviders(true), loadModelRoles(true)]);
       toast.success('Provider removed.');
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not remove that AI key.');
+      toast.error(error instanceof Error ? error.message : UI_COPY.settings.removeAiKey);
     } finally {
       setRemovingId(null);
     }
@@ -549,7 +558,7 @@ export default function Settings() {
         setProviderErrors((prev) => ({ ...prev, [providerId]: errorMsg }));
       }
     } catch (error: unknown) {
-      const errorMsg = error instanceof Error ? error.message : 'Could not test the connection.';
+      const errorMsg = error instanceof Error ? error.message : UI_COPY.settings.testAiKey;
       setProviderErrors((prev) => ({ ...prev, [providerId]: errorMsg }));
     } finally {
       setTestingId(null);
@@ -639,7 +648,7 @@ export default function Settings() {
       setModelRoleForm(mapRolesToFormState(saved));
       toast.success('Model roles saved.');
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not save model roles.');
+      toast.error(error instanceof Error ? error.message : UI_COPY.settings.saveModelRoles);
     } finally {
       setIsSavingModelRoles(false);
     }
@@ -746,7 +755,7 @@ export default function Settings() {
       setExpandedMCPType(null);
       toast.success('Research tool connected.');
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not connect that research tool.');
+      toast.error(error instanceof Error ? error.message : UI_COPY.settings.connectResearch);
     } finally {
       setSavingMCPType(null);
     }
@@ -760,7 +769,7 @@ export default function Settings() {
       await loadMCPServers(true);
       toast.success(result.is_active ? `${server.name} turned on.` : `${server.name} paused.`);
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not update that research tool.');
+      toast.error(error instanceof Error ? error.message : UI_COPY.settings.updateResearch);
     } finally {
       setTogglingMCPId(null);
     }
@@ -777,7 +786,7 @@ export default function Settings() {
       }
       toast.success('Research tool disconnected.');
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Could not disconnect that research tool.');
+      toast.error(error instanceof Error ? error.message : UI_COPY.settings.disconnectResearch);
     } finally {
       setRemovingMCPId(null);
     }
@@ -797,14 +806,14 @@ export default function Settings() {
       <motion.div variants={itemVariants} className="mb-10 max-w-[620px]">
         <h1 className="text-heading mb-3">Settings</h1>
         <p className="text-body">
-          Keep your account close at hand, manage your AI providers, and tune optional
-          research connectors when you want private or indexed sources.
+          Use this workspace control center to see what is missing, why it matters, and what to do next.
         </p>
       </motion.div>
 
       <motion.section
         variants={itemVariants}
         className="mb-8 grid gap-4 md:grid-cols-3"
+        aria-label="Workspace readiness summary"
       >
         <div className="rounded-[16px] border border-border-default bg-bg-surface p-5 shadow-panel">
           <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
@@ -812,12 +821,10 @@ export default function Settings() {
             AI coverage
           </div>
           <div className="text-3xl font-serif tracking-[-0.04em] text-text-primary">
-            {aiProviderCount}
+            {workspaceReadiness.aiSetup.connectedProviderCount}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
-            {aiProviderCount > 0
-              ? 'Your generation keys are connected and ready to use.'
-              : 'Add at least one AI key so Scrimble can start building.'}
+            {workspaceReadiness.aiSetup.recommendation}
           </p>
         </div>
 
@@ -830,7 +837,7 @@ export default function Settings() {
             {activeResearchToolCount}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
-            {`Core stack active (${alwaysOnResearchCards.length}) with ${optionalResearchToolCount} optional connector${optionalResearchToolCount === 1 ? '' : 's'}.`}
+            {workspaceReadiness.researchConnectivity.recommendation}
           </p>
         </div>
 
@@ -840,19 +847,37 @@ export default function Settings() {
             Workspace readiness
           </div>
           <div className="text-lg font-medium tracking-[-0.03em] text-text-primary">
-            {isWorkspaceReady ? 'Ready to build' : 'Needs one quick setup'}
+            {isWorkspaceReady ? 'Ready to build' : 'Needs setup'}
           </div>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
-            {isWorkspaceReady
-              ? 'You can start a new project now and Scrimble will have what it needs.'
-              : 'Once you save an AI key, new projects can run without extra setup.'}
+            {workspaceReadiness.builderProfile.recommendation}
           </p>
         </div>
       </motion.section>
 
+      {workspaceReadiness.nextActions.length > 0 ? (
+        <motion.section
+          variants={itemVariants}
+          className="mb-8 rounded-[16px] border border-accent-border bg-accent-primary-muted/40 p-5"
+          aria-label="Workspace next actions"
+        >
+          <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-accent-primary">Next actions</div>
+          <ul className="mt-3 space-y-2 text-sm leading-relaxed text-text-secondary">
+            {workspaceReadiness.nextActions.map((action) => (
+              <li key={action} className="flex items-start gap-2">
+                <span aria-hidden="true" className="mt-1 h-1.5 w-1.5 rounded-full bg-accent-primary" />
+                <span>{action}</span>
+              </li>
+            ))}
+          </ul>
+        </motion.section>
+      ) : null}
+
       <motion.section
+        id="workspace"
         variants={itemVariants}
         className="mb-8 rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
+        aria-label="Workspace account setup"
       >
         <div className="mb-4 flex items-center gap-2 text-[13px] font-medium text-text-secondary">
           <UserIcon className="h-4 w-4 text-accent-primary" />
@@ -882,6 +907,7 @@ export default function Settings() {
           </div>
 
           <button
+            type="button"
             onClick={() => logout()}
             className="inline-flex h-11 items-center justify-center gap-2 rounded-[8px] border border-border-default bg-bg-surface px-4 text-sm font-medium text-text-secondary transition-colors hover:border-border-strong hover:text-text-primary"
           >
@@ -892,7 +918,7 @@ export default function Settings() {
       </motion.section>
 
       <motion.div variants={itemVariants} className="mb-8">
-        <BuilderProfileSection />
+        <BuilderProfileSection onToolCountChange={setBuilderProfileCount} />
       </motion.div>
 
       <motion.section
@@ -947,11 +973,6 @@ export default function Settings() {
                       <h3 className="text-[17px] font-medium tracking-[-0.03em] text-text-primary">
                         {providerLabels[provider.provider]}
                       </h3>
-                      {provider.is_default ? (
-                        <span className="rounded-[6px] border border-accent-border bg-accent-primary-muted px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] text-accent-primary">
-                          Default
-                        </span>
-                      ) : null}
                     </div>
                     <p className="mb-3 text-sm text-text-secondary">{getProviderSummary(provider)}</p>
 
@@ -987,6 +1008,7 @@ export default function Settings() {
                                 type="button"
                                 onClick={() => handleRemoveModel(provider.id, m.id)}
                                 disabled={removingModelId === m.id}
+                                aria-label={`Remove model ${m.name}`}
                                 className="text-text-tertiary hover:text-status-error transition-colors"
                               >
                                 {removingModelId === m.id ? (
@@ -1032,6 +1054,7 @@ export default function Settings() {
                       type="button"
                       onClick={() => handleTestProvider(provider.id)}
                       disabled={testingId === provider.id}
+                      aria-label={`Test ${providerLabels[provider.provider]} provider`}
                       className="btn-secondary"
                     >
                       {testingId === provider.id ? (
@@ -1045,6 +1068,7 @@ export default function Settings() {
                       type="button"
                       onClick={() => handleRemoveProvider(provider.id)}
                       disabled={removingId === provider.id}
+                      aria-label={`Remove ${providerLabels[provider.provider]} provider`}
                       className="btn-danger"
                     >
                       {removingId === provider.id ? (
@@ -1066,137 +1090,158 @@ export default function Settings() {
         </div>
 
         <div className="mt-6 rounded-[14px] border border-border-default bg-bg-elevated/40 p-5">
-          <div className="mb-4 flex items-center gap-2 text-[15px] font-medium text-text-primary">
-            <Cpu className="h-4 w-4 text-accent-primary" />
-            Model roles.
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-[15px] font-medium text-text-primary">
+              <Cpu className="h-4 w-4 text-accent-primary" />
+              Advanced model controls
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowAdvancedControls((current) => !current)}
+              className="inline-flex items-center rounded-[8px] border border-border-default bg-bg-base px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:text-text-primary"
+              aria-expanded={showAdvancedControls}
+            >
+              {showAdvancedControls ? 'Hide' : 'Show'}
+            </button>
           </div>
+          <p className="mb-4 text-sm leading-relaxed text-text-secondary">
+            Optional: use separate fast/deep model slots. If you skip this, Scrimble uses provider defaults.
+          </p>
 
-          {modelRoleLoadError ? (
-            <div className="mb-4 flex flex-col gap-3 rounded-[12px] border border-status-error/25 bg-status-error/8 p-3 sm:flex-row sm:items-center sm:justify-between">
-              <p className="text-sm text-text-secondary">{modelRoleLoadError}</p>
-              <button
-                type="button"
-                onClick={() => void loadModelRoles()}
-                className="inline-flex items-center gap-2 rounded-[8px] border border-status-error/25 px-3 py-2 text-sm font-medium text-status-error transition-colors hover:bg-status-error/10"
-              >
-                <RefreshCw className="h-4 w-4" />
-                Try again
-              </button>
-            </div>
-          ) : null}
+          {showAdvancedControls ? (
+            <>
+              {modelRoleLoadError ? (
+                <div className="mb-4 flex flex-col gap-3 rounded-[12px] border border-status-error/25 bg-status-error/8 p-3 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-text-secondary">{modelRoleLoadError}</p>
+                  <button
+                    type="button"
+                    onClick={() => void loadModelRoles()}
+                    className="inline-flex items-center gap-2 rounded-[8px] border border-status-error/25 px-3 py-2 text-sm font-medium text-status-error transition-colors hover:bg-status-error/10"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                    Try again
+                  </button>
+                </div>
+              ) : null}
 
-          {isLoadingModelRoles ? (
-            <div className="rounded-[12px] border border-border-default bg-bg-elevated/60 p-4 text-sm text-text-secondary">
-              Loading your model role preferences...
-            </div>
+              {isLoadingModelRoles ? (
+                <div className="rounded-[12px] border border-border-default bg-bg-elevated/60 p-4 text-sm text-text-secondary">
+                  Loading your model role preferences...
+                </div>
+              ) : (
+                <form onSubmit={handleSaveModelRoles} className="space-y-5">
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="rounded-[12px] border border-border-default bg-bg-surface/70 p-4">
+                      <h3 className="mb-1 text-[15px] font-medium text-text-primary">Fast model</h3>
+                      <p className="mb-4 text-sm text-text-secondary">
+                        For quick tasks (structuring, routing, research summaries).
+                      </p>
+
+                      <div className="space-y-3">
+                        <div>
+                          <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                            Connected provider
+                          </label>
+                          <select
+                            value={modelRoleForm.fast.providerId}
+                            onChange={(event) => handleModelRoleFieldChange('fast', 'providerId', event.target.value)}
+                            className={inputClassName}
+                            disabled={isSavingModelRoles}
+                          >
+                            <option value="">Use default AI</option>
+                            {providers.map((provider) => (
+                              <option key={provider.id} value={provider.id}>
+                                {getProviderDropdownLabel(provider)}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                            Model name
+                          </label>
+                          <input
+                            type="text"
+                            value={modelRoleForm.fast.modelName}
+                            onChange={(event) => handleModelRoleFieldChange('fast', 'modelName', event.target.value)}
+                            placeholder="e.g. gemini-2.0-flash, gpt-4o-mini, llama-3.3-70b"
+                            className={inputClassName}
+                            disabled={isSavingModelRoles}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-[12px] border border-border-default bg-bg-surface/70 p-4">
+                      <h3 className="mb-1 text-[15px] font-medium text-text-primary">Deep model</h3>
+                      <p className="mb-4 text-sm text-text-secondary">
+                        For complex tasks (plan generation, architecture, step writing).
+                      </p>
+
+                      <div className="space-y-3">
+                        <div>
+                          <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                            Connected provider
+                          </label>
+                          <select
+                            value={modelRoleForm.deep.providerId}
+                            onChange={(event) => handleModelRoleFieldChange('deep', 'providerId', event.target.value)}
+                            className={inputClassName}
+                            disabled={isSavingModelRoles}
+                          >
+                            <option value="">Use default AI</option>
+                            {providers.map((provider) => (
+                              <option key={provider.id} value={provider.id}>
+                                {getProviderDropdownLabel(provider)}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="mb-2 block text-[13px] font-medium text-text-secondary">
+                            Model name
+                          </label>
+                          <input
+                            type="text"
+                            value={modelRoleForm.deep.modelName}
+                            onChange={(event) => handleModelRoleFieldChange('deep', 'modelName', event.target.value)}
+                            placeholder="e.g. gemini-2.5-pro, gpt-4o, claude-3-5-sonnet"
+                            className={inputClassName}
+                            disabled={isSavingModelRoles}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <p className="font-mono text-[11px] leading-relaxed text-text-tertiary">
+                      Not sure? Leave these blank and Scrimble will use your default AI for everything.
+                    </p>
+                    <p className="font-mono text-[11px] leading-relaxed text-text-tertiary">
+                      For the best plans, use a fast model (e.g. Flash, mini variants) for the quick slot and your smartest model for the deep slot.
+                    </p>
+                  </div>
+
+                  <div className="flex justify-end">
+                    <button
+                      type="submit"
+                      disabled={isSavingModelRoles}
+                      className="btn-secondary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {isSavingModelRoles ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                      {isSavingModelRoles ? 'Saving…' : 'Save advanced model controls'}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </>
           ) : (
-            <form onSubmit={handleSaveModelRoles} className="space-y-5">
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="rounded-[12px] border border-border-default bg-bg-surface/70 p-4">
-                  <h3 className="mb-1 text-[15px] font-medium text-text-primary">Fast model</h3>
-                  <p className="mb-4 text-sm text-text-secondary">
-                    For quick tasks (structuring, routing, research summaries).
-                  </p>
-
-                  <div className="space-y-3">
-                    <div>
-                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
-                        Connected provider
-                      </label>
-                      <select
-                        value={modelRoleForm.fast.providerId}
-                        onChange={(event) => handleModelRoleFieldChange('fast', 'providerId', event.target.value)}
-                        className={inputClassName}
-                        disabled={isSavingModelRoles}
-                      >
-                        <option value="">Use default AI</option>
-                        {providers.map((provider) => (
-                          <option key={provider.id} value={provider.id}>
-                            {getProviderDropdownLabel(provider)}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
-                        Model name
-                      </label>
-                      <input
-                        type="text"
-                        value={modelRoleForm.fast.modelName}
-                        onChange={(event) => handleModelRoleFieldChange('fast', 'modelName', event.target.value)}
-                        placeholder="e.g. gemini-2.0-flash, gpt-4o-mini, llama-3.3-70b"
-                        className={inputClassName}
-                        disabled={isSavingModelRoles}
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="rounded-[12px] border border-border-default bg-bg-surface/70 p-4">
-                  <h3 className="mb-1 text-[15px] font-medium text-text-primary">Deep model</h3>
-                  <p className="mb-4 text-sm text-text-secondary">
-                    For complex tasks (plan generation, architecture, step writing).
-                  </p>
-
-                  <div className="space-y-3">
-                    <div>
-                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
-                        Connected provider
-                      </label>
-                      <select
-                        value={modelRoleForm.deep.providerId}
-                        onChange={(event) => handleModelRoleFieldChange('deep', 'providerId', event.target.value)}
-                        className={inputClassName}
-                        disabled={isSavingModelRoles}
-                      >
-                        <option value="">Use default AI</option>
-                        {providers.map((provider) => (
-                          <option key={provider.id} value={provider.id}>
-                            {getProviderDropdownLabel(provider)}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="mb-2 block text-[13px] font-medium text-text-secondary">
-                        Model name
-                      </label>
-                      <input
-                        type="text"
-                        value={modelRoleForm.deep.modelName}
-                        onChange={(event) => handleModelRoleFieldChange('deep', 'modelName', event.target.value)}
-                        placeholder="e.g. gemini-2.5-pro, gpt-4o, claude-3-5-sonnet"
-                        className={inputClassName}
-                        disabled={isSavingModelRoles}
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-1">
-                <p className="font-mono text-[11px] leading-relaxed text-text-tertiary">
-                  Not sure? Leave these blank and Scrimble will use your default AI for everything.
-                </p>
-                <p className="font-mono text-[11px] leading-relaxed text-text-tertiary">
-                  For the best plans, use a fast model (e.g. Flash, mini variants) for the quick slot and your smartest model for the deep slot.
-                </p>
-              </div>
-
-              <div className="flex justify-end">
-                <button
-                  type="submit"
-                  disabled={isSavingModelRoles}
-                  className="btn-secondary flex items-center gap-2 rounded-[8px] disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isSavingModelRoles ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {isSavingModelRoles ? 'Saving...' : 'Save model roles'}
-                </button>
-              </div>
-            </form>
+            <p className="rounded-[10px] border border-border-default bg-bg-base/60 px-3 py-2 text-[12px] text-text-secondary">
+              Hidden until you need role-specific model routing.
+            </p>
           )}
         </div>
 
@@ -1344,6 +1389,7 @@ export default function Settings() {
         id="research-tools"
         variants={itemVariants}
         className="rounded-[16px] border border-border-default bg-bg-surface p-6 shadow-panel"
+        aria-label="Research connectors and tools"
       >
         <div className="mb-6 max-w-[720px]">
           <div className="section-label mb-4">Research tools</div>
@@ -1482,6 +1528,7 @@ export default function Settings() {
                             type="button"
                             onClick={() => void handleToggleMCPServer(connectedServer)}
                             disabled={togglingMCPId === connectedServer.id}
+                            aria-label={`${connectedServer.is_active ? 'Pause' : 'Turn on'} ${connectedServer.name}`}
                             className="inline-flex items-center gap-2 text-sm font-medium text-text-secondary transition-colors hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {togglingMCPId === connectedServer.id ? (
@@ -1493,6 +1540,7 @@ export default function Settings() {
                             type="button"
                             onClick={() => void handleRemoveMCPServer(connectedServer)}
                             disabled={removingMCPId === connectedServer.id}
+                            aria-label={`Disconnect ${connectedServer.name}`}
                             className="inline-flex items-center gap-2 text-sm font-medium text-status-error transition-colors hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {removingMCPId === connectedServer.id ? (

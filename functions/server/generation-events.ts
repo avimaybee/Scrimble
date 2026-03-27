@@ -8,28 +8,43 @@ export type GenerationStreamEvent =
   | { type: 'batch_complete'; batch: GenerationBatchName; duration_ms: number; progress_percent: number }
   | { type: 'checkpoint'; adr: Batch3Architect; run_id?: string }
   | { type: 'pipeline_complete'; project_id: string }
-  | { type: 'pipeline_failed'; error: string };
+  | { type: 'pipeline_failed'; error: string; failureClass?: string }
+  | { type: 'invariant'; drift_type: string; message: string; timestamp: string };
 
-type LiveGenerationEventEnvelope = {
+type PersistedGenerationEventType = GenerationStreamEvent['type'];
+
+export type GenerationEventEnvelopeV1 = {
+  version: 1;
+  eventType: PersistedGenerationEventType;
+  projectId: string;
+  runId: string | null;
+  batch: GenerationBatchName | null;
+  timestamp: string;
+  payload: Record<string, unknown>;
+};
+
+type PersistedGenerationStreamEvent = GenerationStreamEvent;
+
+type LiveGenerationEventRecord = {
   id: number | null;
   projectId: string;
+  runId: string | null;
   batchName: GenerationBatchName | null;
   createdAt: string;
-  event: GenerationStreamEvent;
+  event: PersistedGenerationStreamEvent;
 };
 
-type PersistedGenerationEvent = LiveGenerationEventEnvelope & {
+type PersistedGenerationEvent = LiveGenerationEventRecord & {
   id: number;
-};
-
-type GenerationReplayContext = {
-  generationStatus: string | null;
-  generationRunId: string | null;
 };
 
 const encoder = new TextEncoder();
 const TERMINAL_EVENT_TYPES = new Set<GenerationStreamEvent['type']>(['pipeline_complete', 'pipeline_failed']);
 const EVENT_POLL_INTERVAL_MS = 2_000;
+const GENERATION_EVENT_VERSION = 1 as const;
+const SSE_EVENT_NAME = 'generation_event';
+const THINKING_EVENT_WINDOW_SIZE = 60;
+const ACTIVE_THINKING_RUN_STATUSES = new Set(['queued', 'running', 'awaiting_review', 'approved']);
 
 const batchLabels: Record<GenerationBatchName, string> = {
   batch_1_research_stack: 'Identifying your stack',
@@ -59,125 +74,223 @@ function asNumber(value: unknown, fallback = 0): number {
   return fallback;
 }
 
-function formatRelativeDuration(status: unknown) {
-  if (typeof status === 'number') {
-    return `(${status})`;
+function optionalText(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
   }
 
-  if (typeof status === 'string' && status.trim()) {
-    return `(${status.trim()})`;
-  }
-
-  return '';
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
-function mapLegacyActivityIcon(kind: unknown) {
-  switch (kind) {
-    case 'fetch':
-      return '🔍';
-    case 'github':
-      return '📦';
-    case 'warning':
-      return '⚠️';
-    case 'architecture':
-      return '🏗️';
-    case 'complete':
-      return '✅';
-    case 'writing':
-      return '📝';
-    default:
-      return '✦';
-  }
-}
-
-function mapLegacyStoredEvent(
-  eventType: string,
-  payload: Record<string, unknown>,
-  batchName: GenerationBatchName | null,
-): GenerationStreamEvent | null {
-  if (payload.type && typeof payload.type === 'string') {
-    const typedPayload = payload as GenerationStreamEvent;
-    if (
-      typedPayload.type === 'batch_start' ||
-      typedPayload.type === 'activity' ||
-      typedPayload.type === 'batch_complete' ||
-      typedPayload.type === 'checkpoint' ||
-      typedPayload.type === 'pipeline_complete' ||
-      typedPayload.type === 'pipeline_failed'
-    ) {
-      return typedPayload;
-    }
-  }
-
-  switch (eventType) {
+function eventPayloadFromStreamEvent(event: PersistedGenerationStreamEvent): Record<string, unknown> {
+  switch (event.type) {
+    case 'batch_start':
+      return {
+        batch: event.batch,
+        label: event.label,
+      };
     case 'activity':
       return {
-        type: 'activity',
-        icon: mapLegacyActivityIcon(payload.kind),
-        message: asText(payload.message),
-        timestamp: asText(payload.timestamp, new Date().toISOString()),
+        icon: event.icon,
+        message: event.message,
+        timestamp: event.timestamp,
       };
-    case 'fetch_attempt': {
-      const source = asText(payload.source, 'fetch');
-      const technology = asText(payload.technology);
-      const url = asText(payload.url);
-      const durationMs = asNumber(payload.duration_ms);
-      const statusSuffix = formatRelativeDuration(payload.status);
+    case 'thinking':
+      return {
+        content: event.content,
+      };
+    case 'batch_complete':
+      return {
+        batch: event.batch,
+        duration_ms: event.duration_ms,
+        progress_percent: event.progress_percent,
+      };
+    case 'checkpoint':
+      return {
+        adr: event.adr,
+        run_id: event.run_id ?? null,
+      };
+    case 'pipeline_complete':
+      return {
+        project_id: event.project_id,
+      };
+    case 'pipeline_failed':
+      return {
+        error: event.error,
+        failureClass: event.failureClass ?? null,
+      };
+    case 'invariant':
+      return {
+        drift_type: event.drift_type,
+        message: event.message,
+        timestamp: event.timestamp,
+      };
+  }
+}
+
+function streamEventFromEnvelope(envelope: GenerationEventEnvelopeV1): PersistedGenerationStreamEvent | null {
+  switch (envelope.eventType) {
+    case 'batch_start': {
+      const batch = optionalText(envelope.payload.batch) as GenerationBatchName | null;
+      const label = asText(envelope.payload.label);
+      if (!batch || !label) {
+        return null;
+      }
+
+      return {
+        type: 'batch_start',
+        batch,
+        label,
+      };
+    }
+    case 'activity': {
+      const message = asText(envelope.payload.message);
+      const timestamp = asText(envelope.payload.timestamp, envelope.timestamp);
+      if (!message) {
+        return null;
+      }
 
       return {
         type: 'activity',
-        icon: source === 'github' ? '📦' : '🔍',
-        message: `${source === 'github' ? 'Checking' : 'Reading'} ${technology || url} ${statusSuffix} in ${durationMs}ms`.trim(),
-        timestamp: new Date().toISOString(),
+        icon: asText(envelope.payload.icon, '✦'),
+        message,
+        timestamp,
       };
     }
-    case 'batch_completed':
+    case 'thinking': {
+      const content = asText(envelope.payload.content);
+      if (!content) {
+        return null;
+      }
+
+      return {
+        type: 'thinking',
+        content,
+      };
+    }
+    case 'batch_complete': {
+      const batch = optionalText(envelope.payload.batch) as GenerationBatchName | null;
+      if (!batch) {
+        return null;
+      }
+
       return {
         type: 'batch_complete',
-        batch: asText(payload.batch || batchName) as GenerationBatchName,
-        duration_ms: asNumber(payload.duration_ms),
-        progress_percent: asNumber(payload.progress_percent),
+        batch,
+        duration_ms: asNumber(envelope.payload.duration_ms, 0),
+        progress_percent: asNumber(envelope.payload.progress_percent, 0),
       };
-    case 'review_required':
-      return payload.adr
-        ? {
-            type: 'checkpoint',
-            adr: payload.adr as Batch3Architect,
-            run_id: asText(payload.run_id) || undefined,
-          }
-        : null;
-    case 'generation_complete':
+    }
+    case 'checkpoint':
+      if (!envelope.payload.adr || typeof envelope.payload.adr !== 'object') {
+        return null;
+      }
+      return {
+        type: 'checkpoint',
+        adr: envelope.payload.adr as Batch3Architect,
+        run_id: optionalText(envelope.payload.run_id) || undefined,
+      };
+    case 'pipeline_complete':
       return {
         type: 'pipeline_complete',
-        project_id: asText(payload.project_id),
+        project_id: asText(envelope.payload.project_id, envelope.projectId),
       };
-    case 'generation_failed':
+    case 'pipeline_failed':
       return {
         type: 'pipeline_failed',
-        error: asText(payload.error, 'Project generation failed.'),
+        error: asText(envelope.payload.error, 'Project generation failed.'),
+        failureClass: optionalText(envelope.payload.failureClass) || undefined,
+      };
+    case 'invariant':
+      return {
+        type: 'invariant',
+        drift_type: asText(envelope.payload.drift_type),
+        message: asText(envelope.payload.message),
+        timestamp: asText(envelope.payload.timestamp, envelope.timestamp),
       };
     default:
       return null;
   }
 }
 
+function isGenerationEventEnvelopeV1(value: unknown): value is GenerationEventEnvelopeV1 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return candidate.version === GENERATION_EVENT_VERSION
+    && typeof candidate.eventType === 'string'
+    && typeof candidate.projectId === 'string'
+    && typeof candidate.timestamp === 'string'
+    && candidate.payload !== null
+    && typeof candidate.payload === 'object'
+    && !Array.isArray(candidate.payload);
+}
+
+function mapLegacyStoredEvent(payload: Record<string, unknown>): PersistedGenerationStreamEvent | null {
+  if (!payload.type || typeof payload.type !== 'string') {
+    return null;
+  }
+
+  const typedPayload = payload as GenerationStreamEvent;
+  if (
+    typedPayload.type === 'batch_start'
+    || typedPayload.type === 'activity'
+    || typedPayload.type === 'thinking'
+    || typedPayload.type === 'batch_complete'
+    || typedPayload.type === 'checkpoint'
+    || typedPayload.type === 'pipeline_complete'
+    || typedPayload.type === 'pipeline_failed'
+    || typedPayload.type === 'invariant'
+  ) {
+    return typedPayload;
+  }
+
+  return null;
+}
+
+export function buildGenerationEventEnvelope(payload: {
+  projectId: string;
+  runId?: string | null;
+  batchName?: GenerationBatchName | null;
+  timestamp?: string;
+  event: PersistedGenerationStreamEvent;
+}): GenerationEventEnvelopeV1 {
+  return {
+    version: GENERATION_EVENT_VERSION,
+    eventType: payload.event.type,
+    projectId: payload.projectId,
+    runId: payload.runId ?? null,
+    batch: payload.batchName ?? null,
+    timestamp: payload.timestamp ?? new Date().toISOString(),
+    payload: eventPayloadFromStreamEvent(payload.event),
+  };
+}
+
 function parseStoredGenerationEvent(row: Record<string, unknown>): PersistedGenerationEvent | null {
   const payloadText = asText(row.payload, '{}');
-  const eventType = asText(row.event_type);
   const batchName = asText(row.batch_name) || null;
 
   try {
     const payload = JSON.parse(payloadText) as Record<string, unknown>;
-    const event = mapLegacyStoredEvent(eventType, payload, batchName as GenerationBatchName | null);
+    const canonicalEnvelope = isGenerationEventEnvelopeV1(payload)
+      ? payload
+      : null;
+    const event = canonicalEnvelope
+      ? streamEventFromEnvelope(canonicalEnvelope)
+      : mapLegacyStoredEvent(payload);
     if (!event) {
       return null;
     }
 
     return {
       id: asNumber(row.id),
-      projectId: asText(row.project_id),
-      batchName: (batchName as GenerationBatchName | null) || null,
-      createdAt: asText(row.created_at, new Date().toISOString()),
+      projectId: canonicalEnvelope?.projectId || asText(row.project_id),
+      runId: canonicalEnvelope?.runId || optionalText((payload as Record<string, unknown>).run_id),
+      batchName: (canonicalEnvelope?.batch || batchName) as GenerationBatchName | null,
+      createdAt: canonicalEnvelope?.timestamp || asText(row.created_at, new Date().toISOString()),
       event,
     };
   } catch {
@@ -185,45 +298,19 @@ function parseStoredGenerationEvent(row: Record<string, unknown>): PersistedGene
   }
 }
 
-async function loadGenerationReplayContext(env: Bindings, projectId: string): Promise<GenerationReplayContext> {
-  const project = await env.DB.prepare(`
-    SELECT generation_status, generation_run_id
-    FROM projects
-    WHERE id = ?
-  `)
-    .bind(projectId)
-    .first();
-  const projectRow = (project as Record<string, unknown> | null) ?? null;
+// In-memory listeners are runtime-local only. Pages SSE delivery is driven by
+// persisted D1 events because generation runs in a separate worker runtime.
 
-  return {
-    generationStatus: asText(projectRow?.generation_status) || null,
-    generationRunId: asText(projectRow?.generation_run_id) || null,
-  };
-}
-
-function shouldReplayPersistedEvent(event: PersistedGenerationEvent, replayContext: GenerationReplayContext) {
-  if (event.event.type !== 'checkpoint') {
-    return true;
-  }
-
-  if (replayContext.generationStatus !== 'awaiting_review') {
-    return false;
-  }
-
-  return !(
-    event.event.run_id &&
-    replayContext.generationRunId &&
-    event.event.run_id !== replayContext.generationRunId
-  );
-}
-
-// In-memory live listeners removed: the pipeline runs in a separate Worker
-// (scrimble-consumer / Durable Object) so in-memory pub/sub never reaches
-// the Pages SSE endpoint.  All event delivery now goes through D1 polling.
-
-function formatSseEvent(event: LiveGenerationEventEnvelope) {
+function formatSseEvent(event: LiveGenerationEventRecord) {
   const idLine = event.id === null ? '' : `id: ${event.id}\n`;
-  return `${idLine}event: ${event.event.type}\ndata: ${JSON.stringify(event.event)}\n\n`;
+  const envelope = buildGenerationEventEnvelope({
+    projectId: event.projectId,
+    runId: event.runId,
+    batchName: event.batchName,
+    timestamp: event.createdAt,
+    event: event.event,
+  });
+  return `${idLine}event: ${SSE_EVENT_NAME}\ndata: ${JSON.stringify(envelope)}\n\n`;
 }
 
 export function isTerminalGenerationEvent(event: GenerationStreamEvent) {
@@ -234,80 +321,96 @@ export function getBatchStartLabel(batchName: GenerationBatchName) {
   return batchLabels[batchName];
 }
 
-// D1-based thinking state removed — thinking deltas are transient and should
-// not be written to the database.  The frontend receives them as activity
-// events instead (see createThrottledThinkingEmitter below).
-
 export async function resetGenerationThinkingState(
-  _env: Bindings,
-  _projectId: string,
+  env: Bindings,
+  projectId: string,
   _batchName: GenerationBatchName | null,
 ) {
-  // No-op: thinking state is no longer persisted to D1.
+  await env.DB.prepare(`
+    DELETE FROM project_generation_events
+    WHERE project_id = ? AND event_type = 'thinking'
+  `)
+    .bind(projectId)
+    .run();
 }
 
 
 export async function appendGenerationThinkingDelta(
-  _env: Bindings,
-  _payload: {
+  env: Bindings,
+  payload: {
     projectId: string;
+    runId?: string | null;
     batchName: GenerationBatchName;
     content: string;
   },
 ) {
-  // No-op: thinking deltas are no longer persisted to D1.
-}
-
-type Subscriber = (projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) => void;
-const subscribers = new Set<Subscriber>();
-
-export function subscribeToGenerationEvents(fn: Subscriber) {
-  subscribers.add(fn);
-  return () => subscribers.delete(fn);
-}
-
-function publish(projectId: string, eventEnvelope: { id: number | null, event: GenerationStreamEvent }) {
-  console.log(`[GENERATION_EVENTS] Publishing to ${subscribers.size} subscriber(s): type=${eventEnvelope.event.type}, projectId=${projectId}`);
-  for (const sub of subscribers) {
-    try {
-      sub(projectId, eventEnvelope);
-    } catch (e) {
-      console.error('[GENERATION_EVENTS] Error in subscriber', e);
-    }
+  const content = payload.content.trim();
+  if (!content) {
+    return;
   }
+
+  await persistGenerationStreamEvent(env, {
+    projectId: payload.projectId,
+    runId: payload.runId ?? null,
+    batchName: payload.batchName,
+    event: {
+      type: 'thinking',
+      content,
+    },
+  });
+
+  await env.DB.prepare(`
+    DELETE FROM project_generation_events
+    WHERE id IN (
+      SELECT id
+      FROM project_generation_events
+      WHERE project_id = ? AND event_type = 'thinking'
+      ORDER BY id DESC
+      LIMIT -1 OFFSET ?
+    )
+  `)
+    .bind(payload.projectId, THINKING_EVENT_WINDOW_SIZE)
+    .run();
 }
 
 export async function persistGenerationStreamEvent(
   env: Bindings,
   payload: {
     projectId: string;
+    runId?: string | null;
     batchName?: GenerationBatchName;
-    event: Exclude<GenerationStreamEvent, { type: 'thinking' }>;
+    event: GenerationStreamEvent;
   },
 ) {
+  const createdAt = new Date().toISOString();
+  const envelope = buildGenerationEventEnvelope({
+    projectId: payload.projectId,
+    runId: payload.runId ?? null,
+    batchName: payload.batchName || null,
+    timestamp: createdAt,
+    event: payload.event,
+  });
+
   const result = await env.DB.prepare(`
     INSERT INTO project_generation_events (project_id, event_type, batch_name, payload)
     VALUES (?, ?, ?, ?)
   `)
     .bind(
       payload.projectId,
-      payload.event.type,
-      payload.batchName || null,
-      JSON.stringify(payload.event),
+      envelope.eventType,
+      envelope.batch,
+      JSON.stringify(envelope),
     )
     .run();
 
-  const persisted = {
+  return {
     id: asNumber(result.meta?.last_row_id),
     projectId: payload.projectId,
+    runId: payload.runId ?? null,
     batchName: payload.batchName || null,
-    createdAt: new Date().toISOString(),
+    createdAt,
     event: payload.event,
   } satisfies PersistedGenerationEvent;
-  
-  publish(payload.projectId, persisted);
-
-  return persisted;
 }
 
 export function emitTransientGenerationStreamEvent(payload: {
@@ -315,36 +418,52 @@ export function emitTransientGenerationStreamEvent(payload: {
   batchName?: GenerationBatchName;
   event: Extract<GenerationStreamEvent, { type: 'thinking' }>;
 }) {
-  console.log(`[GENERATION_EVENTS] Emitting thinking event for ${payload.projectId}: ${payload.event.content.slice(0, 100)}...`);
-  publish(payload.projectId, { id: null, event: payload.event });
+  void payload;
 }
 
 export function createThrottledThinkingEmitter(
-  _env: Bindings,
+  env: Bindings,
   projectId: string,
+  runId: string,
   batchName: GenerationBatchName,
   flushIntervalMs = 150,
 ) {
   let buffer = '';
   let lastFlush = Date.now();
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  let persistChain = Promise.resolve();
+
+  const queueThinkingPersistence = (content: string) => {
+    persistChain = persistChain
+      .then(() =>
+        appendGenerationThinkingDelta(env, {
+          projectId,
+          runId,
+          batchName,
+          content,
+        }),
+      )
+      .catch((error) => {
+        logStreamWarning('generation-thinking-persist-failed', {
+          projectId,
+          runId,
+          batchName,
+          error: error instanceof Error ? error.message : 'Unknown persistence error',
+        });
+      });
+  };
 
   const flushNow = () => {
     if (!buffer) return;
-    console.log(`[THINKING_EMITTER] Flushing ${buffer.length} chars for ${projectId}/${batchName}`);
-    emitTransientGenerationStreamEvent({
-      projectId,
-      batchName,
-      event: { type: 'thinking', content: buffer },
-    });
+    const nextChunk = buffer;
     buffer = '';
     lastFlush = Date.now();
+    queueThinkingPersistence(nextChunk);
   };
 
   return {
     onReasoningDelta: (delta: string) => {
       buffer += delta;
-      console.log(`[THINKING_EMITTER] Buffer now has ${buffer.length} chars for ${projectId}/${batchName}`);
       
       const now = Date.now();
       if (now - lastFlush >= flushIntervalMs) {
@@ -366,11 +485,37 @@ export function createThrottledThinkingEmitter(
         timeoutId = null;
       }
       flushNow();
+      await persistChain;
     },
   };
 }
 
-export async function listPersistedGenerationEventsSince(env: Bindings, projectId: string, lastEventId: number) {
+async function resolveActiveThinkingRunId(env: Bindings, projectId: string) {
+  const row = await env.DB.prepare(`
+    SELECT p.current_generation_run_id AS run_id, gr.status AS run_status
+    FROM projects p
+    LEFT JOIN generation_runs gr ON gr.id = p.current_generation_run_id
+    WHERE p.id = ?
+    LIMIT 1
+  `)
+    .bind(projectId)
+    .first() as Record<string, unknown> | null;
+
+  const runId = optionalText(row?.run_id);
+  const runStatus = asText(row?.run_status, '').toLowerCase();
+  if (!runId || !ACTIVE_THINKING_RUN_STATUSES.has(runStatus)) {
+    return null;
+  }
+
+  return runId;
+}
+
+export async function listPersistedGenerationEventsSince(
+  env: Bindings,
+  projectId: string,
+  lastEventId: number,
+  options: { activeThinkingRunId?: string | null } = {},
+) {
   const rows = await env.DB.prepare(`
     SELECT id, project_id, event_type, batch_name, payload, created_at
     FROM project_generation_events
@@ -382,7 +527,25 @@ export async function listPersistedGenerationEventsSince(env: Bindings, projectI
 
   return (rows.results as Array<Record<string, unknown>>)
     .map(parseStoredGenerationEvent)
-    .filter((event): event is PersistedGenerationEvent => Boolean(event));
+    .filter((event): event is PersistedGenerationEvent => {
+      if (!event) {
+        return false;
+      }
+
+      if (event.event.type !== 'thinking') {
+        return true;
+      }
+
+      return Boolean(
+        options.activeThinkingRunId
+        && event.runId
+        && event.runId === options.activeThinkingRunId,
+      );
+    });
+}
+
+function logStreamWarning(message: string, payload: Record<string, unknown>) {
+  console.warn(`[generation-events] ${message}`, payload);
 }
 
 export function createGenerationSseStream(
@@ -459,17 +622,19 @@ export function createGenerationSseStream(
     pollInFlight = true;
 
     try {
+      const activeThinkingRunId = await resolveActiveThinkingRunId(env, payload.projectId);
       const persistedEvents = await listPersistedGenerationEventsSince(
         env,
         payload.projectId,
         latestEventId,
+        { activeThinkingRunId },
       );
 
       for (const event of persistedEvents) {
         dispatchEvent(event);
       }
     } catch (error) {
-      console.warn('[generation-stream-poll-failed]', {
+      logStreamWarning('generation-stream-poll-failed', {
         projectId: payload.projectId,
         error: error instanceof Error ? error.message : 'Unknown polling error',
       });
@@ -481,19 +646,16 @@ export function createGenerationSseStream(
   // Bootstrap: replay persisted events, then start polling
   void (async () => {
     try {
-      const replayContext = await loadGenerationReplayContext(env, payload.projectId);
+      const activeThinkingRunId = await resolveActiveThinkingRunId(env, payload.projectId);
       const replayEvents = await listPersistedGenerationEventsSince(
         env,
         payload.projectId,
         payload.lastEventId,
+        { activeThinkingRunId },
       );
 
       for (const event of replayEvents) {
         latestEventId = Math.max(latestEventId, event.id);
-        if (!shouldReplayPersistedEvent(event, replayContext)) {
-          continue;
-        }
-
         enqueueChunk(formatSseEvent(event));
 
         if (isTerminalGenerationEvent(event.event)) {
@@ -517,7 +679,7 @@ export function createGenerationSseStream(
         void pollForNewEvents();
       }, EVENT_POLL_INTERVAL_MS);
     } catch (error) {
-      console.warn('[generation-stream-open-failed]', {
+      logStreamWarning('generation-stream-open-failed', {
         projectId: payload.projectId,
         error: error instanceof Error ? error.message : 'Unknown replay error',
       });

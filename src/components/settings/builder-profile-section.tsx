@@ -50,7 +50,11 @@ function getNextProficiency(current: ToolProficiency) {
   return TOOL_PROFICIENCIES[(currentIndex + 1) % TOOL_PROFICIENCIES.length];
 }
 
-export function BuilderProfileSection() {
+type BuilderProfileSectionProps = {
+  onToolCountChange?: (count: number) => void;
+};
+
+export function BuilderProfileSection({ onToolCountChange }: BuilderProfileSectionProps = {}) {
   const [tools, setTools] = useState<BuilderProfileTool[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [savingKey, setSavingKey] = useState<string | null>(null);
@@ -59,6 +63,10 @@ export function BuilderProfileSection() {
     () => createCategoryRecord(() => ''),
   );
   const [reactionFocus, setReactionFocus] = useState<Partial<Record<BuilderProfileCategory, string>>>({});
+
+  useEffect(() => {
+    onToolCountChange?.(tools.length);
+  }, [onToolCountChange, tools.length]);
 
   useEffect(() => {
     let isMounted = true;

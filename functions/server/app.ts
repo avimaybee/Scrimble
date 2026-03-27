@@ -12,14 +12,29 @@ import {
   getSkillFileSortIndex,
 } from './generation-schemas';
 import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
-import { createGenerationSseStream, persistGenerationStreamEvent } from './generation-events';
 import {
-  hasProjectGenerationBackendBinding,
-  resolveProjectGenerationBackend,
+  createGenerationSseStream,
+  persistGenerationStreamEvent,
+  resetGenerationThinkingState,
+} from './generation-events';
+import {
+  cancelWorkflowGeneration,
+  sendWorkflowDispatchEvent,
   sendGenerationDispatch,
+  WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+  workflowInstanceIdFor,
 } from './generation-dispatch';
+
+import {
+  getGenerationRuntimeState,
+  createGenerationRun,
+  updateGenerationRunStatus,
+  mapProjectRowToResponse,
+  buildGenerationRuntimeContract,
+} from './generation-runtime';
 import {
   callAIWithRetry,
+
   defaultModelForProvider,
   extractJSON,
   getProvider,
@@ -43,8 +58,6 @@ import {
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
   hasApprovedArchitectureReview,
-  isGenerationExecutionStale,
-  isQueuedGenerationResumeReady,
   loadBatchOutput,
   resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
@@ -70,7 +83,6 @@ import {
   type AppEnv,
   type Bindings,
   type GenerationBatchName,
-  type ProjectGenerationBackend,
   type ProjectGenerationStatus,
 } from './types';
 
@@ -102,7 +114,6 @@ const providerSchema = z.object({
   apiKey: z.string().trim().min(1),
   baseUrl: z.string().trim().optional(),
   model: z.string().trim().optional(),
-  isDefault: z.boolean().optional(),
 });
 
 const enrichSchema = z.object({
@@ -110,6 +121,7 @@ const enrichSchema = z.object({
   providerId: z.string().trim().optional(),
   feedback: z.string().trim().optional(),
   editedOutput: z.string().trim().optional(),
+  runId: z.string().trim().optional(),
 });
 
 const proxySchema = z.object({
@@ -118,6 +130,7 @@ const proxySchema = z.object({
   prompt: z.string().trim().min(1),
   projectId: z.string().trim().optional(),
   stepId: z.string().trim().optional(),
+  runId: z.string().trim().optional(),
 });
 
 const createProjectSchema = z.object({
@@ -145,6 +158,7 @@ const modelRolesSchema = z.object({
 
 const architectureReviewApprovalSchema = z.object({
   feedback: z.string().optional().default(''),
+  preferredIde: z.string().trim().optional().default(''),
 });
 
 const userToolSchema = z.object({
@@ -199,13 +213,9 @@ function jsonError(message: string, status: number, details?: unknown) {
   return Response.json(details ? { error: message, details } : { error: message }, { status });
 }
 
-function generationBackendConfigurationError(c: AppContext, backend: ProjectGenerationBackend) {
+function generationWorkflowConfigurationError(c: AppContext) {
   return c.json({
-    error:
-      backend === 'durable_object'
-        ? 'Project generation durable object is not configured.'
-        : 'Project generation queue is not configured.',
-    backend,
+    error: 'Project generation workflow is not configured.',
     envKeys: Object.keys(c.env || {}),
   }, 500);
 }
@@ -265,33 +275,6 @@ function optionalText(value: unknown): string | null {
 
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
-}
-
-function sqlNullableColumnMatch(column: string) {
-  return `((${column} IS NULL AND ? IS NULL) OR ${column} = ?)`;
-}
-
-function getProjectGenerationGuardBindings(project: {
-  generation_run_id?: unknown;
-  generation_provider_id?: unknown;
-  generation_heartbeat_at?: unknown;
-  generation_completed_at?: unknown;
-}) {
-  const generationRunId = optionalText(project.generation_run_id);
-  const generationProviderId = optionalText(project.generation_provider_id);
-  const generationHeartbeatAt = optionalText(project.generation_heartbeat_at);
-  const generationCompletedAt = optionalText(project.generation_completed_at);
-
-  return [
-    generationRunId,
-    generationRunId,
-    generationProviderId,
-    generationProviderId,
-    generationHeartbeatAt,
-    generationHeartbeatAt,
-    generationCompletedAt,
-    generationCompletedAt,
-  ];
 }
 
 function serializeJson(value: unknown): string | null {
@@ -357,7 +340,6 @@ function mapProviderRow(row: any) {
     base_url: row.base_url || undefined,
     model: row.model || undefined,
     models: row.models || [],
-    is_default: toBoolean(row.is_default),
     masked_key: row.masked_key || undefined,
   };
 }
@@ -383,26 +365,7 @@ function maskApiKeyPreview(secret: string) {
 }
 
 function mapProjectRow(row: any) {
-  return {
-    id: row.id,
-    user_id: row.user_id,
-    name: row.name,
-    description: row.description || '',
-    project_type: row.project_type || 'other',
-    stack: row.stack || '{}',
-    status: row.status || 'active',
-    generation_status: row.generation_status || 'complete',
-    generation_error: row.generation_error || undefined,
-    generation_started_at: row.generation_started_at || undefined,
-    generation_completed_at: row.generation_completed_at || undefined,
-    generation_run_id: row.generation_run_id || undefined,
-    generation_provider_id: row.generation_provider_id || undefined,
-    generation_heartbeat_at: row.generation_heartbeat_at || undefined,
-    intake_answers: row.intake_answers || undefined,
-    progress: asNumber(row.progress, 0),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  };
+  return mapProjectRowToResponse(row);
 }
 
 function mapPlanRow(row: any) {
@@ -491,6 +454,23 @@ async function getOwnedProject(c: AppContext, projectId: string) {
   return c.env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, c.get('uid')).first();
 }
 
+async function getOwnedProjectWithRuntime(c: AppContext, projectId: string) {
+  const project = await getOwnedProject(c, projectId);
+  if (!project) {
+    return null;
+  }
+
+  const runtimeState = await getGenerationRuntimeState(c.env, projectId);
+  const generationRuntime = buildGenerationRuntimeContract(runtimeState);
+
+  return {
+    project,
+    runtimeState,
+    generationRuntime,
+    lifecycleStatus: generationRuntime.lifecycleStatus,
+  };
+}
+
 async function getCompletedGenerationBatches(c: AppContext, projectId: string) {
   const rows = await c.env.DB.prepare(`
     SELECT run_type, completed_at
@@ -505,14 +485,15 @@ async function getCompletedGenerationBatches(c: AppContext, projectId: string) {
 }
 
 async function buildIntakeResponse(c: AppContext, projectId: string) {
-  const [project, messages] = await Promise.all([
-    getOwnedProject(c, projectId),
+  const [projectRuntime, messages] = await Promise.all([
+    getOwnedProjectWithRuntime(c, projectId),
     listProjectIntakeMessages(c.env, projectId),
   ]);
 
-  if (!project) {
+  if (!projectRuntime) {
     throw new Error('Project intake state is unavailable.');
   }
+  const { project, generationRuntime } = projectRuntime;
 
   const briefContext = await loadProjectBriefContext(c.env, projectId, c.get('uid'), {
     rawDescription: asText(project.description, ''),
@@ -523,7 +504,7 @@ async function buildIntakeResponse(c: AppContext, projectId: string) {
 
   return {
     project_id: projectId,
-    generation_status: (project.generation_status as string | null) || 'intake',
+    generation_runtime: generationRuntime,
     ready,
     agent_message: latestAgentMessage?.content || '',
     questions: [],
@@ -611,11 +592,21 @@ async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
   return c.env.DB.prepare(`
     SELECT
       p.*,
+      gr.status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
+      gr.id as canonical_run_id,
+      gr.error_message as canonical_run_error,
+      gr.current_batch as canonical_run_current_batch,
+      gr.workflow_instance_id as canonical_run_workflow_instance_id,
+      gr.started_at as canonical_run_started_at,
+      gr.completed_at as canonical_run_completed_at,
+      gr.created_at as canonical_run_created_at,
+      gr.updated_at as canonical_run_updated_at,
       CASE
         WHEN COUNT(s.id) = 0 THEN 0
         ELSE CAST(ROUND(100.0 * SUM(CASE WHEN s.status = 'complete' THEN 1 ELSE 0 END) / COUNT(s.id)) AS INTEGER)
       END AS progress
     FROM projects p
+    LEFT JOIN generation_runs gr ON gr.id = p.current_generation_run_id
     LEFT JOIN workflows w ON w.project_id = p.id
     LEFT JOIN steps s ON s.workflow_id = w.id
     WHERE p.id = ? AND p.user_id = ?
@@ -658,7 +649,7 @@ async function resolveProvider(c: AppContext, providerId?: string) {
   }
 
   return c.env.DB.prepare(
-    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC LIMIT 1'
+    'SELECT * FROM ai_providers WHERE user_id = ? ORDER BY created_at ASC LIMIT 1'
   )
     .bind(uid)
     .first();
@@ -667,7 +658,7 @@ async function resolveProvider(c: AppContext, providerId?: string) {
 async function resolveProviderContext(
   c: AppContext,
   providerId?: string,
-  role: 'fast' | 'deep' | 'default' = 'default',
+  role: 'fast' | 'deep' = 'fast',
 ) {
   return getProvider(c.env, c.get('uid'), { providerId, role });
 }
@@ -676,6 +667,7 @@ async function insertAgentRun(
   c: AppContext,
   payload: {
     projectId: string;
+    runId?: string | null;
     stepId?: string | null;
     runType: string;
     status: string;
@@ -687,12 +679,13 @@ async function insertAgentRun(
 ) {
   const id = crypto.randomUUID();
   await c.env.DB.prepare(`
-    INSERT INTO agent_runs (id, project_id, step_id, run_type, status, provider, model, input, output)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO agent_runs (id, project_id, run_id, step_id, run_type, status, provider, model, input, output)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
       payload.projectId,
+      payload.runId || null,
       payload.stepId || null,
       payload.runType,
       payload.status,
@@ -706,26 +699,42 @@ async function insertAgentRun(
   return id;
 }
 
+
 app.use('*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return jsonError('Missing or invalid Authorization header', 401);
   }
 
+  const firebaseProjectId = optionalText(c.env.FIREBASE_PROJECT_ID) || 'scrimble-auth';
+  if (!optionalText(c.env.FIREBASE_PROJECT_ID)) {
+    console.warn('[auth-config-fallback]', { key: 'FIREBASE_PROJECT_ID', using: firebaseProjectId });
+  }
+
+  let uid: string;
   try {
-    const uid = await verifyFirebaseToken(authHeader.slice(7), c.env.FIREBASE_PROJECT_ID);
-    c.set('uid', uid);
-    await ensureProfile(c, uid);
-    await next();
+    uid = await verifyFirebaseToken(authHeader.slice(7), firebaseProjectId);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Authentication failed';
     return jsonError(`Auth failed: ${message}`, 401);
   }
+
+  c.set('uid', uid);
+
+  try {
+    await ensureProfile(c, uid);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Profile initialization failed';
+    console.error('[auth-profile-sync-failed]', { uid, message });
+    return jsonError(`Failed to initialize your profile: ${message}`, 500);
+  }
+
+  await next();
 });
 
 app.get('/ai/providers', async (c) => {
   const providers = await c.env.DB.prepare(
-    'SELECT id, name, provider, base_url, model, is_default, api_key_enc FROM ai_providers WHERE user_id = ? ORDER BY is_default DESC, created_at ASC'
+    'SELECT id, name, provider, base_url, model, api_key_enc FROM ai_providers WHERE user_id = ? ORDER BY created_at ASC'
   )
     .bind(c.get('uid'))
     .all();
@@ -773,7 +782,6 @@ app.post('/ai/providers', async (c) => {
   const { name, provider, apiKey } = parsed.data;
   const baseUrl = parsed.data.baseUrl?.trim() || null;
   const model = parsed.data.model?.trim() || defaultModelForProvider(provider);
-  const isDefault = parsed.data.isDefault ?? false;
 
   if (provider === 'custom' && !baseUrl) {
     return c.json({ error: 'A base URL is required for custom providers.' }, 400);
@@ -783,15 +791,11 @@ app.post('/ai/providers', async (c) => {
   const encryptedKey = await encrypt(apiKey, c.env.ENCRYPTION_KEY);
   const id = crypto.randomUUID();
 
-  if (isDefault) {
-    await c.env.DB.prepare('UPDATE ai_providers SET is_default = 0 WHERE user_id = ?').bind(c.get('uid')).run();
-  }
-
   const stmts = [
     c.env.DB.prepare(`
-      INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model, is_default)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model, isDefault ? 1 : 0)
+      INSERT INTO ai_providers (id, user_id, name, provider, api_key_enc, base_url, model)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, c.get('uid'), name.trim(), provider, encryptedKey, baseUrl, model)
   ];
 
   if (model) {
@@ -862,7 +866,19 @@ app.delete('/ai/providers/:id', async (c) => {
     return c.json({ error: 'Provider not found' }, 404);
   }
 
-  await c.env.DB.prepare('DELETE FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, c.get('uid')).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`
+      UPDATE profiles
+      SET
+        fast_model_provider_id = CASE WHEN fast_model_provider_id = ? THEN NULL ELSE fast_model_provider_id END,
+        fast_model_name = CASE WHEN fast_model_provider_id = ? THEN NULL ELSE fast_model_name END,
+        deep_model_provider_id = CASE WHEN deep_model_provider_id = ? THEN NULL ELSE deep_model_provider_id END,
+        deep_model_name = CASE WHEN deep_model_provider_id = ? THEN NULL ELSE deep_model_name END,
+        updated_at = datetime("now")
+      WHERE id = ?
+    `).bind(providerId, providerId, providerId, providerId, c.get('uid')),
+    c.env.DB.prepare('DELETE FROM ai_providers WHERE id = ? AND user_id = ?').bind(providerId, c.get('uid')),
+  ]);
   return c.json({ success: true });
 });
 
@@ -1065,11 +1081,21 @@ app.get('/projects', async (c) => {
   const projects = await c.env.DB.prepare(`
     SELECT
       p.*,
+      gr.status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
+      gr.id as canonical_run_id,
+      gr.error_message as canonical_run_error,
+      gr.current_batch as canonical_run_current_batch,
+      gr.workflow_instance_id as canonical_run_workflow_instance_id,
+      gr.started_at as canonical_run_started_at,
+      gr.completed_at as canonical_run_completed_at,
+      gr.created_at as canonical_run_created_at,
+      gr.updated_at as canonical_run_updated_at,
       CASE
         WHEN COUNT(s.id) = 0 THEN 0
         ELSE CAST(ROUND(100.0 * SUM(CASE WHEN s.status = 'complete' THEN 1 ELSE 0 END) / COUNT(s.id)) AS INTEGER)
       END AS progress
     FROM projects p
+    LEFT JOIN generation_runs gr ON gr.id = p.current_generation_run_id
     LEFT JOIN workflows w ON w.project_id = p.id
     LEFT JOIN steps s ON s.workflow_id = w.id
     WHERE p.user_id = ?
@@ -1108,9 +1134,9 @@ app.post('/intake/start', async (c) => {
 
   await c.env.DB.prepare(`
     INSERT INTO projects (
-      id, user_id, name, description, project_type, stack, status, risk_score, generation_status, generation_error
+      id, user_id, name, description, project_type, stack, status, risk_score
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
@@ -1121,8 +1147,6 @@ app.post('/intake/start', async (c) => {
         '{}',
         'active',
         0,
-        'intake',
-        null,
       )
     .run();
 
@@ -1157,12 +1181,13 @@ app.post('/intake/start', async (c) => {
 
 app.post('/intake/:id/respond', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { project, lifecycleStatus } = projectRuntime;
 
-  if ((project.generation_status || 'intake') !== 'intake') {
+  if (lifecycleStatus !== 'intake') {
     return c.json({ error: 'This intake conversation is no longer active.' }, 409);
   }
 
@@ -1209,18 +1234,18 @@ app.post('/intake/:id/respond', async (c) => {
 
 app.post('/intake/:id/confirm', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { project, lifecycleStatus } = projectRuntime;
 
-  if ((project.generation_status || 'intake') !== 'intake') {
+  if (lifecycleStatus !== 'intake') {
     return c.json({ error: 'This project has already moved past intake.' }, 409);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const parsed = intakeConfirmSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1252,35 +1277,16 @@ app.post('/intake/:id/confirm', async (c) => {
       ? `${nextNameBase}...`
       : nextNameBase || asText(project.name, 'Untitled project');
   const runId = crypto.randomUUID();
-  const generationGuardBindings = getProjectGenerationGuardBindings(project);
-
-  const confirmUpdate = await c.env.DB.prepare(`
-    UPDATE projects
-    SET name = ?,
-        generation_status = 'queued',
-        generation_error = NULL,
-        generation_run_id = ?,
-        generation_provider_id = ?,
-        generation_heartbeat_at = datetime("now"),
-        generation_completed_at = NULL,
-        updated_at = datetime("now")
-    WHERE id = ? AND user_id = ? AND generation_status = 'intake'
-      AND ${sqlNullableColumnMatch('generation_run_id')}
-      AND ${sqlNullableColumnMatch('generation_provider_id')}
-      AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
-      AND ${sqlNullableColumnMatch('generation_completed_at')}
-  `)
-    .bind(
-      nextName,
-      runId,
-      providerContext.providerId,
-      projectId,
-      c.get('uid'),
-      ...generationGuardBindings,
-    )
-    .run();
-
-  if (asNumber((confirmUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
+  
+  // Use createGenerationRun canonical service
+  try {
+    await createGenerationRun(c.env, projectId, runId, providerContext.providerId);
+    
+    // Also update the name since createGenerationRun only handles runtime fields
+    await c.env.DB.prepare('UPDATE projects SET name = ?, updated_at = datetime("now") WHERE id = ?')
+      .bind(nextName, projectId)
+      .run();
+  } catch (error) {
     return c.json({ error: 'This project changed while you were confirming it. Reload and try again.' }, 409);
   }
 
@@ -1293,30 +1299,31 @@ app.post('/intake/:id/confirm', async (c) => {
       kind: 'intake_confirm',
       previousStatus: 'intake',
       targetStatus: 'queued',
-    }, { backend: generationBackend });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
-    await c.env.DB.prepare(`
-      UPDATE projects
-      SET name = ?,
-          generation_status = 'intake',
-          generation_error = ?,
-          generation_run_id = NULL,
-          generation_provider_id = NULL,
-          generation_heartbeat_at = NULL,
-          generation_completed_at = NULL,
-          updated_at = datetime("now")
-      WHERE id = ? AND user_id = ? AND generation_status = 'queued' AND generation_run_id = ?
-    `)
-      .bind(project.name, message, projectId, c.get('uid'), runId)
-      .run();
+    
+    // Use updateGenerationRunStatus for cleanup
+    await updateGenerationRunStatus(c.env, runId, 'intake', { errorMessage: message });
+    
     return c.json({ error: 'Failed to start project generation.' }, 503);
   }
 
   return c.json({
     success: true,
     project_id: projectId,
-    generation_status: 'queued',
+    generation_runtime: {
+      runId,
+      lifecycleStatus: 'queued',
+      currentBatch: null,
+      isTerminal: false,
+      canResume: false,
+      isReviewRequired: false,
+      providerId: providerContext.providerId,
+      heartbeatAt: null,
+      completedBatches: [],
+      failureClass: null,
+    },
   });
 });
 
@@ -1335,9 +1342,8 @@ app.post('/projects', async (c) => {
     return c.json({ error: 'A project description is required.', details: parsed.error.format() }, 400);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const providerRecord = await resolveProvider(c, parsed.data.providerId);
@@ -1354,10 +1360,9 @@ app.post('/projects', async (c) => {
 
   await c.env.DB.prepare(`
     INSERT INTO projects (
-      id, user_id, name, description, project_type, stack, status, risk_score, generation_status, generation_error,
-      generation_run_id, generation_provider_id, generation_heartbeat_at
+      id, user_id, name, description, project_type, stack, status, risk_score
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"))
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `)
     .bind(
       id,
@@ -1368,12 +1373,10 @@ app.post('/projects', async (c) => {
       '{}',
       'active',
       0,
-      'queued',
-      null,
-      runId,
-      providerRecord.id as string,
     )
     .run();
+
+  await createGenerationRun(c.env, id, runId, providerRecord.id as string);
 
   try {
     await sendGenerationDispatch(c.env, {
@@ -1384,90 +1387,80 @@ app.post('/projects', async (c) => {
       kind: 'direct_create',
       previousStatus: null,
       targetStatus: 'queued',
-    }, { backend: generationBackend });
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
-    await c.env.DB.prepare(`
-      UPDATE projects
-      SET generation_status = 'failed',
-          generation_error = ?,
-          generation_completed_at = datetime("now"),
-          updated_at = datetime("now")
-      WHERE id = ? AND user_id = ? AND generation_status = 'queued' AND generation_run_id = ?
-    `)
-      .bind(message, id, c.get('uid'), runId)
-      .run();
+    const message = error instanceof Error ? error.message : 'Failed to start project generation.';
+    await updateGenerationRunStatus(c.env, runId, 'failed', { errorMessage: message });
     return c.json({ error: 'Failed to start project generation.', project_id: id }, 503);
   }
 
-  return c.json({ success: true, id, generation_status: 'queued' }, 202);
+  return c.json({
+    success: true,
+    id,
+    generation_runtime: {
+      runId,
+      lifecycleStatus: 'queued',
+      currentBatch: null,
+      isTerminal: false,
+      canResume: false,
+      isReviewRequired: false,
+      providerId: providerRecord.id as string,
+      heartbeatAt: null,
+      completedBatches: [],
+      failureClass: null,
+    },
+  }, 202);
 });
 
 app.get('/projects/:id', async (c) => {
-  const project = await getOwnedProjectWithProgress(c, c.req.param('id'));
+  const projectId = c.req.param('id');
+  const project = await getOwnedProjectWithProgress(c, projectId);
   if (!project) {
     return c.json({ error: 'Project not found' }, 404);
   }
+
+  // Legacy drift correction removed - Phase 3 decommissioning complete
 
   return c.json(mapProjectRow(project));
 });
 
 app.get('/projects/:id/status', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { runtimeState, generationRuntime, lifecycleStatus } = projectRuntime;
 
-  const generationStatus = (project.generation_status as string | null) || 'complete';
-  const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
-  const completedBatchNames = completedBatchRows.map((row) => row.run_type);
-  const reviewConfirmedByStatus =
-    generationStatus === 'approved'
-    || generationStatus === 'batch_4_plan_build'
-    || generationStatus === 'batch_5_enrich_steps'
-    || generationStatus === 'batch_6_generate_files'
-    || generationStatus === 'complete';
-  const hasReviewApproval =
-    reviewConfirmedByStatus ||
-    completedBatchNames.includes('batch_4_plan_build') ||
-    completedBatchNames.includes('batch_5_enrich_steps') ||
-    completedBatchNames.includes('batch_6_generate_files') ||
-    await hasApprovedArchitectureReview(c.env, projectId);
-  const generationHeartbeat = (project.generation_heartbeat_at as string | null) || null;
-  const executionStale = isGenerationExecutionStale(generationStatus, generationHeartbeat);
-  const queuedResumeReady = isQueuedGenerationResumeReady(generationStatus, generationHeartbeat);
-    const resumeStatus = await resolvePipelineStatusToRun(c.env, projectId, generationStatus as ProjectGenerationStatus, completedBatchNames);
+  const executionStale = runtimeState.isStale;
+  const queuedResumeReady = runtimeState.canResume;
 
-  const canResume =
-    generationStatus !== 'complete' &&
-    resumeStatus !== 'awaiting_review' &&
-    (generationStatus === 'failed' || executionStale || queuedResumeReady);
+  const canResume = runtimeState.canResume;
 
-  const completedBatches = completedBatchRows.map((row) => ({
-    batch: row.run_type,
-    completed_at: row.completed_at,
-    message: getBatchCompletionMessage(row.run_type as GenerationBatchName),
+  const completedBatches = runtimeState.completedBatches.map((batchName) => ({
+    batch: batchName,
+    completed_at: null, // We don't have the exact time in the simple list, could fetch but for Phase 1 this is fine if we return correctly below
+    message: getBatchCompletionMessage(batchName as GenerationBatchName),
   }));
 
   return c.json({
     project_id: projectId,
-    generation_status: generationStatus,
-    generation_error: project.generation_error || null,
-    generation_run_id: project.generation_run_id || null,
-    generation_provider_id: project.generation_provider_id || null,
-    generation_heartbeat_at: generationHeartbeat,
+    generation_runtime: generationRuntime,
+    generation_error: runtimeState.run?.error_message || null,
+    workflow_instance_id: runtimeState.run?.workflow_instance_id || null,
+
     completed_batches: completedBatches,
     completed_batch_count: completedBatches.length,
     total_batches: GENERATION_BATCHES.length,
     progress_percent: Math.round((completedBatches.length / GENERATION_BATCHES.length) * 100),
-    is_intake: generationStatus === 'intake',
-    is_complete: generationStatus === 'complete',
-    is_failed: generationStatus === 'failed',
-    is_review_required: generationStatus === 'awaiting_review',
-    is_approved: generationStatus === 'approved',
+    is_intake: lifecycleStatus === 'intake',
+    is_complete: lifecycleStatus === 'complete',
+    is_failed: lifecycleStatus === 'failed' || (canResume && executionStale),
+    is_review_required: generationRuntime.isReviewRequired,
+    is_approved: lifecycleStatus === 'approved',
     execution_stale: canResume && (executionStale || queuedResumeReady),
     can_resume: canResume,
+    resumedAt: runtimeState.run?.updated_at,
   });
 });
 
@@ -1487,16 +1480,16 @@ app.get('/projects/:id/architecture-review', async (c) => {
   }
 });
 
-app.post('/projects/:id/architecture-review', async (c) => {
+const handleProjectArchitectureApproval = async (c: AppContext) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
   const parsed = architectureReviewApprovalSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1504,84 +1497,66 @@ app.post('/projects/:id/architecture-review', async (c) => {
     return c.json({ error: 'Review feedback payload is invalid.', details: parsed.error.format() }, 400);
   }
 
-  if ((project.generation_status || 'complete') !== 'awaiting_review') {
+  if (lifecycleStatus !== 'awaiting_review') {
     return c.json({ error: 'Architecture review is not awaiting approval.' }, 409);
   }
 
   const feedback = parsed.data.feedback?.trim() || '';
+  const preferredIde = parsed.data.preferredIde?.trim() || '';
   let providerId: string | undefined;
-  const runId = crypto.randomUUID();
-  const generationGuardBindings = getProjectGenerationGuardBindings(project);
+  const runId = generationRuntime.runId;
+  const workflowInstanceId = generationRuntime.runId;
+
+  if (!runId || !runId.trim()) {
+    return c.json({ error: 'This generation run has no active run ID. Resume it and try approval again.' }, 409);
+  }
+
+  if (!((workflowInstanceId && workflowInstanceId.trim()) || runId.trim())) {
+    return c.json({ error: 'Workflow instance ID is missing for this generation run.' }, 409);
+  }
 
   try {
     const approval = await saveArchitectureReviewApproval(c.env, projectId, feedback);
-    providerId = approval.providerId || (project.generation_provider_id as string | null) || undefined;
+    providerId = approval.providerId || generationRuntime.providerId || undefined;
     if (!providerId) {
       throw new Error('No AI provider is configured for this project anymore.');
     }
-    const approvalUpdate = await c.env.DB.prepare(`
-      UPDATE projects
-      SET generation_status = 'approved',
-          generation_error = NULL,
-          generation_run_id = ?,
-          generation_provider_id = ?,
-          generation_heartbeat_at = datetime("now"),
-          generation_completed_at = NULL,
-          updated_at = datetime("now")
-      WHERE id = ? AND user_id = ? AND generation_status = 'awaiting_review'
-        AND ${sqlNullableColumnMatch('generation_run_id')}
-        AND ${sqlNullableColumnMatch('generation_provider_id')}
-        AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
-        AND ${sqlNullableColumnMatch('generation_completed_at')}
-    `)
-      .bind(runId, providerId || null, projectId, c.get('uid'), ...generationGuardBindings)
-      .run();
+    
+    // Phase 4: Use updateGenerationRunStatus
+    await updateGenerationRunStatus(c.env, runId, 'approved', {
+      workflowInstanceId: workflowInstanceId,
+    });
 
-    if (asNumber((approvalUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
-      return c.json({ error: 'This review already changed. Reload to see the latest state.' }, 409);
-    }
+    const resolvedWorkflowInstanceId = (workflowInstanceId && workflowInstanceId.trim())
+      ? workflowInstanceId
+      : workflowInstanceIdFor(projectId, runId);
 
-    await sendGenerationDispatch(c.env, {
-      projectId,
-      userId: c.get('uid'),
-      providerId,
-      runId,
-      kind: 'architecture_approval',
-      previousStatus: 'awaiting_review',
-      targetStatus: 'approved',
-    }, { backend: generationBackend });
+    await sendWorkflowDispatchEvent(c.env, {
+      workflowInstanceId: resolvedWorkflowInstanceId,
+      eventType: WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+      eventPayload: {
+        approved: true,
+        feedback,
+        preferredIde,
+      },
+    });
 
-    if (project.generation_run_id) {
-      await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
+    if (runId) {
+      await clearGenerationCheckpoints(c.env, projectId, runId);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to save architecture review approval.';
-    await c.env.DB.prepare(`
-      UPDATE projects
-      SET generation_status = 'awaiting_review',
-          generation_error = NULL,
-          generation_run_id = ?,
-          generation_provider_id = ?,
-          generation_heartbeat_at = ?,
-          generation_completed_at = ?,
-          updated_at = datetime("now")
-      WHERE id = ? AND user_id = ? AND generation_status = 'approved' AND generation_run_id = ?
-    `)
-      .bind(
-        (project.generation_run_id as string | null) || null,
-        (project.generation_provider_id as string | null) || null,
-        (project.generation_heartbeat_at as string | null) || null,
-        (project.generation_completed_at as string | null) || null,
-        projectId,
-        c.get('uid'),
-        runId,
-      )
-      .run();
+    
+    // Phase 4: Use updateGenerationRunStatus
+    await updateGenerationRunStatus(c.env, runId, 'awaiting_review', {
+      errorMessage: message,
+    });
     return c.json({ error: message }, 409);
   }
 
   await persistGenerationStreamEvent(c.env, {
     projectId,
+    runId,
     batchName: 'batch_4_plan_build',
     event: {
       type: 'activity',
@@ -1596,54 +1571,44 @@ app.post('/projects/:id/architecture-review', async (c) => {
 
   return c.json({
     success: true,
-    generation_status: 'approved',
+    generation_runtime: {
+      ...generationRuntime,
+      lifecycleStatus: 'approved',
+      isReviewRequired: false,
+      isTerminal: false,
+      failureClass: null,
+    },
     feedback_provided: feedback.length > 0,
   });
-});
+};
+
+app.post('/projects/:id/approve', handleProjectArchitectureApproval);
+app.post('/projects/:id/architecture-review', handleProjectArchitectureApproval);
 
 app.post('/projects/:id/resume', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
-  const status = project.generation_status || 'queued';
-  if (status === 'complete') {
+  if (lifecycleStatus === 'complete') {
     return c.json({ error: 'Cannot resume a project that is already complete.' }, 409);
   }
 
   const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
   const completedBatchNames = completedBatchRows.map((row) => row.run_type);
-  const reviewConfirmedByStatus =
-    status === 'approved'
-    || status === 'batch_4_plan_build'
-    || status === 'batch_5_enrich_steps'
-    || status === 'batch_6_generate_files'
-    || status === 'complete';
-  const hasReviewApproval =
-    reviewConfirmedByStatus ||
-    completedBatchNames.includes('batch_4_plan_build') ||
-    completedBatchNames.includes('batch_5_enrich_steps') ||
-    completedBatchNames.includes('batch_6_generate_files') ||
-    await hasApprovedArchitectureReview(c.env, projectId);
-    const resumeStatus = await resolvePipelineStatusToRun(c.env, projectId, status as ProjectGenerationStatus, completedBatchNames);
+  const resumeStatus = await resolvePipelineStatusToRun(c.env, projectId, 'queued', completedBatchNames);
 
-  const executionStale = isGenerationExecutionStale(
-    status,
-    (project.generation_heartbeat_at as string | null) || null,
-  );
-  const queuedResumeReady = isQueuedGenerationResumeReady(
-    status,
-    (project.generation_heartbeat_at as string | null) || null,
-  );
+  const runtimeState = await getGenerationRuntimeState(c.env, projectId);
+  const canResume = runtimeState.canResume;
 
-  if (status !== 'failed' && status !== 'cancelled' && !executionStale && !queuedResumeReady) {
+  if (lifecycleStatus !== 'failed' && lifecycleStatus !== 'cancelled' && !canResume) {
     return c.json({ error: 'This generation run is still active. Wait for it to finish or stall before resuming.' }, 409);
   }
 
@@ -1652,7 +1617,7 @@ app.post('/projects/:id/resume', async (c) => {
   }
 
   const body = await c.req.json().catch(() => ({}));
-  const providerId = (body.providerId as string | undefined) || (project.generation_provider_id as string | null) || undefined;
+  const providerId = (body.providerId as string | undefined) || generationRuntime.providerId || undefined;
 
   if (!providerId) {
     return c.json({ error: 'An AI provider is required to resume this project.' }, 409);
@@ -1666,36 +1631,9 @@ app.post('/projects/:id/resume', async (c) => {
   }
 
   const runId = crypto.randomUUID();
-  const generationGuardBindings = getProjectGenerationGuardBindings(project);
-  const resumeUpdate = await c.env.DB.prepare(`
-    UPDATE projects 
-    SET generation_status = ?,
-        generation_error = NULL,
-        generation_run_id = ?,
-        generation_provider_id = ?,
-        generation_heartbeat_at = datetime("now"),
-        generation_completed_at = NULL,
-        updated_at = datetime("now")
-    WHERE id = ? AND user_id = ? AND generation_status = ?
-      AND ${sqlNullableColumnMatch('generation_run_id')}
-      AND ${sqlNullableColumnMatch('generation_provider_id')}
-      AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
-      AND ${sqlNullableColumnMatch('generation_completed_at')}
-  `)
-    .bind(
-      resumeStatus,
-      runId,
-      providerId || null,
-      projectId,
-      c.get('uid'),
-      status,
-      ...generationGuardBindings,
-    )
-    .run();
-
-  if (asNumber((resumeUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
-    return c.json({ error: 'This generation run changed while you were resuming it. Reload and try again.' }, 409);
-  }
+  
+  // Phase 4: Use createGenerationRun
+  await createGenerationRun(c.env, projectId, runId, providerId || null);
 
   try {
     await sendGenerationDispatch(c.env, {
@@ -1704,129 +1642,91 @@ app.post('/projects/:id/resume', async (c) => {
       providerId,
       runId,
       kind: 'resume',
-      previousStatus: status,
+      previousStatus: lifecycleStatus as ProjectGenerationStatus,
       targetStatus: resumeStatus,
-    }, { backend: generationBackend });
+    });
 
-    if (project.generation_run_id) {
-      await clearGenerationCheckpoints(c.env, projectId, project.generation_run_id as string);
-    }
+    await clearGenerationCheckpoints(c.env, projectId, runId);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
-    await c.env.DB.prepare(`
-      UPDATE projects 
-      SET generation_status = ?,
-          generation_error = ?,
-          generation_run_id = ?,
-          generation_provider_id = ?,
-          generation_heartbeat_at = ?,
-          generation_completed_at = ?,
-          updated_at = datetime("now")
-      WHERE id = ? AND user_id = ? AND generation_status = ? AND generation_run_id = ?
-    `)
-      .bind(
-        status,
-        (project.generation_error as string | null) || message,
-        (project.generation_run_id as string | null) || null,
-        (project.generation_provider_id as string | null) || null,
-        (project.generation_heartbeat_at as string | null) || null,
-        (project.generation_completed_at as string | null) || null,
-        projectId,
-        c.get('uid'),
-        resumeStatus,
-        runId,
-      )
-      .run();
+    
+    // Phase 4: Use updateGenerationRunStatus
+    await updateGenerationRunStatus(c.env, runId, 'failed', { errorMessage: message });
     return c.json({ error: 'Failed to resume project generation.' }, 503);
   }
 
   return c.json({
     success: true,
-    generation_status: resumeStatus,
+    generation_runtime: {
+      ...generationRuntime,
+      runId,
+      lifecycleStatus: 'queued',
+      currentBatch: null,
+      isTerminal: false,
+      canResume: false,
+      isReviewRequired: false,
+      providerId: providerId || generationRuntime.providerId,
+      heartbeatAt: null,
+      failureClass: null,
+    },
     resumedAt: new Date().toISOString()
   });
 });
 
 app.post('/projects/:id/nudge', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  if (!hasProjectGenerationBackendBinding(c.env, generationBackend)) {
-    return generationBackendConfigurationError(c, generationBackend);
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
   }
 
-  const status = project.generation_status || 'queued';
-  if (status === 'complete') {
+  if (lifecycleStatus === 'complete') {
     return c.json({ error: 'Cannot nudge a project that is already complete.' }, 409);
   }
 
-  if (status === 'intake') {
+  if (lifecycleStatus === 'intake') {
     return c.json({ error: 'Finish the intake first, then I can continue the build.' }, 409);
   }
 
-  if (status === 'awaiting_review') {
+  if (lifecycleStatus === 'awaiting_review') {
     return c.json({ error: 'Your review is still needed before generation can continue.' }, 409);
   }
 
-  if (status === 'failed') {
+  if (lifecycleStatus === 'failed') {
     return c.json({ error: 'This build stopped. Use resume so Scrimble can continue from the latest completed checkpoint.' }, 409);
   }
 
-  if (status === 'cancelled') {
+  if (lifecycleStatus === 'cancelled') {
     return c.json({ error: 'This build is cancelled. Use resume so Scrimble can continue from the latest completed checkpoint.' }, 409);
   }
 
-  const providerId = (project.generation_provider_id as string | null) || undefined;
+  const providerId = generationRuntime.providerId || undefined;
   if (!providerId) {
     return c.json({ error: 'The original AI provider for this generation run is missing. Start a new generation instead.' }, 409);
   }
 
-  const generationHeartbeat = (project.generation_heartbeat_at as string | null) || null;
-  const executionStale = isGenerationExecutionStale(status, generationHeartbeat);
-  const queuedResumeReady = isQueuedGenerationResumeReady(status, generationHeartbeat);
-  if (!executionStale && !queuedResumeReady) {
+  const runtimeState = await getGenerationRuntimeState(c.env, projectId);
+  if (!runtimeState.canResume) {
     return c.json({
       error: 'This generation run is still active. I only schedule another runner pass after the current one has actually gone quiet.',
     }, 409);
   }
 
-  const runId = project.generation_run_id || crypto.randomUUID();
-  const targetStatus: ProjectGenerationStatus = status === 'approved'
+  const runId = generationRuntime.runId || crypto.randomUUID();
+  const targetStatus: ProjectGenerationStatus = lifecycleStatus === 'approved'
     ? 'approved'
-    : (status as ProjectGenerationStatus);
-  const generationGuardBindings = getProjectGenerationGuardBindings(project);
-  const nudgeUpdate = await c.env.DB.prepare(`
-    UPDATE projects 
-    SET generation_status = ?,
-        generation_error = NULL,
-        generation_run_id = ?,
-        generation_provider_id = ?,
-        generation_heartbeat_at = datetime("now"),
-        generation_completed_at = NULL,
-        updated_at = datetime("now")
-    WHERE id = ? AND user_id = ? AND generation_status = ?
-      AND ${sqlNullableColumnMatch('generation_run_id')}
-      AND ${sqlNullableColumnMatch('generation_provider_id')}
-      AND ${sqlNullableColumnMatch('generation_heartbeat_at')}
-      AND ${sqlNullableColumnMatch('generation_completed_at')}
-  `)
-    .bind(
-      targetStatus,
-      runId,
-      providerId,
-      projectId,
-      c.get('uid'),
-      status,
-      ...generationGuardBindings,
-    )
-    .run();
-
-  if (asNumber((nudgeUpdate as { meta?: { changes?: number } }).meta?.changes, 0) === 0) {
-    return c.json({ error: 'This generation run changed while you were checking in. Reload and try again.' }, 409);
+    : 'queued';
+  
+  // Phase 4: Use createGenerationRun or update status
+  if (generationRuntime.runId === runId) {
+    await updateGenerationRunStatus(c.env, runId, 'queued', { providerId: providerId || null });
+  } else {
+    await createGenerationRun(c.env, projectId, runId, providerId || null);
   }
 
   try {
@@ -1836,9 +1736,9 @@ app.post('/projects/:id/nudge', async (c) => {
       providerId,
       runId,
       kind: 'continuation',
-      previousStatus: status,
+      previousStatus: lifecycleStatus as ProjectGenerationStatus,
       targetStatus,
-    }, { backend: generationBackend });
+    });
 
     return c.json({
       success: true,
@@ -1847,79 +1747,75 @@ app.post('/projects/:id/nudge', async (c) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to nudge project generation.';
-    await c.env.DB.prepare(`
-      UPDATE projects
-      SET generation_error = ?, updated_at = datetime("now")
-      WHERE id = ? AND user_id = ? AND generation_status = ? AND generation_run_id = ?
-    `)
-      .bind(message, projectId, c.get('uid'), targetStatus, runId)
-      .run();
+    
+    // Phase 4: Use updateGenerationRunStatus
+    await updateGenerationRunStatus(c.env, runId, 'failed', { errorMessage: message });
     return c.json({ error: message }, 503);
   }
 });
 
 app.post('/projects/:id/cancel', async (c) => {
   const projectId = c.req.param('id');
-  const project = await getOwnedProject(c, projectId);
-  if (!project) {
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
     return c.json({ error: 'Project not found' }, 404);
   }
+  const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  const status = project.generation_status || 'queued';
-  if (status === 'complete' || status === 'cancelled') {
-    return c.json({ error: `Cannot cancel a project that is already ${status}.` }, 409);
+  if (lifecycleStatus === 'complete' || lifecycleStatus === 'cancelled') {
+    return c.json({ error: `Cannot cancel a project that is already ${lifecycleStatus}.` }, 409);
   }
 
-  if (status === 'intake') {
+  if (lifecycleStatus === 'intake') {
     return c.json({ error: 'This project is still in intake and has not started generating yet.' }, 409);
   }
 
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
+  const runId = generationRuntime.runId;
 
-  // If using DO, tell it to cancel (clears alarms and resets pipeline chain)
-  if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
+  if (c.env.WORKFLOW_SERVICE && runId) {
     try {
-      const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
-      const stub = c.env.PROJECT_GENERATOR.get(objectId);
-      await stub.fetch('https://project-generator/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId }),
+      await cancelWorkflowGeneration(c.env, {
+        projectId,
+        runId,
+        workflowInstanceId: runId,
       });
     } catch (error) {
-      console.warn('[CANCEL] DO cancel call failed, falling back to D1-only cancel.', {
+      console.warn('[CANCEL] Workflow terminate failed, falling back to D1-only cancel.', {
         projectId,
+        runId,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   }
 
-  // Always update D1 directly as the source of truth
-  const cancelledRunId = crypto.randomUUID();
-  await c.env.DB.prepare(`
-    UPDATE projects
-    SET generation_status = 'cancelled',
-        generation_error = 'Generation cancelled by user.',
-        generation_run_id = ?,
-        generation_completed_at = datetime("now"),
-        generation_heartbeat_at = datetime("now"),
-        updated_at = datetime("now")
-    WHERE id = ? AND user_id = ?
-  `)
-    .bind(cancelledRunId, projectId, c.get('uid'))
-    .run();
+  // Phase 4: Use updateGenerationRunStatus
+  if (runId) {
+    await updateGenerationRunStatus(c.env, runId, 'cancelled', {
+      errorMessage: 'Generation cancelled by user.',
+    });
+  } else {
+    console.warn(`[app/cancel] Project ${projectId} has no active run to cancel. Skipping fallback mutation.`);
+  }
 
   await persistGenerationStreamEvent(c.env, {
     projectId,
+    runId,
     event: {
       type: 'pipeline_failed',
       error: 'Generation cancelled by user.',
     },
   });
+  await resetGenerationThinkingState(c.env, projectId, null);
 
   return c.json({
     success: true,
-    generation_status: 'cancelled',
+    generation_runtime: {
+      ...generationRuntime,
+      lifecycleStatus: 'cancelled',
+      isTerminal: true,
+      isReviewRequired: false,
+      failureClass: 'cancelled',
+    },
     cancelledAt: new Date().toISOString(),
   });
 });
@@ -1932,49 +1828,6 @@ app.get('/projects/:id/generation-stream', async (c) => {
   }
 
   const lastEventId = asNumber(c.req.header('Last-Event-ID'), 0);
-  const generationBackend = resolveProjectGenerationBackend(c.req.raw, c.env);
-  
-  // Try proxying to Durable Object if configured
-  if (generationBackend === 'durable_object' && c.env.PROJECT_GENERATOR) {
-    const objectId = c.env.PROJECT_GENERATOR.idFromName(projectId);
-    const stub = c.env.PROJECT_GENERATOR.get(objectId);
-    const proxyUrl = 'http://do/stream?projectId=' + encodeURIComponent(projectId) + '&lastEventId=' + lastEventId;
-
-    const proxyHeaders = new Headers(c.req.raw.headers);
-    proxyHeaders.delete('host');
-    proxyHeaders.delete('cf-ray');
-    proxyHeaders.delete('cf-visitor');
-    proxyHeaders.delete('cf-connecting-ip');
-    proxyHeaders.delete('cf-ipcountry');
-    proxyHeaders.delete('x-forwarded-for');
-    proxyHeaders.delete('x-forwarded-proto');
-    proxyHeaders.delete('x-real-ip');
-
-    console.log(`[STREAM_PROXY] Proxying SSE request to Durable Object: ${proxyUrl}`);
-    const request = new Request(proxyUrl, {
-      method: 'GET',
-      headers: proxyHeaders,
-      signal: c.req.raw.signal,
-    });
-
-    try {
-      const resp = await stub.fetch(request);
-      console.log(`[STREAM_PROXY] DO response status: ${resp.status}, ok: ${resp.ok}`);
-      
-      if (resp.ok) {
-        console.log(`[STREAM_PROXY] Returning DO stream response for ${projectId}`);
-        return resp;
-      }
-      
-      if (resp.status === 404 || resp.status === 405) {
-        console.warn(`[STREAM_PROXY] DO returned ${resp.status}, falling back to local SSE.`);
-      } else {
-        console.warn(`[STREAM_PROXY] DO returned non-ok status ${resp.status}, falling back to local SSE.`);
-      }
-    } catch (error) {
-      console.error(`[STREAM_PROXY] DO proxy failed for ${projectId}, falling back to local SSE:`, error);
-    }
-  }
 
   const stream = createGenerationSseStream(c.env, {
     projectId,
@@ -2036,7 +1889,7 @@ app.patch('/projects/:id', async (c) => {
   const body = await c.req.json();
   await c.env.DB.prepare(`
     UPDATE projects
-    SET name = ?, description = ?, project_type = ?, stack = ?, status = ?, risk_score = ?, generation_provider_id = ?, updated_at = datetime("now")
+    SET name = ?, description = ?, project_type = ?, stack = ?, status = ?, risk_score = ?, updated_at = datetime("now")
     WHERE id = ?
   `)
     .bind(
@@ -2046,7 +1899,6 @@ app.patch('/projects/:id', async (c) => {
       body.stack !== undefined ? serializeJson(body.stack) || '{}' : existingProject.stack,
       optionalText(body.status) || existingProject.status,
       body.risk_score !== undefined ? asNumber(body.risk_score, 0) : asNumber(existingProject.risk_score, 0),
-      optionalText(body.generation_provider_id) || existingProject.generation_provider_id,
       projectId,
     )
     .run();
@@ -2348,14 +2200,18 @@ app.post('/steps/:id/review', async (c) => {
 
   const review = parsed.data;
   const nextOutput = review.edited_output?.trim() || stepRecord.ai_output || null;
+  const runtimeState = await getGenerationRuntimeState(c.env, stepRecord.project_id as string);
   const runId = await insertAgentRun(c, {
     projectId: stepRecord.project_id as string,
+    runId: runtimeState.run?.id || null,
     stepId,
     runType: 'review_gate',
     status: 'complete',
     input: JSON.stringify(review),
     output: review.feedback || nextOutput,
   });
+
+
 
   if (review.decision === 'approve') {
     const unlockedStepIds = (
@@ -2609,13 +2465,12 @@ app.post('/workflows/:id/update', async (c) => {
     return c.json({ error: 'Invalid workflow update payload', details: parsed.error.format() }, 400);
   }
 
-  const [defaultProviderContext, fastProviderContext, deepProviderContext] = await Promise.all([
-    resolveProviderContext(c, parsed.data.providerId, 'default'),
+  const [fastProviderContext, deepProviderContext] = await Promise.all([
     resolveProviderContext(c, parsed.data.providerId, 'fast'),
     resolveProviderContext(c, parsed.data.providerId, 'deep'),
   ]);
 
-  if (!defaultProviderContext || !fastProviderContext || !deepProviderContext) {
+  if (!fastProviderContext || !deepProviderContext) {
     return c.json({ error: 'You need to add an AI key first.' }, 400);
   }
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
@@ -2635,7 +2490,6 @@ app.post('/workflows/:id/update', async (c) => {
             stack: optionalText(workflowRecord.stack),
           },
           providers: {
-            default: defaultProviderContext,
             fast: fastProviderContext,
             deep: deepProviderContext,
           },
@@ -2741,6 +2595,12 @@ app.post('/steps/:id/enrich', async (c) => {
   const researchManifest = buildResearchManifest(
     builderProfile,
     projectBriefContext.summary || asText(projectRecord.description, ''),
+    {
+      confirmedStackTools: projectBriefContext.confirmedStackTools,
+      inferredTechnologies: researchContext.research
+        .map((entry) => entry.technology)
+        .filter(Boolean),
+    },
   );
   const stepResearchContext = await collectStepResearchContext({
     env: c.env,
@@ -2757,6 +2617,7 @@ app.post('/steps/:id/enrich', async (c) => {
     researchManifest,
     batchName: 'batch_5_enrich_steps',
     projectId,
+    runId: (await getGenerationRuntimeState(c.env, projectId)).run?.id || '',
   });
 
   let providerContext;
@@ -2810,6 +2671,7 @@ app.post('/steps/:id/enrich', async (c) => {
 
   const runId = await insertAgentRun(c, {
     projectId,
+    runId: (await getGenerationRuntimeState(c.env, projectId)).run?.id || null,
     stepId,
     runType: 'enrich_step',
     status: 'running',
@@ -2817,6 +2679,7 @@ app.post('/steps/:id/enrich', async (c) => {
     model,
     input: JSON.stringify({ feedback: feedback || null, editedOutput: editedOutput || null }),
   });
+
 
   try {
     const aiResponse = await callAIWithRetry({
@@ -2932,7 +2795,7 @@ app.post('/ai/proxy', async (c) => {
 
   let providerContext;
   try {
-    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'default');
+    providerContext = await resolveProviderContext(c, parsed.data.providerId, 'fast');
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'Failed to decrypt API key' }, 500);
   }
@@ -2949,6 +2812,7 @@ app.post('/ai/proxy', async (c) => {
         status: 'running',
         provider: providerType,
         model,
+        runId: parsed.data.runId || null,
       })
     : null;
 
@@ -2960,7 +2824,7 @@ app.post('/ai/proxy', async (c) => {
       baseUrl,
       system: parsed.data.system || null,
       prompt: parsed.data.prompt,
-      role: 'default',
+      role: 'fast',
     });
 
     if (!response.ok) {

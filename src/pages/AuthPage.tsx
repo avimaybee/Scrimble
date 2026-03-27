@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, Hexagon, LayoutDashboard, CheckCircle2, Zap, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { signInWithGoogle } from '../lib/firebase';
-import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
+import { UI_COPY } from '../lib/ui-copy';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
@@ -117,7 +117,9 @@ function LeftPanel() {
                   {carouselSlides.map((_, idx) => (
                     <button
                       key={idx}
+                      type="button"
                       onClick={() => setActiveSlide(idx)}
+                      aria-label={`Show ${carouselSlides[idx]?.title} slide`}
                       className={`h-1.5 rounded-full transition-all duration-300 ${
                         idx === activeSlide ? 'w-6' : 'w-1.5'
                       }`}
@@ -166,7 +168,7 @@ function RightPanel({ mode }: { mode: 'login' | 'signup' }) {
       await signInWithGoogle();
       navigate(mode === 'signup' ? '/new' : '/dashboard');
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Could not sign you in right now.');
+      setError(err instanceof Error ? err.message : UI_COPY.auth.signInFailed);
     } finally {
       setLoading(false);
     }
@@ -212,6 +214,7 @@ function RightPanel({ mode }: { mode: 'login' | 'signup' }) {
             ) : null}
 
             <button
+              type="button"
               onClick={handleGoogleAuth}
               disabled={loading}
               className={`group flex w-full items-center justify-center gap-3 rounded-lg border border-transparent bg-white px-4 py-3 text-sm font-medium text-[#0f0e0e] transition-all hover:bg-[#f5f5f5] hover:shadow-lg focus-visible:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-primary disabled:cursor-not-allowed disabled:opacity-70 ${
@@ -221,7 +224,7 @@ function RightPanel({ mode }: { mode: 'login' | 'signup' }) {
               {loading ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  <span>Signing you in...</span>
+                  <span>Signing you in…</span>
                 </>
               ) : (
                 <>
@@ -250,61 +253,9 @@ function RightPanel({ mode }: { mode: 'login' | 'signup' }) {
             </button>
           </div>
 
-          <div>
-            <div className="mb-4 flex items-center gap-3">
-              <div className="h-px flex-1 bg-border-subtle" />
-              <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                or
-              </span>
-              <div className="h-px flex-1 bg-border-subtle" />
-            </div>
-
-            <div className="space-y-4">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div>
-                  <label className="mb-2 block text-[13px] font-medium text-text-secondary">
-                    Email address
-                  </label>
-                  <input
-                    type="email"
-                    placeholder="you@example.com"
-                    className="field-input cursor-not-allowed opacity-40"
-                    disabled
-                    readOnly
-                  />
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent>Email sign-in coming soon — use Google for now.</TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div>
-                  <label className="mb-2 block text-[13px] font-medium text-text-secondary">
-                    Password
-                  </label>
-                  <input
-                    type="password"
-                    placeholder="••••••••"
-                    className="field-input cursor-not-allowed opacity-40"
-                    disabled
-                    readOnly
-                  />
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent>Email sign-in coming soon — use Google for now.</TooltipContent>
-              </Tooltip>
-
-              <button
-                type="button"
-                className="btn-ghost w-full cursor-not-allowed opacity-40"
-                disabled
-              >
-                Sign in with email
-              </button>
-            </div>
-          </div>
+          <p className="text-[13px] leading-6 text-text-secondary">
+            Google sign-in is the only supported method right now.
+          </p>
         </motion.section>
 
         <motion.div variants={itemVariants} className="mt-6 text-center text-sm text-text-secondary">

@@ -76,6 +76,7 @@ type ResearchServiceContext = {
   userId?: string;
   projectId?: string;
   batchName?: GenerationBatchName;
+  runId?: string;
   subrequestTracker?: ResearchSubrequestTracker;
 };
 
@@ -328,6 +329,7 @@ export function createResearchService(context: ResearchServiceContext): Research
     try {
       await persistGenerationStreamEvent(context.env, {
         projectId: context.projectId,
+        runId: context.runId || null,
         batchName: context.batchName,
         event: {
           type: 'activity',

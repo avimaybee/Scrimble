@@ -1,7 +1,13 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Sparkles, Send, Check, RefreshCw, ExternalLink } from 'lucide-react';
-import { Step, ChecklistItem, Project } from '../types';
+import {
+  Step,
+  ChecklistItem,
+  Project,
+  parseStepContent,
+  type StepResearchFooterMeta,
+} from '../types';
 import { cn } from '../lib/utils';
 import { dbService } from '../lib/db';
 import { callAIProxy, getAIProviders, type AIProvider } from '../lib/ai';
@@ -9,49 +15,9 @@ import ReactMarkdown from 'react-markdown';
 import confetti from 'canvas-confetti';
 import { toast } from 'sonner';
 import { useStepExecution } from '../hooks/useStepExecution';
-
-type StepResearchFooterMeta = {
-  researched_at: string;
-  tools: string[];
-};
+import { UI_COPY } from '../lib/ui-copy';
 
 const LEGACY_RESEARCH_FOOTER_PATTERN = /(?:\n{1,2})(Researched\s+\d{4}-\d{2}-\d{2}\s+using[^\n]+\.?)\s*$/i;
-
-function parseResearchFooterMeta(rawValue: string | undefined): StepResearchFooterMeta | null {
-  if (!rawValue) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(rawValue) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return null;
-    }
-
-    const candidate = parsed as { researched_at?: unknown; tools?: unknown };
-    const researchedAt =
-      typeof candidate.researched_at === 'string'
-        ? candidate.researched_at.trim()
-        : '';
-    const tools = Array.isArray(candidate.tools)
-      ? candidate.tools
-        .filter((tool): tool is string => typeof tool === 'string')
-        .map((tool) => tool.trim())
-        .filter(Boolean)
-      : [];
-
-    if (!researchedAt || tools.length === 0) {
-      return null;
-    }
-
-    return {
-      researched_at: researchedAt,
-      tools,
-    };
-  } catch {
-    return null;
-  }
-}
 
 function extractLegacyResearchFooter(aiOutput: string | undefined) {
   const raw = (aiOutput || '').trim();
@@ -115,7 +81,7 @@ export default function DetailPanel({
       setTasks(fetchedTasks || []);
     } catch (err) {
       console.error('Failed to load step details:', err);
-      toast.error('Could not load this step right now.');
+      toast.error(UI_COPY.detailPanel.loadStep);
     } finally {
       setLoading(false);
     }
@@ -133,7 +99,7 @@ export default function DetailPanel({
     try {
       const providerList = await getAIProviders();
       setProviders(providerList);
-      const defaultProvider = providerList.find((provider) => provider.is_default) || providerList[0];
+      const defaultProvider = providerList[0];
       setSelectedProviderId((current) => {
         if (current && providerList.some((provider) => provider.id === current)) {
           return current;
@@ -141,7 +107,7 @@ export default function DetailPanel({
         return defaultProvider?.id || '';
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not load AI providers.';
+      const message = error instanceof Error ? error.message : UI_COPY.detailPanel.loadProviders;
       setProviderLoadError(message);
     } finally {
       setIsLoadingProviders(false);
@@ -173,43 +139,19 @@ export default function DetailPanel({
     setShowAiChat(false);
   }, [stepId]);
 
-  const navigationLinks = useMemo(() => {
-    if (!step?.navigation_links) {
-      return [];
-    }
-
-    try {
-      const parsed = JSON.parse(step.navigation_links) as unknown;
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-
-      return parsed
-        .map((entry) => {
-          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-            return null;
-          }
-
-          const candidate = entry as { label?: unknown; url?: unknown; when?: unknown };
-          const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
-          const url = typeof candidate.url === 'string' ? candidate.url.trim() : '';
-          const when = typeof candidate.when === 'string' ? candidate.when.trim() : 'Start here';
-          if (!label || !url) {
-            return null;
-          }
-
-          return { label, url, when };
-        })
-        .filter((entry): entry is { label: string; url: string; when: string } => Boolean(entry));
-    } catch {
-      return [];
-    }
-  }, [step?.navigation_links]);
-
-  const parsedFooterMeta = useMemo(
-    () => parseResearchFooterMeta(step?.research_footer_meta),
-    [step?.research_footer_meta],
+  const parsedStepContent = useMemo(
+    () => parseStepContent({
+      navigation_links: step?.navigation_links,
+      prompts: step?.prompts,
+      research_footer_meta: step?.research_footer_meta,
+      suggested_tools: step?.suggested_tools,
+    }),
+    [step?.navigation_links, step?.prompts, step?.research_footer_meta, step?.suggested_tools],
   );
+  const navigationLinks = parsedStepContent.navigationLinks;
+  const parsedFooterMeta: StepResearchFooterMeta | null = parsedStepContent.researchFooterMeta;
+  const primaryPrompt = parsedStepContent.prompts[0] || null;
+  const primaryTool = parsedStepContent.suggestedTools[0] || null;
 
   const { body: aiOutputBody, footer: legacyFooter } = useMemo(
     () => extractLegacyResearchFooter(step?.ai_output),
@@ -221,7 +163,17 @@ export default function DetailPanel({
       const researchedAt = parsedFooterMeta.researched_at.includes('T')
         ? parsedFooterMeta.researched_at.slice(0, 10)
         : parsedFooterMeta.researched_at;
-      const sentence = `Researched ${researchedAt} using ${parsedFooterMeta.tools.join(', ')}`;
+      let sentence = `Researched ${researchedAt} using ${parsedFooterMeta.tools.join(', ')}`;
+      
+      // B4: Add quality indicator
+      if (parsedFooterMeta.quality === 'cached') {
+        sentence += ' (using cached research)';
+      } else if (parsedFooterMeta.quality === 'degraded') {
+        sentence += ' (some sources unavailable)';
+      } else if (parsedFooterMeta.quality === 'none') {
+        sentence += ' (limited research available)';
+      }
+      
       return sentence.endsWith('.') ? sentence : `${sentence}.`;
     }
 
@@ -231,6 +183,24 @@ export default function DetailPanel({
 
     return null;
   }, [legacyFooter, parsedFooterMeta]);
+  
+  // B4: Determine quality badge for visual indicator
+  const researchQualityBadge = useMemo(() => {
+    if (!parsedFooterMeta?.quality) return null;
+    
+    switch (parsedFooterMeta.quality) {
+      case 'live':
+        return { label: 'Live', color: 'text-green-500', bg: 'bg-green-500/10' };
+      case 'cached':
+        return { label: 'Cached', color: 'text-yellow-500', bg: 'bg-yellow-500/10' };
+      case 'degraded':
+        return { label: 'Degraded', color: 'text-orange-500', bg: 'bg-orange-500/10' };
+      case 'none':
+        return { label: 'Limited', color: 'text-red-400', bg: 'bg-red-400/10' };
+      default:
+        return null;
+    }
+  }, [parsedFooterMeta?.quality]);
 
   const toggleTask = async (task: ChecklistItem) => {
     const newStatus = !task.is_completed;
@@ -251,7 +221,7 @@ export default function DetailPanel({
       await dbService.updateChecklistItem(task.id, { label: trimmed });
     } catch {
       setTasks(prev => prev.map(t => t.id === task.id ? { ...t, label: task.label } : t));
-      toast.error('Failed to update task.');
+      toast.error(UI_COPY.detailPanel.updateTask);
     }
   };
 
@@ -272,7 +242,7 @@ export default function DetailPanel({
       setStep((current) => (current ? { ...current, status: 'complete' } : current));
       await onProjectUpdated?.();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not mark this step complete.';
+      const message = error instanceof Error ? error.message : UI_COPY.detailPanel.completeStep;
       toast.error(message);
     }
   };
@@ -311,7 +281,7 @@ Use markdown with short bullets when useful. Keep advice specific to the project
 
       setAiHistory((prev) => [...prev, { role: 'ai', content: response.trim() || 'No response received.' }]);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'AI request failed.';
+      const message = error instanceof Error ? error.message : UI_COPY.detailPanel.aiRequest;
       setAiHistory((prev) => [...prev, { role: 'ai', content: `I couldn't answer yet: ${message}` }]);
     } finally {
       setAskingAi(false);
@@ -370,7 +340,7 @@ Use markdown with short bullets when useful. Keep advice specific to the project
       await loadStepData();
       await onProjectUpdated?.();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not submit this review.';
+      const message = error instanceof Error ? error.message : UI_COPY.detailPanel.reviewSubmit;
       toast.error(message);
     }
   };
@@ -399,12 +369,45 @@ Use markdown with short bullets when useful. Keep advice specific to the project
               <>
                 <div className="flex items-center justify-between border-b border-border-subtle p-6">
                   <h2 className="text-xl font-semibold text-text-primary tracking-tight">{step.title}</h2>
-                  <button onClick={onClose} className="rounded-md p-1.5 text-text-muted hover:bg-bg-elevated hover:text-text-primary transition-colors">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    aria-label="Close step details"
+                    className="rounded-md p-1.5 text-text-muted hover:bg-bg-elevated hover:text-text-primary transition-colors"
+                  >
                     <X className="h-5 w-5" />
                   </button>
                 </div>
 
                 <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
+                  <div className="rounded-[12px] border border-border-default bg-bg-elevated/35 p-4">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Execution guide</div>
+                    <div className="mt-3 space-y-3 text-[13px] leading-relaxed text-text-secondary">
+                      <div>
+                        <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Tool</div>
+                        <div className="mt-1 text-text-primary">{primaryTool?.name || 'Use the tool listed in this step notes.'}</div>
+                      </div>
+                      <div>
+                        <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Destination</div>
+                        <div className="mt-1 text-text-primary">{navigationLinks[0]?.label || navigationLinks[0]?.url || 'Open the place this step references.'}</div>
+                      </div>
+                      <div>
+                        <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Action</div>
+                        <div className="mt-1 text-text-primary">{step.objective || step.why_it_matters || 'Complete the exact step objective before moving on.'}</div>
+                      </div>
+                      {primaryPrompt ? (
+                        <div>
+                          <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Use this value/snippet</div>
+                          <pre className="mt-1 whitespace-pre-wrap rounded-[8px] bg-bg-base/70 px-3 py-2 text-[12px] text-text-primary">{primaryPrompt.content}</pre>
+                        </div>
+                      ) : null}
+                      <div>
+                        <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Done when</div>
+                        <div className="mt-1 text-text-primary">{step.done_when || 'You can verify the expected output and safely continue.'}</div>
+                      </div>
+                    </div>
+                  </div>
+
                   {step.objective && (
                     <div className="text-[14px] leading-relaxed text-text-secondary">
                       {step.objective}
@@ -447,12 +450,14 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                       <div className="flex flex-col gap-2">
                         {tasks.map(task => (
                           <div key={task.id} className="flex items-start gap-3 group">
-                             <button
-                               onClick={() => void toggleTask(task)}
-                               className={cn(
-                               "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors duration-150 cursor-pointer",
-                               task.is_completed ? "border-accent-primary bg-accent-primary text-white" : "border-border-strong text-transparent hover:border-accent-primary"
-                             )}>
+                              <button
+                                type="button"
+                                onClick={() => void toggleTask(task)}
+                                aria-label={task.is_completed ? `Mark ${task.label} incomplete` : `Mark ${task.label} complete`}
+                                className={cn(
+                                "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors duration-150 cursor-pointer",
+                                task.is_completed ? "border-accent-primary bg-accent-primary text-white" : "border-border-strong text-transparent hover:border-accent-primary"
+                              )}>
                                <Check className="h-3 w-3 stroke-[3]" />
                              </button>
                              <input
@@ -476,8 +481,17 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                   )}
 
                   {researchFooterText ? (
-                    <div className="rounded-[10px] border border-border-subtle/70 bg-bg-base/50 px-3 py-2 font-mono text-[11px] text-text-muted">
-                      {researchFooterText}
+                    <div className="rounded-[10px] border border-border-subtle/70 bg-bg-base/50 px-3 py-2 font-mono text-[11px] text-text-muted flex items-center gap-2">
+                      {researchQualityBadge && (
+                        <span className={cn(
+                          "inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider",
+                          researchQualityBadge.bg,
+                          researchQualityBadge.color
+                        )}>
+                          {researchQualityBadge.label}
+                        </span>
+                      )}
+                      <span className="flex-1">{researchFooterText}</span>
                     </div>
                   ) : null}
                   
@@ -571,8 +585,10 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                           className="w-full rounded-lg border border-border-strong bg-bg-base px-3 py-2 pr-10 text-[13px] text-text-primary placeholder:text-text-muted focus:border-accent-primary focus:outline-none disabled:opacity-70"
                         />
                         <button
+                          type="button"
                           onClick={() => void handleAskAI()}
                           disabled={!selectedProviderId || askingAi || isExecuting || !aiMessage.trim()}
+                          aria-label="Send AI help message"
                           className="absolute right-2 top-1/2 -translate-y-1/2 text-accent-primary hover:text-accent-hover p-1 disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <Send className="h-4 w-4" />
@@ -615,7 +631,8 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                 </div>
 
                 <div className="border-t border-border-subtle p-6 flex flex-col gap-3 bg-bg-surface">
-                  <button 
+                  <button
+                    type="button"
                     onClick={handleCompleteStep}
                     disabled={step.status === 'complete' || step.status === 'needs_review'}
                     className="w-full flex items-center justify-center py-3 px-4 bg-accent-primary hover:bg-accent-hover text-white rounded-lg font-medium tracking-tight transition-all disabled:opacity-50 disabled:cursor-not-allowed"
@@ -626,11 +643,13 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                         ? 'Submit review to continue'
                         : 'Mark step complete →'}
                   </button>
-                  <button 
+                  <button
+                    type="button"
                     onClick={() => setShowAiChat(!showAiChat)}
+                    aria-expanded={showAiChat}
                     className="w-full flex items-center justify-center py-2.5 px-4 bg-transparent border border-border-strong hover:bg-bg-elevated text-text-secondary hover:text-text-primary rounded-lg text-[13px] font-medium transition-colors"
                   >
-                    {showAiChat ? 'Hide AI assistant' : 'Ask AI for help'}
+                    {showAiChat ? 'Hide AI assistant' : 'AI help (secondary)'}
                   </button>
                 </div>
               </>
