@@ -1,4 +1,9 @@
 import type { ZodType } from 'zod';
+import { 
+  fetchLibraryDocs as facadeFetchDocs, 
+  analyzeGitHubRepo as facadeAnalyzeGitHubRepo, 
+  searchWeb as facadeSearchWeb
+} from './research-facade';
 import {
   Batch1ResearchStackSchema,
   Batch2FetchAndReadSchema,
@@ -11,7 +16,7 @@ import {
   type Batch1ResearchStack,
   type Batch2FetchAndRead,
   type Batch3Architect,
-  type Batch4PlanBuild,
+  type PlanAuthoringRecord,
   type Batch5EnrichSteps,
   type Batch6GenerateFiles,
   type SkillFileName,
@@ -26,7 +31,6 @@ import {
 } from './types';
 import {
   createThrottledThinkingEmitter,
-  emitTransientGenerationStreamEvent,
   getBatchStartLabel,
   isTerminalGenerationEvent,
   persistGenerationStreamEvent,
@@ -34,11 +38,13 @@ import {
 } from './generation-events';
 import {
   callAIText,
+  classifyAIError,
   containsReasoningMarkers,
   containsStreamTransportMarkers,
   extractJSON,
   getProvider,
   RetryableAIError,
+  type GenerationFailureClass,
 } from './ai';
 import {
   deleteJsonPayload,
@@ -50,19 +56,14 @@ import {
 
 import { extractGitHubRepository } from '../utils/fetch-url';
 import { buildResearchManifest } from './research-manifest';
+import { buildResearchQuery } from './research-query-policy';
 import {
-  createResearchService,
   createResearchSubrequestTracker,
-  fetchSequentially,
   RESEARCH_SUBREQUEST_LIMIT,
   resolveToolDocsEntry,
   type ResearchResult,
 } from './research';
-import {
-  getBuilderProfileDocsTopic,
-  getBuilderProfileResearchUrls,
-  normalizeBuilderProfileName,
-} from '../../src/lib/builder-profile';
+import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
 import { getConnectedResearchTools } from './mcp-servers';
 import { appendProjectBriefSystemPrompt, loadProjectBriefContext } from './project-briefs';
 import {
@@ -74,6 +75,12 @@ import {
   buildSkillFileProfileInstructions,
   loadBuilderProfileContext,
 } from './user-tools';
+import { 
+  getGenerationRuntimeState, 
+  persistInvariantViolation,
+  updateGenerationRunStatus,
+  touchGenerationRunHeartbeat,
+} from './generation-runtime';
 
 export type ProviderConfig = {
   providerId: string;
@@ -94,10 +101,7 @@ export type ProjectRecord = {
   intake_answers: string | null;
   project_type: string | null;
   stack: string | null;
-  generation_status: string | null;
-  generation_run_id: string | null;
-  generation_provider_id: string | null;
-  generation_heartbeat_at: string | null;
+  current_generation_run_id?: string | null;
 };
 
 type AgentRunRecord = {
@@ -174,18 +178,18 @@ type ArchitectureReviewContext = {
 
 type PlanStepEnrichment = Batch5EnrichSteps['enrichments'][number];
 
-type EnrichedPlanStep = Batch4PlanBuild['stages'][number]['steps'][number] & {
+type EnrichedPlanStep = PlanAuthoringRecord['stages'][number]['steps'][number] & {
   ai_output: string;
   done_when: string;
   navigation_links: PlanStepEnrichment['navigation_links'];
   prompts: PlanStepEnrichment['prompts'];
 };
 
-type EnrichedPlanStage = Omit<Batch4PlanBuild['stages'][number], 'steps'> & {
+type EnrichedPlanStage = Omit<PlanAuthoringRecord['stages'][number], 'steps'> & {
   steps: EnrichedPlanStep[];
 };
 
-type EnrichedPlan = Omit<Batch4PlanBuild, 'stages'> & {
+type EnrichedPlan = Omit<PlanAuthoringRecord, 'stages'> & {
   stages: EnrichedPlanStage[];
 };
 
@@ -297,7 +301,7 @@ type Batch2CheckpointData = {
 };
 
 type Batch5ResearchStep = Pick<
-  Batch4PlanBuild['stages'][number]['steps'][number],
+  PlanAuthoringRecord['stages'][number]['steps'][number],
   'id' | 'title' | 'objective' | 'why_it_matters' | 'category' | 'done_when' | 'is_gate'
 >;
 
@@ -553,35 +557,10 @@ function resolveResearchRepository(githubUrl: string, fallbackGithubSlug?: strin
 }
 
 function buildBatch2SearchQuery(technologyName: string) {
-  return buildCategorySearchQuery(technologyName, 'changelog');
-}
-
-function buildBatch2SetupQuery(technologyName: string) {
-  return `${technologyName} setup 2025`;
-}
-
-function truncateQueryWords(query: string, maxWords = 8) {
-  return query
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .slice(0, maxWords)
-    .join(' ');
-}
-
-function buildCategorySearchQuery(
-  technologyName: string,
-  category: 'setup' | 'errors' | 'changelog',
-) {
-  const normalizedTechnology =
-    normalizeBuilderProfileName(technologyName).replace(/[^a-z0-9@.+#\-/ ]/g, '') || 'technology';
-  const rawQuery =
-    category === 'setup'
-      ? buildBatch2SetupQuery(normalizedTechnology)
-      : category === 'errors'
-        ? `${normalizedTechnology} errors 2025`
-        : `${normalizedTechnology} changelog 2026`;
-  return truncateQueryWords(rawQuery, 8);
+  return buildResearchQuery({
+    technology: technologyName,
+    family: 'release_notes',
+  });
 }
 
 function isNonStackWorkspaceToolCategory(category: string) {
@@ -935,24 +914,15 @@ function limitResearchTargets(
   };
 }
 
-function mapPriorityToResearchSource(priority: 'high' | 'medium' | 'low'): ResearchTechnologyTarget['source'] {
-  switch (priority) {
-    case 'high':
-      return 'brief';
-    case 'medium':
-      return 'profile';
-    case 'low':
-    default:
-      return 'inferred';
-  }
-}
-
 function buildResearchTargets(
   inferredTechnologies: Batch1ResearchStack['technologies'],
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
   maxTargets: number,
 ) {
+  // B2: Profile tools are now HARD inputs, not filtered by inference
+  // The profile determines the research graph; inference fills gaps
+  
   const nonStackWorkspaceToolKeys = new Set(
     builderProfile.tools
       .filter((tool) => isNonStackWorkspaceToolCategory(tool.category))
@@ -963,64 +933,69 @@ function buildResearchTargets(
     const normalized = normalizeBuilderProfileName(technology.name || '');
     return Boolean(normalized) && !nonStackWorkspaceToolKeys.has(normalized);
   });
-  const inferredTechnologyKeys = new Set(
-    stackInferredTechnologies
-      .map((technology) => normalizeBuilderProfileName(technology.name || ''))
-      .filter(Boolean),
-  );
+
   const manifest = buildResearchManifest(
     builderProfile,
     projectBrief.summary || stackInferredTechnologies.map((technology) => technology.name).join(' '),
+    {
+      confirmedStackTools: projectBrief.confirmedStackTools,
+      inferredTechnologies: stackInferredTechnologies
+        .map((technology) => technology.name || '')
+        .filter(Boolean),
+    },
   );
-  const manifestTargets: ResearchTechnologyTarget[] = manifest.tools
-    .filter((tool) => inferredTechnologyKeys.has(normalizeBuilderProfileName(tool.name)))
+
+  const toTargetSource = (source: 'builder_profile' | 'project_stack' | 'inferred') =>
+    source === 'builder_profile' ? 'profile' : source === 'project_stack' ? 'brief' : 'inferred';
+
+  const profileTargets: ResearchTechnologyTarget[] = manifest.tools
+    .filter((tool) => tool.source === 'builder_profile')
     .map((tool) => ({
       name: tool.name,
       docs_url: tool.docsUrl,
       github_url: tool.githubRepo ? `https://github.com/${tool.githubRepo}` : '',
       changelog_url: '',
       docs_topic: tool.docsTopic,
-      search_query: buildBatch2SearchQuery(tool.name),
+      search_query: tool.searchQuery || buildBatch2SearchQuery(tool.name),
       priority: tool.priority,
       community_search_results: [],
       breaking_change_search_results: [],
-      source: mapPriorityToResearchSource(tool.priority),
+      source: toTargetSource(tool.source),
     }));
 
-  const inferredTargets: ResearchTechnologyTarget[] = stackInferredTechnologies.map((technology) =>
-    toResearchTechnologyTarget(
-      technology,
-      'inferred',
-      'installation, migration, compatibility, breaking changes, best practices',
-      'low',
-    ),
-  );
+  const briefTargets: ResearchTechnologyTarget[] = manifest.tools
+    .filter((tool) => tool.source === 'project_stack')
+    .map((tool) => ({
+      name: tool.name,
+      docs_url: tool.docsUrl,
+      github_url: tool.githubRepo ? `https://github.com/${tool.githubRepo}` : '',
+      changelog_url: '',
+      docs_topic: tool.docsTopic,
+      search_query: tool.searchQuery || buildBatch2SearchQuery(tool.name),
+      priority: tool.priority,
+      community_search_results: [],
+      breaking_change_search_results: [],
+      source: toTargetSource(tool.source),
+    }));
 
-  const briefTargets: ResearchTechnologyTarget[] = projectBrief.confirmedStackTools
-    .filter((technology) => inferredTechnologyKeys.has(normalizeBuilderProfileName(technology)))
-    .map((technology) => {
-      const researchUrls = getBuilderProfileResearchUrls(technology);
-      return {
-        name: technology,
-        docs_url: researchUrls.docsUrl,
-        github_url: researchUrls.githubUrl,
-        changelog_url: researchUrls.changelogUrl,
-        docs_topic:
-          researchUrls.docsUrl || researchUrls.githubUrl || researchUrls.changelogUrl
-            ? getBuilderProfileDocsTopic('frontend', technology)
-            : 'installation, migration, compatibility, breaking changes, best practices',
-        search_query: buildBatch2SearchQuery(technology),
-        priority: 'high',
-        community_search_results: [],
-        breaking_change_search_results: [],
-        source: 'brief',
-      };
-    });
+  const inferredTargets: ResearchTechnologyTarget[] = manifest.tools
+    .filter((tool) => tool.source === 'inferred')
+    .map((tool) => ({
+      name: tool.name,
+      docs_url: tool.docsUrl,
+      github_url: tool.githubRepo ? `https://github.com/${tool.githubRepo}` : '',
+      changelog_url: '',
+      docs_topic: tool.docsTopic,
+      search_query: tool.searchQuery || buildBatch2SearchQuery(tool.name),
+      priority: tool.priority,
+      community_search_results: [],
+      breaking_change_search_results: [],
+      source: toTargetSource(tool.source),
+    }));
 
-  const stackOnlyTargets = [...briefTargets, ...manifestTargets, ...inferredTargets].filter((target) =>
-    inferredTechnologyKeys.has(normalizeBuilderProfileName(target.name)),
-  );
-  const limitedTargets = limitResearchTargets(stackOnlyTargets, projectBrief, maxTargets);
+  // Combine: brief first (highest signal), then profile, then inferred (gap-fillers)
+  const allTargets = [...briefTargets, ...profileTargets, ...inferredTargets];
+  const limitedTargets = limitResearchTargets(allTargets, projectBrief, maxTargets);
   const fallbackTargets = limitResearchTargets(inferredTargets, projectBrief, maxTargets);
   return limitedTargets.targets.length > 0 ? limitedTargets : fallbackTargets;
 }
@@ -1373,7 +1348,7 @@ function retrieveStepResearchSlice(
 }
 
 function buildBatch2FanOutQueries(toolName: string) {
-  return [buildCategorySearchQuery(toolName, 'setup')];
+  return [buildResearchQuery({ technology: toolName, family: 'setup' })];
 }
 
 function buildBatch2PromptPayload(
@@ -1883,11 +1858,11 @@ function buildArchitectureReviewPayload(
   };
 }
 
-function countPlanSteps(plan: Batch4PlanBuild) {
+function countPlanSteps(plan: PlanAuthoringRecord) {
   return plan.stages.reduce((total, stage) => total + stage.steps.length, 0);
 }
 
-function mergePlanWithEnrichments(plan: Batch4PlanBuild, enrichments: Batch5EnrichSteps['enrichments']): EnrichedPlan {
+export function mergePlanWithEnrichments(plan: PlanAuthoringRecord, enrichments: Batch5EnrichSteps['enrichments']): EnrichedPlan {
   const enrichmentMap = new Map(enrichments.map((enrichment) => [enrichment.step_id, enrichment]));
 
   return {
@@ -1909,6 +1884,104 @@ function mergePlanWithEnrichments(plan: Batch4PlanBuild, enrichments: Batch5Enri
   };
 }
 
+export function buildPlanMarkdown(
+  authoredPlan: PlanAuthoringRecord,
+  enrichedPlan: EnrichedPlan,
+  reviewFeedback: string | undefined,
+): string {
+  const lines: string[] = [];
+  lines.push(`# ${authoredPlan.project_name}`);
+  lines.push('');
+  lines.push(`Type: ${authoredPlan.project_type}`);
+  lines.push('');
+  lines.push('## The problem');
+  lines.push('');
+  lines.push(authoredPlan.problem);
+  lines.push('');
+  lines.push("## What we're building");
+  lines.push('');
+  lines.push(authoredPlan.solution);
+  lines.push('');
+  lines.push("## Who it's for");
+  lines.push('');
+  lines.push(authoredPlan.target_user);
+  lines.push('');
+  lines.push('## MVP scope');
+  lines.push('');
+  lines.push(authoredPlan.mvp_scope);
+  lines.push('');
+  lines.push('## Done when');
+  lines.push('');
+  lines.push(authoredPlan.done_when);
+  lines.push('');
+  lines.push("## How it's built");
+  lines.push('');
+  lines.push(authoredPlan.architecture_notes);
+  lines.push('');
+  lines.push('## Data model');
+  lines.push('');
+  lines.push(authoredPlan.data_model_notes);
+  lines.push('');
+  lines.push(buildPlanSectionMarkdown(enrichedPlan));
+
+  if (reviewFeedback?.trim()) {
+    lines.push('');
+    lines.push('## Review Notes');
+    lines.push('');
+    lines.push(reviewFeedback.trim());
+  }
+
+  return lines.join('\n');
+}
+
+function buildPlanSectionMarkdown(enrichedPlan: EnrichedPlan): string {
+  const lines: string[] = [];
+  lines.push('## Build plan\n');
+  
+  for (const stage of enrichedPlan.stages) {
+    lines.push(`### ${stage.title}\n`);
+    
+    for (const step of stage.steps) {
+      const statusBadge = step.is_milestone 
+        ? `[Milestone: ${step.milestone_label || 'Checkpoint'}]`
+        : step.is_gate 
+          ? '[Gate]' 
+          : '';
+      
+      lines.push(`#### ${step.title} ${statusBadge}\n`);
+      
+      if (step.objective) {
+        lines.push(`**Objective:** ${step.objective}\n`);
+      }
+      
+      if (step.why_it_matters) {
+        lines.push(`**Why it matters:** ${step.why_it_matters}\n`);
+      }
+      
+      if (step.done_when) {
+        lines.push(`**Done when:** ${step.done_when}\n`);
+      }
+      
+      if (step.suggested_tools && step.suggested_tools.length > 0) {
+        lines.push(`**Suggested tools:** ${step.suggested_tools.join(', ')}\n`);
+      }
+      
+      if (step.checklist && step.checklist.length > 0) {
+        lines.push('\n**Checklist:**');
+        for (const item of step.checklist) {
+          const required = item.is_required ? ' (required)' : '';
+          lines.push(`- [ ] ${item.label}${required}`);
+        }
+        lines.push('');
+      }
+      
+      lines.push('');
+    }
+  }
+  
+  return lines.join('\n');
+}
+
 function makeUniquePlanId(value: string, fallbackPrefix: string, index: number, seen: Set<string>) {
   const base = normalizeBuilderProfileName(value) || `${fallbackPrefix}-${index + 1}`;
   let candidate = base;
@@ -1923,7 +1996,7 @@ function makeUniquePlanId(value: string, fallbackPrefix: string, index: number, 
   return candidate;
 }
 
-function normalizePlanStructure(plan: Batch4PlanBuild): Batch4PlanBuild {
+export function normalizePlanStructure(plan: PlanAuthoringRecord): PlanAuthoringRecord {
   const seenStageIds = new Set<string>();
   const seenStepIds = new Set<string>();
   const seenChecklistIds = new Set<string>();
@@ -1973,7 +2046,7 @@ function normalizePlanStructure(plan: Batch4PlanBuild): Batch4PlanBuild {
   });
 
   const validStepIds = new Set(stages.flatMap((stage) => stage.steps.map((step) => step.id)));
-  const edges: Batch4PlanBuild['edges'] = [];
+  const edges: PlanAuthoringRecord['edges'] = [];
   for (const [index, edge] of plan.edges.entries()) {
     const sourceStepId = stepIdMap.get(edge.source_step_id) || edge.source_step_id;
     const targetStepId = stepIdMap.get(edge.target_step_id) || edge.target_step_id;
@@ -2225,7 +2298,7 @@ async function ensureCompleteGeneratedFiles(
   }));
 }
 
-function flattenPlanSteps(plan: Batch4PlanBuild): Batch5ResearchStep[] {
+function flattenPlanSteps(plan: PlanAuthoringRecord): Batch5ResearchStep[] {
   return plan.stages.flatMap((stage) =>
     stage.steps.map((step) => ({
       id: step.id,
@@ -2278,139 +2351,21 @@ async function getProjectById(env: Bindings, projectId: string) {
   return env.DB.prepare('SELECT * FROM projects WHERE id = ?').bind(projectId).first() as ProjectRecord;
 }
 
-async function updateProjectGenerationStatus(
-  env: Bindings,
-  projectId: string,
-  generationStatus: ProjectGenerationStatus,
-  options: {
-    generationError?: string | null;
-    markStarted?: boolean;
-    markCompleted?: boolean;
-    clearCompletedAt?: boolean;
-    touchHeartbeat?: boolean;
-    generationRunId?: string | null;
-    generationProviderId?: string | null;
-    expectedRunId?: string | null;
-  } = {},
-) {
-  const timestamp = new Date().toISOString();
-  console.log(`[STATUS_TRACE] ${timestamp} updateProjectGenerationStatus for ${projectId}: status=${generationStatus}, runId=${options.generationRunId}, expectedRunId=${options.expectedRunId}`);
-  
-  const generationError = options.generationError ?? null;
-  const result = await env.DB.prepare(`
-    UPDATE projects
-    SET generation_status = ?,
-        generation_error = ?,
-        generation_run_id = CASE
-          WHEN ? = 1 THEN ?
-          ELSE generation_run_id
-        END,
-        generation_provider_id = CASE
-          WHEN ? = 1 THEN ?
-          ELSE generation_provider_id
-        END,
-        generation_started_at = CASE
-          WHEN ? = 1 AND generation_started_at IS NULL THEN datetime("now")
-          ELSE generation_started_at
-        END,
-        generation_completed_at = CASE
-          WHEN ? = 1 THEN datetime("now")
-          WHEN ? = 1 THEN NULL
-          ELSE generation_completed_at
-        END,
-        generation_heartbeat_at = CASE
-          WHEN ? = 1 THEN datetime("now")
-          ELSE generation_heartbeat_at
-        END,
-        updated_at = datetime("now")
-    WHERE id = ?
-      AND generation_status <> 'cancelled'
-      AND (
-        ? IS NULL
-        OR generation_run_id IS NULL
-        OR generation_run_id = ?
-      )
-  `)
-    .bind(
-      generationStatus,
-      generationError,
-      options.generationRunId !== undefined ? 1 : 0,
-      options.generationRunId ?? null,
-      options.generationProviderId !== undefined ? 1 : 0,
-      options.generationProviderId ?? null,
-      options.markStarted ? 1 : 0,
-      options.markCompleted ? 1 : 0,
-      options.clearCompletedAt ? 1 : 0,
-      options.touchHeartbeat ? 1 : 0,
-      projectId,
-      options.expectedRunId ?? null,
-      options.expectedRunId ?? null,
-    )
-    .run();
 
-  const changes = Number((result as { meta?: { changes?: number } }).meta?.changes || 0);
-  if (changes > 0) {
-    console.log(`[STATUS_TRACE] ${timestamp} SUCCESS: updated project ${projectId} to status ${generationStatus}`);
-  } else {
-    console.log(`[STATUS_TRACE] ${timestamp} SKIPPED: project ${projectId} status change to ${generationStatus} not applied (likely runId mismatch or cancelled)`);
-  }
 
-  return changes;
-}
 
-async function touchGenerationHeartbeat(
-  env: Bindings,
-  projectId: string,
-  runId?: string | null,
-) {
-  if (runId) {
-    const result = await env.DB.prepare(`
-      UPDATE projects
-      SET generation_run_id = CASE
-            WHEN generation_run_id IS NULL THEN ?
-            ELSE generation_run_id
-          END,
-          generation_heartbeat_at = datetime("now"),
-          updated_at = datetime("now")
-      WHERE id = ?
-        AND generation_status IN (${ACTIVE_GENERATION_HEARTBEAT_STATUSES.map(() => '?').join(', ')})
-        AND (generation_run_id IS NULL OR generation_run_id = ?)
-    `)
-      .bind(runId, projectId, ...ACTIVE_GENERATION_HEARTBEAT_STATUSES, runId)
-      .run();
-
-    if (Number((result as { meta?: { changes?: number } }).meta?.changes || 0) > 0) {
-      lastHeartbeatTouchByProject.set(projectId, Date.now());
-    }
-    return;
-  }
-
-  const result = await env.DB.prepare(`
-    UPDATE projects
-    SET generation_heartbeat_at = datetime("now"),
-        updated_at = datetime("now")
-    WHERE id = ?
-      AND generation_status IN (${ACTIVE_GENERATION_HEARTBEAT_STATUSES.map(() => '?').join(', ')})
-  `)
-    .bind(projectId, ...ACTIVE_GENERATION_HEARTBEAT_STATUSES)
-    .run();
-
-  if (Number((result as { meta?: { changes?: number } }).meta?.changes || 0) > 0) {
-    lastHeartbeatTouchByProject.set(projectId, Date.now());
-  }
-}
 
 async function maybeTouchGenerationHeartbeat(
   env: Bindings,
   projectId: string,
-  runId?: string | null,
+  runId: string,
 ) {
   const lastTouchedAt = lastHeartbeatTouchByProject.get(projectId) || 0;
   if (Date.now() - lastTouchedAt < HEARTBEAT_TOUCH_INTERVAL_MS) {
     return;
   }
-
-  await touchGenerationHeartbeat(env, projectId, runId);
+  lastHeartbeatTouchByProject.set(projectId, Date.now());
+  await touchGenerationRunHeartbeat(env, runId);
 }
 
 async function insertAgentRun(
@@ -2561,7 +2516,7 @@ async function saveGenerationCheckpoint<T>(
       .run();
   }
 
-  await touchGenerationHeartbeat(env, projectId, runId);
+  await touchGenerationRunHeartbeat(env, runId);
 }
 
 async function clearGenerationCheckpoint(
@@ -2653,20 +2608,17 @@ function staleGenerationRunError(projectId: string, runId: string, phase: string
 }
 
 async function emitBatchStart(env: Bindings, projectId: string, runId: string, batchName: GenerationBatchName) {
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, batchName, {
-    generationError: null,
-    markStarted: true,
-    clearCompletedAt: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
+  const { changes } = await updateGenerationRunStatus(env, runId, batchName, {
+    currentBatch: batchName,
   });
-  if (statusChanges === 0) {
+  if (changes === 0) {
     throw staleGenerationRunError(projectId, runId, `starting ${batchName}`);
   }
+  await touchGenerationRunHeartbeat(env, runId);
   await resetGenerationThinkingState(env, projectId, batchName);
   await persistGenerationStreamEvent(env, {
     projectId,
+    runId,
     batchName,
     event: {
       type: 'batch_start',
@@ -2689,6 +2641,7 @@ async function insertGenerationEvent(
     case 'activity':
       await persistGenerationStreamEvent(env, {
         projectId: payload.projectId,
+        runId: optionalText(payload.body.run_id),
         batchName: payload.batchName,
         event: {
           type: 'activity',
@@ -2708,6 +2661,7 @@ async function insertGenerationEvent(
 
       await persistGenerationStreamEvent(env, {
         projectId: payload.projectId,
+        runId: optionalText(payload.body.run_id),
         batchName: payload.batchName,
         event: {
           type: 'activity',
@@ -2721,6 +2675,7 @@ async function insertGenerationEvent(
     case 'batch_completed':
       await persistGenerationStreamEvent(env, {
         projectId: payload.projectId,
+        runId: optionalText(payload.body.run_id),
         batchName: payload.batchName,
         event: {
           type: 'batch_complete',
@@ -2735,6 +2690,7 @@ async function insertGenerationEvent(
       if (payload.body.adr) {
         await persistGenerationStreamEvent(env, {
           projectId: payload.projectId,
+          runId: optionalText(payload.body.run_id),
           batchName: payload.batchName,
           event: {
             type: 'checkpoint',
@@ -2747,6 +2703,7 @@ async function insertGenerationEvent(
     case 'generation_complete':
       await persistGenerationStreamEvent(env, {
         projectId: payload.projectId,
+        runId: optionalText(payload.body.run_id),
         batchName: payload.batchName,
         event: {
           type: 'pipeline_complete',
@@ -2758,10 +2715,12 @@ async function insertGenerationEvent(
     case 'generation_failed':
       await persistGenerationStreamEvent(env, {
         projectId: payload.projectId,
+        runId: optionalText(payload.body.run_id),
         batchName: payload.batchName,
         event: {
           type: 'pipeline_failed',
           error: asText(payload.body.error, 'Project generation failed.'),
+          failureClass: asText(payload.body.failureClass, 'unknown'),
         },
       });
       await resetGenerationThinkingState(env, payload.projectId, null);
@@ -2785,6 +2744,7 @@ async function logActivity(
     eventType: 'activity',
     batchName: payload.batchName,
     body: {
+      run_id: payload.runId || undefined,
       batch: payload.batchName,
       kind: payload.kind,
       message: payload.message,
@@ -2807,7 +2767,7 @@ async function callAITextWithHeartbeat(
       try {
         await new Promise((resolve) => setTimeout(resolve, HEARTBEAT_TOUCH_INTERVAL_MS));
         if (!active) break;
-        await touchGenerationHeartbeat(env, projectId, runId);
+        await touchGenerationRunHeartbeat(env, runId);
       } catch (error) {
         console.warn('[generation-heartbeat] Failed to refresh heartbeat during AI call:', error);
       }
@@ -2817,9 +2777,9 @@ async function callAITextWithHeartbeat(
   const loopPromise = heartbeatLoop();
 
   try {
-    await touchGenerationHeartbeat(env, projectId, runId);
+    await touchGenerationRunHeartbeat(env, runId);
     const response = await callAIText(payload);
-    await touchGenerationHeartbeat(env, projectId, runId);
+    await touchGenerationRunHeartbeat(env, runId);
     return response;
   } finally {
     active = false;
@@ -2847,18 +2807,15 @@ export async function loadBatchOutput<T>(
   runType: GenerationBatchName,
   schema: ZodType<T>,
 ) {
-  console.log(`[PIPELINE_TRACE] loadBatchOutput for project ${projectId}, runType ${runType}`);
   const typedRecord = await loadBatchRunRecord(env, projectId, runType);
 
   if (!typedRecord) {
-    console.warn(`[PIPELINE_TRACE] loadBatchOutput: Missing output record for ${runType}`);
     throw new GenerationPipelineError(`Missing output record for ${runType}. Please ensure the previous step completed successfully.`);
   }
 
   const storedOutput = await loadJsonPayloadText(env, typedRecord.output, typedRecord.output_r2_key);
 
   if (!storedOutput) {
-    console.warn(`[PIPELINE_TRACE] loadBatchOutput: Output record exists for ${runType} but content is empty`);
     throw new GenerationPipelineError(`Output record for ${runType} exists but content is empty.`);
   }
 
@@ -2934,7 +2891,6 @@ export async function saveArchitectureReviewApproval(
     review_feedback_updated_at: timestamp,
   };
 
-  console.log(`[APPROVAL_TRACE] ${timestamp} Updating agent_run ${context.runId} with approval marker`);
   await env.DB.prepare('UPDATE agent_runs SET input = ? WHERE id = ?')
     .bind(JSON.stringify(nextInput), context.runId)
     .run();
@@ -3007,6 +2963,7 @@ function isHeartbeatOlderThan(
 async function resolveProviderConfiguration(
   env: Bindings,
   projectId: string,
+  runId: string | null,
   userId: string,
   role: GenerationModelRole,
   providerId?: string,
@@ -3018,6 +2975,7 @@ async function resolveProviderConfiguration(
 
   await persistGenerationStreamEvent(env, {
     projectId,
+    runId,
     event: {
       type: 'activity',
       icon: '⚡',
@@ -3036,7 +2994,7 @@ export async function resolveGenerationProviderConfiguration(
   role: GenerationModelRole,
   providerId?: string,
 ): Promise<ProviderConfig> {
-  return resolveProviderConfiguration(env, projectId, userId, role, providerId);
+  return resolveProviderConfiguration(env, projectId, null, userId, role, providerId);
 }
 
 function formatSchemaCorrectionPrompt(previousResponse: string, schemaDescription: string) {
@@ -3117,7 +3075,12 @@ async function callValidatedBatch<T>(
 ) {
   let prompt = options.prompt;
   let lastError = 'The AI response was empty.';
-  const emitter = createThrottledThinkingEmitter(options.env, options.projectId, options.runType);
+  const emitter = createThrottledThinkingEmitter(
+    options.env,
+    options.projectId,
+    options.runId,
+    options.runType,
+  );
   try {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       await logActivity(options.env, {
@@ -3232,9 +3195,11 @@ async function failBatch(
   provider: ProviderConfig,
   runType: GenerationBatchName,
   input: unknown,
-  message: string,
+  error: unknown,
   attemptCount: number,
 ): Promise<never> {
+  const message = error instanceof Error ? error.message : String(error);
+  
   await insertAgentRun(env, {
     projectId,
     runType,
@@ -3247,15 +3212,10 @@ async function failBatch(
     attemptCount,
   });
 
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'failed', {
-    generationError: message,
-    markStarted: true,
-    markCompleted: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
+  const { changes } = await updateGenerationRunStatus(env, runId, 'failed', {
+    errorMessage: message,
   });
-  if (statusChanges === 0) {
+  if (changes === 0) {
     throw staleGenerationRunError(projectId, runId, `failing ${runType}`);
   }
 
@@ -3266,6 +3226,7 @@ async function failBatch(
     body: {
       batch: runType,
       error: message,
+      failureClass: classifyAIError(error),
       message: `Failed during ${runType}.`,
       status: 'failed',
     },
@@ -3298,14 +3259,10 @@ async function completeBatch<T>(
     attemptCount,
   });
 
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, runType, {
-    generationError: null,
-    markStarted: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
+  const { changes } = await updateGenerationRunStatus(env, runId, runType, {
+    currentBatch: runType,
   });
-  if (statusChanges === 0) {
+  if (changes === 0) {
     throw staleGenerationRunError(projectId, runId, `completing ${runType}`);
   }
 
@@ -3321,7 +3278,7 @@ async function completeBatch<T>(
   });
 }
 
-async function materializePlanStructure(env: Bindings, projectId: string, plan: Batch4PlanBuild) {
+async function materializePlanStructure(env: Bindings, projectId: string, plan: PlanAuthoringRecord) {
   const workflowResult = await env.DB.prepare('SELECT id FROM workflows WHERE project_id = ? LIMIT 1').bind(projectId).first();
   let workflowId = workflowResult?.id as string | undefined;
 
@@ -3700,15 +3657,9 @@ Identify the stack implied by the idea. For each technology, provide:
     });
     return 'complete';
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 1 failed.';
-    const isRetryable = 
-      error instanceof RetryableAIError ||
-      errorMessage.includes('Network connection lost') ||
-      errorMessage.includes('fetch failed') ||
-      errorMessage.includes('timeout') ||
-      errorMessage.includes('ECONNREFUSED');
-    
-    if (isRetryable) {
+    const errorClass = classifyAIError(error);
+    if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
+      const errorMessage = error instanceof Error ? error.message : 'Batch 1 failed.';
       throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
@@ -3719,7 +3670,7 @@ Identify the stack implied by the idea. For each technology, provide:
       provider,
       'batch_1_research_stack',
       input,
-      error instanceof Error ? error.message : 'Batch 1 failed.',
+      error,
       2,
     );
   }
@@ -3779,13 +3730,6 @@ export async function executeBatch2(
   const subrequestTracker = createResearchSubrequestTracker({
     initialCount: 0,
     limit: maxSubrequestBudget,
-  });
-  const researchService = createResearchService({
-    env,
-    userId: project.user_id,
-    projectId,
-    batchName: 'batch_2_fetch_and_read',
-    subrequestTracker,
   });
 
   const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
@@ -3871,17 +3815,74 @@ export async function executeBatch2(
       : (technology.github_url || '').trim();
       const changelogUrl = (technology.changelog_url || '').trim();
 
+    const researchContext: Parameters<typeof facadeFetchDocs>[0] = {
+      env,
+      userId: project.user_id,
+      projectId,
+      batchName: 'batch_2_fetch_and_read',
+      subrequestTracker,
+    };
+
     const fanOutQueries = buildBatch2FanOutQueries(technology.name);
-    const [docsResult] = docsUrl
-      ? await fetchSequentially([() => researchService.fetchDoc(docsUrl)])
-      : [emptyResearchResult('', `No docs URL found for ${technology.name}.`)];
-    const [githubResult] = githubRepository
-      ? await fetchSequentially([() => researchService.fetchGitHubRepo(githubRepository.owner, githubRepository.repo)])
-      : [emptyResearchResult('', `No GitHub repo found for ${technology.name}.`)];
-    const fanOutSearchResults = await fetchSequentially(
-      fanOutQueries.map((query) => () => researchService.searchWeb(query, searchResultLimit)),
+    
+    // docsResult
+    let docsResult: ResearchResult;
+    if (docsUrl) {
+      const resp = await facadeFetchDocs(researchContext, technology.name, technology.docs_topic, docsUrl);
+      docsResult = {
+        content: resp.content,
+        source: resp.source,
+        tool: resp.metadata.tool as any,
+        chars: resp.content.length,
+        error: resp.metadata.degraded ? resp.metadata.degradationReason : undefined,
+      };
+    } else {
+      docsResult = emptyResearchResult('', `No docs URL found for ${technology.name}.`);
+    }
+
+    // githubResult
+    let githubResult: ResearchResult;
+    if (githubRepository) {
+      const resp = await facadeAnalyzeGitHubRepo(researchContext, githubRepository.owner, githubRepository.repo);
+      const headline = `${resp.owner}/${resp.repo} — ${resp.stars} stars, ${resp.openIssues} open issues`;
+      const releasesText = (resp.releases || [])
+        .slice(0, 4)
+        .map((r: any) => `${r.tagName} (${r.publishedAt}): ${r.body}`)
+        .join('\n\n');
+      const issuesText = (resp.recentIssues || [])
+        .slice(0, 8)
+        .map((i: any) => `Issue (${i.createdAt}) ${i.title}: ${i.body}`)
+        .join('\n\n');
+      const combinedContent = [headline, resp.readme, releasesText, issuesText].filter(Boolean).join('\n\n');
+      
+      githubResult = {
+        content: combinedContent,
+        source: `https://github.com/${resp.owner}/${resp.repo}`,
+        tool: resp.metadata.tool as any,
+        chars: combinedContent.length,
+        error: resp.metadata.degraded && resp.metadata.quality === 'failed' ? resp.metadata.degradationReason : undefined,
+      };
+    } else {
+      githubResult = emptyResearchResult('', `No GitHub repo found for ${technology.name}.`);
+    }
+
+    // fanOutSearchResults
+    const fanOutSearchResultsRaw = await Promise.all(
+      fanOutQueries.map((query) => facadeSearchWeb(researchContext, query, searchResultLimit))
     );
-    const flattenedWebResearchResults = dedupeResearchResults(fanOutSearchResults.flat());
+    
+    // Legacy compatibility for following lines: fanOutSearchResults.flat()
+    const fanOutSearchResults: ResearchResult[][] = fanOutSearchResultsRaw.map(resp => 
+      resp.results.map(r => ({
+        content: r.description,
+        source: r.url,
+        title: r.title,
+        tool: (resp.metadata.tool as any) || 'jina_search',
+        chars: r.description.length,
+      }))
+    );
+
+    const flattenedWebResearchResults: ResearchResult[] = fanOutSearchResults.flat();
 
     subrequestCounter = subrequestTracker.count;
 
@@ -4291,15 +4292,9 @@ Preserve specific version and compatibility details.`;
     });
     return 'complete';
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 2 failed.';
-    const isRetryable = 
-      error instanceof RetryableAIError ||
-      errorMessage.includes('Network connection lost') ||
-      errorMessage.includes('fetch failed') ||
-      errorMessage.includes('timeout') ||
-      errorMessage.includes('ECONNREFUSED');
-    
-    if (isRetryable) {
+    const errorClass = classifyAIError(error);
+    if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
+      const errorMessage = error instanceof Error ? error.message : 'Batch 2 failed.';
       throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
@@ -4310,7 +4305,7 @@ Preserve specific version and compatibility details.`;
       provider,
       'batch_2_fetch_and_read',
       input,
-      error instanceof Error ? error.message : 'Batch 2 failed.',
+      error,
       2,
     );
   }
@@ -4438,15 +4433,9 @@ Base every single recommendation on the provided research corpus. If a technolog
       message: `Architecture locked in — ${result.data.data_model.length} tables, ${result.data.integrations.length} integrations.`,
     });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 3 failed.';
-    const isRetryable = 
-      error instanceof RetryableAIError ||
-      errorMessage.includes('Network connection lost') ||
-      errorMessage.includes('fetch failed') ||
-      errorMessage.includes('timeout') ||
-      errorMessage.includes('ECONNREFUSED');
-    
-    if (isRetryable) {
+    const errorClass = classifyAIError(error);
+    if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
+      const errorMessage = error instanceof Error ? error.message : 'Batch 3 failed.';
       throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
@@ -4457,10 +4446,58 @@ Base every single recommendation on the provided research corpus. If a technolog
       provider,
       'batch_3_architect',
       input,
-      error instanceof Error ? error.message : 'Batch 3 failed.',
+      error,
       2,
     );
   }
+}
+
+async function computeHash(content: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(content);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableSerialize(entry)).join(',')}]`;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerialize(entryValue)}`).join(',')}}`;
+}
+
+function computeAuthoringPayload(plan: PlanAuthoringRecord) {
+  const canonicalPlan = {
+    project_name: plan.project_name,
+    project_type: plan.project_type,
+    problem: plan.problem,
+    solution: plan.solution,
+    target_user: plan.target_user,
+    mvp_scope: plan.mvp_scope,
+    done_when: plan.done_when,
+    architecture_notes: plan.architecture_notes,
+    data_model_notes: plan.data_model_notes,
+    stages: plan.stages,
+    edges: plan.edges,
+  };
+
+  return stableSerialize(canonicalPlan);
+}
+
+export async function computePlanAuthoringHash(plan: PlanAuthoringRecord): Promise<string> {
+  return computeHash(computeAuthoringPayload(plan));
+}
+
+async function withAuthoringHash(plan: PlanAuthoringRecord): Promise<PlanAuthoringRecord> {
+  const authoringHash = await computePlanAuthoringHash(plan);
+  return { ...plan, authoring_hash: authoringHash };
 }
 
 export async function executeBatch4(
@@ -4505,7 +4542,7 @@ export async function executeBatch4(
   });
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s Product Lead and Build Architect. Your goal is to produce two authoritative outputs: 1) A comprehensive Product Requirements Document (plan.md) and 2) A derived implementation plan (JSON stages/steps). The document is the source of truth; the JSON plan must strictly reflect the MVP scope defined within it. Return only valid JSON.',
+    'You are Scrimble’s Product Lead and Build Architect. Batch 4 is the only authoring stage. Return one canonical structured authoring record as valid JSON.',
     projectBrief.promptContext,
   );
   const prompt = `Architecture Decision Record & Research:
@@ -4517,76 +4554,32 @@ ${reviewContext.reviewFeedbackProvided ? reviewContext.reviewFeedback : 'No chan
 Retrieved research context:
 ${planResearchSlice.context || 'No retrieved research chunks were available for this plan pass.'}
 
-STEP 1: Generate the authoritative plan.md PRD content.
-This must be a highly detailed, 600-1000 line document using EXACTLY this structure:
+Return exactly this shape:
+{
+  "project_name": string,
+  "project_type": string,
+  "problem": string,
+  "solution": string,
+  "target_user": string,
+  "mvp_scope": string,
+  "done_when": string,
+  "architecture_notes": string,
+  "data_model_notes": string,
+  "stages": [...],
+  "edges": [...]
+}
 
-# [Project Name]
-[One line — what this is]
-
-## The problem
-[What problem this solves and for who. Why it matters. What happens without it.]
-
-## What we're building
-[Full product description in plain language. Every major feature. What the finished product looks and feels like. What a user can do from the moment they open it to the moment they're done.]
-
-## Who it's for
-[Primary user. What they're trying to do. What they already know. What they don't want to deal with.]
-
-## MVP scope
-### In scope
-[Everything that must exist for this to be a usable V1. Feature by feature.]
-
-### Out of scope (V2+)
-[Everything explicitly deferred. Why each item was deferred.]
-
-### Done when...
-[Exact definition of a shippable MVP. What a user can do. What works end to end.]
-
-## How it's built
-[Every technology from the ADR with pinned version, reason for choice, and any known gotchas from research.]
-
-## How the pieces connect
-[Full data flow in plain prose. Step by step: signup, core feature use, edge cases. How frontend talks to backend. How auth works. How background jobs are triggered.]
-
-## Data model
-[Every table from the ADR. Every column, type, constraint, and a plain English description of what each stores.]
-
-## API surface
-[Every logical route — method, path, what it does, auth required, what it returns.]
-
-## Security model
-[How auth works end to end. What's encrypted. What never touches the DB. Access control rules.]
-
-## Environment variables
-[Every variable — name, where it lives, what it's for, whether it's secret.]
-
-## Conventions
-[File structure, naming patterns, how queries are written, error handling, background job dispatch, response formats.]
-
-## Known gotchas
-[Breaking changes, version incompatibilities, infrastructure limits, and critical research findings.]
-
-## Hard rules
-[Project-specific "never-dos" based on the architecture and security model.]
-
-## Build plan
-[Summarize the stages and steps below. Mark Milestones clearly.]
-
----
-
-STEP 2: Generate the JSON Build Plan (stages, steps, edges).
-- Derive this strictly from the "In scope" MVP features in your PRD.
-- EXCLUDE all V2+ items.
+Rules:
+- This is the only authored artifact. Do not include prd_markdown.
+- stages/edges must represent only MVP scope.
 - suggested_tools must reference specific packages/versions from the ADR.
 - Include mandatory milestones as gate steps:
   1. "MVP complete" — sits at the end of the build stage. Prompt: "Your core product is built. Before we move to testing and launch — does everything work the way you expected?"
   2. "Ready to launch" — sits at the end of the deploy stage. Prompt: "Everything is live. Take a moment to check it yourself before we call this done."
 - Add inflection point milestones where meaningful (e.g., "Auth working end to end", "Data model locked").
 - Milestone nodes must have is_milestone: true and a milestone_label.
-
-Rules:
 - if human feedback asks to swap, remove, or add technologies, you must honour it everywhere.
-- return ONLY a single valid JSON object: { "prd_markdown": string, "project_name": string, "project_type": string, "stages": [...], "edges": [...] }
+- return ONLY a single valid JSON object for the shape above.
 - content must be dense and senior-developer quality.`;
 
   try {
@@ -4601,7 +4594,7 @@ Rules:
       schema: Batch4PlanBuildSchema,
       schemaDescription: schemaDescriptions.batch_4_plan_build,
     });
-    const normalizedPlan = normalizePlanStructure(result.data);
+    const normalizedPlan = await withAuthoringHash(normalizePlanStructure(result.data));
 
     await completeBatch(
       env,
@@ -4623,15 +4616,9 @@ Rules:
       message: `Plan ready — ${normalizedPlan.stages.length} stages, ${countPlanSteps(normalizedPlan)} steps.`,
     });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 4 failed.';
-    const isRetryable = 
-      error instanceof RetryableAIError ||
-      errorMessage.includes('Network connection lost') ||
-      errorMessage.includes('fetch failed') ||
-      errorMessage.includes('timeout') ||
-      errorMessage.includes('ECONNREFUSED');
-    
-    if (isRetryable) {
+    const errorClass = classifyAIError(error);
+    if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
+      const errorMessage = error instanceof Error ? error.message : 'Batch 4 failed.';
       throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
@@ -4642,7 +4629,7 @@ Rules:
       provider,
       'batch_4_plan_build',
       input,
-      errorMessage,
+      error,
       2,
     );
   }
@@ -4682,15 +4669,20 @@ export async function executeBatch5(
   const researchManifest = buildResearchManifest(
     builderProfile,
     projectBrief.summary || project.description || '',
+    {
+      confirmedStackTools: projectBrief.confirmedStackTools,
+      inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean),
+    },
   );
   const planSteps = checkpoint?.data.steps || flattenPlanSteps(plan);
   const stepResearchContexts: StepResearchContext[] = checkpoint?.data.stepResearchContexts
     ? [...checkpoint.data.stepResearchContexts]
     : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
-  // Keep only durable logical progress in checkpoints; this per-invocation counter must
-  // reset on resume so checkpointed iterations can advance safely.
-  let subrequestCounter = 0;
+  const subrequestTracker = createResearchSubrequestTracker({
+    initialCount: 0,
+    limit: 40, // Cloudflare standard limit is 50
+  });
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
   await logActivity(env, {
@@ -4737,6 +4729,8 @@ export async function executeBatch5(
       projectId,
       connectedTools,
       researchManifest,
+      runId,
+      subrequestTracker,
     });
 
     stepResearchContexts.push(stepResearch);
@@ -4748,21 +4742,13 @@ export async function executeBatch5(
       message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
     });
 
-    // Estimate subrequests used by this research step
-    let stepSubrequests = 3; // Heartbeat + 2 logActivity calls
-    if (stepResearch.toolsUsed.includes('Live docs')) stepSubrequests += 4;
-    if (stepResearch.toolsUsed.includes('GitHub')) stepSubrequests += 2;
-    if (stepResearch.toolsUsed.includes('Brave Search')) stepSubrequests += 4;
-    if (stepResearch.toolsUsed.includes('Context7')) stepSubrequests += 4;
-    subrequestCounter += stepSubrequests;
-
-    const maxSubrequestBudget = 40; // Cloudflare standard limit is 50
-    const SUB_RESERVE = 8;
+    // Standard overhead for current step (heartbeat, logs)
+    subrequestTracker.count += 3;
 
     const normalizedCheckpointStepInterval = Math.max(1, checkpointStepInterval);
     const shouldCheckpoint = (index + 1 < planSteps.length) && (
       (index + 1 - startIndex) >= normalizedCheckpointStepInterval || // Process groups safely within one turn
-      subrequestCounter >= (maxSubrequestBudget - SUB_RESERVE) // Or when near subrequest limit
+      subrequestTracker.count >= 32 // Or when near subrequest limit (40 - 8 reserve)
     );
 
     if (shouldCheckpoint) {
@@ -4800,7 +4786,7 @@ export async function executeBatch5(
     step_research: stepResearchContexts,
   };
 
-  await touchGenerationHeartbeat(env, projectId, runId);
+  await touchGenerationRunHeartbeat(env, runId);
 
   await logActivity(env, {
     projectId,
@@ -4897,15 +4883,9 @@ Populate navigation_links from the researched docs URLs so the user can click di
     });
     return 'complete';
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 5 failed.';
-    const isRetryable = 
-      error instanceof RetryableAIError ||
-      errorMessage.includes('Network connection lost') ||
-      errorMessage.includes('fetch failed') ||
-      errorMessage.includes('timeout') ||
-      errorMessage.includes('ECONNREFUSED');
-    
-    if (isRetryable) {
+    const errorClass = classifyAIError(error);
+    if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
+      const errorMessage = error instanceof Error ? error.message : 'Batch 5 failed.';
       throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 
@@ -4916,7 +4896,7 @@ Populate navigation_links from the researched docs URLs so the user can click di
       provider,
       'batch_5_enrich_steps',
       input,
-      error instanceof Error ? error.message : 'Batch 5 failed.',
+      error,
       2,
     );
   }
@@ -4961,59 +4941,48 @@ export async function executeBatch6(
     kind: 'writing',
     message: 'Preparing your downloadable files...',
   });
-  await logActivity(env, {
-    projectId,
-    batchName: 'batch_6_generate_files',
-    kind: 'system',
-    message: `Retrieved ${fileResearchSlice.chunkCount} chunks from ${fileResearchSlice.totalChunks} total (estimated ${fileResearchSlice.estimatedTokens.toLocaleString()} tokens) for file-generation prompt assembly.`,
-  });
 
-  const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s Product Lead. Your goal is to produce the final "plan.md" by taking the authoritative PRD from Batch 4 and updating its "Build plan" section with the final enriched implementation details and current step statuses. Return only valid JSON with the filename "plan.md".',
-    projectBrief.promptContext,
-  );
+  // C1: Batch 6 is deterministic rendering only; fail closed on authored-record drift.
+  const storedHash = plan.authoring_hash;
+  const currentHash = await computePlanAuthoringHash(plan);
 
-  const prompt = `Authoritative PRD from Batch 4:
-${(plan as any).prd_markdown || 'No PRD found in Batch 4 output. Generate from scratch using the context below.'}
-
-Architecture Decision Record:
-${JSON.stringify(reviewContext.adr, null, 2)}
-
-Complete Enriched Implementation Plan (JSON):
-${JSON.stringify(enrichedPlan, null, 2)}
-
-Human Review Feedback:
-${reviewContext.reviewFeedbackProvided ? reviewContext.reviewFeedback : 'No review adjustments were requested.'}
-
-Retrieved research context:
-${fileResearchSlice.context || 'No retrieved chunks were available for this final generation pass.'}
-
-Generate the final "plan.md". This is a comprehensive Product Requirements Document. 
-Keep the exact structure and content from the Batch 4 PRD, but ENSURE the "Build plan" section is exhaustive and uses the detail from the Enriched Implementation Plan (JSON) including objectives, suggested tools, and current statuses (e.g., [Active], [Locked], [Complete]).
-
-Rules:
-- Return ONLY a single valid JSON object: { "files": [{ "filename": "plan.md", "content": string }] }
-- Content must be dense (600-1000 lines).
-- Extremely carefully escape double quotes (") and backslashes (\\) in the JSON content string.`;
-
-  try {
-    const result = await callValidatedBatch(provider, {
+  if (storedHash && storedHash !== currentHash) {
+    const errorMsg = `Authoring record drift detected. Batch 4 authored content changed before Batch 6 assembly. Resume from Batch 4 to regenerate canonical outputs. (Stored: ${storedHash.slice(0, 8)}, Current: ${currentHash.slice(0, 8)})`;
+    console.error(`[INVARIANT_VIOLATION] Batch 6: ${errorMsg} for project ${projectId}`);
+    
+    await persistInvariantViolation(
       env,
       projectId,
       runId,
-      runType: 'batch_6_generate_files',
-      role: 'deep',
-      systemPrompt,
-      prompt,
-      schema: Batch6GenerateFilesSchema,
-      schemaDescription: schemaDescriptions.batch_6_generate_files,
-    });
+      'authoring_record_drift',
+      errorMsg
+    );
     
-    const finalFiles = result.data.files as Array<{ filename: SkillFileName; content: string }>;
-    const finalResult: Batch6GenerateFiles = {
-      files: finalFiles,
-    };
+    // Fail the run - Batch 6 must be assembly-only and cannot tolerate drift
+    await failBatch(
+      env,
+      projectId,
+      runId,
+      provider,
+      'batch_6_generate_files',
+      input,
+      errorMsg,
+      0
+    );
+    return;
+  }
 
+  const reviewFeedbackText = reviewContext.reviewFeedbackProvided 
+    ? reviewContext.reviewFeedback 
+    : undefined;
+  const planContent = buildPlanMarkdown(plan, enrichedPlan, reviewFeedbackText);
+  
+  const finalFiles: Array<{ filename: SkillFileName; content: string }> = [
+    { filename: 'plan.md' as SkillFileName, content: planContent },
+  ];
+  const finalResult: Batch6GenerateFiles = { files: finalFiles };
+
+  try {
     await completeBatch(
       env,
       projectId,
@@ -5022,7 +4991,7 @@ Rules:
       'batch_6_generate_files',
       input,
       finalResult,
-      result.attemptCount,
+      1, // No retries needed - deterministic
       finalFiles,
       Date.now() - startedAt,
     );
@@ -5034,18 +5003,6 @@ Rules:
       message: 'Project plan.md is ready for download.',
     });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Batch 6 failed.';
-    const isRetryable = 
-      error instanceof RetryableAIError ||
-      errorMessage.includes('Network connection lost') ||
-      errorMessage.includes('fetch failed') ||
-      errorMessage.includes('timeout') ||
-      errorMessage.includes('ECONNREFUSED');
-    
-    if (isRetryable) {
-      throw new RetryableGenerationPipelineError(errorMessage, 45);
-    }
-
     await failBatch(
       env,
       projectId,
@@ -5053,40 +5010,29 @@ Rules:
       provider,
       'batch_6_generate_files',
       input,
-      error instanceof Error ? error.message : 'Batch 6 failed.',
-      2,
+      error,
+      1,
     );
   }
 }
 
 export async function pauseForArchitectureReview(env: Bindings, projectId: string, runId: string) {
-  const timestamp = new Date().toISOString();
-  console.log(`[PIPELINE_TRACE] ${timestamp} pauseForArchitectureReview called for project: ${projectId}, runId: ${runId}`);
-  
   // HARDENING: Check if we already have an approval for this run
   if (await hasApprovedArchitectureReview(env, projectId)) {
-    console.log(`[PIPELINE_TRACE] ${timestamp} SKIPPED: project ${projectId} already has an approved architecture review`);
     return;
   }
 
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
 
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'awaiting_review', {
-    generationError: null,
-    markStarted: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
-  });
-  if (statusChanges === 0) {
-    console.log(`[PIPELINE_TRACE] ${timestamp} SKIPPED: project ${projectId} status change to awaiting_review failed (likely already approved or status changed)`);
+  const { changes } = await updateGenerationRunStatus(env, runId, 'awaiting_review');
+  if (changes === 0) {
     return;
   }
 
-  console.log(`[PIPELINE_TRACE] ${timestamp} SUCCESS: project ${projectId} is now awaiting_review`);
   await logActivity(env, {
     projectId,
     batchName: 'batch_3_architect',
+    runId,
     kind: 'system',
     message: "Here's what I found — review the architecture before I build the plan.",
   });
@@ -5102,15 +5048,8 @@ export async function pauseForArchitectureReview(env: Bindings, projectId: strin
 }
 
 export async function finalizeProjectGeneration(env: Bindings, projectId: string, runId: string) {
-  const statusChanges = await updateProjectGenerationStatus(env, projectId, 'complete', {
-    generationError: null,
-    markStarted: true,
-    markCompleted: true,
-    touchHeartbeat: true,
-    generationRunId: runId,
-    expectedRunId: runId,
-  });
-  if (statusChanges === 0) {
+  const { changes } = await updateGenerationRunStatus(env, runId, 'complete');
+  if (changes === 0) {
     throw staleGenerationRunError(projectId, runId, 'finalizing generation');
   }
   await clearGenerationCheckpoints(env, projectId, runId);
@@ -5189,4 +5128,9 @@ export async function resolvePipelineStatusToRun(
 
   return 'complete';
 }
+
+
+
+
+
 

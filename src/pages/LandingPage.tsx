@@ -5,9 +5,9 @@ import { Hexagon, ArrowRight } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
-const HERO_SOCIAL_PROOF_TARGET = 2000;
 const PROMPT_DEMO_TEXT =
   'I want to build a booking app for independent dog walkers with recurring billing, client notes, and a clear daily checklist for each walk.';
+const SCRIMBLE_GITHUB_URL = 'https://github.com/';
 
 const heroContainerVariants = {
   hidden: {},
@@ -427,7 +427,6 @@ export default function LandingPage() {
   const { ref: planSectionRef, hasRevealed: hasPlanRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
   const { ref: aiSectionRef, hasRevealed: hasAiRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
   const { ref: morningSectionRef, hasRevealed: hasMorningRevealed } = useRevealOnIntersect<HTMLDivElement>(0.2);
-  const heroBuilderCount = HERO_SOCIAL_PROOF_TARGET;
   const [typedPrompt, setTypedPrompt] = useState('');
 
   useEffect(() => {
@@ -518,17 +517,8 @@ export default function LandingPage() {
                 <span className="tracking-tight">🔒 No subscription required</span>
               </div>
             </motion.div>
-              <motion.div variants={heroItemVariants} className="mt-8 flex items-center gap-3">
-                <div className="flex -space-x-2">
-                  {[1, 2, 3, 4].map((i) => (
-                    <div key={i} className="h-8 w-8 rounded-full border-2 border-bg-base bg-bg-surface flex items-center justify-center text-[10px] font-bold text-text-secondary overflow-hidden">
-                      <img src={`https://i.pravatar.cc/100?img=${i + 10}`} alt={`User ${i}`} className="w-full h-full object-cover" />
-                    </div>
-                  ))}
-                </div>
-                <div className="text-sm font-medium text-text-secondary">
-                  Join <span className="text-text-primary">{heroBuilderCount.toLocaleString()}+</span> solo builders
-                </div>
+              <motion.div variants={heroItemVariants} className="mt-8 rounded-[10px] border border-border-default bg-bg-surface/55 px-3 py-2 text-sm text-text-secondary">
+                Built for solo builders who want one guided path from idea to shipped project.
               </motion.div>
             </motion.div>
 
@@ -607,54 +597,7 @@ export default function LandingPage() {
           </div>
         </section>
 
-        {/* Step 5 — Social Proof Section */}
-        <section className="mx-auto max-w-[1200px] px-6 sm:px-10 lg:px-20 pb-[100px]">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="rounded-[14px] bg-[#161616] border border-[rgba(255,255,255,0.06)] p-6 flex flex-col justify-between">
-              <p className="font-serif italic text-text-primary text-[17px] leading-relaxed mb-6">
-                “I've started ten projects this year and finished none. Scrimble actually forced me to ship by breaking my monolithic anxiety into tiny steps.”
-              </p>
-              <div className="flex items-center gap-3 mt-auto">
-                <div className="h-8 w-8 rounded-full overflow-hidden bg-bg-surface">
-                  <img src="https://i.pravatar.cc/100?img=33" alt="Builder" className="w-full h-full object-cover" />
-                </div>
-                <div className="text-[13px] font-medium text-text-muted">
-                  @mkdev · Full-stack dev
-                </div>
-              </div>
-            </div>
-
-            <div className="rounded-[14px] bg-[#161616] border border-[rgba(255,255,255,0.06)] p-6 flex flex-col justify-between">
-              <p className="font-serif italic text-text-primary text-[17px] leading-relaxed mb-6">
-                “The AI planning is magical. It spotted edge cases in my auth flow that I hadn't even considered. Finally, an AI tool that organizes instead of just generating code.”
-              </p>
-              <div className="flex items-center gap-3 mt-auto">
-                <div className="h-8 w-8 rounded-full overflow-hidden bg-bg-surface">
-                  <img src="https://i.pravatar.cc/100?img=12" alt="Builder" className="w-full h-full object-cover" />
-                </div>
-                <div className="text-[13px] font-medium text-text-muted">
-                  @sarah_codes · Indie hacker
-                </div>
-              </div>
-            </div>
-
-            <div className="rounded-[14px] bg-[#161616] border border-[rgba(255,255,255,0.06)] p-6 flex flex-col justify-between">
-              <p className="font-serif italic text-text-primary text-[17px] leading-relaxed mb-6">
-                “Bring your own key is the best part. I'm not trapped in another $20/mo subscription just to have a competent project manager.”
-              </p>
-              <div className="flex items-center gap-3 mt-auto">
-                <div className="h-8 w-8 rounded-full overflow-hidden bg-bg-surface">
-                  <img src="https://i.pravatar.cc/100?img=68" alt="Builder" className="w-full h-full object-cover" />
-                </div>
-                <div className="text-[13px] font-medium text-text-muted">
-                  @joshbuilds · Solo founder
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Step 6 — Bottom CTA Section */}
+        {/* Bottom CTA Section */}
         <section className="relative w-full border-t border-[rgba(255,255,255,0.06)] bg-bg-base overflow-hidden py-24 sm:py-32">
           <div className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-[radial-gradient(ellipse_at_center,rgba(230,100,30,0.06)_0%,transparent_70%)]" />
           
@@ -692,18 +635,16 @@ export default function LandingPage() {
             <div>
               <h3 className="font-mono text-[11px] uppercase tracking-widest text-text-primary mb-4 font-semibold">Product</h3>
               <ul className="space-y-3 text-sm text-text-secondary">
-                <li><a href="#" className="hover:text-text-primary transition-colors">Features</a></li>
-                <li><a href="#" className="hover:text-text-primary transition-colors">Pricing</a></li>
-                <li><a href="#" className="hover:text-text-primary transition-colors">Changelog</a></li>
+                <li><a href="#how-it-works" className="hover:text-text-primary transition-colors">How it works</a></li>
+                <li><Link to="/signup" className="hover:text-text-primary transition-colors">Start building</Link></li>
+                <li><Link to="/login" className="hover:text-text-primary transition-colors">Sign in</Link></li>
               </ul>
             </div>
             
             <div>
               <h3 className="font-mono text-[11px] uppercase tracking-widest text-text-primary mb-4 font-semibold">Legal</h3>
               <ul className="space-y-3 text-sm text-text-secondary">
-                <li><a href="#" className="hover:text-text-primary transition-colors">Privacy Policy</a></li>
-                <li><a href="#" className="hover:text-text-primary transition-colors">Terms of Service</a></li>
-                <li><a href="#" className="hover:text-text-primary transition-colors">Contact</a></li>
+                <li><a href="mailto:support@scrimble.com" className="hover:text-text-primary transition-colors">Contact support</a></li>
               </ul>
             </div>
           </div>
@@ -711,8 +652,7 @@ export default function LandingPage() {
           <div className="flex flex-col md:flex-row items-center justify-between pt-8 border-t border-border-subtle text-xs text-text-tertiary">
             <p>© 2026 Scrimble Inc. All rights reserved.</p>
             <div className="flex gap-4 mt-4 md:mt-0">
-              <a href="#" className="hover:text-text-primary transition-colors">Twitter</a>
-              <a href="#" className="hover:text-text-primary transition-colors">GitHub</a>
+              <a href={SCRIMBLE_GITHUB_URL} target="_blank" rel="noreferrer" className="hover:text-text-primary transition-colors">GitHub profile</a>
             </div>
           </div>
         </div>

@@ -834,6 +834,44 @@ export class PipelineQuotaExceededError extends Error {
   }
 }
 
+export type GenerationFailureClass =
+  | 'transport_provider_transient' // Provider unavailable, network issue, 5xx
+  | 'schema_correction'            // JSON parse failed, schema validation failed
+  | 'orchestration'                // Cloudflare budget exceeded, duration limits
+  | 'content_business_logic'       // Moderation, context limits, user error
+  | 'unknown';
+
+export function classifyAIError(error: unknown): GenerationFailureClass {
+  if (error instanceof PipelineQuotaExceededError) {
+    return 'orchestration';
+  }
+  
+  if (error instanceof RetryableAIError) {
+    return 'transport_provider_transient';
+  }
+  
+  if (error instanceof Error) {
+    const msg = error.message.toLowerCase();
+    
+    // Schema / Format
+    if (msg.includes('json') && msg.includes('parse')) return 'schema_correction';
+    if (msg.includes('validation') || msg.includes('schema expected')) return 'schema_correction';
+    if (msg.includes('zoderror')) return 'schema_correction';
+    
+    // Orchestration
+    if (msg.includes('timeout') || msg.includes('abort')) return 'orchestration';
+    
+    // Network / Transport
+    if (msg.includes('network connection lost') || msg.includes('fetch failed') || msg.includes('econnrefused')) return 'transport_provider_transient';
+
+    // Content / Budget
+    if (msg.includes('content filter') || msg.includes('moderation')) return 'content_business_logic';
+    if (msg.includes('maximum context length')) return 'content_business_logic';
+  }
+
+  return 'unknown';
+}
+
 function createAIErrorResponse(status: number, error: string, message: string) {
   return Response.json({ error, message }, { status });
 }

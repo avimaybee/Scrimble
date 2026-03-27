@@ -42,6 +42,76 @@ export type ProjectGenerationStatus =
   | 'failed'
   | 'cancelled';
 
+/**
+ * Generation Run Status - the lifecycle status of a single generation execution.
+ * Unlike ProjectGenerationStatus (which mixes batch names with lifecycle states),
+ * this type cleanly separates runtime lifecycle from batch progress.
+ */
+export type GenerationRunStatus =
+  | 'queued'           // Waiting to start
+  | 'running'          // Executing a batch
+  | 'awaiting_review'  // Paused at human gate
+  | 'approved'         // User approved, ready to continue
+  | 'complete'         // Finished successfully
+  | 'failed'           // Failed with error
+  | 'cancelled';       // User cancelled
+
+/**
+ * Generation Run - represents a single execution of the generation pipeline.
+ * This is the canonical runtime state model (Task A2).
+ * 
+ * A project can have many runs over time, but only one can be "current".
+ * This separates durable project facts from transient workflow runtime.
+ */
+export type GenerationRun = {
+  id: string;                              // Same as projects.generation_run_id
+  project_id: string;
+  workflow_instance_id: string | null;     // Cloudflare Workflow instance ID
+  
+  // Lifecycle
+  status: GenerationRunStatus;
+  current_batch: GenerationBatchName | null;  // Currently executing batch
+  
+  // Runtime tracking
+  provider_id: string | null;
+  heartbeat_at: string | null;
+  
+  // Error handling
+  error_message: string | null;
+  
+  // Timestamps
+  started_at: string;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/**
+ * Maps the legacy ProjectGenerationStatus to the new GenerationRunStatus.
+ * Used during the transition period while both models coexist.
+ */
+export function projectStatusToRunStatus(status: ProjectGenerationStatus): GenerationRunStatus {
+  if (status === 'intake' || status === 'queued') return 'queued';
+  if (status.startsWith('batch_')) return 'running';
+  if (status === 'awaiting_review') return 'awaiting_review';
+  if (status === 'approved') return 'approved';
+  if (status === 'complete') return 'complete';
+  if (status === 'failed') return 'failed';
+  if (status === 'cancelled') return 'cancelled';
+  return 'queued'; // fallback
+}
+
+/**
+ * Extracts the current batch from a ProjectGenerationStatus.
+ * Returns null if the status is not a batch status.
+ */
+export function extractBatchFromStatus(status: ProjectGenerationStatus): GenerationBatchName | null {
+  if (GENERATION_BATCHES.includes(status as GenerationBatchName)) {
+    return status as GenerationBatchName;
+  }
+  return null;
+}
+
 export type WorkflowInstanceStatus =
   | 'queued'
   | 'running'
@@ -131,7 +201,8 @@ export type GenerationEventType =
   | 'batch_complete'
   | 'checkpoint'
   | 'pipeline_complete'
-  | 'pipeline_failed';
+  | 'pipeline_failed'
+  | 'invariant';
 
 export type Variables = {
   uid: string;

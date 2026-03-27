@@ -4,6 +4,8 @@ import {
   ArchitectureReviewResponse,
   ChecklistItem,
   Edge as AppEdge,
+  GenerationStreamEventEnvelopeV1,
+  GenerationRuntime,
   GeneratedProjectFile,
   Plan,
   Project,
@@ -41,8 +43,16 @@ interface ReviewResponse {
 
 interface CreateProjectResponse {
   id: string;
-  generation_status: Project['generation_status'];
+  generation_runtime: GenerationRuntime;
 }
+
+type RuntimeNormalizedResponse = {
+  success: boolean;
+  generation_runtime: GenerationRuntime;
+  resumedAt?: string;
+  cancelledAt?: string;
+  feedback_provided?: boolean;
+};
 
 interface UpdateWorkflowOptions {
   onActivity?: (activity: WorkflowUpdateActivity) => void;
@@ -124,6 +134,169 @@ const generationBatchLabels: Record<ProjectGenerationBatchStartEvent['batch'], s
   batch_5_enrich_steps: 'Writing step details',
   batch_6_generate_files: 'Preparing your files',
 };
+
+type ParsedGenerationStreamEvent =
+  | { kind: 'batch_start'; event: ProjectGenerationBatchStartEvent }
+  | { kind: 'activity'; event: ProjectGenerationActivity }
+  | { kind: 'thinking'; event: ProjectGenerationThinking }
+  | { kind: 'batch_complete'; event: ProjectGenerationEvent }
+  | { kind: 'checkpoint'; event: ProjectGenerationCheckpointEvent }
+  | { kind: 'pipeline_complete' }
+  | { kind: 'pipeline_failed'; message: string }
+  | { kind: 'ignored' };
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function asEventBatch(value: unknown): ProjectGenerationBatchStartEvent['batch'] | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  return value in generationBatchLabels
+    ? (value as ProjectGenerationBatchStartEvent['batch'])
+    : null;
+}
+
+function parseGenerationEnvelope(value: unknown): GenerationStreamEventEnvelopeV1 | null {
+  const object = asObject(value);
+  if (!object) {
+    return null;
+  }
+
+  if (
+    object.version !== 1
+    || typeof object.eventType !== 'string'
+    || typeof object.projectId !== 'string'
+    || typeof object.timestamp !== 'string'
+  ) {
+    return null;
+  }
+
+  const payload = asObject(object.payload);
+  if (!payload) {
+    return null;
+  }
+
+  const batch = typeof object.batch === 'string' ? object.batch : null;
+  const runId = typeof object.runId === 'string' ? object.runId : null;
+
+  return {
+    version: 1,
+    eventType: object.eventType as GenerationStreamEventEnvelopeV1['eventType'],
+    projectId: object.projectId,
+    runId,
+    batch: batch as GenerationStreamEventEnvelopeV1['batch'],
+    timestamp: object.timestamp,
+    payload,
+  };
+}
+
+function parseGenerationStreamEvent(payload: unknown): ParsedGenerationStreamEvent {
+  const envelope = parseGenerationEnvelope(payload);
+  if (!envelope) {
+    return { kind: 'ignored' };
+  }
+
+  const eventPayload = envelope.payload;
+  switch (envelope.eventType) {
+    case 'batch_start': {
+      const batch = asEventBatch(eventPayload.batch);
+      const label = typeof eventPayload.label === 'string' ? eventPayload.label : '';
+      if (!batch || !label) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'batch_start',
+        event: { batch, label },
+      };
+    }
+    case 'activity': {
+      const message = typeof eventPayload.message === 'string' ? eventPayload.message : '';
+      if (!message) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'activity',
+        event: {
+          icon: typeof eventPayload.icon === 'string' ? eventPayload.icon : '✦',
+          message,
+          timestamp: typeof eventPayload.timestamp === 'string' ? eventPayload.timestamp : envelope.timestamp,
+        },
+      };
+    }
+    case 'thinking': {
+      const content = typeof eventPayload.content === 'string' ? eventPayload.content : '';
+      if (!content) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'thinking',
+        event: {
+          content,
+          timestamp: envelope.timestamp,
+        },
+      };
+    }
+    case 'batch_complete': {
+      const batch = asEventBatch(eventPayload.batch);
+      if (!batch) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'batch_complete',
+        event: {
+          batch,
+          completed_at: envelope.timestamp,
+          duration_ms: typeof eventPayload.duration_ms === 'number' ? eventPayload.duration_ms : undefined,
+          message: `${generationBatchLabels[batch]} complete.`,
+        },
+      };
+    }
+    case 'checkpoint':
+      if (!asObject(eventPayload.adr)) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'checkpoint',
+        event: {
+          adr: eventPayload.adr as ArchitectureDecisionRecord,
+          run_id: typeof eventPayload.run_id === 'string' ? eventPayload.run_id : undefined,
+        },
+      };
+    case 'pipeline_complete':
+      return { kind: 'pipeline_complete' };
+    case 'pipeline_failed':
+      return {
+        kind: 'pipeline_failed',
+        message: typeof eventPayload.error === 'string' ? eventPayload.error : 'Project generation failed.',
+      };
+    default:
+      return { kind: 'ignored' };
+  }
+}
+
+function normalizeProject(project: Project): Project {
+  return project;
+}
+
+function normalizeProjectStatus(status: ProjectGenerationStatusResponse): ProjectGenerationStatusResponse {
+  return status;
+}
+
+function normalizeIntakeSession(session: ProjectIntakeSession): ProjectIntakeSession {
+  return session;
+}
 
 function extractStepEnrichmentStreamText(parsed: unknown): string {
   if (!parsed || typeof parsed !== 'object') {
@@ -254,14 +427,16 @@ async function fetchWithAuth(endpoint: string, options: APIRequestOptions = {}):
 
 export const dbService = {
   async getProject(id: string): Promise<Project | null> {
-    return fetchAPI<Project | null>(`/projects/${id}`);
+    const project = await fetchAPI<Project | null>(`/projects/${id}`);
+    return project ? normalizeProject(project) : null;
   },
 
-  async resumeProjectGeneration(id: string, options: { description?: string; providerId?: string } = {}): Promise<{ success: boolean; generation_status: string; resumedAt?: string }> {
-    return fetchAPI(`/projects/${id}/resume`, {
+  async resumeProjectGeneration(id: string, options: { description?: string; providerId?: string } = {}): Promise<{ success: boolean; generation_runtime: GenerationRuntime; resumedAt?: string }> {
+    const response = await fetchAPI<RuntimeNormalizedResponse>(`/projects/${id}/resume`, {
       method: 'POST',
       body: JSON.stringify(options),
     });
+    return response;
   },
 
   async nudgeProjectGeneration(id: string): Promise<{ success: boolean; message: string; nudgedAt?: string }> {
@@ -270,21 +445,24 @@ export const dbService = {
     });
   },
 
-  async cancelProjectGeneration(id: string): Promise<{ success: boolean; generation_status: string; cancelledAt?: string }> {
-    return fetchAPI(`/projects/${id}/cancel`, {
+  async cancelProjectGeneration(id: string): Promise<{ success: boolean; generation_runtime: GenerationRuntime; cancelledAt?: string }> {
+    const response = await fetchAPI<RuntimeNormalizedResponse>(`/projects/${id}/cancel`, {
       method: 'POST',
     });
+    return response;
   },
 
   async getProjectsByUserId(): Promise<Project[]> {
-    return fetchAPI<Project[]>('/projects');
+    const projects = await fetchAPI<Project[]>('/projects');
+    return projects.map(normalizeProject);
   },
 
   async createProject(project: { description: string; providerId?: string }): Promise<CreateProjectResponse> {
-    return fetchAPI<CreateProjectResponse>('/projects', {
+    const response = await fetchAPI<CreateProjectResponse>('/projects', {
       method: 'POST',
       body: JSON.stringify(project),
     });
+    return response;
   },
 
   async updateProject(id: string, updates: Partial<Project>): Promise<void> {
@@ -295,36 +473,45 @@ export const dbService = {
   },
 
   async getProjectGenerationStatus(projectId: string): Promise<ProjectGenerationStatusResponse> {
-    return fetchAPI<ProjectGenerationStatusResponse>(`/projects/${projectId}/status`);
+    const status = await fetchAPI<ProjectGenerationStatusResponse>(`/projects/${projectId}/status`);
+    return normalizeProjectStatus(status);
   },
 
   async startProjectIntake(payload: IntakeStartPayload): Promise<ProjectIntakeSession> {
-    return fetchAPI<ProjectIntakeSession>('/intake/start', withoutClientTimeout({
+    const session = await fetchAPI<ProjectIntakeSession>('/intake/start', withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify(payload),
     }));
+    return normalizeIntakeSession(session);
   },
 
   async respondToProjectIntake(projectId: string, payload: IntakeRespondPayload): Promise<ProjectIntakeSession> {
-    return fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/respond`, withoutClientTimeout({
+    const session = await fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/respond`, withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify(payload),
     }));
+    return normalizeIntakeSession(session);
   },
 
   async confirmProjectIntake(projectId: string, payload: IntakeConfirmPayload = {}): Promise<{
     success: boolean;
     project_id: string;
-    generation_status: Project['generation_status'];
+    generation_runtime: GenerationRuntime;
   }> {
-    return fetchAPI(`/intake/${projectId}/confirm`, {
+    const response = await fetchAPI<{
+      success: boolean;
+      project_id: string;
+      generation_runtime: GenerationRuntime;
+    }>(`/intake/${projectId}/confirm`, {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+    return response;
   },
 
   async getProjectIntake(projectId: string): Promise<ProjectIntakeSession> {
-    return fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/brief`);
+    const session = await fetchAPI<ProjectIntakeSession>(`/intake/${projectId}/brief`);
+    return normalizeIntakeSession(session);
   },
 
   async getGeneratedFiles(projectId: string): Promise<GeneratedProjectFile[]> {
@@ -337,17 +524,17 @@ export const dbService = {
 
   async approveArchitectureReview(projectId: string, feedback: string, preferredIde = ''): Promise<{
     success: boolean;
-    generation_status: Project['generation_status'];
+    generation_runtime: GenerationRuntime;
     feedback_provided: boolean;
   }> {
-    return fetchAPI<{
-      success: boolean;
-      generation_status: Project['generation_status'];
-      feedback_provided: boolean;
-    }>(`/projects/${projectId}/approve`, withoutClientTimeout({
+    const response = await fetchAPI<RuntimeNormalizedResponse>(`/projects/${projectId}/approve`, withoutClientTimeout({
       method: 'POST',
       body: JSON.stringify({ feedback, preferredIde }),
     }));
+    return {
+      ...response,
+      feedback_provided: Boolean(response.feedback_provided),
+    };
   },
 
   async downloadSkillFiles(projectId: string): Promise<void> {
@@ -430,7 +617,7 @@ export const dbService = {
           currentData = [];
 
           try {
-            const parsed = JSON.parse(payload) as Record<string, unknown>;
+            const parsed = parseGenerationStreamEvent(JSON.parse(payload));
             const persistedEventId = currentEventId > 0 ? currentEventId : null;
             if (persistedEventId !== null) {
               if (seenEventIds.has(persistedEventId)) {
@@ -441,56 +628,33 @@ export const dbService = {
               lastEventId = persistedEventId;
             }
 
-            if (currentEvent === 'batch_start' && typeof parsed.batch === 'string' && typeof parsed.label === 'string') {
-              options.onBatchStart?.({
-                batch: parsed.batch as ProjectGenerationBatchStartEvent['batch'],
-                label: parsed.label,
-              });
-            }
-
-            if (currentEvent === 'activity' && typeof parsed.message === 'string' && typeof parsed.timestamp === 'string') {
-              options.onActivity?.({
-                icon: typeof parsed.icon === 'string' ? parsed.icon : '✦',
-                message: parsed.message,
-                timestamp: parsed.timestamp,
-              });
-            }
-
-            if (currentEvent === 'thinking' && typeof parsed.content === 'string') {
-              console.log(`[STREAM] Received thinking event: ${parsed.content.slice(0, 50)}...`);
-              options.onThinking?.({
-                content: parsed.content,
-                timestamp: new Date().toISOString(),
-              });
-            }
-
-            if (currentEvent === 'batch_complete' && typeof parsed.batch === 'string') {
-              const batch = parsed.batch as ProjectGenerationEvent['batch'];
-              options.onBatchCompleted?.({
-                batch,
-                completed_at: new Date().toISOString(),
-                duration_ms: typeof parsed.duration_ms === 'number' ? parsed.duration_ms : undefined,
-                message: `${generationBatchLabels[batch]} complete.`,
-              });
-            }
-
-            if (currentEvent === 'checkpoint' && parsed.adr && typeof parsed.adr === 'object') {
-              options.onCheckpoint?.({
-                adr: parsed.adr as ArchitectureDecisionRecord,
-                run_id: typeof parsed.run_id === 'string' ? parsed.run_id : undefined,
-              });
-            }
-
-            if (currentEvent === 'pipeline_complete') {
-              reachedTerminalEvent = true;
-              options.onComplete?.();
-            }
-
-            if (currentEvent === 'pipeline_failed') {
-              reachedTerminalEvent = true;
-              options.onFailed?.(
-                typeof parsed.error === 'string' ? parsed.error : 'Project generation failed.',
-              );
+            switch (parsed.kind) {
+              case 'batch_start':
+                options.onBatchStart?.(parsed.event);
+                return;
+              case 'activity':
+                options.onActivity?.(parsed.event);
+                return;
+              case 'thinking':
+                options.onThinking?.(parsed.event);
+                return;
+              case 'batch_complete':
+                options.onBatchCompleted?.(parsed.event);
+                return;
+              case 'checkpoint':
+                options.onCheckpoint?.(parsed.event);
+                return;
+              case 'pipeline_complete':
+                reachedTerminalEvent = true;
+                options.onComplete?.();
+                return;
+              case 'pipeline_failed':
+                reachedTerminalEvent = true;
+                options.onFailed?.(parsed.message);
+                return;
+              case 'ignored':
+              default:
+                return;
             }
           } catch {
             if (currentEvent === 'pipeline_failed') {

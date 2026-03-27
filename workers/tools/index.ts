@@ -11,6 +11,7 @@ export type Env = Bindings & {
   TOOL_CONTEXT?: {
     projectId: string;
     batchName: GenerationBatchName;
+    runId?: string;
   };
 };
 
@@ -193,6 +194,7 @@ async function emitToolEvent(env: Env | undefined, icon: string, message: string
   try {
     await persistGenerationStreamEvent(env, {
       projectId: context.projectId,
+      runId: context.runId || null,
       batchName: context.batchName,
       event: {
         type: 'activity',

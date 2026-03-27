@@ -8,6 +8,7 @@ import { getAIProviders, getAIModelRoles, saveAIModelRoles } from '../lib/ai';
 import { getMCPServers } from '../lib/mcp';
 import { hasConfiguredRole, resolveModelRoleDisplay } from '../lib/model-roles';
 import { cn } from '../lib/utils';
+import { UI_COPY } from '../lib/ui-copy';
 import {
   Dialog,
   DialogContent,
@@ -219,7 +220,7 @@ export default function NewProject() {
         fast: 'default model',
         deep: 'default model',
       });
-      setError('Could not load your saved settings. Reload and try again.');
+      setError(UI_COPY.newProject.loadPreparation);
     } finally {
       setIsPreparationLoading(false);
     }
@@ -254,8 +255,13 @@ export default function NewProject() {
           return;
         }
 
-        if (project.generation_status !== 'intake') {
-          if (project.generation_status === 'complete') {
+        const runtime = project.generation_runtime;
+        if (!runtime) {
+          throw new Error('Project runtime state is unavailable.');
+        }
+
+        if (runtime.lifecycleStatus !== 'intake') {
+          if (runtime.lifecycleStatus === 'complete') {
             navigate(`/project/${intakeProjectId}`, { replace: true });
             return;
           }
@@ -285,7 +291,7 @@ export default function NewProject() {
         }
 
         console.error('Failed to resume intake conversation:', loadError);
-        setError(loadError instanceof Error ? loadError.message : 'Could not reopen this intake conversation.');
+        setError(loadError instanceof Error ? loadError.message : UI_COPY.newProject.reopenIntake);
       } finally {
         if (isMounted) {
           setIsResumingIntake(false);
@@ -329,7 +335,7 @@ export default function NewProject() {
       setError(
         confirmError instanceof Error
           ? confirmError.message
-          : 'Could not start your plan. Check your AI key and try again.',
+          : UI_COPY.newProject.startPlan,
       );
     }
   };
@@ -342,7 +348,7 @@ export default function NewProject() {
     }
 
     if (!generationPreparation?.has_ai_provider) {
-      setError('You need to add an AI key first.');
+      setError(UI_COPY.newProject.missingAiKey);
       return;
     }
 
@@ -372,7 +378,7 @@ export default function NewProject() {
       setError(
         startError instanceof Error
           ? startError.message
-          : 'Could not start the intake conversation. Try again.',
+          : UI_COPY.newProject.startIntake,
       );
     } finally {
       setIsStartingIntake(false);
@@ -413,7 +419,7 @@ export default function NewProject() {
       setError(
         replyError instanceof Error
           ? replyError.message
-          : 'Could not send that reply. Try again.',
+          : UI_COPY.newProject.sendReply,
       );
     } finally {
       setIsSendingReply(false);
@@ -446,7 +452,7 @@ export default function NewProject() {
       setError('');
     } catch (saveError) {
       console.error('Failed to save model role settings:', saveError);
-      setError(saveError instanceof Error ? saveError.message : 'Could not save model role settings.');
+      setError(saveError instanceof Error ? saveError.message : UI_COPY.newProject.saveModelRoles);
     }
   }, [modalRoleType, modelRoles, providers]);
 
@@ -617,7 +623,7 @@ export default function NewProject() {
                                 </div>
                               </div>
                             )
-                            : 'You need to add an AI key first.'}
+                            : UI_COPY.newProject.missingAiKey}
                       </div>
                       <div className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">
                         Plain language works best here

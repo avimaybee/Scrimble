@@ -34,7 +34,6 @@ type ProjectDispatchContext = {
   user_id: string;
   description: string | null;
   intake_answers: string | null;
-  workflow_instance_id: string | null;
 };
 
 type StoredIntakeAnswerEntry = {
@@ -247,7 +246,7 @@ async function loadProjectDispatchContext(
   userId: string,
 ): Promise<ProjectDispatchContext> {
   const record = await env.DB.prepare(`
-    SELECT id, user_id, description, intake_answers, workflow_instance_id
+    SELECT id, user_id, description, intake_answers
     FROM projects
     WHERE id = ? AND user_id = ?
     LIMIT 1
@@ -362,15 +361,6 @@ export async function sendGenerationDispatch(
 
   const workflowPayload = await buildWorkflowPayload(env, payload);
   const instance = await createWorkflowGeneration(env, workflowPayload);
-
-  await env.DB.prepare(`
-    UPDATE projects
-    SET workflow_instance_id = ?,
-        updated_at = datetime("now")
-    WHERE id = ?
-  `)
-    .bind(instance.instanceId, payload.projectId)
-    .run();
 
   return instance.instanceId;
 }

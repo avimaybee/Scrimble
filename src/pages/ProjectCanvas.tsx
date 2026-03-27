@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   ReactFlow,
@@ -98,6 +98,7 @@ export default function ProjectCanvas() {
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
   const [showQuickPlanEditor, setShowQuickPlanEditor] = useState(false);
+  const [isAdvancedMode, setIsAdvancedMode] = useState(false);
   const [isSavingPlanEdit, setIsSavingPlanEdit] = useState(false);
   const [newStageTitle, setNewStageTitle] = useState('');
   const [newStageType, setNewStageType] = useState('build');
@@ -130,13 +131,16 @@ export default function ProjectCanvas() {
         setProject(null);
         return;
       }
+      if (!proj.generation_runtime) {
+        throw new Error('Project runtime state is unavailable.');
+      }
 
-      if (proj.generation_status === 'intake') {
+      if (proj.generation_runtime.lifecycleStatus === 'intake') {
         navigate(`/new?intake=${id}`, { replace: true });
         return;
       }
 
-      if (proj.generation_status !== 'complete') {
+      if (proj.generation_runtime.lifecycleStatus !== 'complete') {
         navigate(`/project/${id}/generating`, { replace: true });
         return;
       }
@@ -810,7 +814,39 @@ export default function ProjectCanvas() {
     );
   }
 
-  const aiFilesReady = Boolean(project && project.generation_status === 'complete');
+  const aiFilesReady = Boolean(project?.generation_runtime?.lifecycleStatus === 'complete');
+  const currentStep = useMemo(() => {
+    const ordered = [...appSteps].sort((left, right) => (left.order_index || 0) - (right.order_index || 0));
+    return ordered.find((step) => step.status === 'needs_review')
+      ?? ordered.find((step) => step.status === 'agent_working')
+      ?? ordered.find((step) => step.status === 'active' || step.status === 'waiting')
+      ?? ordered.find((step) => step.status === 'locked')
+      ?? null;
+  }, [appSteps]);
+  const currentStage = useMemo(
+    () => stages.find((stage) => stage.id === currentStep?.stage_id) || null,
+    [currentStep?.stage_id, stages],
+  );
+  const blockedReason = useMemo(() => {
+    if (!currentStep) {
+      return appSteps.length === 0 ? 'Plan structure is still loading.' : null;
+    }
+
+    if (currentStep.status === 'needs_review') {
+      return 'A review decision is needed before this path can continue.';
+    }
+
+    if (currentStep.status === 'agent_working') {
+      return 'Scrimble is actively working on this step right now.';
+    }
+
+    if (currentStep.status === 'locked') {
+      return 'Complete earlier steps to unlock this one.';
+    }
+
+    return null;
+  }, [appSteps.length, currentStep]);
+  const remainingStepCount = appSteps.filter((step) => step.status !== 'complete' && step.status !== 'skipped').length;
 
   return (
     <div className="flex-1 flex flex-col bg-bg-base font-sans overflow-hidden">
@@ -834,7 +870,12 @@ export default function ProjectCanvas() {
                     }}
                     className="flex-1 bg-bg-elevated border border-accent-primary/30 rounded px-2 py-1 text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent-primary"
                   />
-                  <button onClick={handleRename} className="p-1 text-status-secure hover:bg-bg-elevated rounded">
+                  <button
+                    type="button"
+                    onClick={handleRename}
+                    aria-label="Save project name"
+                    className="p-1 text-status-secure hover:bg-bg-elevated rounded"
+                  >
                     <Check className="w-4 h-4" />
                   </button>
                 </div>
@@ -843,10 +884,12 @@ export default function ProjectCanvas() {
                   <h2 className="text-panel-title truncate pr-6 group relative">
                     {project?.name}
                     <button 
+                      type="button"
                       onClick={() => {
                         setNewName(project?.name || '');
                         setIsEditingName(true);
                       }}
+                      aria-label="Rename project"
                       className="ml-2 p-1 text-text-tertiary hover:text-text-primary transition-colors inline-block"
                     >
                       <Pencil className="w-3 h-3" />
@@ -883,11 +926,29 @@ export default function ProjectCanvas() {
                 <div className="text-xs text-text-secondary">done</div>
               </div>
             </div>
+
+            <div className="mt-6 rounded-[12px] border border-border-default bg-bg-elevated/45 px-3 py-3">
+              <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Guided map</div>
+              <div className="mt-2 text-[13px] font-medium text-text-primary">
+                {currentStep?.title || 'No active step yet'}
+              </div>
+              <div className="mt-1 text-[12px] text-text-secondary">
+                {currentStage ? `Stage: ${currentStage.title}` : 'Stage path will appear here.'}
+              </div>
+              <div className="mt-2 text-[11px] text-text-muted">
+                {remainingStepCount > 0 ? `${remainingStepCount} step${remainingStepCount === 1 ? '' : 's'} left on this path.` : 'All mapped steps are complete.'}
+              </div>
+              {blockedReason ? (
+                <div className="mt-2 rounded-[8px] border border-border-subtle bg-bg-base/50 px-2.5 py-2 text-[11px] text-text-tertiary">
+                  {blockedReason}
+                </div>
+              ) : null}
+            </div>
           </div>
           
           <div className="flex-1 overflow-y-auto p-4">
             <div className="space-y-1">
-              {stages.sort((a, b) => a.order_index - b.order_index).map(stage => {
+              {[...stages].sort((a, b) => a.order_index - b.order_index).map(stage => {
                 const stageSteps = appSteps.filter(s => s.stage_id === stage.id);
                 const isComplete = stageSteps.length > 0 && stageSteps.every(s => s.status === 'complete');
                 const isActive = stageSteps.some((s) =>
@@ -895,8 +956,18 @@ export default function ProjectCanvas() {
                 );
                 
                 return (
-                  <div 
+                  <button
+                    type="button"
                     key={stage.id}
+                    onClick={() => {
+                      const stageFirstStep = stageSteps
+                        .slice()
+                        .sort((left, right) => (left.order_index || 0) - (right.order_index || 0))[0];
+                      if (stageFirstStep) {
+                        setSelectedStepId(stageFirstStep.id);
+                      }
+                    }}
+                    aria-label={`Open stage ${stage.title}`}
                     className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
                       isActive ? 'bg-accent-primary-muted text-accent-primary font-medium' : 'hover:bg-bg-elevated text-text-secondary'
                     }`}
@@ -905,7 +976,7 @@ export default function ProjectCanvas() {
                       isComplete ? 'bg-status-secure' : isActive ? 'bg-accent-primary' : 'bg-border-strong'
                     }`} />
                     {stage.title}
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -913,10 +984,12 @@ export default function ProjectCanvas() {
           
           <div className="p-4 border-t border-border-subtle space-y-4">
             <button 
+              type="button"
               onClick={() => {
                 setUpdateActivities([]);
                 setShowUpdateModal(true);
               }}
+              aria-label="Open plan update"
               className="group w-full flex items-center justify-between px-4 py-3 rounded-xl bg-bg-elevated border border-border-default hover:border-accent-primary/30 transition-all hover:shadow-sm"
             >
               <div className="flex items-center gap-3">
@@ -957,124 +1030,150 @@ export default function ProjectCanvas() {
 
             <button
               type="button"
-              onClick={() => setShowQuickPlanEditor((current) => !current)}
+              onClick={() => {
+                setIsAdvancedMode((current) => {
+                  const next = !current;
+                  if (!next) {
+                    setShowQuickPlanEditor(false);
+                  }
+                  return next;
+                });
+              }}
               className="btn-ghost w-full flex items-center justify-center gap-2"
             >
               <Pencil className="w-4 h-4 text-accent-primary" />
-              {showQuickPlanEditor ? 'Hide quick edit' : 'Quick edit plan'}
+              {isAdvancedMode ? 'Advanced mode: on' : 'Advanced mode: off'}
             </button>
 
-            {showQuickPlanEditor ? (
-              <div className="space-y-3 rounded-[10px] border border-border-default bg-bg-elevated/35 p-3">
-                <div className="space-y-2">
-                  <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
-                    Add stage
-                  </label>
-                  <input
-                    type="text"
-                    value={newStageTitle}
-                    onChange={(event) => setNewStageTitle(event.target.value)}
-                    placeholder="Stage title"
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  />
-                  <input
-                    type="text"
-                    value={newStageType}
-                    onChange={(event) => setNewStageType(event.target.value)}
-                    placeholder="Stage type (e.g. discover)"
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void handleCreateStage()}
-                    disabled={isSavingPlanEdit || !newStageTitle.trim()}
-                    className="btn-secondary w-full text-[12px] disabled:opacity-60"
-                  >
-                    Add stage
-                  </button>
-                </div>
+            {isAdvancedMode ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowQuickPlanEditor((current) => !current)}
+                  className="btn-ghost w-full flex items-center justify-center gap-2"
+                >
+                  <Pencil className="w-4 h-4 text-accent-primary" />
+                  {showQuickPlanEditor ? 'Hide quick edit' : 'Quick edit plan'}
+                </button>
 
-                <div className="space-y-2 border-t border-border-default pt-3">
-                  <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
-                    Add step
-                  </label>
-                  <select
-                    value={newStepStageId}
-                    onChange={(event) => setNewStepStageId(event.target.value)}
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  >
-                    <option value="">Select stage</option>
-                    {stages.map((stage) => (
-                      <option key={stage.id} value={stage.id}>
-                        {stage.title}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    type="text"
-                    value={newStepTitle}
-                    onChange={(event) => setNewStepTitle(event.target.value)}
-                    placeholder="Step title"
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  />
-                  <input
-                    type="text"
-                    value={newStepObjective}
-                    onChange={(event) => setNewStepObjective(event.target.value)}
-                    placeholder="Optional objective"
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void handleCreateStep()}
-                    disabled={isSavingPlanEdit || !newStepTitle.trim() || !newStepStageId}
-                    className="btn-secondary w-full text-[12px] disabled:opacity-60"
-                  >
-                    Add step
-                  </button>
-                </div>
+                {showQuickPlanEditor ? (
+                  <div className="space-y-3 rounded-[10px] border border-border-default bg-bg-elevated/35 p-3">
+                    <div className="space-y-2">
+                      <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                        Add stage
+                      </label>
+                      <input
+                        type="text"
+                        value={newStageTitle}
+                        onChange={(event) => setNewStageTitle(event.target.value)}
+                        placeholder="Stage title"
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      />
+                      <input
+                        type="text"
+                        value={newStageType}
+                        onChange={(event) => setNewStageType(event.target.value)}
+                        placeholder="Stage type (e.g. discover)"
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleCreateStage()}
+                        disabled={isSavingPlanEdit || !newStageTitle.trim()}
+                        className="btn-secondary w-full text-[12px] disabled:opacity-60"
+                      >
+                        Add stage
+                      </button>
+                    </div>
 
-                <div className="space-y-2 border-t border-border-default pt-3">
-                  <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
-                    Connect steps
-                  </label>
-                  <select
-                    value={newEdgeSourceId}
-                    onChange={(event) => setNewEdgeSourceId(event.target.value)}
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  >
-                    <option value="">Source step</option>
-                    {appSteps.map((step) => (
-                      <option key={step.id} value={step.id}>
-                        {step.title}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    value={newEdgeTargetId}
-                    onChange={(event) => setNewEdgeTargetId(event.target.value)}
-                    className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
-                  >
-                    <option value="">Target step</option>
-                    {appSteps.map((step) => (
-                      <option key={step.id} value={step.id}>
-                        {step.title}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => void handleCreateEdge()}
-                    disabled={isSavingPlanEdit || !newEdgeSourceId || !newEdgeTargetId}
-                    className="btn-secondary w-full text-[12px] disabled:opacity-60"
-                  >
-                    Add connection
-                  </button>
-                </div>
-              </div>
-            ) : null}
+                    <div className="space-y-2 border-t border-border-default pt-3">
+                      <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                        Add step
+                      </label>
+                      <select
+                        value={newStepStageId}
+                        onChange={(event) => setNewStepStageId(event.target.value)}
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      >
+                        <option value="">Select stage</option>
+                        {stages.map((stage) => (
+                          <option key={stage.id} value={stage.id}>
+                            {stage.title}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        value={newStepTitle}
+                        onChange={(event) => setNewStepTitle(event.target.value)}
+                        placeholder="Step title"
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      />
+                      <input
+                        type="text"
+                        value={newStepObjective}
+                        onChange={(event) => setNewStepObjective(event.target.value)}
+                        placeholder="Optional objective"
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleCreateStep()}
+                        disabled={isSavingPlanEdit || !newStepTitle.trim() || !newStepStageId}
+                        className="btn-secondary w-full text-[12px] disabled:opacity-60"
+                      >
+                        Add step
+                      </button>
+                    </div>
 
-            <button 
+                    <div className="space-y-2 border-t border-border-default pt-3">
+                      <label className="block text-[10px] font-mono uppercase tracking-[0.14em] text-text-tertiary">
+                        Connect steps
+                      </label>
+                      <select
+                        value={newEdgeSourceId}
+                        onChange={(event) => setNewEdgeSourceId(event.target.value)}
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      >
+                        <option value="">Source step</option>
+                        {appSteps.map((step) => (
+                          <option key={step.id} value={step.id}>
+                            {step.title}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={newEdgeTargetId}
+                        onChange={(event) => setNewEdgeTargetId(event.target.value)}
+                        className="w-full rounded-lg border border-border-default bg-bg-base px-3 py-2 text-[12px] text-text-primary outline-none focus:border-accent-border"
+                      >
+                        <option value="">Target step</option>
+                        {appSteps.map((step) => (
+                          <option key={step.id} value={step.id}>
+                            {step.title}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => void handleCreateEdge()}
+                        disabled={isSavingPlanEdit || !newEdgeSourceId || !newEdgeTargetId}
+                        className="btn-secondary w-full text-[12px] disabled:opacity-60"
+                      >
+                        Add connection
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <p className="rounded-[10px] border border-border-default bg-bg-elevated/35 px-3 py-2 text-[11px] leading-5 text-text-tertiary">
+                Guided mode keeps editing controls hidden by default.
+              </p>
+            )}
+
+            <button
+              type="button"
               onClick={() => setShowDeleteDialog(true)}
               className="btn-ghost w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-status-error hover:bg-status-error/5"
             >
@@ -1082,24 +1181,24 @@ export default function ProjectCanvas() {
               Delete project
             </button>
 
-            <DropdownMenu>
-              <DropdownMenuTrigger className="w-full">
-                <button className="w-full flex items-center justify-center gap-2 text-text-tertiary hover:text-text-primary px-4 py-2 rounded-[8px] text-sm font-medium transition-colors">
+            {isAdvancedMode ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger className="w-full flex items-center justify-center gap-2 rounded-[8px] px-4 py-2 text-sm font-medium text-text-tertiary transition-colors hover:text-text-primary">
                   <Download className="w-4 h-4" />
                   Export
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-[248px]">
-                <DropdownMenuItem onClick={exportAsMarkdown} className="flex gap-2">
-                  <FileText className="w-4 h-4" />
-                  <span>Download Markdown (.md)</span>
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={exportAsJSON} className="flex gap-2">
-                  <FileJson className="w-4 h-4" />
-                  <span>Download plan (.json)</span>
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-[248px]">
+                  <DropdownMenuItem onClick={exportAsMarkdown} className="flex gap-2">
+                    <FileText className="w-4 h-4" />
+                    <span>Download Markdown (.md)</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={exportAsJSON} className="flex gap-2">
+                    <FileJson className="w-4 h-4" />
+                    <span>Download plan (.json)</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
             </div>
           </div>
         </div>
@@ -1113,6 +1212,7 @@ export default function ProjectCanvas() {
                 </div>
                 <h3 className="text-2xl font-serif mb-3 text-text-primary">Something went wrong with your plan view.</h3>
                 <button 
+                  type="button"
                   onClick={() => window.location.reload()}
                   className="btn-primary flex items-center gap-2"
                 >
@@ -1125,15 +1225,18 @@ export default function ProjectCanvas() {
             <ReactFlow
               nodes={nodes}
               edges={edges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
+              onNodesChange={isAdvancedMode ? onNodesChange : undefined}
+              onEdgesChange={isAdvancedMode ? onEdgesChange : undefined}
+              onConnect={isAdvancedMode ? onConnect : undefined}
               onNodeClick={handleNodeClick}
               nodeTypes={nodeTypes}
               fitView
               className="bg-bg-base"
               minZoom={0.1}
               maxZoom={1.5}
+              nodesDraggable={isAdvancedMode}
+              nodesConnectable={isAdvancedMode}
+              elementsSelectable={isAdvancedMode}
               defaultEdgeOptions={{
                 style: { stroke: 'var(--color-border-strong)', strokeWidth: 1.5, opacity: 0.6 },
                 type: 'bezier',
@@ -1201,8 +1304,8 @@ export default function ProjectCanvas() {
                   This sidebar shows every stage. Use it to see progress and update the whole plan when things change.
                 </p>
                 <div className="flex justify-between items-center">
-                  <button onClick={dismissGuide} className="text-xs font-medium text-text-muted hover:text-text-primary">Skip</button>
-                  <button onClick={() => setGuideStep(2)} className="btn-primary min-h-0 px-3 py-1.5 text-xs">Next</button>
+                  <button type="button" onClick={dismissGuide} className="text-xs font-medium text-text-muted hover:text-text-primary">Skip</button>
+                  <button type="button" onClick={() => setGuideStep(2)} className="btn-primary min-h-0 px-3 py-1.5 text-xs">Next</button>
                 </div>
                 <div className="absolute left-[-8px] top-[50%] translate-y-[-50%] w-0 h-0 border-y-8 border-y-transparent border-r-8 border-r-bg-overlay" />
               </motion.div>
@@ -1228,8 +1331,8 @@ export default function ProjectCanvas() {
                   Every step lives here. Click any card to open the work panel and see what to do next.
                 </p>
                 <div className="flex justify-between items-center">
-                  <button onClick={dismissGuide} className="text-xs font-medium text-text-muted hover:text-text-primary">Skip</button>
-                  <button onClick={() => setGuideStep(3)} className="btn-primary min-h-0 px-3 py-1.5 text-xs">Next</button>
+                  <button type="button" onClick={dismissGuide} className="text-xs font-medium text-text-muted hover:text-text-primary">Skip</button>
+                  <button type="button" onClick={() => setGuideStep(3)} className="btn-primary min-h-0 px-3 py-1.5 text-xs">Next</button>
                 </div>
               </motion.div>
             )}
@@ -1254,7 +1357,7 @@ export default function ProjectCanvas() {
                   Update the plan when things change, or export it when you&apos;re ready to build.
                 </p>
                 <div className="flex justify-end items-center">
-                  <button onClick={dismissGuide} className="btn-primary min-h-0 px-4 py-1.5 text-xs">Got it</button>
+                  <button type="button" onClick={dismissGuide} className="btn-primary min-h-0 px-4 py-1.5 text-xs">Got it</button>
                 </div>
                 <div className="absolute right-24 bottom-[-8px] h-0 w-0 border-x-8 border-x-transparent border-t-8 border-t-bg-overlay" />
               </motion.div>
@@ -1396,6 +1499,7 @@ export default function ProjectCanvas() {
           
           <DialogFooter>
             <button 
+              type="button"
               onClick={() => {
                 if (isUpdating || isApplyingDiff) {
                   return;
@@ -1412,6 +1516,7 @@ export default function ProjectCanvas() {
               Cancel
             </button>
             <button
+              type="button"
               onClick={() => void handleApplyAiDiff()}
               className="btn-ghost"
               disabled={isUpdating || isApplyingDiff || !updateMessage.trim()}
@@ -1419,6 +1524,7 @@ export default function ProjectCanvas() {
               {isApplyingDiff ? 'Applying diff...' : 'Apply AI diff'}
             </button>
             <button 
+              type="button"
               onClick={() => void handlePlanUpdate()}
               className="btn-primary"
               disabled={isUpdating || isApplyingDiff || !updateMessage.trim()}
@@ -1440,6 +1546,7 @@ export default function ProjectCanvas() {
           </DialogHeader>
           <DialogFooter className="mt-6 flex gap-3">
             <button
+              type="button"
               onClick={() => setShowDeleteDialog(false)}
               className="btn-ghost"
               disabled={isDeleting}
@@ -1447,6 +1554,7 @@ export default function ProjectCanvas() {
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleDeleteProject}
               className="btn-primary bg-status-error hover:bg-status-error/90 border-status-error/20"
               disabled={isDeleting}

@@ -1,9 +1,9 @@
 # Scrimble — Complete Project Documentation
 ### The Research-First Build Companion for Solo Builders
-*Version 5.0 — March 2026 — Single source of truth*
+*Version 6.0 — March 2026 — Reflecting Phase 13 release-candidate state*
 
 > [!NOTE]
-> Version 5.0 — Realigned to true product vision. Previous versions described implementation state. This version describes intended product experience.
+> Version 6.0 — Reflects the release-candidate state through Phase 13, including canonical runtime ownership, versioned event transport, and go-live gate readiness docs.
 
 ---
 
@@ -176,10 +176,11 @@ Note: the project is deployed to Cloudflare Pages for the frontend + Pages Funct
 |---|---|---|
 | Runtime | Cloudflare Pages Functions | Edge serverless — owns the API, dispatches workflow events, and streams generation state |
 | Background Jobs | Cloudflare Workflows (in standalone Worker) | Hosts `GenerationWorkflow` as the primary pipeline runtime; each `step.do()` gets isolated retries/timeouts/subrequest budgets |
+| Canonical Runtime | `generation-runtime.ts` | Shared logic between Pages and Workflow Workers for writing to `generation_runs` and `project_generation_events`. |
 | Database | Cloudflare D1 (SQLite) | Relational, edge-native, shared between environments |
-| Auth | Firebase Auth (auth only) | Google OAuth + email/password — JWT verification in Functions |
+| Auth | Firebase Auth (auth only) | Google OAuth — JWT verification in Functions |
 | AI Routing | Function-side proxy | All AI calls proxied through Functions or Background Worker |
-| Hosting | Cloudflare Pages | Unified frontend and API deployment |
+| Host | Cloudflare Pages | Unified frontend and API deployment |
 
 ### shadcn Usage Policy
 **Use shadcn for invisible infrastructure only:**
@@ -204,7 +205,7 @@ Any library that genuinely improves the product may be used. Suggested candidate
 - `date-fns` — Date formatting
 - `hono` — Lightweight Workers router
 
-Note: the repository includes `next-themes` in package.json. This project is a Vite-built SPA; audit `next-themes` usage and remove or replace it if it's a leftover from earlier Next.js plans.
+Note: `next-themes` was removed during dependency cleanup; theme behavior is handled through the app’s own CSS/token system.
 
 ---
 
@@ -241,7 +242,7 @@ export const auth = getAuth(app)
 
 ### Auth Flow
 ```
-1. User signs in via Firebase Auth (Google OAuth or email/password)
+1. User signs in via Firebase Auth (Google OAuth)
 2. Firebase returns a JWT (ID token)
 3. Frontend attaches token to every API request: Authorization: Bearer <token>
 4. Cloudflare Worker verifies the JWT using Firebase's public keys
@@ -600,7 +601,7 @@ transition: { duration: 0.25, ease: [0.16, 1, 0.3, 1] }
 
 ### 10.14 Thinking State & Loading Transparency
 Animations alone aren’t enough — Scrimble must be transparent about *why* the user is waiting.
-- **Agent Thinking**: The `ThinkingBubble` component renders a dedicated, persistent but transient "Agent Thoughts" card. It uses a spinning `Sparkles` icon and a breathing `Brain` pulse to signal active reasoning. Content is streamed via the `thinking` SSE event.
+- **Agent Thinking**: The `ThinkingBubble` component renders a dedicated "Agent Thoughts" card while reasoning exists. It uses a spinning `Sparkles` icon and a breathing `Brain` pulse to signal active reasoning. Content is streamed via canonical `thinking` SSE events and replayed only for active runs within a bounded window.
 - **Modular Skeletons**: The `Skeleton` component provides four consistent variants (`body`, `heading`, `circle`, `badge`) to bridge the gap between initial mount and data arrival.
 - **Progressive Disclosure**: As the agent works, the UI never blocks. It populates skeletons in the detail panels while the `ThinkingBubble` streams the latest reasoning in real-time.
 
@@ -826,11 +827,30 @@ CREATE TABLE IF NOT EXISTS checklist_items (
 );
 
 -- ────────────────────────────────────────────
--- AGENT RUNS (audit log of AI agent activity)
+-- GENERATION RUNS (Source of Truth for execution)
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS generation_runs (
+  id                    TEXT PRIMARY KEY,
+  project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  workflow_instance_id  TEXT,                 -- Cloudflare Workflow ID
+  status                TEXT NOT NULL,        -- 'queued'|'running'|'awaiting_review'|'approved'|'complete'|'failed'|'cancelled'
+  current_batch         TEXT,                 -- 'batch_1_research_stack' | ...
+  provider_id           TEXT,                 -- Resolved AI provider for the run
+  error_message         TEXT,                 -- Last seen error message
+  heartbeat_at          TEXT,                 -- ISO timestamp of last worker activity
+  started_at            TEXT DEFAULT (datetime('now')),
+  completed_at          TEXT,
+  created_at            TEXT DEFAULT (datetime('now')),
+  updated_at            TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- AGENT RUNS (execution logs)
 -- ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS agent_runs (
   id              TEXT PRIMARY KEY,
   project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id          TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
   step_id         TEXT REFERENCES steps(id),
   run_type        TEXT NOT NULL,  -- 'generate_plan' | 'enrich_step' | 'update_plan' | 'review_gate'
   status          TEXT DEFAULT 'running', -- 'running' | 'waiting_review' | 'complete' | 'failed'
@@ -843,24 +863,51 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 
 -- ────────────────────────────────────────────
+-- GENERATION EVENTS (Durable stream history)
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_generation_events (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id          TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
+  event_type      TEXT NOT NULL,  -- 'batch_start' | 'activity' | 'batch_complete' | ...
+  payload         TEXT,           -- JSON: event data
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
+-- INVARIANT VIOLATIONS (Audit of state drift)
+-- ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_invariant_violations (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id          TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
+  drift_type      TEXT NOT NULL,  -- 'state_drift' | 'type_mismatch'
+  message         TEXT NOT NULL,
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- ────────────────────────────────────────────
 -- INDEXES
 -- ────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_projects_user      ON projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_workflows_project  ON workflows(project_id);
 CREATE INDEX IF NOT EXISTS idx_stages_workflow    ON stages(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_workflow     ON steps(workflow_id);
-CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
+CREATE INDEX IF NOT EXISTS idx_steps_stage        ON stages(id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_user   ON mcp_servers(user_id);
+CREATE INDEX IF NOT EXISTS idx_gen_runs_project    ON generation_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_gen_events_project  ON project_generation_events(project_id);
 ```
 
 ```text
--- TRANSIENT STATE (Thinking / Reasoning Relay)
--- These reasoning deltas are now streamed directly to the frontend via SSE
--- rather than being persisted in D1.
+-- ACTIVE-RUN STATE (Thinking / Reasoning Relay)
+-- Thinking deltas are persisted in D1 using the canonical generation_event envelope.
+-- Replay is bounded and filtered to the active run only, and terminal completion/failure/cancel
+-- clears thinking replay state from the live-session view.
 ```
 
-Migration `010_schema_reconciliation.sql` patches the legacy schema (adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, and removes the obsolete `project_generation_live_state` table) so the backend and worker rely on a single consistent set of column names while reasoning data stays transient in SSE `thinking` events.
+Migration `010_schema_reconciliation.sql` patches the legacy schema (adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, and removes the obsolete `project_generation_live_state` table) so the backend and worker rely on a single consistent set of column names while reasoning replay remains explicit and bounded.
 
 
 ---
@@ -924,11 +971,15 @@ Architecture path:
 - Consumer Worker → Workflow binding `GENERATION_WORKFLOW`
 - Workflow executes `GenerationWorkflow`
 
-- **One workflow instance per run**: Each run uses `run_id` as the workflow instance ID and persists progress through D1 + R2.
+- **Canonical Runtime Model**: `generation-runtime.ts` provides a unified service for managing `generation_runs`. Each dispatch creates a unique `run_id`, decoupling ephemeral workflow state from permanent project records.
+- **Canonical Write Boundary**: All project state mutations (intake, retry, rollback, review, finalize) are funnelled through `createGenerationRun`, `updateGenerationRunStatus`, and `touchGenerationRunHeartbeat`. Legacy mutations directly on the `projects` table are deprecated.
+- **Decommissioned Dual-Writes**: Project status columns in the `projects` table are no longer updated during generation. The UI read-path performs a `LEFT JOIN` on the latest `generation_runs` to synthesize project state.
 - **Per-step budgets and retries**: The pipeline is split across `step.do(...)` units so each step gets its own retry policy, timeout, and fresh subrequest budget.
 - **1MB step-state safe**: Large artifacts (Batch outputs, chunk store, architecture, plan) are written to R2 under `workflows/{projectId}/{runId}/*.json`; steps return only compact R2 keys.
-- **SSE-friendly**: Durable events are written to `project_generation_events`, and `/api/projects/:id/generation-stream` replays history + polls D1 to keep the SPA live while workflow steps run in the background worker.
+- **SSE-friendly**: Durable events are written to `project_generation_events` via `insertGenerationEvent`, and `/api/projects/:id/generation-stream` replays history + polls D1 to keep the SPA live while workflow steps run in the background worker.
 - **Dispatch safety**: Pages updates generation status and workflow instance linkage atomically around workflow dispatch so failed starts are rolled back and no ghost `queued` runs remain.
+- **Unified Workflow Update**: Natural language plan updates (`/api/workflows/:id/update`) now share the same canonical pipeline logic and R2-backed checkpointing as the initial generation path.
+- **Explicit Failure Semantics**: AI and transport errors are categorized into four classes: `transport_provider_transient`, `schema_correction`, `orchestration`, and `content_business_logic`. Retries are handled centrally based on these classes.
 
 ### Sequential Generation Pipeline
 
@@ -947,19 +998,29 @@ Each batch executes in order with **Smart Caps** to ensure extreme thoroughness 
 - **AI Patience**: 10-minute timeout per AI provider call (managed via AbortController).
 - **Research Liberty**: 2-minute timeout for documentation fetches; up to 100,000 tokens processed per document.
 - **Subrequest Guardrail**: Research fetching now runs through a strict sequential queue (one fetch at a time) and stops at 35 subrequests to preserve headroom under Cloudflare’s 50-subrequest worker limit.
-- **Stack-Only Research Scope**: Batch 2 now researches only technologies inferred from Batch 1 stack output. Workspace profile IDE + AI assistant choices are excluded from documentation fetches and are used only for step/file personalization later in the pipeline.
+- **Profile-Driven Retrieval Inputs**: Batch 2 and workflow update research now use one canonical retrieval-input contract where builder profile + confirmed stack technologies are primary and inferred tech only fills gaps.
 - **In-memory RAG context control**: Batch 2 now chunks fetched materials and downstream batches retrieve only the most relevant chunks (top-k) per prompt, keeping research context targeted and under ~10k estimated tokens without model-specific prompt caps.
 - **Output Freedom**: Up to 16,384 tokens per AI response to provide headroom for models with extensive reasoning/thinking blocks (e.g., GLM-5, DeepSeek-R1).
 - **Thought-Only Guard**: If a model exhausts its output window with reasoning but provides no JSON content, the system automatically triggers a single "JSON-only" retry.
 
-Batch 3 pauses before continuing—Scrimble saves the architecture decision record and waits for the human review gate to be approved using `step.waitForEvent(...)`. The review payload (including feedback and preferred IDE) is stored and forwarded to batches 4‑6 so every subsequent step honors the builder’s choices.
+### Research Facade & Subrequest Tracking
+Research is no longer performed directly by batches. Instead, all tools (documentation, GitHub, web search) are routed through the `ResearchFacade`.
+- **Subrequest Tracker**: All fetches (even across multiple tools) share a single `SubrequestTracker` instance within a batch, ensuring strict enforcement of Cloudflare's 50-subrequest per-step limit.
+- **Durable Logging**: Parallel and sequential research fetches generate `activity` events, rendering a research footer that cites specific tools and sources used for each plan step.
+- **Shadow Mode Ready**: The facade supports shadow-mode comparisons between legacy and new research toolsets without impacting the production generation path.
+- **Unified Updates**: Plan updates use the same research facade for mini-research passes, ensuring parity between initial generation and mid-build changes.
 
-### Resume & Retry Flow
-The pipeline is designed for resilience. If a project hits a "snag" (timeout, provider error, or transient fetch/tool failure), it enters a `failed` state.
-1. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches even `failed` projects, picking up from the last incomplete batch through the active workflow.
-2. **Frontend Recovery**: The "Try again" button in the generation error state triggers a real backend resume request, reconnecting the SSE stream only after the run is scheduled again.
-3. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints now rebuild their updates as compare-and-set statements against the four `generation_*` columns (run id, provider, heartbeat, completed). If another agent already flipped the status, the request returns `409` so the UI can refresh instead of scheduling another overlapping run.
-4. **Manual stop / kill switch**: The generation screen’s `Stop generation` button posts to `/api/projects/:id/cancel`, which marks the run `cancelled` in D1 and terminates the active workflow instance when available. Checkpoints remain intact and the cancelled UI invites the builder to resume from the latest completed batch or return to the dashboard.
+### Resume, Retry & Cancellation Flow
+The pipeline is designed for resilience. If a project hits a "snag", it is categorized and handled by the unified retry architecture.
+1. **Centralized AI Error Discovery**: `classifyAIError` (in `ai.ts`) identifies errors from raw fetch results and provider throws.
+2. **Four-Class Retry Policy**: 
+   - `transport_provider_transient`: Automatic retry with exponential backoff (covers connection resets, 429s, 503s).
+   - `schema_correction`: Automatic retry with "JSON-only" system override (covers malformed output).
+   - `orchestration`: Terminals if infra limits hit.
+   - `content_business_logic`: Terminal, requires user intervention or resume.
+3. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches failed projects, picking up from the last incomplete batch through the active workflow.
+4. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints use compare-and-set statements against the `generation_runs` status.
+5. **Manual Stop / Kill Switch**: `POST /api/projects/:id/cancel` marks the run `cancelled` and terminates the active workflow instance. Checkpoints remain intact for later resumption.
 
 
 ### Professional Icon System
@@ -971,9 +1032,11 @@ Scrimble strictly uses technical, engineering-focused icons (Lucide React) to ma
 - *Prohibited: Any whimsical, magic, sparkle, or glitter-themed icons.*
 
 The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. 
-That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate background worker runtime. 
+That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate background worker runtime.
 
-To handle high-frequency reasoning deltas, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`) that buffers incoming tokens in memory and emits transient `thinking` SSE events in short bursts (~150ms cadence). These deltas are intentionally not persisted to D1, keeping storage focused on durable lifecycle events while preserving responsive live feedback.
+Durable generation events now use a canonical versioned envelope (`version: 1`) with stable fields: `eventType`, `projectId`, `runId`, `batch`, `timestamp`, and `payload`. The backend emits `event: generation_event` for persisted stream records, and the frontend stream adapter parses this envelope directly.
+
+To handle high-frequency reasoning deltas, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`) that buffers incoming tokens and persists `thinking` events in the same canonical envelope as other generation events. Thinking persistence is bounded to a rolling window for the active run and is cleared on terminal completion/failure/cancel so reconnects are truthful without implying long-term permanence.
 
 > [!IMPORTANT]
 > Cloudflare Workflow limits shape pipeline structure:
@@ -1065,10 +1128,10 @@ interface AIProvider {
 `GenerationWorkflow` now executes every generation run as explicit Workflow steps. Each of the six batches:
 
 1. Reads the previous batch output from `agent_runs`.
-2. Dispatches a single BYOK AI call (streaming reasoning tokens into `thinking` events).
+2. Dispatches a single BYOK AI call (streaming reasoning tokens into canonical `thinking` events).
 3. Validates the JSON response with Zod and retries once if validation fails.
 4. Writes results back into `agent_runs` and persists large payloads to R2 so checkpoints stay lightweight.
-5. Touches `projects.generation_status` as soon as the batch starts so status polling stays truthful.
+5. Touches `generation_runs.status` (and `current_batch`) as soon as the batch starts so status polling stays truthful.
 6. Emits a durable SSE event (`batch_start`, `activity`, `batch_complete`, etc.) so `/api/projects/:id/generation-stream` can replay history + stream real-time deltas.
 
 The workflow keeps running even if all tabs are closed: it stores checkpoints in D1, persists large payloads to R2, and resumes deterministically with step-level retries/timeouts. Generation is workflow-only, with `WORKFLOW_SERVICE` as the single dispatch path from Pages Functions.
@@ -1077,7 +1140,7 @@ Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct UR
 
 **Resilience Features**:
 - **Reasoning-Only Guard**: Models with high-effort reasoning (GLM-5, DeepSeek-R1) can sometimes exhaust their output limit with thought alone. If the stream closes with reasoning but an empty JSON body, the system triggers a single retry with a "JSON-only, no reasoning" system prompt override.
-- **Privacy Purge**: To protect intellectual property and user privacy, all transient reasoning/thinking data is physically DELETED from D1 as soon as a batch or the entire pipeline completes.
+- **Thinking Window Purge**: To protect intellectual property and avoid misleading permanence, the active run keeps only a bounded rolling thinking window; terminal completion/failure/cancel clears the thinking window from replay.
 - **JSON Security**: The `extractJSON()` utility strips markdown fences and handles malformed-buffer edge cases where transport metadata might leak into the response.
 
 Step enrichment is now deeper too: auth steps fetch security/session docs plus recent vulnerability chatter, database steps pull schema+migration references, deployment steps read platform docs/issues/checklists, and payment steps pull live Stripe checkout + webhook guidance before the AI writes the final step artifact. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
@@ -1090,7 +1153,7 @@ Batch 2 also records a `research_sources` ledger (tool, source URL, one-line sum
 |---|---|---|---|---|---|
 | 1 | Research architecture | Fetch docs then dump/truncate into prompts | Fetch broad, chunk, retrieve only relevant slices per call | Lightweight in-memory RAG in Batch 2 with reusable `chunk_store` | Medium |
 | 2 | Context limits | Model-specific char caps | Relevance-first budgets, model-agnostic | Remove model lookup/caps; target retrieved research slices around 6-8k tokens | Low |
-| 3 | Search strategy | Single targeted search query per tool | Query fan-out by subtopic | Keep exactly 1 targeted query per tool using `technology + (setup/errors/changelog) + year`, max 8 words | Low |
+| 3 | Search strategy | Shared policy (`setup` / `errors` / `release_notes` / `deployment`) | Query fan-out by subtopic | Keep exactly 1 targeted query per tool/family using canonical `buildResearchQuery(...)`, max 8 words | Low |
 | 4 | Source selection | Fetch everything then trim | Rank relevance earlier | Score/merge candidate results before inclusion in the fetch corpus | Low |
 | 5 | Fetch orchestration | Partially parallel | Fully parallel | Enforce strict sequential fetches across docs/github/search (no cross-tool Promise.all) | Low |
 | 6 | Chunking strategy | Character truncation | Recursive split with overlap | Recursive chunking over `['\n\n', '\n', '. ', ' ']` with overlap and dedupe | Low |
@@ -1099,13 +1162,13 @@ Batch 2 also records a `research_sources` ledger (tool, source URL, one-line sum
 | 9 | Model context detection | Hardcoded lookup table | Not needed with focused retrieval | Remove model context window lookup for research budgeting | Low |
 | 10 | Research quality signal | Tool badges only | Inline evidence with relevance | Persist chunk-level context and surface retrieval counts in activity logs | Low |
 
-The backend emits durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` SSE events that the frontend uses to animate the generation heading, the historical activity log, progress dots, ETA counter, and review gate. The `/api/projects/:id/generation-stream` route always replays missed durable events first using `Last-Event-ID`, then polls D1 for new rows every ~2 seconds so background-written updates still flow even though the browser and background runner live in separate runtimes. Provider reasoning chunks are streamed separately as transient `thinking` events; they are emitted in-memory by the active runtime and are not persisted in D1. This split keeps replay deterministic while preserving live model-thinking feedback.
+The backend emits durable `batch_start`, `activity`, `thinking`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` events inside the versioned `generation_event` envelope. The `/api/projects/:id/generation-stream` route always replays missed events first using `Last-Event-ID`, then polls D1 for new rows every ~2 seconds so background-written updates still flow even though the browser and background runner live in separate runtimes. Thinking replay is limited to active runs and bounded history; terminal runs no longer replay stale reasoning.
 
 ### Durable Checkpoints & Dispatch Safety
 
 Every generation run records a `run_id` on the project before work starts. Dispatch is workflow-only and uses compare-and-set updates with rollback on failure so no ghost `queued` state sticks around.
 
-Workflow dispatch now uses `run_id` as the workflow instance ID and persists it in `projects.workflow_instance_id`. Pages Functions do not call the workflow binding directly; they call `env.WORKFLOW_SERVICE`. The consumer worker entrypoint then creates instances and sends approval events (`architecture-approved`), which immediately resume the paused `step.waitForEvent(...)` gate.
+Workflow dispatch uses `run_id` as the workflow instance identity and keeps linkage in `generation_runs.workflow_instance_id` while `projects.current_generation_run_id` remains the only project-level runtime pointer. Pages Functions do not call the workflow binding directly; they call `env.WORKFLOW_SERVICE`. The consumer worker entrypoint then creates instances and sends approval events (`architecture-approved`), which immediately resume the paused `step.waitForEvent(...)` gate.
 
 The worker loads the latest entry from `generation_checkpoints`, writes a new checkpoint after every batch, and stores metadata (batch name, provider, `degraded_tools`, `partial_failures`, etc.) in D1 while pushing large payloads—research summaries, chunk stores, partial responses—into the Cloudflare R2 bucket named `scrimble`. Workflow steps return R2 keys so each step payload stays comfortably under Cloudflare’s 1MB state cap.
 
@@ -1126,7 +1189,7 @@ Certain steps are **gates** (`is_gate = 1`). At a gate:
 7. User can: **Approve** (agent continues) / **Edit** (modify AI output, then approve) / **Reject** (agent retries with feedback)
 8. On approval: step status → `complete`, downstream steps unlock, agent continues
 
-After `batch_3_architect` finishes, the pipeline halts automatically. The project’s `generation_status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The next leg (`batch_4_plan_build`) is dispatched only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
+After `batch_3_architect` finishes, the pipeline halts automatically. The project’s canonical `generation_runs.status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The next leg (`batch_4_plan_build`) is dispatched only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
 
 **Gate review API:**
 ```typescript
@@ -1336,7 +1399,7 @@ If no AI provider is configured, `/new` blocks submission and shows a direct "Yo
 - A `Stop generation` control sits inside the connection bar (XCircle icon). It fires `POST /api/projects/:id/cancel`, cancels the run in D1, attempts to terminate the active workflow instance, and surfaces a cancelled banner with “Resume from checkpoint” and “Back to dashboard” actions so checkpoints are preserved after a manual halt.
 
 When a run is cancelled via the stop control the generation screen switches into the “Generation stopped” banner state: a muted XCircle explains that checkpoints remain intact, offers to resume or exit to the dashboard, and quietly marks the run `cancelled` so the backend can reject duplicate runners while the frontend keeps the builder in control.
-- If a builder returns to `/project/:id` while generation is still running (or while the architecture checkpoint is waiting), the canvas route redirects them back to `/project/:id/generating`, the screen reloads `projects.generation_status`, reconnects to the SSE stream, and reconstructs the full generation state from replayed D1 events before resuming live updates.
+- If a builder returns to `/project/:id` while generation is still running (or while the architecture checkpoint is waiting), the canvas route redirects them back to `/project/:id/generating`, the screen reloads the status from `generation_runs`, reconnects to the SSE stream, and reconstructs the full generation state from replayed events before resuming live updates.
 
 **Review checkpoint**
 - When `batch_3_architect` emits a `checkpoint` SSE event, AnimatePresence crossfades the activity feed into the review panel (y: 24 → 0, opacity: 0 → 1). The panel shows:
@@ -1357,8 +1420,8 @@ When a run is cancelled via the stop control the generation screen switches into
 ### 15.2.1 Auth (`/login` & `/signup`)
 
 - Auth lives on a single, centered card inside the warm radial gradients of the entry page. The hero area stacks the hexagon badge, the mono “Getting started” label, and a heading that switches between “Pick up where you left off.” (login) and “Start your first plan.” (signup) so the surface feels more confident than a generic login form.
-- The card is divided into two sections. The upper half showcases Google sign-in: a small title (“Continue with Google”), a supporting sentence about tying your plan to one account, a soft warning banner for errors (`bg-status-skipped` + `text-status-error`), and the primary button with Google’s colored icon, the label “Continue with Google,” and the paprika arrow icon.
-- The lower half signals that email sign-in is coming soon. Two disabled inputs (email, password) sit under the helper text “Email sign-in is on the way,” followed by a disabled ghost button. This keeps the copy calm and honest while still hinting that more options are on the roadmap.
+- The card focuses on one real auth path: Google sign-in. It includes a supporting sentence about tying your plan to one account, a soft warning banner for errors (`bg-status-skipped` + `text-status-error`), and the primary button with Google’s colored icon and the label “Continue with Google.”
+- Email/password placeholder controls were removed from shipped UI to avoid “coming soon” affordances in the core sign-in flow.
 - Beneath the card, micro-copy toggles between “Don’t have an account yet?” and “Already have an account?” depending on the route, linking to the respective signup or login page with the same accent color used in the rest of the UI.
 
 ---
@@ -1389,28 +1452,21 @@ Good morning.                                    [+ New project]
 - Progress dots represent stages (not percentage)
 - Stack tags: JetBrains Mono uppercase, text-muted
 - "Good morning/afternoon/evening" greeting based on time of day
+- Dashboard now prioritizes one **active project** block with one primary next action (resume intake, review build, resume build, watch progress, or open plan), derived from canonical runtime semantics through a shared generation-session adapter.
+- Remaining projects are shown as lighter secondary cards so re-entry focus stays on the immediate next action.
 
 ---
 
 ### 15.4 Project View (`/project/[id]`)
 
-The vision for this view is a **Node-Based Canvas** where the project plan is a visual map.
+Project view is now a **guided map canvas** built around progress/navigation first.
 
-> [!IMPORTANT]
-> **Priority Gap**: The current implementation uses a vertical timeline "Infinite Spine" as a functional placeholder. The full Node-Based Canvas redesign is the top UI priority and is not yet implemented.
-
-**The Intended Canvas Experience:**
-- **Node-Based Workflow**: A canvas where each stage is a cluster and each step is a node.
-- **Path Visualization**: Nodes are connected with directional edges showing the linear path.
-- **Visual State**: Completed nodes are visually distinct (emerald) from active (paprika pulse) and locked (muted) nodes.
-- **Dynamic Updates**: When a new feature is added mid-build, the agent weaves new nodes into the existing workflow without disrupting completed work.
-- **Daily Anchor**: This view is the daily anchor where users see exactly where they've been and where they are going.
-
-**Current Placeholder (The Infinite Spine):**
-- A central vertical line connecting all steps.
-- Stage clusters grouped under sticky headers.
-- Detail panel slides from right on step click.
-- *This will be replaced by the Canvas experience described above.*
+**Current Canvas Experience:**
+- **Guided mode by default**: Read-only posture with current stage, current step, path-ahead summary, and blocked-state messaging.
+- **Executable navigation**: Stage rows are real buttons that open the stage’s first step.
+- **Advanced mode is explicit**: Graph mutation controls (quick edit, add stage/step/edge, export, drag/connect) stay hidden until the user enables **Advanced mode**.
+- **Detail-first workflow**: Step detail panel remains the execution companion, while the map keeps orientation and progress visible.
+- **Status-aware nodes**: Completed, active/working, review, and locked states remain visually distinct.
 
 **App Bottom Pill Nav** (timeline, dashboard, settings only):
 position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -1456,6 +1512,8 @@ Width 176px. Status-driven appearance:
 7. **Done when...** — exit criteria in emerald border container
 
  Every enriched step now ends with a JetBrains Mono 11px footer that reads `Researched {date} using {tools used}`. The footer is rendered from persisted step metadata (`steps.research_footer_meta`) so it remains stable across refreshes and re-enrichments while keeping the AI narrative body clean.
+
+ The panel now leads with an **Execution guide** section that explicitly answers: tool, destination, exact action, optional value/snippet, and done condition. AI chat remains available but is secondary in the default flow.
 
 Behind the scenes the panel now routes every enrichment request through `dbService.streamStepEnrichment` and the shared `useStepExecution` hook so AI output arrives as an SSE stream and the toaster-enabled UX stays responsive. While the agent is working the drawer keeps the skeletons active, disables Skip/Mark as done until the network call completes, and instantly surfaces any fetch or enrichment errors with a subtle banner plus a “Try again” button that refreshes that step without closing the drawer. Toast guidance confirms both successes and failures, which keeps the flow feeling steady even when external services pause or hiccup.
 
@@ -1586,6 +1644,13 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 
 ## 17. Build Status
 
+### ✅ Phase 1-5 Migration Complete (Architecture Stabilization)
+- **Phase 1-3**: Decoupled `projects` from `generation_runs`, centralized research via `ResearchFacade`.
+- **Phase 4**: Canonical Write Boundary. Removed direct project mutations; unified state management in `generation-runtime.ts`.
+- **Phase 5**: Workflow Unification & Retry Layer. Collapsed `workflow-update.ts` into the main pipeline; implemented the four-class `classifyAIError` retry system.
+- **SSE Stream Stabilization**: Durable generation events replayed via polling; high-frequency `thinking` deltas emitted transiently.
+- **Dual-Write Decommissioned**: All legacy mutation bridges removed; read-path standardized.
+
 ### ✅ Complete
 - Firebase Auth (Google OAuth) + protected routes (Zustand authStore)
 - Cloudflare D1 schema (controlled by `001_initial_schema.sql`)
@@ -1599,7 +1664,7 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **Infinite Spine Timeline**: Transitioned project view from a graph canvas to a linear, high-focus vertical timeline.
 - **Onboarding Journey**: Dedicated `WelcomeModal` and `OnboardingChecklist` to guide users through AI key and profile setup.
 - **Route Handling**: Logical `PlanRoute` for deep-linking into active work.
-- **Landing Page Overhaul**: New animations, intersection observer scroll reveals, `useCountUp` hook for animated statistics, social proof counter, demo prompt preview.
+- **Landing Page Overhaul**: Refined animation/layout pass with real navigation/contact links and placeholder social-proof content removed.
 - **Auth Page Redesign**: Split-screen layout with branded visuals, animated state transitions, improved error handling.
 - **Settings Page Expansion**: Builder profile management, AI provider configuration, MCP server connections, preference toggles.
 - **New UI Components**: `InlineError` for inline validation, `NewProjectModal` for streamlined project creation, `Sidebar` for project navigation.
@@ -1623,10 +1688,10 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - **Dispatch Safety & R2 Checkpoints**: Workflow dispatch is service-bound and guarded against stale state, while the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`) to preserve durable history without D1 payload bloat.
   - **Provider Pinning & Retrieval Assembly**: The workflow enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now assembles provider prompts from retrieved chunk subsets so large research corpora remain stable without prompt-budget overflow failures.
   - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
-  - **Query Hygiene + Scope Guardrails**: Research-layer search queries are now sanitized, short (≤8 words), and category-based (`setup` / `errors` / `changelog` with year), with no raw project-description interpolation. Batch 2 additionally excludes workspace profile IDE/AI tools from documentation fetch targets.
-- **Migration History**: All schema updates from `0000_initial.sql` through `016_step_research_footer_metadata.sql` have been successfully applied and reconciled.
+- **Query Hygiene + Scope Guardrails**: Research-layer search queries are now sanitized, short (≤8 words), and category-based (`setup` / `errors` / `changelog` with year), with no raw project-description interpolation. Batch 2 additionally excludes workspace profile IDE/AI tools from documentation fetch targets.
+- **Migration History**: Runtime-schema migrations through `023_drop_legacy_project_generation_columns.sql` are now part of release-candidate validation and go-live gating.
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
-- **SSE Streaming Overhaul**: Durable generation events are persisted in D1 and replayed via polling; high-frequency `thinking` deltas are emitted transiently in-memory by the active runtime. This keeps replay deterministic while preserving responsive live feedback.
+- **SSE Streaming Overhaul**: Durable generation events are persisted in D1 and replayed via polling; `thinking` events now use the same canonical envelope, persist in a bounded rolling window, replay for active runs only, and are cleared from live replay on terminal outcomes.
 - **Connection Safety**: Implemented strict stream lifecycle management; `writer.close()` is now guaranteed on all terminal pipeline events and server-side cleanups.
 - **UI Transparency**: Introduced `Skeleton` and `ThinkingBubble` components across the dashboard and project canvas to maintain transparency during agent work.
 - Research depth badges and the "Researched {date} using {tools}" footer inject transparency into the detail panel and architecture review, highlighting when Context7, Brave Search, or GitHub were used and nudging builders to connect any missing tools for deeper next-time results.
@@ -1647,36 +1712,45 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 - **Checklist Interactions**: Added `updateChecklistItem` to db client allowing full checklist item mutations (labels, requirement status) beyond simple toggles.
 - **SSE Progress Sync**: Added `progress_percent` metric to `batch_complete` events in the generation pipeline to ensure the client-side progress bar perfectly reflects backend generation state.
 - **Review Flapping Fixes**: Hardened the approval/resume flow to prevent status oscillation.
-- **Thinking Stream Debug Logging (March 2026)**: Added comprehensive debug logging across the thinking event flow to diagnose why real-time thinking isn't visible in the frontend.
+- **Thinking Stream Diagnostics (March 2026)**: Added temporary diagnostics across the thinking event flow during runtime-stream investigation.
 - **Phase 7 — Fallback Chain Transparency**:
   - Batch 2 now persists a structured research source ledger (`tool`, `url`, `title`, `chars_read`, `relevance`, `insight`) and carries it through the architecture review payload.
   - The architecture review disclosure ("What I read") renders that ledger directly, including character counts and relevance labels for each source.
   - Architecture review now surfaces an amber limited-research notice when fewer than 3 sources are fetched successfully.
   - The generation screen now shows model-role transparency under the batch heading: `Using [fast model] for research · [deep model] for generation`.
 
-++  - The pipeline now adds a `[MODEL_RESOLUTION] Role: …` activity line so the transcript shows exactly which provider/model resolved before each batch, and it surfaces the `No model configured for role: {role}. Please set your models in Settings.` error instead of silently defaulting to GLM when a fast/deep slot is missing.
+  - The pipeline now adds a `[MODEL_RESOLUTION] Role: …` activity line so the transcript shows exactly which provider/model resolved before each batch, and it surfaces the `No model configured for role: {role}. Please set your models in Settings.` error instead of silently defaulting to GLM when a fast/deep slot is missing.
   - Step enrichment now stores per-step research footer metadata and the step detail drawer renders a dedicated JetBrains Mono footer from metadata instead of appending footer text into `ai_output`.
   - Migration added: `016_step_research_footer_metadata.sql` (`steps.research_footer_meta`).
 
-### 17.5 Known Product Gaps & Roadmap Priorities
+### 17.5 Vision Audit Snapshot (Phase 12)
 
-These are the priority gaps between the current implementation and the stated product vision:
+The Phase 12 verification pass re-scored shipped behavior against `docs/the-vision.md`:
 
-1. **Workspace Profile Integration**: User profile data (connected IDEs, frameworks, etc.) is not yet fully wired into Batch 2 research.
-2. **Turn-by-Turn Navigation**: Step content currently offers guidance/advice rather than exact, executable tool-specific instructions.
-3. **Node-Based Canvas**: The plan view is currently a vertical timeline placeholder instead of the intended node-based canvas.
-4. **Research Depth**: Batch 2 research is functional but does not yet consistently study documentation and issues at the depth required by the vision.
-5. **Clarifying Questions Consistency**: The high-quality editorial intake style has been restored and is functional across the primary project workflows.
+1. **Deep research**: Query generation is now centralized and stack-specific (`setup/errors/release_notes/deployment` families), with retrieval input precedence (`builder_profile > project_stack > inferred`) applied across generation + workflow update paths.
+2. **Turn-by-turn navigation**: Detail panel now consumes canonical typed step content directly for primary execution guidance, evidence quality, and done criteria.
+3. **Forcing function**: Runtime-native lifecycle + checkpoint/resume semantics remain enforced across review, failure, cancel, and resume transitions.
+4. **Workspace profile as intelligence engine**: Profile and confirmed stack now shape the research graph deterministically instead of acting like soft metadata.
+5. **Daily re-entry clarity**: Dashboard + generation session adapters remain runtime-driven and actionable (review/resume/working states), with no legacy-status branching.
+6. **Living plan updates**: Workflow update path uses the same retrieval/query policy contract as initial generation, keeping post-intake plan updates stack-specific and consistent.
+
+---
+
+### 17.6 Release Candidate Gate Snapshot (Phase 13)
+
+- Added release-candidate runbook: `docs/release-candidate-go-live.md` with migration order, deploy order, rollback playbook, RC checklist, observability policy, and go/no-go criteria.
+- Added post-`023` schema safety checks: `scripts/phase13-release-candidate.assertions.ts`.
+- Standardized user-facing error copy on Auth, Dashboard, New Project, and Project Generation via `src/lib/ui-copy.ts`.
+- Confirmed canonical runtime ownership remains `generation_runs` + `projects.current_generation_run_id` (no project-level legacy lifecycle columns after `023`).
 
 ---
 
 ### 18. Remaining Work
 
-**In Progress:**
-- Error boundary improvements across all routes
-- Mobile responsive design for timeline view
-- Performance optimization for large projects (100+ steps)
-- **Real-time thinking streaming debugging** (see below)
+**Release blockers only (Phase 13 scope freeze):**
+- Staging migration rehearsal and bug-bash signoff.
+- Mobile/narrow viewport verification for Dashboard, Generation, Canvas, Detail Panel, and Settings.
+- Large-project performance benchmark (`100+` steps) and measured bottleneck fixes if needed.
 
 ---
 
@@ -1688,29 +1762,11 @@ When using high reasoning/depth models (e.g., DeepSeek R1, OpenAI o1, Claude Opu
 Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
 ```
 
-**Debug Logging Added:**
-- `functions/server/generation-events.ts`: Added logging in `emitTransientGenerationStreamEvent()` and `createThrottledThinkingEmitter()`
-- `functions/server/ai.ts`: Added logging when reasoning/thinking is extracted from provider responses
-- `functions/server/app.ts`: Added generation stream diagnostics around replay/polling flow
-- Frontend (`src/lib/db.ts`, `src/pages/ProjectGeneration.tsx`): Added thinking event debug logs
-
-**Expected Log Flow (for debugging):**
-```
-[AI] OpenAI/Anthropic reasoning extracted: "..."     # AI returns thinking
-[THINKING_EMITTER] Buffer now has X chars             # Reasoning buffered
-[THINKING_EMITTER] Flushing X chars                   # Thinking emitted
-[GENERATION_EVENTS] Emitting thinking event           # Event being published
-[GENERATION_EVENTS] Publishing to N subscriber(s)     # Subscribers receive
-[GENERATION_EVENTS] Emitting thinking event           # Event emitted by background runtime
-[STREAM] Forwarding thinking delta                     # SSE route forwards transient delta
-[STREAM] Received thinking event                      # Frontend receives
-[SSE_EVENT] onThinking received                        # Frontend processes
-```
-
-**Proposed Solutions (under evaluation):**
-- Option A: Keep long-running execution in Workflows with tighter step boundaries
-- Option B: Implement periodic heartbeat chunks during AI streaming to prevent idle gaps
-- Option C: Checkpoint and resume from partial reasoning when timeout occurs
+**Current behavior:**
+- Thinking events now use the same canonical envelope as all other generation events.
+- Active runs retain a bounded rolling thinking window for reconnect/replay.
+- Terminal completion/failure/cancel clears thinking replay state.
+- UI only shows live model reasoning when real `thinking` events exist (no fake placeholder reasoning state).
 
 ---
 
@@ -1748,5 +1804,5 @@ Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
 
 ---
 
-*Scrimble Documentation v5.0 — March 2026*
-*This document supersedes all previous versions and all FlowForge documentation.*
+*Scrimble Documentation v5.5 — March 2026*
+*This document supersedes all previous versions.*

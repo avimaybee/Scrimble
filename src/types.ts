@@ -18,6 +18,223 @@ export type GenerationStatus =
   | 'failed'
   | 'cancelled';
 
+export type GenerationLifecycleStatus =
+  | 'intake'
+  | 'queued'
+  | 'running'
+  | 'awaiting_review'
+  | 'approved'
+  | 'complete'
+  | 'failed'
+  | 'cancelled';
+
+export type GenerationFailureClass = 'run_failed' | 'stalled' | 'cancelled' | null;
+
+export interface GenerationRuntime {
+  runId: string | null;
+  lifecycleStatus: GenerationLifecycleStatus;
+  currentBatch: GenerationBatchName | null;
+  isTerminal: boolean;
+  canResume: boolean;
+  isReviewRequired: boolean;
+  providerId: string | null;
+  heartbeatAt: string | null;
+  completedBatches: GenerationBatchName[];
+  failureClass: GenerationFailureClass;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Step Content Types (Task A3)
+// These are the canonical typed structures for step content fields.
+// They replace the previous string-based JSON fields that required
+// parsing at render time.
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * A navigation link for a step - points to documentation, setup pages, etc.
+ */
+export interface StepNavigationLink {
+  label: string;      // Display text, e.g. "Supabase Dashboard"
+  url: string;        // URL to navigate to
+  when: string;       // Context for when to use this link, e.g. "during setup"
+}
+
+/**
+ * A prompt card for AI assistance within a step.
+ */
+export interface StepPrompt {
+  label: string;      // Prompt title, e.g. "Generate authentication hook"
+  content: string;    // The actual prompt content to use with AI
+}
+
+/**
+ * Research metadata showing what tools were used to generate step content.
+ */
+export interface StepResearchFooterMeta {
+  researched_at: string;   // ISO date when research was performed
+  tools: string[];         // Tools used, e.g. ["Brave Search", "Context7"]
+  // B3: Quality metadata for transparency about research reliability
+  quality?: 'live' | 'cached' | 'degraded' | 'none';
+  live_source_count?: number;
+  cached_source_count?: number;
+  degraded_sources?: string[];
+}
+
+/**
+ * A suggested tool for completing a step.
+ */
+export interface StepSuggestedTool {
+  name: string;
+  url?: string;
+  reason?: string;
+}
+
+/**
+ * Parsed step content - the canonical typed structure for step display.
+ * This is what DetailPanel and other UI components should consume.
+ */
+export interface ParsedStepContent {
+  navigationLinks: StepNavigationLink[];
+  prompts: StepPrompt[];
+  researchFooterMeta: StepResearchFooterMeta | null;
+  suggestedTools: StepSuggestedTool[];
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Step Content Parsing Utilities
+// These functions convert raw JSON strings to typed structures.
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Parse navigation_links JSON string to typed array.
+ */
+export function parseNavigationLinks(raw: string | undefined | null): StepNavigationLink[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return null;
+        const e = entry as Record<string, unknown>;
+        const label = typeof e.label === 'string' ? e.label.trim() : '';
+        const url = typeof e.url === 'string' ? e.url.trim() : '';
+        const when = typeof e.when === 'string' ? e.when.trim() : '';
+        if (!label || !url) return null;
+        return { label, url, when };
+      })
+      .filter((entry): entry is StepNavigationLink => entry !== null);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parse prompts JSON string to typed array.
+ */
+export function parsePrompts(raw: string | undefined | null): StepPrompt[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return null;
+        const e = entry as Record<string, unknown>;
+        const label = typeof e.label === 'string' ? e.label.trim() : '';
+        const content = typeof e.content === 'string' ? e.content.trim() : '';
+        if (!label || !content) return null;
+        return { label, content };
+      })
+      .filter((entry): entry is StepPrompt => entry !== null);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parse research_footer_meta JSON string to typed object.
+ */
+export function parseResearchFooterMeta(raw: string | undefined | null): StepResearchFooterMeta | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const p = parsed as Record<string, unknown>;
+    const researched_at = typeof p.researched_at === 'string' ? p.researched_at.trim() : '';
+    const tools = Array.isArray(p.tools)
+      ? p.tools.filter((t): t is string => typeof t === 'string').map((t) => t.trim()).filter(Boolean)
+      : [];
+    if (!researched_at || tools.length === 0) return null;
+    
+    // B3: Parse quality metadata
+    const validQuality = ['live', 'cached', 'degraded', 'none'] as const;
+    const quality = typeof p.quality === 'string' && validQuality.includes(p.quality as typeof validQuality[number])
+      ? (p.quality as StepResearchFooterMeta['quality'])
+      : undefined;
+    const live_source_count = typeof p.live_source_count === 'number' ? p.live_source_count : undefined;
+    const cached_source_count = typeof p.cached_source_count === 'number' ? p.cached_source_count : undefined;
+    const degraded_sources = Array.isArray(p.degraded_sources)
+      ? p.degraded_sources.filter((s): s is string => typeof s === 'string')
+      : undefined;
+    
+    return { 
+      researched_at, 
+      tools,
+      quality,
+      live_source_count,
+      cached_source_count,
+      degraded_sources: degraded_sources?.length ? degraded_sources : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse suggested_tools JSON string to typed array.
+ */
+export function parseSuggestedTools(raw: string | undefined | null): StepSuggestedTool[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((entry): StepSuggestedTool | null => {
+        if (!entry || typeof entry !== 'object') return null;
+        const e = entry as Record<string, unknown>;
+        const name = typeof e.name === 'string' ? e.name.trim() : '';
+        if (!name) return null;
+        return {
+          name,
+          url: typeof e.url === 'string' ? e.url.trim() : undefined,
+          reason: typeof e.reason === 'string' ? e.reason.trim() : undefined,
+        };
+      })
+      .filter((entry): entry is StepSuggestedTool => entry !== null);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parse all step content fields at once.
+ * This is the recommended way to get typed step content.
+ */
+export function parseStepContent(step: {
+  navigation_links?: string;
+  prompts?: string;
+  research_footer_meta?: string;
+  suggested_tools?: string;
+}): ParsedStepContent {
+  return {
+    navigationLinks: parseNavigationLinks(step.navigation_links),
+    prompts: parsePrompts(step.prompts),
+    researchFooterMeta: parseResearchFooterMeta(step.research_footer_meta),
+    suggestedTools: parseSuggestedTools(step.suggested_tools),
+  };
+}
+
 export interface Profile {
   id: string;
   name: string | null;
@@ -34,14 +251,8 @@ export interface Project {
   project_type: ProjectType;
   stack: string;
   status: 'active' | 'completed' | 'archived';
-  generation_status: GenerationStatus;
+  generation_runtime: GenerationRuntime;
   generation_error?: string;
-  generation_started_at?: string;
-  generation_completed_at?: string;
-  generation_run_id?: string;
-  workflow_instance_id?: string;
-  generation_provider_id?: string;
-  generation_heartbeat_at?: string;
   intake_answers?: string;
   progress: number;
   created_at: string;
@@ -183,14 +394,31 @@ export interface ProjectGenerationCheckpointEvent {
   run_id?: string;
 }
 
+export type GenerationStreamEventType =
+  | 'batch_start'
+  | 'activity'
+  | 'thinking'
+  | 'batch_complete'
+  | 'checkpoint'
+  | 'pipeline_complete'
+  | 'pipeline_failed'
+  | 'invariant';
+
+export interface GenerationStreamEventEnvelopeV1 {
+  version: 1;
+  eventType: GenerationStreamEventType;
+  projectId: string;
+  runId: string | null;
+  batch: GenerationBatchName | null;
+  timestamp: string;
+  payload: Record<string, unknown>;
+}
+
 export interface ProjectGenerationStatusResponse {
   project_id: string;
-  generation_status: GenerationStatus;
+  generation_runtime: GenerationRuntime;
   generation_error: string | null;
-  generation_run_id: string | null;
   workflow_instance_id: string | null;
-  generation_provider_id: string | null;
-  generation_heartbeat_at: string | null;
   completed_batches: ProjectGenerationEvent[];
   completed_batch_count: number;
   total_batches: number;
@@ -253,7 +481,7 @@ export interface ProjectBrief {
 
 export interface ProjectIntakeSession {
   project_id: string;
-  generation_status: GenerationStatus;
+  generation_runtime: GenerationRuntime;
   ready: boolean;
   agent_message: string;
   agent_thinking?: string;
@@ -343,6 +571,27 @@ export interface GenerationPreparationState {
   has_brave_search: boolean;
   has_github_token: boolean;
   has_context7: boolean;
+}
+
+export interface WorkspaceReadiness {
+  aiSetup: {
+    isReady: boolean;
+    connectedProviderCount: number;
+    recommendation: string;
+  };
+  builderProfile: {
+    isReady: boolean;
+    savedToolCount: number;
+    recommendation: string;
+  };
+  researchConnectivity: {
+    isReady: boolean;
+    alwaysOnCount: number;
+    optionalConnectedCount: number;
+    recommendation: string;
+  };
+  overallReadiness: 'ready' | 'needs_setup';
+  nextActions: string[];
 }
 
 export interface WorkflowUpdateActivity {

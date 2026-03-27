@@ -17,6 +17,8 @@ import { useAuthStore } from '../store/authStore';
 import { dbService } from '../lib/db';
 import { Project, Stage, Step } from '../types';
 import { cn } from '../lib/utils';
+import { getDashboardGenerationAction } from '../lib/generation-session';
+import { UI_COPY } from '../lib/ui-copy';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -102,56 +104,6 @@ function parseStack(stackValue: string) {
   }
 }
 
-function getProjectCardDescriptor(project: Project, nextStep: Step | null, isAgentWorking: boolean) {
-  if (project.generation_status === 'intake') {
-    return {
-      statusLabel: 'Continuing your brief',
-      ctaLabel: 'Resume intake',
-      destination: `/new?intake=${project.id}`,
-      focusCopy: 'Finish the intake conversation.',
-      badgeClassName: 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
-    };
-  }
-
-  if (project.generation_status === 'awaiting_review' || nextStep?.status === 'needs_review') {
-    return {
-      statusLabel: 'Your review',
-      ctaLabel: 'Review build',
-      destination: `/project/${project.id}/generating`,
-      focusCopy: nextStep?.title ?? 'Review the architecture checkpoint.',
-      badgeClassName: 'border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] text-status-warning',
-    };
-  }
-
-  if (project.generation_status === 'failed') {
-    return {
-      statusLabel: 'Needs attention',
-      ctaLabel: 'Recover build',
-      destination: `/project/${project.id}/generating`,
-      focusCopy: 'Reopen the build and continue from the last safe checkpoint.',
-      badgeClassName: 'border-[rgba(248,113,113,0.22)] bg-[rgba(248,113,113,0.08)] text-status-error',
-    };
-  }
-
-  if (isAgentWorking) {
-    return {
-      statusLabel: 'Working now',
-      ctaLabel: 'Watch progress',
-      destination: `/project/${project.id}/generating`,
-      focusCopy: nextStep?.title ?? 'Scrimble is still building this plan.',
-      badgeClassName: 'border-accent-border/70 bg-accent-primary-muted/25 text-accent-soft',
-    };
-  }
-
-  return {
-    statusLabel: 'Next up',
-    ctaLabel: 'Open plan',
-    destination: `/project/${project.id}`,
-    focusCopy: nextStep?.title ?? 'Plan details are still coming together.',
-    badgeClassName: 'border-border-default bg-bg-elevated/55 text-text-secondary',
-  };
-}
-
 export default function Dashboard() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
@@ -198,7 +150,7 @@ export default function Dashboard() {
       setBuilderProfileCount(userTools.length);
     } catch (loadError) {
       console.error('Error fetching projects:', loadError);
-      setError(loadError instanceof Error ? loadError.message : 'Could not load your projects.');
+      setError(loadError instanceof Error ? loadError.message : UI_COPY.dashboard.loadProjects);
     } finally {
       setLoading(false);
     }
@@ -229,19 +181,8 @@ export default function Dashboard() {
           return;
         }
 
-        const activeStatuses = new Set([
-          'queued',
-          'batch_1_research_stack',
-          'batch_2_fetch_and_read',
-          'batch_3_architect',
-          'batch_4_plan_build',
-          'batch_5_enrich_steps',
-          'batch_6_generate_files',
-          'awaiting_review',
-          'approved',
-        ]);
-
-        if (activeStatuses.has(status.generation_status)) {
+        const runtime = status.generation_runtime;
+        if (runtime && runtime.lifecycleStatus !== 'intake' && !runtime.isTerminal) {
           navigate(`/project/${activeGeneration}/generating`, { replace: true });
         } else {
           try {
@@ -287,7 +228,7 @@ export default function Dashboard() {
       toast.success('Project moved to the archive.');
     } catch (error) {
       console.error('Error archiving project:', error);
-      toast.error('Could not archive that project.');
+      toast.error(UI_COPY.dashboard.archiveProject);
     }
   };
 
@@ -304,7 +245,7 @@ export default function Dashboard() {
       toast.success('Project restored.');
     } catch (error) {
       console.error('Error restoring project:', error);
-      toast.error('Could not restore that project.');
+      toast.error(UI_COPY.dashboard.restoreProject);
     }
   };
 
@@ -319,7 +260,7 @@ export default function Dashboard() {
       setProjectToDelete(null);
     } catch (error) {
       console.error('Error deleting project:', error);
-      toast.error('Could not delete project.');
+      toast.error(UI_COPY.dashboard.deleteProject);
     } finally {
       setIsDeleting(false);
     }
@@ -329,6 +270,36 @@ export default function Dashboard() {
     () => projectCards.filter((entry) => (showArchived ? entry.project.status === 'archived' : entry.project.status === 'active')),
     [projectCards, showArchived],
   );
+
+  const activeProjectCard = useMemo(() => {
+    if (showArchived) {
+      return null;
+    }
+
+    const candidates = projectCards
+      .filter((entry) => entry.project.status === 'active')
+      .map((entry) => ({
+        ...entry,
+        descriptor: getDashboardGenerationAction(entry.project, entry.nextStep),
+      }))
+      .sort((left, right) => {
+        if (left.descriptor.priority !== right.descriptor.priority) {
+          return left.descriptor.priority - right.descriptor.priority;
+        }
+
+        return Date.parse(right.project.updated_at) - Date.parse(left.project.updated_at);
+      });
+
+    return candidates[0] || null;
+  }, [projectCards, showArchived]);
+
+  const secondaryCards = useMemo(() => {
+    if (!activeProjectCard) {
+      return visibleCards;
+    }
+
+    return visibleCards.filter((entry) => entry.project.id !== activeProjectCard.project.id);
+  }, [activeProjectCard, visibleCards]);
 
   const hasArchivedProjects = projectCards.some((entry) => entry.project.status === 'archived');
 
@@ -354,6 +325,7 @@ export default function Dashboard() {
         <motion.div variants={itemVariants} className="flex flex-wrap items-center gap-3">
           {hasArchivedProjects ? (
             <button
+              type="button"
               onClick={() => setShowArchived((current) => !current)}
               className="btn-ghost"
             >
@@ -440,195 +412,164 @@ export default function Dashboard() {
           ) : null}
         </motion.div>
       ) : (
-        <motion.div variants={containerVariants} className="grid grid-cols-1 gap-6 md:grid-cols-2">
-          {visibleCards.map(({ project, nextStep, stages, steps, activeStepCount }) => {
-            const stack = parseStack(project.stack || '{}');
-            const completedStageCount = stages.filter((stage) => stage.status === 'complete').length;
-            const stageTotal = stages.length || 1;
-            const stageProgress = Math.min(Math.max(completedStageCount, 0), stageTotal);
-            const isAgentWorking = ['queued', 'batch_1_research_stack', 'batch_2_fetch_and_read', 'batch_3_architect', 'batch_4_plan_build', 'batch_5_enrich_steps', 'batch_6_generate_files'].includes(project.generation_status || '') || nextStep?.status === 'agent_working';
-            const descriptor = getProjectCardDescriptor(project, nextStep, isAgentWorking);
-
-            return (
-              <motion.article
-                key={project.id}
-                variants={itemVariants}
-                onClick={() => navigate(descriptor.destination)}
-                className="surface-card group cursor-pointer p-6 transition-transform duration-200 hover:-translate-y-1"
-              >
-                <div className="mb-5 flex items-start justify-between gap-4">
-                  <div>
-                    <h2 className="text-[24px] font-serif tracking-[-0.03em] text-text-primary">
-                      {project.name}
-                    </h2>
-                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] font-mono uppercase tracking-[0.12em] text-text-muted">
-                      <span>{project.project_type.replace('_', ' ')}</span>
-                      <span>•</span>
-                      <span>Updated {formatDistanceToNow(new Date(project.updated_at))} ago</span>
-                    </div>
+        <div className="space-y-8">
+          {activeProjectCard ? (
+            <motion.section variants={itemVariants} className="surface-card p-7">
+              <div className="mb-6 flex items-start justify-between gap-4">
+                <div>
+                  <div className="section-label">Active project</div>
+                  <h2 className="mt-3 text-[30px] font-serif tracking-[-0.03em] text-text-primary">
+                    {activeProjectCard.project.name}
+                  </h2>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] font-mono uppercase tracking-[0.12em] text-text-muted">
+                    <span>{activeProjectCard.project.project_type.replace('_', ' ')}</span>
+                    <span>•</span>
+                    <span>Updated {formatDistanceToNow(new Date(activeProjectCard.project.updated_at))} ago</span>
                   </div>
-
-                  <div className="flex items-start gap-3">
-                    <span
-                      className={cn(
-                        'inline-flex items-center rounded-[8px] border px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em]',
-                        descriptor.badgeClassName,
-                      )}
+                </div>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label={`Open actions for ${activeProjectCard.project.name}`}
+                      className="flex h-10 w-10 items-center justify-center rounded-[10px] border border-border-default bg-bg-elevated/60 text-text-tertiary transition-colors hover:text-text-primary"
                     >
-                      {descriptor.statusLabel}
-                    </span>
-                    <div className="flex items-center gap-1 pt-1">
-                      {Array.from({ length: stageTotal }).map((_, index) => (
-                        <span
-                          key={`${project.id}-stage-${index}`}
-                          className={cn(
-                            'h-1.5 w-1.5 rounded-full transition-colors duration-300',
-                            index < stageProgress
-                              ? 'bg-accent-primary shadow-[0_0_8px_rgba(235,94,40,0.38)]'
-                              : 'bg-bg-elevated',
-                          )}
-                        />
-                      ))}
-                    </div>
+                      <MoreHorizontal className="h-4 w-4" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem onClick={() => navigate(`/project/${activeProjectCard.project.id}`)}>
+                      <FolderOpen className="mr-2 h-4 w-4" />
+                      Open project
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={() => void handleArchiveProject(activeProjectCard.project.id)}
+                      className="text-status-error hover:text-accent-soft"
+                    >
+                      <Archive className="mr-2 h-4 w-4" />
+                      Archive project
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={() => setProjectToDelete(activeProjectCard.project.id)}
+                      className="text-status-error hover:bg-status-error/10"
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Delete project
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
 
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          className="flex h-10 w-10 items-center justify-center rounded-[10px] border border-border-default bg-bg-elevated/60 text-text-tertiary transition-colors hover:text-text-primary"
-                          onClick={(event) => event.stopPropagation()}
-                        >
-                          <MoreHorizontal className="h-4 w-4" />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onClick={() => navigate(`/project/${project.id}`)}>
-                          <FolderOpen className="mr-2 h-4 w-4" />
-                          Open project
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        {project.status === 'archived' ? (
-                          <DropdownMenuItem onClick={() => void handleRestoreProject(project.id)}>
-                            <Undo2 className="mr-2 h-4 w-4" />
-                            Restore project
-                          </DropdownMenuItem>
-                        ) : (
-                          <DropdownMenuItem
-                            onClick={() => void handleArchiveProject(project.id)}
-                            className="text-status-error hover:text-accent-soft"
-                          >
-                            <Archive className="mr-2 h-4 w-4" />
-                            Archive project
-                          </DropdownMenuItem>
-                        )}
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setProjectToDelete(project.id);
-                          }}
-                          className="text-status-error hover:bg-status-error/10"
-                        >
-                          <Trash2 className="mr-2 h-4 w-4" />
-                          Delete project
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
+              <button
+                type="button"
+                onClick={() => navigate(activeProjectCard.descriptor.destination)}
+                aria-label={`${activeProjectCard.descriptor.ctaLabel} for ${activeProjectCard.project.name}`}
+                className={cn(
+                  'group w-full rounded-[14px] border px-5 py-5 text-left transition-colors',
+                  activeProjectCard.descriptor.isAgentWorking
+                    ? 'border-accent-border/50 bg-accent-primary-muted/20 hover:border-accent-border'
+                    : 'border-border-default bg-bg-elevated/35 hover:border-accent-border/60',
+                )}
+              >
+                <div className="flex items-center justify-between gap-4">
+                  <span
+                    className={cn(
+                      'inline-flex items-center rounded-[8px] border px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em]',
+                      activeProjectCard.descriptor.badgeClassName,
+                    )}
+                  >
+                    {activeProjectCard.descriptor.statusLabel}
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-[13px] font-medium text-accent-primary transition-colors group-hover:text-accent-primary-hover">
+                    {activeProjectCard.descriptor.ctaLabel}
+                    <ArrowRight className="h-4 w-4" />
+                  </span>
                 </div>
-
-                <div className={cn(
-                  "rounded-[12px] border px-4 py-3 relative overflow-hidden",
-                  isAgentWorking 
-                    ? "border-accent-border/40 bg-accent-primary-muted/20" 
-                    : "border-accent-border bg-accent-primary-muted/50"
-                )}>
-                  {isAgentWorking && (
-                    <motion.div
-                      initial={{ left: '-100%' }}
-                      animate={{ left: '100%' }}
-                      transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
-                      className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-accent-primary/10 to-transparent z-0"
-                    />
+                <div className="mt-3 flex items-center gap-2 text-[16px] font-medium tracking-[-0.01em] text-text-primary">
+                  {activeProjectCard.descriptor.isAgentWorking ? (
+                    <Brain className="h-4 w-4 text-accent-primary animate-pulse" />
+                  ) : (
+                    <ArrowRight className="h-4 w-4 text-accent-primary" />
                   )}
-                  
-                  <div className="flex items-center justify-between mb-1 relative z-10">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-accent-primary">
-                      {descriptor.statusLabel}
-                    </div>
-                    {isAgentWorking && (
-                      <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent-primary/10 border border-accent-primary/20">
-                        <motion.div
-                          animate={{ rotate: 360 }}
-                          transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
-                        >
-                          <Sparkles className="w-2.5 h-2.5 text-accent-primary" />
-                        </motion.div>
-                        <span className="text-[9px] font-mono text-accent-primary uppercase tracking-wider font-bold">Live</span>
+                  <span>{activeProjectCard.descriptor.focusCopy}</span>
+                </div>
+                <div className="mt-4 flex items-center justify-between text-[12px] text-text-secondary">
+                  <span>
+                    {activeProjectCard.steps.filter((step) => step.status === 'complete').length}/{activeProjectCard.steps.length || 0} steps complete
+                  </span>
+                  <span>{activeProjectCard.activeStepCount > 0 ? `${activeProjectCard.activeStepCount} active` : 'No active steps yet'}</span>
+                </div>
+              </button>
+            </motion.section>
+          ) : null}
+
+          {secondaryCards.length > 0 ? (
+            <motion.div variants={containerVariants} className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              {secondaryCards.map(({ project, nextStep, activeStepCount }) => {
+                const stack = parseStack(project.stack || '{}');
+                const descriptor = getDashboardGenerationAction(project, nextStep);
+
+                return (
+                  <motion.article
+                    key={project.id}
+                    variants={itemVariants}
+                    className="surface-card p-5"
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h3 className="text-[22px] font-serif tracking-[-0.02em] text-text-primary">
+                          {project.name}
+                        </h3>
+                        <div className="mt-1 text-[11px] font-mono uppercase tracking-[0.12em] text-text-muted">
+                          Updated {formatDistanceToNow(new Date(project.updated_at))} ago
+                        </div>
                       </div>
-                    )}
-                  </div>
-                  
-                  <div className="flex items-center gap-2 text-[15px] font-medium tracking-[-0.01em] text-text-primary relative z-10">
-                    {isAgentWorking ? (
-                      <Brain className="h-4 w-4 text-accent-primary animate-pulse" />
-                    ) : (
-                      <ArrowRight className="h-4 w-4 text-accent-primary" />
-                    )}
-                    <span>
-                      {descriptor.focusCopy}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="mt-5">
-                  <div className="mb-2 flex items-center justify-between text-sm text-text-secondary">
-                    <span>Progress</span>
-                    <span className="font-mono text-[12px] uppercase tracking-[0.12em] text-text-muted">
-                      {project.progress}% · {steps.filter((step) => step.status === 'complete').length}/{steps.length || 0} done
-                    </span>
-                  </div>
-                  <div className="relative h-[3px] overflow-hidden rounded-[2px] bg-bg-elevated">
-                    <motion.div
-                      initial={{ width: 0 }}
-                      animate={{ width: `${project.progress}%` }}
-                      transition={{ type: 'spring', stiffness: 100, damping: 20 }}
-                      className="absolute inset-y-0 left-0 bg-accent-primary"
-                    />
-                    <motion.div
-                      initial={{ left: 0 }}
-                      animate={{ left: `${Math.max(project.progress - 2, 0)}%` }}
-                      transition={{ type: 'spring', stiffness: 100, damping: 20 }}
-                      className="absolute top-1/2 h-2 w-2 -translate-y-1/2 rounded-full bg-accent-soft shadow-[0_0_10px_rgba(243,159,126,0.55)]"
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-5 flex items-center justify-between gap-4 border-t border-border-subtle pt-4">
-                  <div className="flex flex-wrap gap-2">
-                    {Object.values(stack).filter(Boolean).slice(0, 3).map((item) => (
                       <span
-                        key={`${project.id}-${item}`}
-                        className="rounded-[6px] border border-border-default bg-bg-elevated/70 px-2 py-1 text-[10px] font-mono uppercase tracking-[0.12em] text-text-muted"
+                        className={cn(
+                          'inline-flex items-center rounded-[8px] border px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em]',
+                          descriptor.badgeClassName,
+                        )}
                       >
-                        {item}
+                        {descriptor.statusLabel}
                       </span>
-                    ))}
-                  </div>
-
-                  <div className="flex items-center gap-3">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">
-                      {activeStepCount > 0 ? `${activeStepCount} in play` : 'Quiet for now'}
                     </div>
-                    <span className="inline-flex items-center gap-1 text-[13px] font-medium text-accent-primary transition-colors group-hover:text-accent-primary-hover">
-                      {descriptor.ctaLabel}
-                      <ArrowRight className="h-4 w-4" />
-                    </span>
-                  </div>
-                </div>
-              </motion.article>
-            );
-          })}
-        </motion.div>
+
+                    <button
+                      type="button"
+                      onClick={() => navigate(descriptor.destination)}
+                      aria-label={`${descriptor.ctaLabel} for ${project.name}`}
+                      className="mt-4 w-full rounded-[10px] border border-border-default bg-bg-elevated/45 px-4 py-3 text-left transition-colors hover:border-accent-border/60"
+                    >
+                      <div className="text-[14px] font-medium text-text-primary">{descriptor.focusCopy}</div>
+                      <div className="mt-2 inline-flex items-center gap-1 text-[12px] font-medium text-accent-primary">
+                        {descriptor.ctaLabel}
+                        <ArrowRight className="h-3.5 w-3.5" />
+                      </div>
+                    </button>
+
+                    <div className="mt-4 flex items-center justify-between border-t border-border-subtle pt-3">
+                      <div className="flex flex-wrap gap-2">
+                        {Object.values(stack).filter(Boolean).slice(0, 2).map((item) => (
+                          <span
+                            key={`${project.id}-${item}`}
+                            className="rounded-[6px] border border-border-default bg-bg-elevated/70 px-2 py-1 text-[10px] font-mono uppercase tracking-[0.12em] text-text-muted"
+                          >
+                            {item}
+                          </span>
+                        ))}
+                      </div>
+                      <div className="text-[10px] font-mono uppercase tracking-[0.12em] text-text-muted">
+                        {activeStepCount > 0 ? `${activeStepCount} in play` : 'Quiet'}
+                      </div>
+                    </div>
+                  </motion.article>
+                );
+              })}
+            </motion.div>
+          ) : null}
+        </div>
       )}
 
       {!loading && !showArchived && visibleCards.length > 0 && builderProfileCount < 3 && !workspaceNudgeDismissed ? (
@@ -675,6 +616,7 @@ export default function Dashboard() {
           </DialogHeader>
           <DialogFooter className="mt-6 flex gap-3">
             <button
+              type="button"
               onClick={() => setProjectToDelete(null)}
               className="btn-ghost"
               disabled={isDeleting}
@@ -682,6 +624,7 @@ export default function Dashboard() {
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleDeleteProject}
               className="btn-primary bg-status-error hover:bg-status-error/90 border-status-error/20"
               disabled={isDeleting}

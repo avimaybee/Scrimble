@@ -3,10 +3,10 @@ import {
   Batch1ResearchStackSchema,
   Batch2FetchAndReadSchema,
   Batch3ArchitectSchema,
-  Batch4PlanBuildSchema,
+  PlanAuthoringRecordSchema,
   Batch5EnrichStepsSchema,
 } from './generation-schemas';
-import { persistGenerationStreamEvent } from './generation-events';
+import { persistGenerationStreamEvent, resetGenerationThinkingState } from './generation-events';
 import {
   executeBatch1,
   executeBatch2,
@@ -22,6 +22,7 @@ import {
   saveArchitectureReviewApproval,
   type ProviderConfig,
 } from './generation-pipeline';
+import { getGenerationRuntimeState, updateGenerationRunStatus } from './generation-runtime';
 import { loadProjectBriefContext } from './project-briefs';
 import { loadBuilderProfileContext } from './user-tools';
 import { saveToR2, loadFromR2 } from './workflow-storage';
@@ -29,6 +30,7 @@ import { WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED } from './generation-dispatch
 import type {
   Bindings,
   GenerationBatchName,
+  GenerationRunStatus,
   ProjectGenerationStatus,
   ResolvedGenerationProviderConfig,
 } from './types';
@@ -85,10 +87,7 @@ type ProjectGenerationRow = {
   intake_answers: string | null;
   project_type: string | null;
   stack: string | null;
-  generation_status: string | null;
-  generation_run_id: string | null;
-  generation_provider_id: string | null;
-  generation_heartbeat_at: string | null;
+  current_generation_run_id: string | null;
 };
 
 type Batch2LoopOutcome =
@@ -129,28 +128,6 @@ function normalizeStepName(value: string) {
     .slice(0, 80) || 'step';
 }
 
-function normalizeProjectStatus(value: unknown): ProjectGenerationStatus {
-  const candidate = typeof value === 'string' ? value : 'queued';
-  switch (candidate) {
-    case 'intake':
-    case 'queued':
-    case 'batch_1_research_stack':
-    case 'batch_2_fetch_and_read':
-    case 'batch_3_architect':
-    case 'batch_4_plan_build':
-    case 'batch_5_enrich_steps':
-    case 'batch_6_generate_files':
-    case 'awaiting_review':
-    case 'approved':
-    case 'complete':
-    case 'failed':
-    case 'cancelled':
-      return candidate;
-    default:
-      return 'queued';
-  }
-}
-
 async function getProjectRow(env: Bindings, projectId: string): Promise<ProjectGenerationRow | null> {
   return env.DB.prepare(`
     SELECT
@@ -161,10 +138,7 @@ async function getProjectRow(env: Bindings, projectId: string): Promise<ProjectG
       intake_answers,
       project_type,
       stack,
-      generation_status,
-      generation_run_id,
-      generation_provider_id,
-      generation_heartbeat_at
+      current_generation_run_id
     FROM projects
     WHERE id = ?
     LIMIT 1
@@ -189,30 +163,36 @@ async function getCompletedGenerationBatches(env: Bindings, projectId: string) {
 }
 
 async function resolveCurrentStatusToRun(env: Bindings, projectId: string) {
-  const project = await getProjectRow(env, projectId);
+  const [project, runtimeState] = await Promise.all([
+    getProjectRow(env, projectId),
+    getGenerationRuntimeState(env, projectId),
+  ]);
   if (!project) {
     throw new Error('Project not found.');
   }
 
   const completedBatches = await getCompletedGenerationBatches(env, projectId);
-  const currentStatus = normalizeProjectStatus(project.generation_status);
-  const statusToRun = await resolvePipelineStatusToRun(env, projectId, currentStatus, completedBatches);
+  const currentStatus: GenerationRunStatus | 'intake' = runtimeState.run?.status ?? 'intake';
+  const statusToRun = await resolvePipelineStatusToRun(env, projectId, 'queued', completedBatches);
   return { project, completedBatches, currentStatus, statusToRun };
 }
 
 async function assertActiveRun(env: Bindings, projectId: string, runId: string) {
-  const project = await getProjectRow(env, projectId);
+  const [project, runtimeState] = await Promise.all([
+    getProjectRow(env, projectId),
+    getGenerationRuntimeState(env, projectId),
+  ]);
   if (!project) {
     throw new WorkflowRunStoppedError('Project no longer exists.');
   }
 
-  if (normalizeProjectStatus(project.generation_status) === 'cancelled') {
+  if (runtimeState.isCancelled) {
     throw new WorkflowRunStoppedError('Project generation was cancelled.');
   }
 
-  if (project.generation_run_id && project.generation_run_id !== runId) {
+  if (project.current_generation_run_id !== runId) {
     throw new WorkflowRunStoppedError(
-      `Run ${runId} is stale; active run is ${project.generation_run_id}.`,
+      `Run ${runId} is stale; active run is ${project.current_generation_run_id ?? 'none'}.`,
     );
   }
 
@@ -225,20 +205,9 @@ async function markProjectApproved(
   runId: string,
   providerId: string | null,
 ) {
-  await env.DB.prepare(`
-    UPDATE projects
-    SET generation_status = 'approved',
-        generation_error = NULL,
-        generation_provider_id = ?,
-        generation_heartbeat_at = datetime("now"),
-        generation_completed_at = NULL,
-        updated_at = datetime("now")
-    WHERE id = ?
-      AND generation_status IN ('awaiting_review', 'approved')
-      AND (generation_run_id IS NULL OR generation_run_id = ?)
-  `)
-    .bind(providerId, projectId, runId)
-    .run();
+  await updateGenerationRunStatus(env, runId, 'approved', {
+    providerId: providerId || undefined,
+  });
 }
 
 async function markProjectCancelled(
@@ -247,26 +216,19 @@ async function markProjectCancelled(
   runId: string,
   reason: string,
 ) {
-  await env.DB.prepare(`
-    UPDATE projects
-    SET generation_status = 'cancelled',
-        generation_error = ?,
-        generation_heartbeat_at = datetime("now"),
-        generation_completed_at = datetime("now"),
-        updated_at = datetime("now")
-    WHERE id = ?
-      AND (generation_run_id IS NULL OR generation_run_id = ?)
-  `)
-    .bind(reason, projectId, runId)
-    .run();
+  await updateGenerationRunStatus(env, runId, 'cancelled', {
+    errorMessage: reason,
+  });
 
   await persistGenerationStreamEvent(env, {
     projectId,
+    runId,
     event: {
       type: 'pipeline_failed',
       error: reason,
     },
   });
+  await resetGenerationThinkingState(env, projectId, null);
 }
 
 async function markProjectFailed(
@@ -275,26 +237,19 @@ async function markProjectFailed(
   runId: string,
   reason: string,
 ) {
-  await env.DB.prepare(`
-    UPDATE projects
-    SET generation_status = 'failed',
-        generation_error = ?,
-        generation_heartbeat_at = datetime("now"),
-        generation_completed_at = datetime("now"),
-        updated_at = datetime("now")
-    WHERE id = ?
-      AND (generation_run_id IS NULL OR generation_run_id = ?)
-  `)
-    .bind(reason, projectId, runId)
-    .run();
+  await updateGenerationRunStatus(env, runId, 'failed', {
+    errorMessage: reason,
+  });
 
   await persistGenerationStreamEvent(env, {
     projectId,
+    runId,
     event: {
       type: 'pipeline_failed',
       error: reason,
     },
   });
+  await resetGenerationThinkingState(env, projectId, null);
 }
 
 async function saveBatchOutputSnapshot<T>(
@@ -489,6 +444,7 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
         const count = techsToResearch.length;
         await persistGenerationStreamEvent(this.env, {
           projectId,
+          runId,
           batchName: 'batch_2_fetch_and_read',
           event: {
             type: 'activity',
@@ -570,6 +526,7 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
           await markProjectApproved(this.env, projectId, runId, fastProvider.providerId || null);
           await persistGenerationStreamEvent(this.env, {
             projectId,
+            runId,
             batchName: 'batch_4_plan_build',
             event: {
               type: 'activity',
@@ -584,6 +541,7 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
           if (reviewEvent.preferredIde?.trim()) {
             await persistGenerationStreamEvent(this.env, {
               projectId,
+              runId,
               batchName: 'batch_4_plan_build',
               event: {
                 type: 'activity',
@@ -614,7 +572,7 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
             runId,
             'plan',
             'batch_4_plan_build',
-            Batch4PlanBuildSchema,
+            PlanAuthoringRecordSchema,
           );
           return plan.r2Key;
         });
@@ -626,7 +584,7 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
             runId,
             'plan',
             'batch_4_plan_build',
-            Batch4PlanBuildSchema,
+            PlanAuthoringRecordSchema,
           );
           return plan.r2Key;
         });

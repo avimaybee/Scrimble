@@ -10,8 +10,18 @@ import {
 import type { Batch2FetchAndRead, Batch3Architect } from './generation-schemas';
 import { getConnectedResearchTools } from './mcp-servers';
 import { selectManifestToolsForStep, type ResearchManifest } from './research-manifest';
-import { createResearchService, fetchSequentially } from './research';
 import type { Bindings, GenerationBatchName } from './types';
+import { persistInvariantViolation } from './generation-runtime';
+import { 
+  fetchLibraryDocs, 
+  fetchMultipleDocuments as facadeFetchMultiple,
+  analyzeGitHubRepo as facadeAnalyzeGitHubRepo,
+  searchWeb as facadeSearchWeb,
+  type ResearchContext,
+  type SubrequestTracker
+} from './research-facade';
+import type { WebSearchResponse, DocumentFetchResponse, GitHubAnalysisResponse } from './research-facade';
+import { buildResearchQuery, type ResearchQueryFamily } from './research-query-policy';
 
 type ConnectedResearchTools = Awaited<ReturnType<typeof getConnectedResearchTools>>;
 
@@ -61,6 +71,11 @@ export type StepResearchContext = {
 export type StepResearchFooterMeta = {
   researched_at: string;
   tools: string[];
+  // B3: Quality metadata for transparency
+  quality: 'live' | 'cached' | 'degraded' | 'none';
+  live_source_count: number;
+  cached_source_count: number;
+  degraded_sources?: string[];
 };
 
 type CollectStepResearchArgs = {
@@ -77,9 +92,11 @@ type CollectStepResearchArgs = {
   research: Batch2FetchAndRead;
   batchName?: GenerationBatchName;
   projectId?: string;
+  runId?: string;
   connectedTools?: ConnectedResearchTools;
   researchManifest?: ResearchManifest;
   additionalResearch?: Batch2FetchAndRead['research'];
+  subrequestTracker?: SubrequestTracker;
 };
 
 const STOP_WORDS = new Set([
@@ -103,7 +120,12 @@ const STOP_WORDS = new Set([
   'your',
 ]);
 
-function createToolEnv(env: Bindings, batchName?: GenerationBatchName, projectId?: string): ToolEnv {
+function createToolEnv(
+  env: Bindings,
+  batchName?: GenerationBatchName,
+  projectId?: string,
+  runId?: string,
+): ToolEnv {
   if (!batchName || !projectId) {
     return env;
   }
@@ -113,6 +135,7 @@ function createToolEnv(env: Bindings, batchName?: GenerationBatchName, projectId
     TOOL_CONTEXT: {
       projectId,
       batchName,
+      runId,
     },
   };
 }
@@ -447,18 +470,54 @@ function filterIssuesByStepKeywords(
   });
 }
 
-function buildFooter(dateLabel: string, toolsUsed: string[], connectedTools: ConnectedResearchTools) {
+function buildFooter(dateLabel: string, toolsUsed: string[], connectedTools: ConnectedResearchTools, quality: StepResearchFooterMeta['quality']) {
+  const qualityLabel = quality === 'live' 
+    ? '' 
+    : quality === 'cached' 
+      ? ' (using cached research)' 
+      : quality === 'degraded' 
+        ? ' (some sources unavailable)' 
+        : ' (limited research)';
+  
   if (connectedTools.has_brave_search && connectedTools.has_context7 && toolsUsed.length > 0) {
-    return `Researched ${dateLabel} using ${toolsUsed.join(', ')}`;
+    return `Researched ${dateLabel} using ${toolsUsed.join(', ')}${qualityLabel}`;
   }
 
-  return `Researched ${dateLabel} using the default research stack.`;
+  return `Researched ${dateLabel} using the default research stack${qualityLabel}`;
 }
 
-function buildFooterMeta(dateLabel: string, toolsUsed: string[]): StepResearchFooterMeta {
+type FooterMetaInput = {
+  dateLabel: string;
+  toolsUsed: string[];
+  liveSourceCount: number;
+  cachedSourceCount: number;
+  degradedSources?: string[];
+};
+
+function buildFooterMeta(input: FooterMetaInput): StepResearchFooterMeta {
+  const { dateLabel, toolsUsed, liveSourceCount, cachedSourceCount, degradedSources } = input;
+  
+  // B3: Determine quality based on source distribution
+  let quality: StepResearchFooterMeta['quality'];
+  const totalSources = liveSourceCount + cachedSourceCount;
+  
+  if (totalSources === 0) {
+    quality = 'none';
+  } else if ((degradedSources?.length ?? 0) > 0) {
+    quality = 'degraded';
+  } else if (cachedSourceCount > liveSourceCount) {
+    quality = 'cached';
+  } else {
+    quality = 'live';
+  }
+  
   return {
     researched_at: dateLabel,
     tools: toolsUsed.length > 0 ? toolsUsed : ['default research stack'],
+    quality,
+    live_source_count: liveSourceCount,
+    cached_source_count: cachedSourceCount,
+    degraded_sources: degradedSources?.length ? degradedSources : undefined,
   };
 }
 
@@ -516,29 +575,22 @@ function getPrimaryDocsTopic(stepKind: StepResearchKind, stepTitle: string) {
 function getPrimarySearchQuery(args: {
   stepKind: StepResearchKind;
   packageName: string;
-  year: number;
+  docsTopic: string;
 }) {
   const packageName = normalizeToken(args.packageName).replace(/[^a-z0-9@.+#\-/]/g, '');
-  const truncate = (value: string) =>
-    value
-      .replace(/\s+/g, ' ')
-      .trim()
-      .split(' ')
-      .slice(0, 8)
-      .join(' ');
-
-  switch (args.stepKind) {
-    case 'auth':
-      return truncate(`${packageName} errors ${args.year}`);
-    case 'database':
-      return truncate(`${packageName} changelog ${args.year}`);
-    case 'deployment':
-      return truncate(`${packageName} setup ${args.year}`);
-    case 'payment':
-      return truncate(`stripe errors ${args.year}`);
-    default:
-      return truncate(`${packageName} setup ${args.year}`);
-  }
+  const queryFamilyByStepKind: Record<StepResearchKind, ResearchQueryFamily> = {
+    auth: 'errors',
+    database: 'release_notes',
+    deployment: 'deployment',
+    payment: 'errors',
+    general: 'setup',
+  };
+  const technology = args.stepKind === 'payment' ? 'stripe' : packageName;
+  return buildResearchQuery({
+    technology,
+    family: queryFamilyByStepKind[args.stepKind],
+    intent: args.docsTopic,
+  });
 }
 
 function prioritizeLibrariesForStepKind(stepKind: StepResearchKind, libraries: RelevantLibrary[]) {
@@ -585,17 +637,14 @@ export async function collectStepResearchContext({
   research,
   batchName,
   projectId,
+  runId,
   connectedTools,
   researchManifest,
   additionalResearch = [],
+  subrequestTracker,
 }: CollectStepResearchArgs): Promise<StepResearchContext> {
-  const toolEnv = createToolEnv(env, batchName, projectId);
-  const researchService = createResearchService({
-    env,
-    userId,
-    projectId,
-    batchName,
-  });
+  const startedAt = Date.now();
+  const toolEnv = createToolEnv(env, batchName, projectId, runId);
   const resolvedConnectedTools = connectedTools || (await getConnectedResearchTools(env, userId));
   const mergedResearchEntries = mergeResearchEntries(research.research, additionalResearch);
   const stepKind = detectStepResearchKind({
@@ -609,16 +658,24 @@ export async function collectStepResearchContext({
   const relevantLibraries = prioritizeLibrariesForStepKind(
     stepKind,
     inferRelevantLibraries(stepTitle, stepObjective, adr, mergedResearchEntries),
-  ).slice(0, stepKind === 'general' && !stepIsGate ? 1 : 2);
+  ).slice(0, stepKind !== 'general' || Boolean(stepIsGate) ? 2 : 1);
   const docs: StepResearchContext['docs'] = [];
   const issues: StepResearchContext['issues'] = [];
   const community: StepResearchContext['community'] = [];
   const toolsUsed = new Set<string>();
-  const currentYear = new Date().getFullYear();
   const dateLabel = new Date().toISOString().slice(0, 10);
   const frameworkLabel = getFrameworkLabel(adr);
   const requirements = getStepKindRequirements(stepKind, frameworkLabel);
-  const shouldUseLiveResearch = stepKind !== 'general' || Boolean(stepIsGate);
+  
+  // B3: Default to live research for ALL steps, not just specialized ones
+  // This ensures user-visible steps are backed by current evidence
+  const shouldUseLiveResearch = true;
+  
+  // B3: Track source quality for transparency
+  let liveSourceCount = 0;
+  let cachedSourceCount = 0;
+  const degradedSources: string[] = [];
+  
   const manifestTools = researchManifest
     ? selectManifestToolsForStep(researchManifest, {
         stepKind,
@@ -636,19 +693,24 @@ export async function collectStepResearchContext({
     }
 
     seenManifestDocUrls.add(docsUrl.toLowerCase());
-    const manifestDoc = await researchService.fetchDoc(docsUrl);
-    if (!manifestDoc.content) {
+    const context: ResearchContext = { env, userId, projectId, batchName, runId, subrequestTracker };
+    const [facadeDoc] = await facadeFetchMultiple(context, [docsUrl]);
+    
+    if (!facadeDoc || !facadeDoc.content) {
+      // B3: Track failed fetches as degraded
+      degradedSources.push(`${manifestTool.name} docs`);
       continue;
     }
 
     docs.push({
       library: manifestTool.name,
-      source: manifestDoc.tool === 'cf_scrape' ? 'Cloudflare Scrape' : 'Jina Reader',
+      source: facadeDoc.metadata.tool === 'cf_scrape' ? 'Cloudflare Scrape' : 'Jina Reader',
       version: 'unknown',
       url: docsUrl,
-      content: trimLongText(manifestDoc.content, 3200),
+      content: trimLongText(facadeDoc.content, 3200),
     });
-    toolsUsed.add(manifestDoc.tool === 'cf_scrape' ? 'Cloudflare Scrape' : 'Jina Reader');
+    toolsUsed.add(facadeDoc.metadata.tool === 'cf_scrape' ? 'Cloudflare Scrape' : 'Jina Reader');
+    liveSourceCount++; // B3: Track live source
   }
 
   for (const library of relevantLibraries) {
@@ -657,6 +719,7 @@ export async function collectStepResearchContext({
         ? 'stripe'
         : library.packageName;
 
+    // B3: shouldUseLiveResearch is now always true, but keep fallback path for future configurability
     if (!shouldUseLiveResearch) {
       appendExistingResearchContext({
         library,
@@ -665,100 +728,111 @@ export async function collectStepResearchContext({
         community,
         toolsUsed,
       });
+      cachedSourceCount++; // B3: Track cached source
       continue;
     }
 
     const docsTopic = getPrimaryDocsTopic(stepKind, stepTitle);
-    const docsResults = await fetchSequentially([
-      () => getLibraryDocs(docsLibraryName, docsTopic, userId, toolEnv),
-    ]);
-    const rawIssues = library.repo
-      ? await getLibraryIssues(library.repo.owner, library.repo.repo, ['bug'], 90, userId, toolEnv)
-      : [];
+    
+    // Phase 2: Facade is now primary
+    const facadeContext = { env, userId, projectId, batchName };
+    const facadeResult = await fetchLibraryDocs(
+      facadeContext as any, 
+      docsLibraryName, 
+      docsTopic, 
+      library.docsUrl || undefined
+    );
+    
+    if (facadeResult.content) {
+      docs.push({
+        library: docsLibraryName,
+        source: facadeResult.source,
+        version: facadeResult.version || 'unknown',
+        url: facadeResult.source.startsWith('http') ? facadeResult.source : (library.docsUrl || ''),
+        content: trimLongText(facadeResult.content, 3200),
+      });
+      toolsUsed.add(facadeResult.source === 'Context7' ? 'Context7' : 'Live docs');
+      liveSourceCount++;
+    } else {
+      degradedSources.push(`${docsLibraryName} docs (facade)`);
+    }
+
+    // GitHub and Search via Facade
+    const researchContext: ResearchContext = { env, userId, projectId, batchName, runId, subrequestTracker };
+    
+    let facadeGitHub: GitHubAnalysisResponse | null = null;
+    if (library.repo) {
+      facadeGitHub = await facadeAnalyzeGitHubRepo(researchContext, library.repo.owner, library.repo.repo);
+    }
+
     const searchQuery = resolvedConnectedTools.has_brave_search
       ? getPrimarySearchQuery({
           stepKind,
           packageName: library.packageName,
-          year: currentYear,
+          docsTopic,
         })
       : '';
-    const searchResultSets = searchQuery
-      ? await fetchSequentially([() => searchWeb(searchQuery, userId, toolEnv)])
-      : [];
-    const docsResultsWithContent = docsResults.filter((result) => result.content.trim().length > 0);
-    const searchResults = searchResultSets.flat();
-    let docsContent = docsResultsWithContent
-      .map((result) => {
-        const sourceLabel =
-          result.source === 'Context7' && result.version !== 'unknown'
-            ? `${result.source} ${result.version}`
-            : result.source;
-        return `${sourceLabel}\n${result.content}`;
-      })
-      .join('\n\n');
-    let docsUrl =
-      docsResultsWithContent.find((result) => result.source.startsWith('http'))?.source ||
-      library.docsUrl ||
-      '';
 
-    if (!resolvedConnectedTools.has_context7 && library.docsUrl) {
-      const fetchedDocs = await fetchUrl(library.docsUrl, toolEnv);
-      if (fetchedDocs.content) {
-        docsContent = fetchedDocs.content;
-        docsUrl = fetchedDocs.url;
+    let facadeSearch: WebSearchResponse | null = null;
+    if (searchQuery) {
+      facadeSearch = await facadeSearchWeb(researchContext, searchQuery, 3);
+    }
+
+    if (facadeGitHub && facadeGitHub.metadata.quality !== 'failed') {
+      const filteredIssues = stepKind === 'deployment'
+        ? facadeGitHub.recentIssues.slice(0, 3)
+        : filterIssuesByStepKeywords(
+            facadeGitHub.recentIssues.map(i => ({ ...i, id: 0, labels: [], state: 'open' as any })),
+            stepTitle, 
+            stepObjective
+          ).slice(0, 3);
+
+      filteredIssues.forEach((issue) => {
+        issues.push({
+          library: library.packageName,
+          title: issue.title,
+          url: issue.url,
+          body: trimLongText(issue.body, 900),
+          createdAt: issue.createdAt,
+        });
+      });
+      if (filteredIssues.length > 0) {
+        toolsUsed.add('GitHub');
+        liveSourceCount++;
       }
     }
 
-    if (docsContent) {
-      docs.push({
-        library: docsLibraryName,
-        source: docsResultsWithContent.some((result) => result.source === 'Context7') ? 'Context7' : 'Docs',
-        version:
-          docsResultsWithContent.find((result) => result.version !== 'unknown')?.version || 'unknown',
-        url: docsUrl || library.docsUrl || '',
-        content: trimLongText(docsContent, 3200),
-      });
-      toolsUsed.add(
-        docsResultsWithContent.some((result) => result.source === 'Context7') ? 'Context7' : 'Live docs',
-      );
-    }
-
-    const filteredIssues =
-      stepKind === 'deployment'
-        ? rawIssues.slice(0, 3)
-        : filterIssuesByStepKeywords(rawIssues, stepTitle, stepObjective).slice(0, 3);
-    filteredIssues.forEach((issue) => {
-      issues.push({
+    if (facadeSearch && facadeSearch.results.length > 0) {
+      const communityPages = facadeSearch.results.slice(0, 3).map((result) => ({
         library: library.packageName,
-        title: issue.title,
-        url: issue.url,
-        body: trimLongText(issue.body, 900),
-        createdAt: issue.createdAt,
-      });
-    });
-    if (filteredIssues.length > 0) {
-      toolsUsed.add('GitHub');
-    }
+        title: result.title,
+        url: result.url,
+        summary: summarizeText(result.description || result.title),
+      }));
 
-    const communityPages = (searchResults as SearchResult[]).slice(0, 3).map((result) => ({
-      library: library.packageName,
-      title: result.title,
-      url: result.url,
-      summary: summarizeText(result.description || result.title),
-    }));
+      communityPages
+        .filter((page) => page.summary.length > 0)
+        .forEach((page) => {
+          community.push(page);
+        });
 
-    communityPages
-      .filter((page) => page.summary.length > 0)
-      .forEach((page) => {
-        community.push(page);
-      });
-
-    if (communityPages.length > 0) {
-      toolsUsed.add('Brave Search');
+      if (communityPages.length > 0) {
+        toolsUsed.add(facadeSearch.metadata.tool === 'brave_search' ? 'Brave Search' : 'Jina Search');
+        liveSourceCount++;
+      }
     }
   }
 
   const orderedTools = Array.from(toolsUsed);
+  
+  // B3: Build footer with quality metadata
+  const footerMeta = buildFooterMeta({
+    dateLabel,
+    toolsUsed: orderedTools,
+    liveSourceCount,
+    cachedSourceCount,
+    degradedSources: degradedSources.length > 0 ? degradedSources : undefined,
+  });
 
   return {
     stepId,
@@ -770,8 +844,8 @@ export async function collectStepResearchContext({
     community,
     toolsUsed: orderedTools,
     requirements,
-    footer: buildFooter(dateLabel, orderedTools, resolvedConnectedTools),
-    footerMeta: buildFooterMeta(dateLabel, orderedTools),
+    footer: buildFooter(dateLabel, orderedTools, resolvedConnectedTools, footerMeta.quality),
+    footerMeta,
   };
 }
 
@@ -803,3 +877,4 @@ export function formatStepResearchPrompt(context: StepResearchContext) {
     2,
   );
 }
+

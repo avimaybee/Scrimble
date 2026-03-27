@@ -71,7 +71,7 @@ function normalizeObject<T extends Record<string, unknown>>(
   value: unknown,
   fallbackFactory: () => T,
 ) {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value : fallbackFactory();
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as T) : fallbackFactory();
 }
 
 function createOptionalTextSchema(fallback = '') {
@@ -342,54 +342,74 @@ const planStepSchema = z.preprocess(
   }),
 );
 
-export const Batch4PlanBuildSchema = z.preprocess(
-  (value) => normalizeObject(value, () => ({})),
+const planStageSchema = z.preprocess(
+  (entry) => normalizeObject(entry, () => ({})),
+  z.object({
+    id: createOptionalTextSchema(''),
+    title: createRequiredTextSchema('Untitled stage'),
+    type: createRequiredTextSchema('stage'),
+    order_index: createNumberSchema(0),
+    steps: z.preprocess(normalizeObjectArray, z.array(planStepSchema).min(1)),
+  }),
+);
+
+const planEdgeSchema = z.preprocess(
+  (entry) => normalizeObject(entry, () => ({})),
+  z.object({
+    id: createOptionalTextSchema(''),
+    source_step_id: createOptionalTextSchema(''),
+    target_step_id: createOptionalTextSchema(''),
+    edge_type: createOptionalTextSchema('default'),
+  }),
+);
+
+function extractLegacyPrdSection(markdown: string, heading: string): string {
+  if (!markdown.trim()) {
+    return '';
+  }
+
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const sectionRegex = new RegExp(`##\\s+${escapedHeading}\\s*\\n([\\s\\S]*?)(?=\\n##\\s+|$)`, 'i');
+  const match = markdown.match(sectionRegex);
+  return match?.[1]?.trim() || '';
+}
+
+function normalizeLegacyPlanAuthoringRecord(value: unknown) {
+  const normalized = normalizeObject<Record<string, unknown>>(value, () => ({}));
+  const legacyPrdMarkdown = normalizeText(normalized['prd_markdown'], '');
+
+  return {
+    ...normalized,
+    problem: normalizeText(normalized['problem'], extractLegacyPrdSection(legacyPrdMarkdown, 'The problem') || 'Define the core problem this project solves.'),
+    solution: normalizeText(normalized['solution'], extractLegacyPrdSection(legacyPrdMarkdown, "What we're building") || 'Describe the product experience and how it solves the problem.'),
+    target_user: normalizeText(normalized['target_user'], extractLegacyPrdSection(legacyPrdMarkdown, "Who it's for") || 'Describe the primary user and their goals.'),
+    mvp_scope: normalizeText(normalized['mvp_scope'], extractLegacyPrdSection(legacyPrdMarkdown, 'MVP scope') || 'List the in-scope MVP features and explicit out-of-scope items.'),
+    done_when: normalizeText(normalized['done_when'], extractLegacyPrdSection(legacyPrdMarkdown, 'Done when') || 'Define clear acceptance criteria for a shippable MVP.'),
+    architecture_notes: normalizeText(normalized['architecture_notes'], extractLegacyPrdSection(legacyPrdMarkdown, "How it's built") || extractLegacyPrdSection(legacyPrdMarkdown, 'How the pieces connect')),
+    data_model_notes: normalizeText(normalized['data_model_notes'], extractLegacyPrdSection(legacyPrdMarkdown, 'Data model')),
+    authoring_hash: normalizeText(normalized['authoring_hash'], normalizeText(normalized['prd_hash'], '')),
+  };
+}
+
+export const PlanAuthoringRecordSchema = z.preprocess(
+  normalizeLegacyPlanAuthoringRecord,
   z.object({
     project_name: createRequiredTextSchema('Untitled Project'),
     project_type: createRequiredTextSchema('other'),
-    prd_markdown: createRequiredTextSchema(''),
-    stack: z.preprocess((value) => {
-      if (typeof value === 'string') {
-        return value.trim();
-      }
-
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        return value;
-      }
-
-      return '';
-    }, z.union([z.string(), z.record(z.string(), z.unknown())])),
-    stages: z.preprocess(
-      normalizeObjectArray,
-      z.array(
-        z.preprocess(
-          (entry) => normalizeObject(entry, () => ({})),
-          z.object({
-            id: createOptionalTextSchema(''),
-            title: createRequiredTextSchema('Untitled stage'),
-            type: createRequiredTextSchema('stage'),
-            order_index: createNumberSchema(0),
-            steps: z.preprocess(normalizeObjectArray, z.array(planStepSchema).min(1)),
-          }),
-        ),
-      ).min(1),
-    ),
-    edges: z.preprocess(
-      normalizeObjectArray,
-      z.array(
-        z.preprocess(
-          (entry) => normalizeObject(entry, () => ({})),
-          z.object({
-            id: createOptionalTextSchema(''),
-            source_step_id: createOptionalTextSchema(''),
-            target_step_id: createOptionalTextSchema(''),
-            edge_type: createOptionalTextSchema('default'),
-          }),
-        ),
-      ),
-    ),
+    problem: createRequiredTextSchema('Define the core problem this project solves.'),
+    solution: createRequiredTextSchema('Describe the product experience and how it solves the problem.'),
+    target_user: createRequiredTextSchema('Describe the primary user and their goals.'),
+    mvp_scope: createRequiredTextSchema('List the in-scope MVP features and explicit out-of-scope items.'),
+    done_when: createRequiredTextSchema('Define clear acceptance criteria for a shippable MVP.'),
+    architecture_notes: createRequiredTextSchema('Summarize architecture and integration decisions.'),
+    data_model_notes: createRequiredTextSchema('Summarize the core entities and relationships.'),
+    authoring_hash: createOptionalTextSchema(''),
+    stages: z.preprocess(normalizeObjectArray, z.array(planStageSchema).min(1)),
+    edges: z.preprocess(normalizeObjectArray, z.array(planEdgeSchema)),
   }),
 );
+
+export const Batch4PlanBuildSchema = PlanAuthoringRecordSchema;
 
 export const Batch5EnrichStepsSchema = z.preprocess(
   (value) => normalizeObject(value, () => ({})),
@@ -408,6 +428,16 @@ export const Batch5EnrichStepsSchema = z.preprocess(
                 z.object({
                   researched_at: createOptionalTextSchema(''),
                   tools: createStringArraySchema(),
+                  quality: z.preprocess(
+                    (quality) => normalizeText(quality, '').toLowerCase(),
+                    z.enum(['live', 'cached', 'degraded', 'none']).optional(),
+                  ),
+                  live_source_count: createNonNegativeIntSchema(0).optional(),
+                  cached_source_count: createNonNegativeIntSchema(0).optional(),
+                  degraded_sources: z.preprocess(
+                    normalizeStringArray,
+                    z.array(z.string().min(1)).optional(),
+                  ),
                 }),
               ).optional(),
               navigation_links: z.preprocess(
@@ -483,9 +513,10 @@ export const schemaDescriptions = {
   batch_3_architect:
     '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:
-    '{ project_name: string, project_type: string, prd_markdown: string, stack?: string | Record<string, unknown>, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, is_milestone?, milestone_label?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
+    '{ project_name: string, project_type: string, problem: string, solution: string, target_user: string, mvp_scope: string, done_when: string, architecture_notes: string, data_model_notes: string, authoring_hash?: string, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, is_milestone?, milestone_label?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
+
   batch_5_enrich_steps:
-    '{ enrichments: [{ step_id: string, ai_output: string, done_when?: string, research_footer_meta?: { researched_at: string, tools: string[] }, navigation_links?: [{ label: string, url: string, when: string }], prompts: [{ label: string, content: string }] }] }',
+    '{ enrichments: [{ step_id: string, ai_output: string, done_when?: string, research_footer_meta?: { researched_at: string, tools: string[], quality?: "live"|"cached"|"degraded"|"none", live_source_count?: number, cached_source_count?: number, degraded_sources?: string[] }, navigation_links?: [{ label: string, url: string, when: string }], prompts: [{ label: string, content: string }] }] }',
   batch_6_generate_files:
     '{ files: [{ filename: "plan.md", content: string }] }',
 } as const;
@@ -493,6 +524,7 @@ export const schemaDescriptions = {
 export type Batch1ResearchStack = z.infer<typeof Batch1ResearchStackSchema>;
 export type Batch2FetchAndRead = z.infer<typeof Batch2FetchAndReadSchema>;
 export type Batch3Architect = z.infer<typeof Batch3ArchitectSchema>;
+export type PlanAuthoringRecord = z.infer<typeof PlanAuthoringRecordSchema>;
 export type Batch4PlanBuild = z.infer<typeof Batch4PlanBuildSchema>;
 export type Batch5EnrichSteps = z.infer<typeof Batch5EnrichStepsSchema>;
 export type Batch6GenerateFiles = z.infer<typeof Batch6GenerateFilesSchema>;
