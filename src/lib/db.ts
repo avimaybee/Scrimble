@@ -92,6 +92,16 @@ export class WorkflowBriefDriftError extends Error {
   }
 }
 
+export class APIError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'APIError';
+    this.status = status;
+  }
+}
+
 type SaveUserToolPayload = {
   category: BuilderProfileCategory;
   name: string;
@@ -394,14 +404,14 @@ async function fetchWithAuth(endpoint: string, options: APIRequestOptions = {}):
     if (!response.ok) {
       const errorBody = await response.json().catch(() => null) as { error?: string } | null;
       if (response.status === 401) {
-        throw new Error('Your session expired. Sign in again to keep going.');
+        throw new APIError('Your session expired. Sign in again to keep going.', 401);
       }
 
       if (response.status >= 500) {
-        throw new Error(errorBody?.error || "Something's off on our end. Give it a second.");
+        throw new APIError(errorBody?.error || "Something's off on our end. Give it a second.", response.status);
       }
 
-      throw new Error(errorBody?.error || `API error: ${response.statusText}`);
+      throw new APIError(errorBody?.error || `API error: ${response.statusText}`, response.status);
     }
 
     return response;

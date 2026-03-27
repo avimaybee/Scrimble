@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowRight, ChevronRight, Hexagon, KeyRound, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
-import { dbService } from '../lib/db';
+import { APIError, dbService } from '../lib/db';
 import { getAIProviders, getAIModelRoles, saveAIModelRoles } from '../lib/ai';
 import { getMCPServers } from '../lib/mcp';
 import { hasConfiguredRole, resolveModelRoleDisplay } from '../lib/model-roles';
@@ -331,6 +331,21 @@ export default function NewProject() {
       }, 250);
     } catch (confirmError: unknown) {
       console.error('Failed to confirm intake:', confirmError);
+
+      if (confirmError instanceof APIError && (confirmError.status === 404 || confirmError.status === 409)) {
+        setSearchParams({}, { replace: true });
+        setIntakeSession(null);
+        setManualPrompt('');
+        setSelectedChoice('');
+        setReply('');
+        setScreenState('initial');
+        setLoading(false);
+        setLoadingSteps([]);
+        setError('That intake session expired. Start a fresh project and we’ll get you moving again.');
+        navigate('/new', { replace: true });
+        return;
+      }
+
       setLoading(false);
       setError(
         confirmError instanceof Error
