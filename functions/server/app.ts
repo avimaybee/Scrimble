@@ -592,7 +592,7 @@ async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
   return c.env.DB.prepare(`
     SELECT
       p.*,
-      gr.status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
+      gr.lifecycle_status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
       gr.id as canonical_run_id,
       gr.error_message as canonical_run_error,
       gr.current_batch as canonical_run_current_batch,
@@ -1081,7 +1081,7 @@ app.get('/projects', async (c) => {
   const projects = await c.env.DB.prepare(`
     SELECT
       p.*,
-      gr.status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
+      gr.lifecycle_status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
       gr.id as canonical_run_id,
       gr.error_message as canonical_run_error,
       gr.current_batch as canonical_run_current_batch,

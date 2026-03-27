@@ -492,7 +492,7 @@ export function createThrottledThinkingEmitter(
 
 async function resolveActiveThinkingRunId(env: Bindings, projectId: string) {
   const row = await env.DB.prepare(`
-    SELECT p.current_generation_run_id AS run_id, gr.status AS run_status
+    SELECT p.current_generation_run_id AS run_id, gr.lifecycle_status AS run_status
     FROM projects p
     LEFT JOIN generation_runs gr ON gr.id = p.current_generation_run_id
     WHERE p.id = ?

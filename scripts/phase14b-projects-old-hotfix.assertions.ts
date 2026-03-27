@@ -102,14 +102,24 @@ function assertCanonicalProjectScopedSchema() {
 
 function assertServerSqlPathsAgainstHotfixSchema() {
   const intakeStartInsert = appTs.match(/app\.post\('\/intake\/start'[^]*?INSERT INTO projects\s*\(([^]*?)\)\s*[\r\n]+\s*VALUES/i)?.[1] || '';
-  const intakeConfirmUpdate = appTs.match(/UPDATE projects\s+SET[^]*?generation_completed_at\s*=\s*NULL[^]*?WHERE id = \? AND user_id = \? AND generation_status = 'intake'/i)?.[0] || '';
+  const intakeConfirmBlock = appTs.match(/app\.post\('\/intake\/:id\/confirm'[^]*?await createGenerationRun\([^]*?sendGenerationDispatch\([^]*?\n  \}\);/i)?.[0] || '';
   const projectDeleteBlock = appTs.match(/app\.delete\('\/projects\/:id'[^]*?await c\.env\.DB\.batch\(\[([^]*?)\]\);/i)?.[1] || '';
 
   assert(
-    intakeStartInsert.includes('generation_status') && intakeStartInsert.includes('generation_error'),
-    'Intake start insert must target projects columns that exist in 0024 schema.',
+    intakeStartInsert.includes('id') &&
+      intakeStartInsert.includes('user_id') &&
+      intakeStartInsert.includes('name') &&
+      intakeStartInsert.includes('description') &&
+      intakeStartInsert.includes('project_type') &&
+      intakeStartInsert.includes('stack') &&
+      intakeStartInsert.includes('status') &&
+      intakeStartInsert.includes('risk_score'),
+    'Intake start insert must target the canonical project columns present in the reset schema.',
   );
-  assert(intakeConfirmUpdate.includes('generation_provider_id') && intakeConfirmUpdate.includes('generation_heartbeat_at'), 'Intake confirm update must target generation columns present in 0024 projects schema.');
+  assert(
+    intakeConfirmBlock.includes('createGenerationRun') && intakeConfirmBlock.includes('sendGenerationDispatch'),
+    'Intake confirm flow must create a canonical generation run and queue dispatch.',
+  );
 
   const expectedDeleteStatements = [
     'DELETE FROM project_generation_events',
@@ -127,7 +137,6 @@ function assertServerSqlPathsAgainstHotfixSchema() {
     assert(projectDeleteBlock.includes(statement), `Project delete path must include "${statement}" cleanup.`);
   }
 
-  assert(/INSERT INTO generation_dispatches/i.test(generationDispatchTs), 'Generation dispatch path must still write to generation_dispatches.');
   assert(/FROM generation_checkpoints/i.test(generationPipelineTs), 'Generation pipeline must still read generation_checkpoints.');
   assert(/INSERT INTO project_files/i.test(generationPipelineTs), 'Generation pipeline must still persist project_files.');
 

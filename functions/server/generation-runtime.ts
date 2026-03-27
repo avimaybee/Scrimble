@@ -108,7 +108,7 @@ export async function getGenerationRuntimeState(
       gr.id,
       gr.project_id,
       gr.workflow_instance_id,
-      gr.status,
+      gr.lifecycle_status AS status,
       gr.current_batch,
       gr.provider_id,
       gr.heartbeat_at,
