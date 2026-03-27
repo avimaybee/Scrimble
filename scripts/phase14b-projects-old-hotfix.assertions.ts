@@ -11,7 +11,13 @@ const migration0024Path = path.join(
   'migrations',
   '0024_reset_project_scoped_schema_after_projects_rebuild.sql',
 );
+const migration0025Path = path.join(
+  repoRoot,
+  'migrations',
+  '0025_restore_current_generation_run_id.sql',
+);
 const migration0024 = readFileSync(migration0024Path, 'utf8');
+const migration0025 = readFileSync(migration0025Path, 'utf8');
 
 const appTs = readFileSync(path.join(repoRoot, 'functions', 'server', 'app.ts'), 'utf8');
 const generationPipelineTs = readFileSync(path.join(repoRoot, 'functions', 'server', 'generation-pipeline.ts'), 'utf8');
@@ -100,6 +106,18 @@ function assertCanonicalProjectScopedSchema() {
   pass('0024 defines canonical project-scoped schema against projects(id)');
 }
 
+function assertProjectGenerationPointerRestored() {
+  assert(
+    /ALTER TABLE\s+projects\s+ADD COLUMN\s+current_generation_run_id\s+TEXT\s+REFERENCES\s+generation_runs\s*\(\s*id\s*\)/i.test(migration0025),
+    'Migration 0025 must restore projects.current_generation_run_id as a foreign key to generation_runs(id).',
+  );
+  assert(
+    /CREATE INDEX IF NOT EXISTS idx_projects_generation_run\s+ON projects\s*\(\s*current_generation_run_id\s*\)/i.test(migration0025),
+    'Migration 0025 must index projects.current_generation_run_id.',
+  );
+  pass('0025 restores the canonical project-to-run pointer');
+}
+
 function assertServerSqlPathsAgainstHotfixSchema() {
   const intakeStartInsert = appTs.match(/app\.post\('\/intake\/start'[^]*?INSERT INTO projects\s*\(([^]*?)\)\s*[\r\n]+\s*VALUES/i)?.[1] || '';
   const intakeConfirmBlock = appTs.match(/app\.post\('\/intake\/:id\/confirm'[^]*?await createGenerationRun\([^]*?sendGenerationDispatch\([^]*?\n  \}\);/i)?.[0] || '';
@@ -144,7 +162,7 @@ function assertServerSqlPathsAgainstHotfixSchema() {
 }
 
 function assertNoProjectsOldRuntimeReferences() {
-  const combined = `${appTs}\n${generationPipelineTs}\n${generationDispatchTs}`;
+  const combined = `${appTs}\n${generationPipelineTs}\n${generationDispatchTs}\n${migration0025}`;
   assert(!/projects_old/i.test(combined), 'Runtime server surfaces must not reference projects_old.');
   pass('runtime server surfaces contain no projects_old references');
 }
@@ -152,6 +170,7 @@ function assertNoProjectsOldRuntimeReferences() {
 function run() {
   assertMigrationNoProjectsOld();
   assertCanonicalProjectScopedSchema();
+  assertProjectGenerationPointerRestored();
   assertServerSqlPathsAgainstHotfixSchema();
   assertNoProjectsOldRuntimeReferences();
   console.log('Phase 14B projects_old hotfix assertions passed.');
