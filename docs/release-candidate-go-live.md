@@ -1,55 +1,45 @@
-# Production Go-Live Runbook (Phase 14 Direct Rollout)
+# Production Go-Live Runbook (Phase 14F Release Closeout)
 
-This runbook is the direct production rollout contract for the hobby release. There is no separate staging stack, so rollout discipline is enforced through local preflight, production backup, ordered deploy/migrate steps, live verification, and a short monitoring window.
+This runbook is the production release contract for the reliability-hardening rollout. There is no separate staging stack. Release safety comes from local preflight, paired runtime deployment, production smoke gates, and a short monitoring window.
 
-## Migration order
+## Release contract (current reality)
 
-1. `021_generation_runtime.sql`
-2. `022_agent_runs_run_id.sql`
-3. `023_drop_legacy_project_generation_columns.sql`
+- Canonical database contract is `migrations/0026_full_canonical_rebuild.sql`.
+- Do **not** treat `021 -> 023` replay as the current go-live path.
+- Pages/API and `worker-consumer` are version-coupled and must be deployed together.
+- Generation liveness is valid only after a real heartbeat or real generation event.
 
-## Deploy and migration order (direct production)
+## Migration order (historical note)
 
-1. Run local preflight suite and ensure all checks pass.
-2. Take a production D1 backup/export before any migration is applied.
-3. Verify production bindings are intact (`DB`, `CHECKPOINT_BUCKET`, `WORKFLOW_SERVICE`, `GENERATION_WORKFLOW`, auth config).
-4. Deploy application code:
-   - `npm run deploy`
-   - `npm run deploy:consumer`
-   - or `npm run deploy:all`
-5. Apply production migrations one-by-one in exact order (`021` -> `022` -> `023`), without batching or reordering.
-6. Run immediate post-migration live verification (boot/auth/status/stream/post-`023` checks).
-7. Run production bug-bash checklist, mobile-width sanity checks, and one heavy-project benchmark.
-8. Enter a 24-48 hour monitoring window before declaring rollout closed.
+The old `021 -> 023` migration order is retained only as historical context for prior release notes. It is **not** the active go-live path for this release.
 
-## Rollback playbook
+## Deploy order (direct production)
 
-### 021_generation_runtime.sql
+1. Run local preflight and confirm all checks pass.
+2. Take a production D1 backup/export before deployment.
+3. Verify production bindings (`DB`, `CHECKPOINT_BUCKET`, `WORKFLOW_SERVICE`, `GENERATION_WORKFLOW`, auth config).
+4. Deploy both runtimes together:
+   - `npm run deploy:all`
+   - or `npm run deploy` then `npm run deploy:consumer` in the same release window
+5. Run immediate production smoke checks (first event, first heartbeat, status/stream coherence).
+6. Run critical-flow and manual release gates.
+7. Enter monitoring window and watch for blocker regressions.
 
-- Trigger condition: runtime status endpoints fail or `generation_runs` lifecycle updates drift from expected state.
-- Failure detection: `/api/projects/:id/status` cannot resolve canonical `generation_runtime`, run linkage errors, or lifecycle stalls.
-- Rollback type: application rollback first; schema rollback only if migration was not applied cleanly and data integrity is preserved.
-- Data risk: partial run lifecycle data in `generation_runs` and stale `current_generation_run_id` pointers.
+## Deploy and migration order (current)
 
-### 022_agent_runs_run_id.sql
+Deploy both runtimes first, then validate behavior against canonical `0026` schema state. Do not replay legacy migration chains during this rollout.
 
-- Trigger condition: resume/recovery queries fail to scope batch history by run.
-- Failure detection: recovery path loads wrong batch outputs or resume target mismatch.
-- Rollback type: application rollback preferred; schema rollback optional if column/index creation caused runtime errors.
-- Data risk: null/incorrect `run_id` on new `agent_runs` rows during rollout window.
+## Rollback policy
 
-### 023_drop_legacy_project_generation_columns.sql
-
-- Trigger condition: any runtime query still references removed legacy project lifecycle columns.
-- Failure detection: SQL errors after migration (`no such column: generation_status`, etc.) or post-migration API failures.
-- Rollback type: app rollback plus forward-fix migration (do not mutate applied migration files).
-- Data risk: low for project facts, medium for release timing if post-`023` queries are not runtime-native.
+- Roll back code first (Pages and consumer together).
+- Do not edit applied migration files.
+- Use a forward-fix migration only if a **new** production schema defect appears.
+- Do not replay obsolete migration sequences as a rollback strategy.
 
 ## Automated preflight validation suite
 
 Run immediately before deployment:
 
-- `npm run lint`
 - `npm run build`
 - `npx tsc --noEmit`
 - `npx tsx scripts/phase6-runtime-bridge.assertions.ts`
@@ -60,114 +50,66 @@ Run immediately before deployment:
 - `npx tsx scripts/phase11-workspace-surfaces.assertions.ts`
 - `npx tsx scripts/phase12-research-thinking-verification.assertions.ts`
 - `npx tsx scripts/phase13-release-candidate.assertions.ts`
+- `npx tsx scripts/phase14d-canonical-rebuild.assertions.ts`
+- `npx tsx scripts/phase14e-reliability-hardening.assertions.ts`
+
+## Production smoke gate (release blockers)
+
+Record pass/fail and blocker notes for each:
+
+- start intake
+- confirm intake
+- verify generation starts
+- verify first live event arrives
+- verify first heartbeat arrives
+- verify no false "last runner signal" before heartbeat/event
+- verify Batch 2 no longer fails on undefined heartbeat binding
+- cancel generation, then resume generation
+- reopen dashboard and confirm runtime state remains coherent
+- verify settings model-role save/load
 
 ## RC checklist (critical flows)
 
-Record for each flow: pass/fail, environment, timestamp, blocker notes.
+- Google sign-in
+- new project intake
+- generation start and live transcript/activity
+- cancel/resume
+- dashboard re-entry coherence
+- settings model-role save/load
+
+## Manual release gates
 
 - Google sign-in
-- New project intake
-- Generation start
-- Live generation activity
-- Architecture review approve
-- Failed -> resume
-- Cancelled -> resume
-- Dashboard re-entry
-- Settings readiness recovery
-- Guided canvas navigation
-- Detail-panel execution flow
-
-Pass criteria: each flow completes without manual DB edits, route-reload hacks, or hidden recovery steps.
-
-## Immediate post-migration verification
-
-- Live app boots and authenticated navigation works.
-- `/api/projects/:id/status` returns canonical `generation_runtime`.
-- `/api/projects/:id/generation-stream` connects and emits canonical versioned envelope events.
-- Thinking replay returns bounded recent events only for active runs.
-- Post-`023`, no runtime reference to removed legacy project lifecycle columns appears in logs/errors.
-- Project screens load via `generation_runs` + `projects.current_generation_run_id`.
-
-Treat any SQL/runtime error after `023` as a release blocker.
-
-## Observability policy
-
-### Must log
-
-- `projectId`
-- `runId`
-- `batch`
-- `failureClass`
-- `eventType`
-
-### Never log
-
-- API keys, tokens, decrypted provider credentials
-- raw encrypted secret blobs
-- full user private input that is not required for diagnostics
-
-### Severity expectations
-
-- `warning`: degraded tool access, reconnect/replay hiccups, recoverable retries.
-- `error`: run failures, checkpoint corruption, lifecycle transition violations.
-- `fatal`: migration failure that blocks core flows or breaks runtime contract integrity.
-
-## Operator runbook
-
-### Identify failed migration
-
-1. Check migration execution logs and SQL error output.
-2. Confirm schema shape (`projects` has only `current_generation_run_id` for runtime linkage post-`023`).
-3. Validate `/api/projects/:id/status` and `/api/projects/:id/generation-stream` on production.
-
-### Identify stuck generation run
-
-1. Query `generation_runs` for stale `heartbeat_at` while status is non-terminal.
-2. Check recent `project_generation_events` for missing `batch_complete` progression.
-3. Resume from checkpoint and verify status transitions back to `queued`/`running`.
-
-### Identify degraded research tooling
-
-1. Inspect review payload `degraded_tools` and `partial_failures`.
-2. Check activity feed events for Context7/Brave/GitHub tool failures.
-3. Validate fallback path keeps user messaging honest and actionable.
-
-### Identify broken auth/setup paths
-
-1. Verify Google sign-in on `/login`.
-2. Verify settings load for AI providers, model roles, and research connectors.
-3. Confirm readiness model updates and next-actions render correctly.
-
-## Go/no-go criteria
-
-Go-live is allowed only if all are true:
-
-- local preflight validation suite passed
-- production D1 backup/export completed before migrations
-- production deploy completed (`deploy` + `deploy:consumer` or `deploy:all`)
-- production migrations succeeded in sequence (`021` -> `022` -> `023`)
-- immediate post-migration verification passed, including post-`023` checks
-- critical-flow bug-bash passed
-- no blocking mobile issues remain
-- no blocking large-project performance issue remains
-- no runtime reference to dropped legacy columns remains
-- operator runbook exists and is current
-- docs/status are reconciled with shipped behavior
-- short monitoring window completed with no release blockers
-
-If any item fails, production push is blocked (no-go).
+- new project intake
+- review/approval path (if reachable)
+- cancel/resume
+- mobile-width sanity on Dashboard, Project Generation, Project Canvas, Detail Panel, and Settings
+- one `100+` step benchmark
 
 ## Monitoring window (24-48 hours)
 
-Watch logs/runtime state for:
+Watch logs/runtime for:
 
-- migration errors or failed follow-up queries
-- non-terminal `generation_runs` with stale heartbeat
-- repeated `pipeline_failed` or lifecycle transition violations
-- repeated degraded research/tool failures across runs
+- repeated `pipeline_failed`
+- non-terminal runs without real heartbeat/events
+- protocol mismatch failures between Pages and consumer
+- `D1_ERROR` regressions from runtime/schema contract drift
 
 If a severe issue appears:
 
-1. Roll back app deploy first.
-2. Do not edit applied migration files.
-3. Use a forward-fix migration only for schema-level repair.
+1. Roll back app code first (paired runtimes).
+2. Preserve diagnostics and run IDs.
+3. Apply forward-fix migration only when schema-level repair is required.
+
+## Go/No-Go criteria
+
+Go-live is allowed only if all are true:
+
+- local preflight suite passed
+- production backup/export completed
+- paired deployment completed
+- production smoke gate passed
+- critical-flow and manual release gates passed (or documented non-blocking exceptions)
+- monitoring window starts with no release blockers
+
+If any blocker fails, release is no-go until fixed.

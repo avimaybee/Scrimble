@@ -50,6 +50,7 @@ import type {
   Project,
   ProjectGenerationEvent,
   ProjectGenerationCheckpointEvent,
+  ProjectGenerationInvariantEvent,
   ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
 } from '../types';
@@ -498,7 +499,7 @@ export default function ProjectGeneration() {
 
     setProject(projectData);
     applyStatusUpdate(statusData);
-    noteProgressTimestamp(statusData.generation_runtime?.heartbeatAt || projectData.updated_at);
+    noteProgressTimestamp(statusData.generation_runtime?.heartbeatAt);
 
     setShowResumeBadge(statusData.generation_runtime?.canResume === true && statusData.execution_stale);
 
@@ -724,6 +725,22 @@ export default function ProjectGeneration() {
             return next;
           });
         },
+        onInvariant: (event: ProjectGenerationInvariantEvent) => {
+          noteProgressTimestamp(event.timestamp);
+          const key = `${event.timestamp}-invariant-${event.drift_type}`;
+          if (activityKeysRef.current.has(key)) {
+            return;
+          }
+
+          activityKeysRef.current.add(key);
+          replaceCurrentActivity({
+            key,
+            kind: 'activity' as const,
+            icon: '⚠️',
+            message: `Runner invariant: ${event.message}`,
+            timestamp: event.timestamp,
+          });
+        },
         onCheckpoint: (event: ProjectGenerationCheckpointEvent) => {
           const currentStatus = statusRef.current;
           if (!currentStatus) {
@@ -875,7 +892,6 @@ export default function ProjectGeneration() {
   const latestProgressTimestamp = pickLatestTimestamp(
     lastProgressAt,
     status?.generation_runtime?.heartbeatAt,
-    project?.updated_at,
   );
   const quietDurationMs = latestProgressTimestamp
     ? Math.max(0, clockNow - (toTimestampMs(latestProgressTimestamp) || clockNow))

@@ -143,6 +143,7 @@ export type WorkflowBindingLike<TParams = unknown> = {
 };
 
 export type GenerationWorkflowPayload = {
+  protocolVersion: number;
   projectId: string;
   userId: string;
   runId: string;

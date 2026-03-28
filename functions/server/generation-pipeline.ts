@@ -2358,8 +2358,12 @@ async function getProjectById(env: Bindings, projectId: string) {
 async function maybeTouchGenerationHeartbeat(
   env: Bindings,
   projectId: string,
-  runId: string,
+  runId?: string | null,
 ) {
+  if (!runId) {
+    return;
+  }
+
   const lastTouchedAt = lastHeartbeatTouchByProject.get(projectId) || 0;
   if (Date.now() - lastTouchedAt < HEARTBEAT_TOUCH_INTERVAL_MS) {
     return;
@@ -3088,6 +3092,7 @@ async function callValidatedBatch<T>(
       await logActivity(options.env, {
         projectId: options.projectId,
         batchName: options.runType,
+        runId: options.runId,
         kind: 'system',
         message:
           attempt === 1
@@ -3107,6 +3112,7 @@ async function callValidatedBatch<T>(
       await logActivity(options.env, {
         projectId: options.projectId,
         batchName: options.runType,
+        runId: options.runId,
         kind: 'system',
         message: `Model response received for ${getBatchStartLabel(options.runType).toLowerCase()}. Validating and applying it now...`,
       });
@@ -3134,6 +3140,7 @@ async function callValidatedBatch<T>(
           await logActivity(options.env, {
             projectId: options.projectId,
             batchName: options.runType,
+            runId: options.runId,
             kind: 'warning',
             message: isReasoningOnly
               ? 'The model provided only thoughts but no data, so I am retrying with a direct JSON instruction.'
@@ -3171,6 +3178,7 @@ async function callValidatedBatch<T>(
         await logActivity(options.env, {
           projectId: options.projectId,
           batchName: options.runType,
+          runId: options.runId,
           kind: 'warning',
           message: `The first model reply had a schema error, so I'm asking for a correction.`,
         });
@@ -3588,6 +3596,7 @@ export async function executeBatch1(
   await logActivity(env, {
     projectId: project.id,
     batchName: 'batch_1_research_stack',
+    runId,
     kind: 'fetch',
     message: 'Scanning your brief for technologies, services, and infrastructure choices...',
   });
@@ -3632,6 +3641,7 @@ Identify the stack implied by the idea. For each technology, provide:
       await logActivity(env, {
         projectId: project.id,
         batchName: 'batch_1_research_stack',
+        runId,
         kind: 'system',
         message: `Focused the stack scan on the top ${technologies.length} implementation-critical technologies so research stays fast.`,
       });
@@ -3656,6 +3666,7 @@ Identify the stack implied by the idea. For each technology, provide:
     await logActivity(env, {
       projectId: project.id,
       batchName: 'batch_1_research_stack',
+      runId,
       kind: 'complete',
       message: `Stack candidates identified — ${enrichedBatch1.technologies.length} technologies queued for deeper research next.`,
     });
@@ -3742,6 +3753,7 @@ export async function executeBatch2(
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
+      runId,
       kind: 'warning',
       message,
     });
@@ -3751,6 +3763,7 @@ export async function executeBatch2(
   await logActivity(env, {
     projectId,
     batchName: 'batch_2_fetch_and_read',
+    runId,
     kind: 'fetch',
     message:
       briefResearchCount > 0
@@ -3762,6 +3775,7 @@ export async function executeBatch2(
   await logActivity(env, {
     projectId,
     batchName: 'batch_2_fetch_and_read',
+    runId,
     kind: 'system',
     message: `RAG retrieval mode enabled with ${deepProvider.model}: researching up to ${sourceTargetCount} technologies, using strict sequential fetches and one targeted search query per tool, and assembling prompts from retrieved chunks only.`,
   });
@@ -3770,6 +3784,7 @@ export async function executeBatch2(
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
+      runId,
       kind: 'system',
       message: `Resuming fetched-doc research at technology ${startIndex + 1} of ${researchTargets.length}.`,
     });
@@ -3780,6 +3795,7 @@ export async function executeBatch2(
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
+      runId,
       kind: 'fetch',
       message:
         technology.source === 'brief'
@@ -3805,6 +3821,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'system',
         message: `Approaching subrequest budget limit — saved checkpoint at technology ${index + 1} of ${researchTargets.length}. Resuming from the next workflow step...`,
       });
@@ -3903,6 +3920,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'fetch',
         message: `${humanDocToolLabel(docsResult.tool)}: read ${charCount} from ${technology.name} docs.`,
       });
@@ -3947,6 +3965,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'warning',
         message: `Could not read ${technology.name} documentation — continuing with the rest of the research.`,
       });
@@ -3956,6 +3975,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'warning',
         message: `${technology.name} did not include a valid GitHub repository URL — skipping repository analysis.`,
       });
@@ -3963,6 +3983,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'warning',
         message: `Could not inspect ${technology.name} on GitHub — continuing with the rest of the sources.`,
       });
@@ -3971,6 +3992,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'github',
         message: `${humanGithubToolLabel(githubResult.tool)}: read ${charCount} from ${githubRepository.owner}/${githubRepository.repo}.`,
       });
@@ -3980,6 +4002,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'fetch',
         message: `Read ${searchResults.length} web source${searchResults.length === 1 ? '' : 's'} for ${technology.name}.`,
       });
@@ -3987,6 +4010,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'warning',
         message: `No web changelog sources were found for ${technology.name} in this pass.`,
       });
@@ -4122,6 +4146,7 @@ export async function executeBatch2(
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
+        runId,
         kind: 'system',
         message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
       });
@@ -4135,6 +4160,7 @@ export async function executeBatch2(
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
+      runId,
       kind: 'warning',
       message: `Chunk store is large (${chunkStore.length.toLocaleString()} chunks). Retrieval will continue with top-ranked subsets.`,
     });
@@ -4183,6 +4209,7 @@ export async function executeBatch2(
   await logActivity(env, {
     projectId,
     batchName: 'batch_2_fetch_and_read',
+    runId,
     kind: 'system',
     message: `Retrieved ${retrievedSlice.chunkCount} chunks from ${retrievedSlice.totalChunks} total (estimated ${retrievedSlice.estimatedTokens.toLocaleString()} tokens) for batch 2 prompt assembly.`,
   });
@@ -4291,6 +4318,7 @@ Preserve specific version and compatibility details.`;
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
+      runId,
       kind: 'complete',
       message: `Stack research complete — ${finalOutput.research.length} technologies analysed across ${finalOutput.data_quality.urls_fetched} sources.`,
     });
@@ -4354,12 +4382,14 @@ export async function executeBatch3(
   await logActivity(env, {
     projectId,
     batchName: 'batch_3_architect',
+    runId,
     kind: 'architecture',
     message: 'Designing your data model...',
   });
   await logActivity(env, {
     projectId,
     batchName: 'batch_3_architect',
+    runId,
     kind: 'system',
     message: `Retrieved ${architectureResearchSlice.chunkCount} chunks from ${architectureResearchSlice.totalChunks} total (estimated ${architectureResearchSlice.estimatedTokens.toLocaleString()} tokens) for architecture prompt assembly.`,
   });
@@ -4426,6 +4456,7 @@ Base every single recommendation on the provided research corpus. If a technolog
       await logActivity(env, {
         projectId,
         batchName: 'batch_3_architect',
+        runId,
         kind: 'warning',
         message: `Found: ${gotcha.issue} — ${gotcha.mitigation}`,
       });
@@ -4433,6 +4464,7 @@ Base every single recommendation on the provided research corpus. If a technolog
     await logActivity(env, {
       projectId,
       batchName: 'batch_3_architect',
+      runId,
       kind: 'complete',
       message: `Architecture locked in — ${result.data.data_model.length} tables, ${result.data.integrations.length} integrations.`,
     });
@@ -4535,12 +4567,14 @@ export async function executeBatch4(
   await logActivity(env, {
     projectId,
     batchName: 'batch_4_plan_build',
+    runId,
     kind: 'architecture',
     message: 'Building your execution plan...',
   });
   await logActivity(env, {
     projectId,
     batchName: 'batch_4_plan_build',
+    runId,
     kind: 'system',
     message: `Retrieved ${planResearchSlice.chunkCount} chunks from ${planResearchSlice.totalChunks} total (estimated ${planResearchSlice.estimatedTokens.toLocaleString()} tokens) for plan prompt assembly.`,
   });
@@ -4616,6 +4650,7 @@ Rules:
     await logActivity(env, {
       projectId,
       batchName: 'batch_4_plan_build',
+      runId,
       kind: 'complete',
       message: `Plan ready — ${normalizedPlan.stages.length} stages, ${countPlanSteps(normalizedPlan)} steps.`,
     });
@@ -4692,6 +4727,7 @@ export async function executeBatch5(
   await logActivity(env, {
     projectId,
     batchName: 'batch_5_enrich_steps',
+    runId,
     kind: 'fetch',
     message: 'Refreshing every step with live docs, issues, and current implementation notes...',
   });
@@ -4700,6 +4736,7 @@ export async function executeBatch5(
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
+      runId,
       kind: 'system',
       message: `Resuming step research at step ${Math.min(startIndex + 1, planSteps.length)} of ${planSteps.length}.`,
     });
@@ -4713,6 +4750,7 @@ export async function executeBatch5(
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
+      runId,
       kind: 'fetch',
       message: `Refreshing ${step.title} with live docs and current implementation notes...`,
     });
@@ -4742,6 +4780,7 @@ export async function executeBatch5(
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
+      runId,
       kind: 'fetch',
       message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
     });
@@ -4763,6 +4802,7 @@ export async function executeBatch5(
       await logActivity(env, {
         projectId,
         batchName: 'batch_5_enrich_steps',
+        runId,
         kind: 'system',
         message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing from the latest checkpoint...`,
       });
@@ -4795,12 +4835,14 @@ export async function executeBatch5(
   await logActivity(env, {
     projectId,
     batchName: 'batch_5_enrich_steps',
+    runId,
     kind: 'writing',
     message: 'Writing step details for every part of the plan...',
   });
   await logActivity(env, {
     projectId,
     batchName: 'batch_5_enrich_steps',
+    runId,
     kind: 'system',
     message: `Retrieved ${stepResearchSlice.chunkCount} chunks from ${stepResearchSlice.totalChunks} total (estimated ${stepResearchSlice.estimatedTokens.toLocaleString()} tokens) for step enrichment prompt assembly.`,
   });
@@ -4882,6 +4924,7 @@ Populate navigation_links from the researched docs URLs so the user can click di
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
+      runId,
       kind: 'complete',
       message: `Step details complete — ${finalResult.enrichments.length} steps enriched.`,
     });
@@ -4942,6 +4985,7 @@ export async function executeBatch6(
   await logActivity(env, {
     projectId,
     batchName: 'batch_6_generate_files',
+    runId,
     kind: 'writing',
     message: 'Preparing your downloadable files...',
   });
@@ -5003,6 +5047,7 @@ export async function executeBatch6(
     await logActivity(env, {
       projectId,
       batchName: 'batch_6_generate_files',
+      runId,
       kind: 'complete',
       message: 'Project plan.md is ready for download.',
     });
@@ -5060,6 +5105,7 @@ export async function finalizeProjectGeneration(env: Bindings, projectId: string
   await logActivity(env, {
     projectId,
     batchName: 'batch_6_generate_files',
+    runId,
     kind: 'complete',
     message: 'Everything is ready — opening your canvas.',
   });

@@ -1203,7 +1203,7 @@ This phase is release-candidate hardening only: migration safety, validation, ob
 
 ### Phase 13 go/no-go required checks
 
-- [ ] staging migrations rehearsal completed in order (`021` -> `022` -> `023`)
+- [x] canonical schema reset path confirmed via `migrations/0026_full_canonical_rebuild.sql` (legacy `021 -> 023` replay is no longer the go-live contract)
 - [ ] full validation suite passed after migrated schema, including `scripts/phase13-release-candidate.assertions.ts`
 - [ ] critical-flow bug-bash checklist completed and all blockers resolved
 - [ ] mobile/narrow viewport QA completed with no blocking issues
@@ -1236,8 +1236,9 @@ This phase executes go-live directly on production (no separate staging stack), 
 - [ ] production D1 backup/export taken before migrations
 - [ ] production bindings verified (`DB`, `CHECKPOINT_BUCKET`, `WORKFLOW_SERVICE`, `GENERATION_WORKFLOW`, auth config)
 - [ ] production code deploy completed (`npm run deploy` + `npm run deploy:consumer`, or `npm run deploy:all`)
-- [ ] production migrations applied in order (`021` -> `022` -> `023`) with no reordering/batching
-- [ ] immediate post-migration verification passed (boot/auth/status/stream/post-`023` checks)
+- [x] canonical production schema aligned to `0026_full_canonical_rebuild.sql`
+- [ ] paired runtime deploy completed (`npm run deploy:all` or same-window `deploy` + `deploy:consumer`)
+- [ ] post-deploy behavior verification passed (first event + first heartbeat + no false liveness)
 - [ ] critical-flow production bug-bash completed with pass/fail notes
 - [ ] mobile-width sanity checks passed on Dashboard/Generation/Canvas/Detail/Settings
 - [ ] one `100+` step benchmark passed with no blocking freezes or severe lag

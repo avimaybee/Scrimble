@@ -13,6 +13,7 @@ const runtimeTs = readFileSync(path.join(repoRoot, 'functions', 'server', 'gener
 const pipelineTs = readFileSync(path.join(repoRoot, 'functions', 'server', 'generation-pipeline.ts'), 'utf8');
 const appTs = readFileSync(path.join(repoRoot, 'functions', 'server', 'app.ts'), 'utf8');
 const typesTs = readFileSync(path.join(repoRoot, 'functions', 'server', 'types.ts'), 'utf8');
+const projectGenerationTs = readFileSync(path.join(repoRoot, 'src', 'pages', 'ProjectGeneration.tsx'), 'utf8');
 
 function pass(label: string) {
   console.log(`PASS ${label}`);
@@ -108,6 +109,45 @@ function assertPipelineWritesRunScopedAgentRows() {
   pass('pipeline persists run_id on agent_runs rows');
 }
 
+function assertPipelineHeartbeatGuardsMissingRunId() {
+  const maybeHeartbeatMatch = pipelineTs.match(
+    /async function maybeTouchGenerationHeartbeat\([^]*?async function insertAgentRun/,
+  );
+  assert(maybeHeartbeatMatch, 'generation-pipeline.ts must define maybeTouchGenerationHeartbeat.');
+  const maybeHeartbeatBlock = maybeHeartbeatMatch?.[0] || '';
+  assert(
+    /runId\?:\s*string\s*\|\s*null/.test(maybeHeartbeatBlock),
+    'maybeTouchGenerationHeartbeat must accept optional runId.',
+  );
+  assert(
+    /if\s*\(!runId\)\s*\{\s*return;\s*\}/.test(maybeHeartbeatBlock),
+    'maybeTouchGenerationHeartbeat must return early when runId is missing.',
+  );
+  assert(
+    /await touchGenerationRunHeartbeat\(env,\s*runId\)/.test(maybeHeartbeatBlock),
+    'maybeTouchGenerationHeartbeat must only touch heartbeat with a guarded runId.',
+  );
+
+  assert(
+    /await maybeTouchGenerationHeartbeat\(env,\s*payload\.projectId,\s*payload\.runId\)/.test(pipelineTs),
+    'logActivity must forward optional payload.runId into maybeTouchGenerationHeartbeat.',
+  );
+
+  const batch2Match = pipelineTs.match(/export async function executeBatch2\([^]*?export async function executeBatch3/);
+  assert(batch2Match, 'generation-pipeline.ts must define executeBatch2.');
+  const batch2Block = batch2Match?.[0] || '';
+  const batch2LogCalls = [...batch2Block.matchAll(/await logActivity\(\s*env,\s*\{([^]*?)\}\s*\);/g)];
+  assert(batch2LogCalls.length > 0, 'executeBatch2 must emit activity logs.');
+  for (const [index, call] of batch2LogCalls.entries()) {
+    assert(
+      /\brunId\b/.test(call[1]),
+      `executeBatch2 logActivity call #${index + 1} must include runId for heartbeat safety.`,
+    );
+  }
+
+  pass('pipeline heartbeat guard prevents undefined runId bindings');
+}
+
 function assertRuntimeReadPathsUseCanonicalPointer() {
   assert(
     /LEFT JOIN generation_runs gr ON gr\.id = p\.current_generation_run_id/i.test(runtimeTs),
@@ -169,6 +209,30 @@ function assertProjectsRunPointerIsCanonical() {
   pass('projects table keeps only canonical run pointer');
 }
 
+function assertHeartbeatOptionalHelperPatternsAreGuarded() {
+  assert(
+    !/touchGenerationRunHeartbeat\(env,\s*payload\.runId\)/.test(pipelineTs),
+    'No helper should call touchGenerationRunHeartbeat with optional payload.runId directly.',
+  );
+  assert(
+    !/touchGenerationRunHeartbeat\(env,\s*optionalText\(/.test(pipelineTs),
+    'No helper should pass optionalText(...) directly into touchGenerationRunHeartbeat.',
+  );
+  assert(
+    /async function maybeTouchGenerationHeartbeat\([^]*?if\s*\(!runId\)\s*\{\s*return;\s*\}/.test(pipelineTs),
+    'Heartbeat helper must keep explicit guard before touching heartbeat.',
+  );
+  pass('optional heartbeat helper patterns are guarded');
+}
+
+function assertGenerationScreenNoFakeLivenessFallback() {
+  assert(
+    !/noteProgressTimestamp\(statusData\.generation_runtime\?\.heartbeatAt \|\| projectData\.updated_at\)/.test(projectGenerationTs),
+    'Generation page must not use project.updated_at as runner liveness fallback.',
+  );
+  pass('generation page avoids fake liveness fallback');
+}
+
 function run() {
   console.log('Starting Phase 14D Canonical Rebuild Assertions...');
   assertMigrationDropsAndRecreatesEverything();
@@ -177,11 +241,14 @@ function run() {
   assertAgentRunsHasRunId();
   assertRuntimeSqlUsesLifecycleStatus();
   assertPipelineWritesRunScopedAgentRows();
+  assertPipelineHeartbeatGuardsMissingRunId();
   assertRuntimeReadPathsUseCanonicalPointer();
   assertProfileBootstrapAndModelRolesUseCanonicalColumns();
   assertCoreFlowsTargetCanonicalTables();
   assertNoLegacyCompatColumns();
   assertProjectsRunPointerIsCanonical();
+  assertHeartbeatOptionalHelperPatternsAreGuarded();
+  assertGenerationScreenNoFakeLivenessFallback();
   console.log('✅ ALL Phase 14D assertions passed.');
 }
 

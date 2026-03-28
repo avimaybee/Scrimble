@@ -13,6 +13,7 @@ import {
   ProjectGenerationBatchStartEvent,
   ProjectGenerationCheckpointEvent,
   ProjectGenerationEvent,
+  ProjectGenerationInvariantEvent,
   ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
   ProjectIntakeSession,
@@ -119,6 +120,7 @@ interface StreamProjectGenerationOptions {
   onBatchStart?: (event: ProjectGenerationBatchStartEvent) => void;
   onActivity?: (event: ProjectGenerationActivity) => void;
   onThinking?: (event: ProjectGenerationThinking) => void;
+  onInvariant?: (event: ProjectGenerationInvariantEvent) => void;
   onBatchCompleted?: (event: ProjectGenerationEvent) => void;
   onCheckpoint?: (event: ProjectGenerationCheckpointEvent) => void;
   onComplete?: () => void;
@@ -151,6 +153,7 @@ type ParsedGenerationStreamEvent =
   | { kind: 'thinking'; event: ProjectGenerationThinking }
   | { kind: 'batch_complete'; event: ProjectGenerationEvent }
   | { kind: 'checkpoint'; event: ProjectGenerationCheckpointEvent }
+  | { kind: 'invariant'; event: ProjectGenerationInvariantEvent }
   | { kind: 'pipeline_complete' }
   | { kind: 'pipeline_failed'; message: string }
   | { kind: 'ignored' };
@@ -284,6 +287,22 @@ function parseGenerationStreamEvent(payload: unknown): ParsedGenerationStreamEve
           run_id: typeof eventPayload.run_id === 'string' ? eventPayload.run_id : undefined,
         },
       };
+    case 'invariant': {
+      const driftType = typeof eventPayload.drift_type === 'string' ? eventPayload.drift_type : '';
+      const message = typeof eventPayload.message === 'string' ? eventPayload.message : '';
+      if (!driftType || !message) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'invariant',
+        event: {
+          drift_type: driftType,
+          message,
+          timestamp: typeof eventPayload.timestamp === 'string' ? eventPayload.timestamp : envelope.timestamp,
+        },
+      };
+    }
     case 'pipeline_complete':
       return { kind: 'pipeline_complete' };
     case 'pipeline_failed':
@@ -653,6 +672,9 @@ export const dbService = {
                 return;
               case 'checkpoint':
                 options.onCheckpoint?.(parsed.event);
+                return;
+              case 'invariant':
+                options.onInvariant?.(parsed.event);
                 return;
               case 'pipeline_complete':
                 reachedTerminalEvent = true;

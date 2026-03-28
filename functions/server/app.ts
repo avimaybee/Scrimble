@@ -27,6 +27,7 @@ import {
 
 import {
   getGenerationRuntimeState,
+  clearCurrentGenerationRun,
   createGenerationRun,
   updateGenerationRunStatus,
   mapProjectRowToResponse,
@@ -215,9 +216,16 @@ function jsonError(message: string, status: number, details?: unknown) {
 
 function generationWorkflowConfigurationError(c: AppContext) {
   return c.json({
-    error: 'Project generation workflow is not configured.',
-    envKeys: Object.keys(c.env || {}),
-  }, 500);
+    error: 'Project generation is temporarily unavailable. WORKFLOW_SERVICE is not configured. Deploy Pages and scrimble-consumer together.',
+  }, 503);
+}
+
+function requireWorkflowServiceBinding(c: AppContext) {
+  if (!c.env.WORKFLOW_SERVICE) {
+    return generationWorkflowConfigurationError(c);
+  }
+
+  return null;
 }
 
 function getAIErrorMessage(status: number, fallback: string) {
@@ -1244,8 +1252,9 @@ app.post('/intake/:id/confirm', async (c) => {
     return c.json({ error: 'This project has already moved past intake.' }, 409);
   }
 
-  if (!c.env.WORKFLOW_SERVICE) {
-    return generationWorkflowConfigurationError(c);
+  const workflowServiceError = requireWorkflowServiceBinding(c);
+  if (workflowServiceError) {
+    return workflowServiceError;
   }
 
   const parsed = intakeConfirmSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1302,10 +1311,13 @@ app.post('/intake/:id/confirm', async (c) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
-    
-    // Use updateGenerationRunStatus for cleanup
-    await updateGenerationRunStatus(c.env, runId, 'intake', { errorMessage: message });
-    
+
+    await updateGenerationRunStatus(c.env, runId, 'failed', {
+      errorMessage: `orchestration_dispatch_failed: ${message}`,
+      providerId: providerContext.providerId || null,
+    });
+    await clearCurrentGenerationRun(c.env, projectId);
+
     return c.json({ error: 'Failed to start project generation.' }, 503);
   }
 
@@ -1342,8 +1354,9 @@ app.post('/projects', async (c) => {
     return c.json({ error: 'A project description is required.', details: parsed.error.format() }, 400);
   }
 
-  if (!c.env.WORKFLOW_SERVICE) {
-    return generationWorkflowConfigurationError(c);
+  const workflowServiceError = requireWorkflowServiceBinding(c);
+  if (workflowServiceError) {
+    return workflowServiceError;
   }
 
   const providerRecord = await resolveProvider(c, parsed.data.providerId);
@@ -1488,8 +1501,9 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
   }
   const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  if (!c.env.WORKFLOW_SERVICE) {
-    return generationWorkflowConfigurationError(c);
+  const workflowServiceError = requireWorkflowServiceBinding(c);
+  if (workflowServiceError) {
+    return workflowServiceError;
   }
 
   const parsed = architectureReviewApprovalSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -1593,8 +1607,9 @@ app.post('/projects/:id/resume', async (c) => {
   }
   const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  if (!c.env.WORKFLOW_SERVICE) {
-    return generationWorkflowConfigurationError(c);
+  const workflowServiceError = requireWorkflowServiceBinding(c);
+  if (workflowServiceError) {
+    return workflowServiceError;
   }
 
   if (lifecycleStatus === 'complete') {
@@ -1681,8 +1696,9 @@ app.post('/projects/:id/nudge', async (c) => {
   }
   const { generationRuntime, lifecycleStatus } = projectRuntime;
 
-  if (!c.env.WORKFLOW_SERVICE) {
-    return generationWorkflowConfigurationError(c);
+  const workflowServiceError = requireWorkflowServiceBinding(c);
+  if (workflowServiceError) {
+    return workflowServiceError;
   }
 
   if (lifecycleStatus === 'complete') {

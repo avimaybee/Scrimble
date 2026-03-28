@@ -394,6 +394,12 @@ export interface ProjectGenerationCheckpointEvent {
   run_id?: string;
 }
 
+export interface ProjectGenerationInvariantEvent {
+  drift_type: string;
+  message: string;
+  timestamp: string;
+}
+
 export type GenerationStreamEventType =
   | 'batch_start'
   | 'activity'

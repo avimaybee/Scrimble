@@ -6,6 +6,7 @@ import type {
   ResolvedGenerationProviderConfig,
   WorkflowApprovalPayload,
 } from './types';
+import { GENERATION_WORKFLOW_PROTOCOL_VERSION } from './workflow-protocol';
 
 export type GenerationDispatchKind =
   | 'intake_confirm'
@@ -292,6 +293,7 @@ async function buildWorkflowPayload(
   const project = await loadProjectDispatchContext(env, payload.projectId, payload.userId);
   const providers = await resolveProvidersForWorkflow(env, payload.userId, payload.providerId);
   return {
+    protocolVersion: GENERATION_WORKFLOW_PROTOCOL_VERSION,
     projectId: payload.projectId,
     userId: payload.userId,
     runId: payload.runId,

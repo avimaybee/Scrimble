@@ -1684,7 +1684,7 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
   - **Provider Pinning & Retrieval Assembly**: The workflow enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now assembles provider prompts from retrieved chunk subsets so large research corpora remain stable without prompt-budget overflow failures.
   - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
 - **Query Hygiene + Scope Guardrails**: Research-layer search queries are now sanitized, short (≤8 words), and category-based (`setup` / `errors` / `changelog` with year), with no raw project-description interpolation. Batch 2 additionally excludes workspace profile IDE/AI tools from documentation fetch targets.
-- **Migration History**: Runtime-schema migrations through `023_drop_legacy_project_generation_columns.sql` are now part of release-candidate validation and go-live gating.
+- **Canonical Schema Contract**: Production/runtime schema truth is now `migrations/0026_full_canonical_rebuild.sql`; release gating verifies behavior and contract integrity against that canonical state.
 - Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
 - **SSE Streaming Overhaul**: Durable generation events are persisted in D1 and replayed via polling; `thinking` events now use the same canonical envelope, persist in a bounded rolling window, replay for active runs only, and are cleared from live replay on terminal outcomes.
 - **Connection Safety**: Implemented strict stream lifecycle management; `writer.close()` is now guaranteed on all terminal pipeline events and server-side cleanups.
@@ -1733,19 +1733,20 @@ The Phase 12 verification pass re-scored shipped behavior against `docs/the-visi
 
 ### 17.6 Release Candidate Gate Snapshot (Phase 13)
 
-- Added release-candidate runbook: `docs/release-candidate-go-live.md` with migration order, deploy order, rollback playbook, RC checklist, observability policy, and go/no-go criteria.
-- Added post-`023` schema safety checks: `scripts/phase13-release-candidate.assertions.ts`.
+- Added release-candidate runbook: `docs/release-candidate-go-live.md` with paired deploy order (Pages + consumer), rollback policy, smoke gates, and go/no-go criteria aligned to canonical `0026`.
+- Added schema/runtime safety assertions: `scripts/phase13-release-candidate.assertions.ts` plus Phase 14D/14E reliability guards.
 - Standardized user-facing error copy on Auth, Dashboard, New Project, and Project Generation via `src/lib/ui-copy.ts`.
-- Confirmed canonical runtime ownership remains `generation_runs` + `projects.current_generation_run_id` (no project-level legacy lifecycle columns after `023`).
+- Confirmed canonical runtime ownership remains `generation_runs` + `projects.current_generation_run_id` under the `0026` canonical rebuild contract.
 
 ---
 
 ### 18. Remaining Work
 
-**Release blockers only (Phase 13 scope freeze):**
-- Staging migration rehearsal and bug-bash signoff.
+**Release closeout blockers (Phase 14F):**
+- Paired runtime deploy validation (Pages + `worker-consumer`) with first event + first heartbeat confirmation.
 - Mobile/narrow viewport verification for Dashboard, Generation, Canvas, Detail Panel, and Settings.
 - Large-project performance benchmark (`100+` steps) and measured bottleneck fixes if needed.
+- Monitoring window checks for `pipeline_failed`, protocol mismatch, stale heartbeat-less runs, and D1 contract regressions.
 
 ---
 

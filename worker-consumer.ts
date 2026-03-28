@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { GenerationWorkflow } from './functions/server/generation-workflow';
 import { WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED } from './functions/server/generation-dispatch';
+import { assertWorkflowProtocolVersion } from './functions/server/workflow-protocol';
 import type {
   Bindings,
   GenerationWorkflowPayload,
@@ -24,6 +25,7 @@ export class ProjectGeneratorDO {
 
 export default class WorkflowService extends WorkerEntrypoint<Bindings> {
   async createGeneration(payload: GenerationWorkflowPayload): Promise<{ instanceId: string }> {
+    assertWorkflowProtocolVersion(payload.protocolVersion);
     const instance = await this.env.GENERATION_WORKFLOW.create({
       id: payload.runId,
       params: payload,

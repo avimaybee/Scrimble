@@ -63,6 +63,7 @@ const WORKFLOW_BATCH2_CHECKPOINT_INTERVAL = 1;
 const WORKFLOW_BATCH5_CHECKPOINT_INTERVAL = 5;
 
 type GenerationPayload = {
+  protocolVersion: number;
   projectId: string;
   userId: string;
   runId: string;
