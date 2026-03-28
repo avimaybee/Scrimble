@@ -2372,6 +2372,7 @@ async function insertAgentRun(
   env: Bindings,
   payload: {
     projectId: string;
+    runId?: string | null;
     runType: GenerationBatchName;
     status: 'complete' | 'failed';
     input?: string | null;
@@ -2393,12 +2394,13 @@ async function insertAgentRun(
 
   await env.DB.prepare(`
     INSERT INTO agent_runs (
-      id, project_id, run_type, status, input, output, output_r2_key, provider, model, sequence_index, attempt_count, completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"))
+      id, project_id, run_id, run_type, status, input, output, output_r2_key, provider, model, sequence_index, attempt_count, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"))
   `)
     .bind(
       id,
       payload.projectId,
+      payload.runId || null,
       payload.runType,
       payload.status,
       payload.input || null,
@@ -3202,6 +3204,7 @@ async function failBatch(
   
   await insertAgentRun(env, {
     projectId,
+    runId,
     runType,
     status: 'failed',
     input: serializeJson(input),
@@ -3249,6 +3252,7 @@ async function completeBatch<T>(
 ) {
   await insertAgentRun(env, {
     projectId,
+    runId,
     runType,
     status: 'complete',
     input: serializeJson(input),

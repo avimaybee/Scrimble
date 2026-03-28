@@ -271,9 +271,9 @@ export async function createGenerationRun(
   await env.DB.batch([
     env.DB.prepare(`
       INSERT INTO generation_runs (
-        id, project_id, status, provider_id, heartbeat_at, started_at, created_at, updated_at
-      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
-    `).bind(runId, projectId, providerId, now, now, now, now),
+        id, project_id, run_id, lifecycle_status, provider_id, heartbeat_at, started_at, created_at, updated_at
+      ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+    `).bind(runId, projectId, runId, providerId, now, now, now, now),
     env.DB.prepare(`
       UPDATE projects
       SET current_generation_run_id = ?,
@@ -315,7 +315,7 @@ export async function updateGenerationRunStatus(
 
   const result = await env.DB.prepare(`
     UPDATE generation_runs
-    SET status = ?,
+    SET lifecycle_status = ?,
         current_batch = ?,
         error_message = COALESCE(?, error_message),
         workflow_instance_id = COALESCE(?, workflow_instance_id),

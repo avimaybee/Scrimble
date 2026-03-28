@@ -832,10 +832,16 @@ CREATE TABLE IF NOT EXISTS checklist_items (
 CREATE TABLE IF NOT EXISTS generation_runs (
   id                    TEXT PRIMARY KEY,
   project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id                TEXT NOT NULL UNIQUE, -- Stable logical run identifier
   workflow_instance_id  TEXT,                 -- Cloudflare Workflow ID
-  status                TEXT NOT NULL,        -- 'queued'|'running'|'awaiting_review'|'approved'|'complete'|'failed'|'cancelled'
+  lifecycle_status      TEXT NOT NULL DEFAULT 'queued', -- canonical lifecycle field
   current_batch         TEXT,                 -- 'batch_1_research_stack' | ...
+  is_terminal           INTEGER NOT NULL DEFAULT 0,
+  can_resume            INTEGER NOT NULL DEFAULT 0,
+  is_review_required    INTEGER NOT NULL DEFAULT 0,
   provider_id           TEXT,                 -- Resolved AI provider for the run
+  completed_batches     TEXT DEFAULT '[]',
+  failure_class         TEXT,
   error_message         TEXT,                 -- Last seen error message
   heartbeat_at          TEXT,                 -- ISO timestamp of last worker activity
   started_at            TEXT DEFAULT (datetime('now')),
@@ -850,7 +856,7 @@ CREATE TABLE IF NOT EXISTS generation_runs (
 CREATE TABLE IF NOT EXISTS agent_runs (
   id              TEXT PRIMARY KEY,
   project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  run_id          TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
+  run_id          TEXT,           -- logical generation run identifier
   step_id         TEXT REFERENCES steps(id),
   run_type        TEXT NOT NULL,  -- 'generate_plan' | 'enrich_step' | 'update_plan' | 'review_gate'
   status          TEXT DEFAULT 'running', -- 'running' | 'waiting_review' | 'complete' | 'failed'
@@ -866,23 +872,11 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 -- GENERATION EVENTS (Durable stream history)
 -- ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS project_generation_events (
-  id              TEXT PRIMARY KEY,
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  run_id          TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
   event_type      TEXT NOT NULL,  -- 'batch_start' | 'activity' | 'batch_complete' | ...
+  batch_name      TEXT,
   payload         TEXT,           -- JSON: event data
-  created_at      TEXT DEFAULT (datetime('now'))
-);
-
--- ────────────────────────────────────────────
--- INVARIANT VIOLATIONS (Audit of state drift)
--- ────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS project_invariant_violations (
-  id              TEXT PRIMARY KEY,
-  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  run_id          TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
-  drift_type      TEXT NOT NULL,  -- 'state_drift' | 'type_mismatch'
-  message         TEXT NOT NULL,
   created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -893,11 +887,12 @@ CREATE INDEX IF NOT EXISTS idx_projects_user      ON projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_workflows_project  ON workflows(project_id);
 CREATE INDEX IF NOT EXISTS idx_stages_workflow    ON stages(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_steps_workflow     ON steps(workflow_id);
-CREATE INDEX IF NOT EXISTS idx_steps_stage        ON stages(id);
+CREATE INDEX IF NOT EXISTS idx_steps_stage        ON steps(stage_id);
 CREATE INDEX IF NOT EXISTS idx_checklist_step     ON checklist_items(step_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_user   ON mcp_servers(user_id);
-CREATE INDEX IF NOT EXISTS idx_gen_runs_project    ON generation_runs(project_id);
-CREATE INDEX IF NOT EXISTS idx_gen_events_project  ON project_generation_events(project_id);
+CREATE INDEX IF NOT EXISTS idx_gen_runs_project    ON generation_runs(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gen_runs_lifecycle  ON generation_runs(lifecycle_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gen_events_project  ON project_generation_events(project_id, id);
 ```
 
 ```text
@@ -1019,7 +1014,7 @@ The pipeline is designed for resilience. If a project hits a "snag", it is categ
    - `orchestration`: Terminals if infra limits hit.
    - `content_business_logic`: Terminal, requires user intervention or resume.
 3. **Backend Support**: The `/api/projects/:id/resume` endpoint re-dispatches failed projects, picking up from the last incomplete batch through the active workflow.
-4. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints use compare-and-set statements against the `generation_runs` status.
+4. **Guarded transitions**: The intake confirm, architecture approval, resume, and nudge endpoints use compare-and-set statements against `generation_runs.lifecycle_status`.
 5. **Manual Stop / Kill Switch**: `POST /api/projects/:id/cancel` marks the run `cancelled` and terminates the active workflow instance. Checkpoints remain intact for later resumption.
 
 
@@ -1131,7 +1126,7 @@ interface AIProvider {
 2. Dispatches a single BYOK AI call (streaming reasoning tokens into canonical `thinking` events).
 3. Validates the JSON response with Zod and retries once if validation fails.
 4. Writes results back into `agent_runs` and persists large payloads to R2 so checkpoints stay lightweight.
-5. Touches `generation_runs.status` (and `current_batch`) as soon as the batch starts so status polling stays truthful.
+5. Touches `generation_runs.lifecycle_status` (and `current_batch`) as soon as the batch starts so status polling stays truthful.
 6. Emits a durable SSE event (`batch_start`, `activity`, `batch_complete`, etc.) so `/api/projects/:id/generation-stream` can replay history + stream real-time deltas.
 
 The workflow keeps running even if all tabs are closed: it stores checkpoints in D1, persists large payloads to R2, and resumes deterministically with step-level retries/timeouts. Generation is workflow-only, with `WORKFLOW_SERVICE` as the single dispatch path from Pages Functions.
@@ -1189,7 +1184,7 @@ Certain steps are **gates** (`is_gate = 1`). At a gate:
 7. User can: **Approve** (agent continues) / **Edit** (modify AI output, then approve) / **Reject** (agent retries with feedback)
 8. On approval: step status → `complete`, downstream steps unlock, agent continues
 
-After `batch_3_architect` finishes, the pipeline halts automatically. The project’s canonical `generation_runs.status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The next leg (`batch_4_plan_build`) is dispatched only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
+After `batch_3_architect` finishes, the pipeline halts automatically. The project’s canonical `generation_runs.lifecycle_status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The next leg (`batch_4_plan_build`) is dispatched only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
 
 **Gate review API:**
 ```typescript

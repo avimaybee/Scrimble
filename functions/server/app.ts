@@ -1917,6 +1917,10 @@ app.delete('/projects/:id', async (c) => {
   // Delete everything related to this project.
   // Using CASCADE would be ideal, but we'll do explicit deletes for safety.
   await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM generation_dispatches WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM project_files WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM generation_checkpoints WHERE project_id = ?').bind(projectId),
+    c.env.DB.prepare('DELETE FROM generation_runs WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM project_generation_events WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM project_intake_messages WHERE project_id = ?').bind(projectId),
     c.env.DB.prepare('DELETE FROM project_briefs WHERE project_id = ?').bind(projectId),
