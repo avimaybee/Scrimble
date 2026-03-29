@@ -1087,15 +1087,15 @@ Acceptance:
 
 This layer lets the user take the canonical PRD out of Scrimble in a clean, portable format.
 
-### H1. Add a markdown download for the canonical PRD
+### [x] H1. Add a markdown download for the canonical PRD
 
 Depends on: A3, C1, C5, D3
 
 Unlocks: none
 
-Problem:
-- The app can show the canonical PRD in the UI, but it does not yet give the user a simple way to download that artifact as markdown.
-- If the plan is the source of truth, the user should be able to export it without rebuilding it from a stale screen copy.
+Status:
+- Completed in Phase 15.
+- Export now uses the canonical authored-plan serializer path (`/projects/:id/skill-files` + `downloadSkillFiles`) and no longer depends on frontend-assembled markdown.
 
 Work:
 - Add a download action on the generation or plan surface.
@@ -1113,6 +1113,91 @@ Relevant areas:
 - `functions/server/generation-pipeline.ts`
 - `functions/server/app.ts`
 
+## 9. Vision Gap Audit And Workflow Productization
+
+This layer closes the gap between the shipped product and the actual Scrimble vision.
+
+Depends on: F4, H1
+
+Unlocks: a workflow UI and exported plan that feel specific, coherent, and worth returning to.
+
+### I1. Audit current product shape against the vision
+
+Problem:
+- The current workflow can run, but it still feels barebones, generic, and closer to a tool editor than a builder companion.
+- The exported `plan.md` can drift into template-like or unrelated content instead of reflecting the actual project.
+- Small layout problems, like cut-off actions, compound into a product that feels unfinished.
+
+Work:
+- Compare the shipped workflow against `docs/the-vision.md`, the current project screens, and the exported plan artifact.
+- Classify every gap as one of:
+  - UX/layout
+  - content/plan quality
+  - workflow guidance
+  - export/download behavior
+  - research grounding
+- Produce a severity-ranked gap list so the next implementation pass can be ordered by impact instead of by whatever is easiest to touch.
+
+Acceptance:
+- There is one prioritized gap matrix with clear fix order and no vague “clean it up later” buckets.
+- The audit explicitly identifies what is wrong with the product feel, not just what is technically passing.
+
+### I2. Make the final workflow feel like GPS, not an editor
+
+Problem:
+- The primary workflow surfaces still read like a generic plan editor.
+- Important controls can sit below the fold or become effectively unreachable.
+- The UI does not yet deliver the “where am I, what is next, what is blocked” experience from the vision.
+
+Work:
+- Rework the canvas and step details so the default path is guided and readable.
+- Keep the current step, blocked reason, and next action always visible.
+- Move editing, mutation, and advanced controls behind explicit advanced mode or a secondary path.
+- Make primary actions remain visible and clickable at normal desktop and mobile widths.
+
+Acceptance:
+- The default workflow surface feels like a map with a next action, not like an admin panel.
+- No primary action is cut off or hidden behind scroll in the normal layout.
+- The UI communicates the current step and path forward in under a few seconds.
+
+### I3. Ground `plan.md` in the real project
+
+Problem:
+- The downloaded plan artifact is too generic and does not read like a Scrimble-specific build brief.
+- The plan output needs to be tied to the project brief, workspace profile, research results, and the vision, not a template scaffold.
+
+Work:
+- Tighten the plan generation and markdown serialization so the exported artifact reflects:
+  - the real project problem
+  - the chosen stack and workspace profile
+  - research-backed decisions
+  - the staged build plan
+  - explicit done criteria
+- Reject generic or unrelated plan output instead of exporting it as if it were valid.
+- Keep the export tied to the same canonical authored record used in the live plan view.
+
+Acceptance:
+- The downloaded `plan.md` is clearly about Scrimble, not a generic starter app.
+- The exported markdown matches the canonical authored record and current research-backed plan.
+- The output has enough specificity to feel like a real build map rather than boilerplate PRD text.
+
+### I4. Add regression guards for product feel
+
+Problem:
+- The current issues are the kind that come back quietly: clipped controls, generic plan output, and UI that technically works but feels wrong.
+
+Work:
+- Add tests or assertions for:
+  - export button visibility/clickability in normal desktop widths
+  - sidebar/footer actions staying reachable
+  - markdown export content staying project-specific
+  - rejection of obviously generic/template plan output
+- Keep these checks lightweight but strict enough to stop a regression before another push.
+
+Acceptance:
+- The next audit or implementation pass can catch these product-shape regressions locally.
+- Generic plan output and unreachable primary actions fail fast instead of slipping through.
+
 ---
 
 ## Suggested Execution Order
@@ -1127,8 +1212,8 @@ If this needs to be done in a strict sequence, use this order:
 6. D4, D5, D6, D7
 7. E1, E2, E3, E4
 8. F1, F2, F3, F4
-9. G1, G2, G3, G4
-10. H1
+9. I1, I2, I3, I4
+10. G1, G2, G3, G4
 
 If the team wants some parallelization, the safe split is:
 

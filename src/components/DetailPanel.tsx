@@ -152,6 +152,13 @@ export default function DetailPanel({
   const parsedFooterMeta: StepResearchFooterMeta | null = parsedStepContent.researchFooterMeta;
   const primaryPrompt = parsedStepContent.prompts[0] || null;
   const primaryTool = parsedStepContent.suggestedTools[0] || null;
+  const nextStageSteps = useMemo(
+    () =>
+      project?.generation_runtime?.completedBatches?.length
+        ? `${project.generation_runtime.completedBatches.length} generation batch${project.generation_runtime.completedBatches.length === 1 ? '' : 'es'} completed so far.`
+        : 'Completing this step unlocks the next path in your workflow map.',
+    [project?.generation_runtime?.completedBatches],
+  );
 
   const { body: aiOutputBody, footer: legacyFooter } = useMemo(
     () => extractLegacyResearchFooter(step?.ai_output),
@@ -381,7 +388,7 @@ Use markdown with short bullets when useful. Keep advice specific to the project
 
                 <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
                   <div className="rounded-[12px] border border-border-default bg-bg-elevated/35 p-4">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Execution guide</div>
+                    <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Action brief</div>
                     <div className="mt-3 space-y-3 text-[13px] leading-relaxed text-text-secondary">
                       <div>
                         <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Tool</div>
@@ -405,14 +412,18 @@ Use markdown with short bullets when useful. Keep advice specific to the project
                         <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">Done when</div>
                         <div className="mt-1 text-text-primary">{step.done_when || 'You can verify the expected output and safely continue.'}</div>
                       </div>
+                      <div>
+                        <div className="text-[11px] font-bold uppercase tracking-wider text-text-muted">What this unlocks</div>
+                        <div className="mt-1 text-text-primary">{nextStageSteps}</div>
+                      </div>
                     </div>
                   </div>
 
-                  {step.objective && (
-                    <div className="text-[14px] leading-relaxed text-text-secondary">
-                      {step.objective}
+                  {researchQualityBadge?.label === 'Limited' || researchQualityBadge?.label === 'Degraded' ? (
+                    <div className="rounded-[10px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-text-secondary">
+                      Research confidence is limited for this step. Double-check destination links and provider docs before committing irreversible changes.
                     </div>
-                  )}
+                  ) : null}
 
                   <div className="rounded-[12px] bg-[#121212] border border-border-subtle p-5 relative overflow-hidden">
                     <div className="flex items-center gap-1.5 mb-3">

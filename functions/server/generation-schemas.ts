@@ -141,10 +141,94 @@ const researchSourceSchema = z.preprocess(
 const researchChunkSchema = z.preprocess(
   (value) => normalizeObject(value, () => ({})),
   z.object({
+    id: createOptionalTextSchema(''),
+    source_id: createOptionalTextSchema(''),
     content: createRequiredTextSchema(''),
     source: createRequiredTextSchema(''),
+    source_title: createOptionalTextSchema(''),
+    source_type: createOptionalTextSchema('unknown'),
     tool: createRequiredTextSchema('unknown'),
     technology: createRequiredTextSchema('Unknown technology'),
+    rank_score: createNumberSchema(0),
+    start_offset: createNonNegativeIntSchema(0),
+    end_offset: createNonNegativeIntSchema(0),
+  }),
+);
+
+const sourceCandidateSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    id: createRequiredTextSchema('candidate'),
+    technology: createRequiredTextSchema('Unknown technology'),
+    source_type: createRequiredTextSchema('community_page'),
+    tool: createOptionalTextSchema(''),
+    url: createOptionalTextSchema(''),
+    title: createOptionalTextSchema(''),
+    summary: createOptionalTextSchema(''),
+    authority_score: createNumberSchema(0),
+    freshness_score: createNumberSchema(0),
+    relevance_score: createNumberSchema(0),
+    duplicate_penalty: createNumberSchema(0),
+    coverage_score: createNumberSchema(0),
+    rank_score: createNumberSchema(0),
+    selected: createBooleanSchema(false),
+    rejection_reason: createOptionalTextSchema(''),
+  }),
+);
+
+const rankedSourceSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    source_id: createRequiredTextSchema('source'),
+    candidate_id: createRequiredTextSchema('candidate'),
+    technology: createRequiredTextSchema('Unknown technology'),
+    source_type: createRequiredTextSchema('community_page'),
+    tool: createOptionalTextSchema(''),
+    url: createOptionalTextSchema(''),
+    title: createOptionalTextSchema(''),
+    summary: createOptionalTextSchema(''),
+    rank_score: createNumberSchema(0),
+    rank_position: createNonNegativeIntSchema(0),
+    selected: createBooleanSchema(false),
+  }),
+);
+
+const sourceNoteSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    id: createRequiredTextSchema('source_note'),
+    source_id: createRequiredTextSchema('source'),
+    technology: createRequiredTextSchema('Unknown technology'),
+    source_type: createOptionalTextSchema('community_page'),
+    summary: createOptionalTextSchema(''),
+    what_changed: createOptionalTextSchema(''),
+    confidence: z.preprocess(
+      (value) => normalizeText(value, 'medium').toLowerCase(),
+      z.enum(['high', 'medium', 'low', 'degraded']),
+    ),
+    chunk_citations: z.preprocess(normalizeStringArray, z.array(z.string())),
+  }),
+);
+
+const evidencePackSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    id: createRequiredTextSchema('evidence_pack'),
+    topic: createRequiredTextSchema('general'),
+    technology: createRequiredTextSchema('Unknown technology'),
+    summary: createOptionalTextSchema(''),
+    confidence: z.preprocess(
+      (value) => normalizeText(value, 'medium').toLowerCase(),
+      z.enum(['high', 'medium', 'low', 'degraded']),
+    ),
+    coverage: z.preprocess(
+      (value) => normalizeText(value, 'thin').toLowerCase(),
+      z.enum(['strong', 'thin', 'degraded']),
+    ),
+    source_ids: z.preprocess(normalizeStringArray, z.array(z.string())),
+    source_note_ids: z.preprocess(normalizeStringArray, z.array(z.string())),
+    chunk_citations: z.preprocess(normalizeStringArray, z.array(z.string())),
+    rank_score: createNumberSchema(0),
   }),
 );
 
@@ -204,6 +288,10 @@ export const Batch2FetchAndReadSchema = z.preprocess(
       ).min(1),
     ),
     sources: z.preprocess(normalizeObjectArray, z.array(researchSourceSchema)),
+    source_candidates: z.preprocess(normalizeObjectArray, z.array(sourceCandidateSchema)),
+    ranked_sources: z.preprocess(normalizeObjectArray, z.array(rankedSourceSchema)),
+    source_notes: z.preprocess(normalizeObjectArray, z.array(sourceNoteSchema)),
+    evidence_packs: z.preprocess(normalizeObjectArray, z.array(evidencePackSchema)),
     chunk_store: z.preprocess(normalizeObjectArray, z.array(researchChunkSchema)),
     data_quality: z.preprocess(
       (entry) => normalizeObject(entry, () => ({})),
@@ -216,6 +304,22 @@ export const Batch2FetchAndReadSchema = z.preprocess(
         issues_found: createNonNegativeIntSchema(0),
         model_context_window: createNonNegativeIntSchema(128_000),
         source_target_count: createNonNegativeIntSchema(0),
+        ranked_source_count: createNonNegativeIntSchema(0),
+        evidence_pack_count: createNonNegativeIntSchema(0),
+        retrieval_coverage_status: z.preprocess(
+          (value) => normalizeText(value, 'thin').toLowerCase(),
+          z.enum(['strong', 'thin', 'degraded']),
+        ),
+        retrieval_budget_tokens: z.preprocess(
+          (value) => normalizeObject(value, () => ({})),
+          z.object({
+            batch_2_fetch_and_read: createNonNegativeIntSchema(0),
+            batch_3_architect: createNonNegativeIntSchema(0),
+            batch_4_plan_build: createNonNegativeIntSchema(0),
+            batch_5_enrich_steps: createNonNegativeIntSchema(0),
+            batch_6_generate_files: createNonNegativeIntSchema(0),
+          }),
+        ),
         used_full_context_window: createBooleanSchema(false),
         truncated_to_fit_context: createBooleanSchema(false),
         degraded_tools: createStringArraySchema(),
@@ -509,7 +613,7 @@ export const schemaDescriptions = {
   batch_1_research_stack:
     '{ technologies: [{ name: string, docs_url: url, github_url: url, changelog_url: url, community_search_results?: [{ title, url, description }], breaking_change_search_results?: [{ title, url, description }] }] }',
   batch_2_fetch_and_read:
-    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }] }], sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }], chunk_store?: [{ content: string, source: string, tool: string, technology: string }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, model_context_window?: number, source_target_count?: number, used_full_context_window?: boolean, truncated_to_fit_context?: boolean, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
+    '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }] }], sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }], source_candidates?: [{ id: string, technology: string, source_type: string, url?: string, rank_score?: number, selected?: boolean }], ranked_sources?: [{ source_id: string, candidate_id: string, technology: string, source_type: string, rank_score?: number, rank_position?: number, selected?: boolean }], source_notes?: [{ id: string, source_id: string, technology: string, summary?: string, confidence?: "high"|"medium"|"low"|"degraded", chunk_citations?: string[] }], evidence_packs?: [{ id: string, topic: string, technology: string, summary?: string, confidence?: "high"|"medium"|"low"|"degraded", coverage?: "strong"|"thin"|"degraded", source_note_ids?: string[], chunk_citations?: string[] }], chunk_store?: [{ id?: string, source_id?: string, content: string, source: string, source_title?: string, source_type?: string, tool: string, technology: string, rank_score?: number, start_offset?: number, end_offset?: number }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, model_context_window?: number, source_target_count?: number, ranked_source_count?: number, evidence_pack_count?: number, retrieval_coverage_status?: "strong"|"thin"|"degraded", retrieval_budget_tokens?: { batch_2_fetch_and_read?: number, batch_3_architect?: number, batch_4_plan_build?: number, batch_5_enrich_steps?: number, batch_6_generate_files?: number }, used_full_context_window?: boolean, truncated_to_fit_context?: boolean, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
   batch_3_architect:
     '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }] }',
   batch_4_plan_build:

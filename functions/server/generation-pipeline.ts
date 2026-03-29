@@ -201,6 +201,10 @@ type FetchedCommunitySource = {
 };
 
 type CollectedResearchSource = {
+  id: string;
+  source_type: 'official_docs' | 'github_repository' | 'changelog' | 'community_page';
+  title: string;
+  rank_score: number;
   content: string;
   url: string;
   tool: string;
@@ -208,11 +212,25 @@ type CollectedResearchSource = {
 };
 
 type ResearchChunk = {
+  id: string;
+  source_id: string;
   content: string;
   source: string;
+  source_title: string;
+  source_type: string;
   tool: string;
   technology: string;
+  rank_score: number;
+  start_offset: number;
+  end_offset: number;
 };
+
+type SourceCandidate = Batch2FetchAndRead['source_candidates'][number];
+type RankedSource = Batch2FetchAndRead['ranked_sources'][number];
+type SourceNote = Batch2FetchAndRead['source_notes'][number];
+type EvidencePack = Batch2FetchAndRead['evidence_packs'][number];
+type RetrievalBudgetMap = Batch2FetchAndRead['data_quality']['retrieval_budget_tokens'];
+type RetrievalContextKind = 'architecture' | 'plan' | 'step_enrichment' | 'final_files';
 
 type SearchResult = {
   title: string;
@@ -294,6 +312,10 @@ type Batch2CheckpointData = {
   researchTargets: ResearchTechnologyTarget[];
   fetchedSources: FetchedTechnologyResearch[];
   collectedSources: CollectedResearchSource[];
+  sourceCandidates?: SourceCandidate[];
+  rankedSources?: RankedSource[];
+  sourceNotes?: SourceNote[];
+  evidencePacks?: EvidencePack[];
   researchSourceLedger?: Batch2FetchAndRead['sources'];
   issuesFound: number;
   partialFailures: Batch2FetchAndRead['data_quality']['partial_failures'];
@@ -339,10 +361,28 @@ const BATCH2_SEARCH_RESULT_LIMIT = 1;
 const RESEARCH_CHUNK_SIZE_CHARS = 1_600;
 const RESEARCH_CHUNK_OVERLAP_CHARS = 200;
 const RESEARCH_CHUNK_WARN_THRESHOLD = 10_000;
+const RANKED_SOURCES_PER_TECHNOLOGY = 5;
 const RESEARCH_CONTEXT_TOP_K_DEFAULT = 8;
 const RESEARCH_CONTEXT_TOKEN_TARGET = 8_000;
 const RESEARCH_CONTEXT_TOKEN_HARD_LIMIT = 10_000;
 const RESEARCH_CHARS_PER_TOKEN_ESTIMATE = 4;
+const RETRIEVAL_MINIMUM_PACKS = 2;
+const RETRIEVAL_BUDGETS: RetrievalBudgetMap = {
+  batch_2_fetch_and_read: 8_000,
+  batch_3_architect: 7_000,
+  batch_4_plan_build: 7_000,
+  batch_5_enrich_steps: 8_000,
+  batch_6_generate_files: 6_000,
+};
+const GENERIC_PLAN_PHRASES = [
+  'users lack a centralized',
+  'reactive music streaming platform',
+  'audio track upload/management',
+  'browser-based audio playback',
+  'verify environment scaffolding works end-to-end',
+  'works end-to-end in your local environment',
+];
+const PLAN_QUALITY_MIN_STACK_MATCHES = 2;
 const lastHeartbeatTouchByProject = new Map<string, number>();
 
 const batchCompletionMessages: Record<GenerationBatchName, string> = {
@@ -624,6 +664,20 @@ function humanGithubToolLabel(tool: ResearchResult['tool']) {
   return 'GitHub fetch';
 }
 
+function inferSourceTypeFromToolLabel(tool: string): CollectedResearchSource['source_type'] {
+  const normalized = tool.toLowerCase();
+  if (normalized.includes('github')) {
+    return 'github_repository';
+  }
+  if (normalized.includes('changelog') || normalized.includes('release')) {
+    return 'changelog';
+  }
+  if (normalized.includes('search')) {
+    return 'community_page';
+  }
+  return 'official_docs';
+}
+
 function formatCharCount(chars: number | undefined, fallback: number) {
   let value = fallback;
   if (typeof chars === 'number' && Number.isFinite(chars)) {
@@ -673,6 +727,122 @@ function summarizeSnippet(value: string, maxLength = 180) {
   }
 
   return collapsed.length <= maxLength ? collapsed : `${collapsed.slice(0, maxLength)}...`;
+}
+
+function includesAnyNormalizedPhrase(source: string, phrases: string[]) {
+  return phrases.some((phrase) => source.includes(phrase));
+}
+
+function countNormalizedPhraseMatches(source: string, phrases: string[]) {
+  return phrases.reduce((count, phrase) => (source.includes(phrase) ? count + 1 : count), 0);
+}
+
+function collectPlanTextSections(plan: PlanAuthoringRecord) {
+  const stageAndStepText = plan.stages
+    .flatMap((stage) => [
+      stage.title,
+      stage.type,
+      ...stage.steps.flatMap((step) => [
+        step.title,
+        step.category || '',
+        step.objective || '',
+        step.why_it_matters || '',
+        step.done_when || '',
+        ...(step.suggested_tools || []),
+        ...step.checklist.map((item) => item.label),
+      ]),
+    ])
+    .join(' ');
+
+  return [
+    plan.project_name,
+    plan.project_type,
+    plan.problem,
+    plan.solution,
+    plan.target_user,
+    plan.mvp_scope,
+    plan.done_when,
+    plan.architecture_notes,
+    plan.data_model_notes,
+    stageAndStepText,
+  ]
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function countStackMatchesInPlan(
+  planText: string,
+  stackTerms: string[],
+) {
+  const normalizedPlan = planText.toLowerCase();
+  return stackTerms.reduce((count, term) => {
+    const normalizedTerm = term.toLowerCase().trim();
+    if (!normalizedTerm || normalizedTerm.length < 3) {
+      return count;
+    }
+    return normalizedPlan.includes(normalizedTerm) ? count + 1 : count;
+  }, 0);
+}
+
+function extractStackTermsForPlanQuality(
+  projectBrief: LoadedProjectBriefContext,
+  adr: Batch3Architect,
+) {
+  const recommended = Object.values(adr.recommended_stack)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const confirmed = projectBrief.confirmedStackTools
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const combined = [...recommended, ...confirmed];
+  const deduped = new Set<string>();
+  for (const item of combined) {
+    const normalized = normalizeBuilderProfileName(item);
+    if (normalized) {
+      deduped.add(normalized);
+    }
+  }
+  return Array.from(deduped);
+}
+
+function evaluatePlanQuality(
+  plan: PlanAuthoringRecord,
+  projectBrief: LoadedProjectBriefContext,
+  adr: Batch3Architect,
+) {
+  const findings: string[] = [];
+  const planText = collectPlanTextSections(plan);
+  const normalizedPlanText = planText.toLowerCase();
+  const normalizedBriefSummary = projectBrief.summary.toLowerCase();
+
+  if (countNormalizedPhraseMatches(normalizedPlanText, GENERIC_PLAN_PHRASES) >= 2) {
+    findings.push('Plan contains known generic/off-domain phrasing from failed artifacts.');
+  }
+
+  const stackTerms = extractStackTermsForPlanQuality(projectBrief, adr);
+  const stackMatches = countStackMatchesInPlan(planText, stackTerms);
+  if (stackTerms.length > 0 && stackMatches < Math.min(stackTerms.length, PLAN_QUALITY_MIN_STACK_MATCHES)) {
+    findings.push(`Plan only references ${stackMatches} stack signal(s) from confirmed/recommended technologies.`);
+  }
+
+  const hasVagueConfigure = /\bconfigure\b/i.test(planText);
+  const hasSpecificActionSignals = /\b(open|create|set|enable|paste|run|deploy|verify)\b/i.test(planText);
+  if (hasVagueConfigure && !hasSpecificActionSignals) {
+    findings.push('Plan is vague ("configure") without concrete action verbs.');
+  }
+
+  if (
+    includesAnyNormalizedPhrase(normalizedPlanText, ['music streaming', 'audio playback', 'playlist creation'])
+    && !includesAnyNormalizedPhrase(normalizedBriefSummary, ['music', 'audio', 'stream'])
+  ) {
+    findings.push('Plan drifted toward unrelated domain content compared with the project brief.');
+  }
+
+  return {
+    ok: findings.length === 0,
+    findings,
+  };
 }
 
 function dedupeSearchResults(results: SearchResult[]) {
@@ -1138,7 +1308,7 @@ function dedupeCollectedSources(sources: CollectedResearchSource[]) {
   const seen = new Set<string>();
 
   return sources.filter((source) => {
-    const key = `${source.tool}::${source.url}::${source.technology}`.toLowerCase();
+    const key = `${source.tool}::${source.url}::${source.technology}::${source.source_type}`.toLowerCase();
     if (!source.url || !source.content.trim() || seen.has(key)) {
       return false;
     }
@@ -1152,7 +1322,7 @@ function dedupeResearchChunks(chunks: ResearchChunk[]) {
   const seen = new Set<string>();
 
   return chunks.filter((chunk) => {
-    const key = `${chunk.source}::${chunk.tool}::${chunk.technology}::${chunk.content.slice(0, 120)}`.toLowerCase();
+    const key = `${chunk.source_id}::${chunk.start_offset}::${chunk.end_offset}::${chunk.technology}`.toLowerCase();
     if (!chunk.content.trim() || seen.has(key)) {
       return false;
     }
@@ -1164,15 +1334,30 @@ function dedupeResearchChunks(chunks: ResearchChunk[]) {
 
 function buildResearchChunkStore(collectedSources: CollectedResearchSource[]) {
   const chunkStore: ResearchChunk[] = [];
+  const perSourceChunkCount = new Map<string, number>();
 
   for (const source of dedupeCollectedSources(collectedSources)) {
     const chunks = chunkText(source.content);
+    let cursor = 0;
     for (const chunk of chunks) {
+      const current = perSourceChunkCount.get(source.id) || 0;
+      const nextOrdinal = current + 1;
+      perSourceChunkCount.set(source.id, nextOrdinal);
+      const startOffset = cursor;
+      const endOffset = startOffset + chunk.length;
+      cursor = Math.max(endOffset - RESEARCH_CHUNK_OVERLAP_CHARS, endOffset);
       chunkStore.push({
+        id: `${source.id}::chunk-${String(nextOrdinal).padStart(3, '0')}`,
+        source_id: source.id,
         content: chunk,
         source: source.url,
+        source_title: source.title,
+        source_type: source.source_type,
         tool: source.tool,
         technology: source.technology,
+        rank_score: source.rank_score,
+        start_offset: Math.max(0, startOffset),
+        end_offset: Math.max(0, endOffset),
       });
     }
   }
@@ -1218,7 +1403,7 @@ function retrieveRelevantChunks(
       score += (occurrences * 0.7 + posScore * 0.3) * idf;
     }
 
-    return { chunk, score };
+    return { chunk, score: score + chunk.rank_score * 0.35 };
   });
 
   return scored
@@ -1232,119 +1417,457 @@ type RetrievedResearchSlice = {
   chunkCount: number;
   totalChunks: number;
   estimatedTokens: number;
+  coverageStatus: 'strong' | 'thin' | 'degraded';
+  selectedEvidencePackIds: string[];
+  selectedChunkIds: string[];
 };
 
-function retrieveResearchSlice(
-  query: string,
-  chunkStore: ResearchChunk[],
-  topK = RESEARCH_CONTEXT_TOP_K_DEFAULT,
-  maxTokens = RESEARCH_CONTEXT_TOKEN_TARGET,
-): RetrievedResearchSlice {
-  const retrieved = retrieveRelevantChunks(query, chunkStore, topK);
-  if (retrieved.length === 0) {
-    return {
-      context: '',
-      chunkCount: 0,
-      totalChunks: chunkStore.length,
-      estimatedTokens: 0,
+function sourceTypeWeight(sourceType: SourceCandidate['source_type']) {
+  switch (sourceType) {
+    case 'official_docs':
+      return 1;
+    case 'github_repository':
+      return 0.92;
+    case 'changelog':
+      return 0.85;
+    case 'community_page':
+    default:
+      return 0.62;
+  }
+}
+
+function buildSourceCandidateId(
+  technology: string,
+  sourceType: SourceCandidate['source_type'],
+  url: string,
+  ordinal: number,
+) {
+  const key = normalizeBuilderProfileName(`${technology}-${sourceType}-${url || 'source'}-${ordinal}`);
+  return `candidate_${key || `${sourceType}_${ordinal}`}`;
+}
+
+function inferAuthorityScore(sourceType: SourceCandidate['source_type'], url: string) {
+  const normalized = url.toLowerCase();
+  if (sourceType === 'official_docs') return 1;
+  if (sourceType === 'github_repository') return 0.9;
+  if (sourceType === 'changelog') return 0.82;
+  if (normalized.includes('stackoverflow') || normalized.includes('reddit') || normalized.includes('dev.to')) {
+    return 0.48;
+  }
+  return 0.6;
+}
+
+function inferFreshnessScore(
+  sourceType: SourceCandidate['source_type'],
+  lastCommitDate: string,
+  latestVersion: string,
+  content: string,
+) {
+  if (sourceType === 'changelog' || sourceType === 'github_repository') {
+    const hasRecentStamp = /\b20(2[4-9]|3[0-9])\b/.test(`${lastCommitDate} ${latestVersion} ${content}`);
+    return hasRecentStamp ? 0.9 : 0.5;
+  }
+  return 0.65;
+}
+
+function inferCoverageScore(
+  sourceType: SourceCandidate['source_type'],
+  hasDocs: boolean,
+  hasGithub: boolean,
+  hasCommunity: boolean,
+) {
+  if (sourceType === 'official_docs' && hasDocs) return 0.95;
+  if (sourceType === 'github_repository' && hasGithub) return 0.85;
+  if (sourceType === 'community_page' && hasCommunity) return 0.7;
+  if (sourceType === 'changelog') return 0.78;
+  return 0.55;
+}
+
+function buildCandidateSummary(content: string, fallback: string) {
+  const summary = summarizeSnippet(content, 220);
+  return summary || fallback;
+}
+
+function buildRankedResearchSources(
+  fetchedSources: FetchedTechnologyResearch[],
+  projectBrief: LoadedProjectBriefContext,
+) {
+  const candidates: SourceCandidate[] = [];
+  const seenUrl = new Set<string>();
+
+  for (const fetched of fetchedSources) {
+    const technology = fetched.technology;
+    const hasDocs = Boolean(fetched.docs_content && !/unavailable/i.test(fetched.docs_content));
+    const hasGithub = Boolean(fetched.github_readme && !/unavailable/i.test(fetched.github_readme));
+    const hasCommunity = fetched.community_pages.length > 0;
+    const summaryTokens = buildMatchTokens(projectBrief.summary, ...projectBrief.confirmedStackTools);
+    const technologyTokens = buildMatchTokens(technology);
+    const briefOverlap = targetsOverlap(summaryTokens, technologyTokens);
+    const relevanceBase = briefOverlap ? 0.9 : 0.65;
+
+    const pushCandidate = (
+      sourceType: SourceCandidate['source_type'],
+      url: string,
+      title: string,
+      content: string,
+      tool: string,
+      ordinal: number,
+      fallbackSummary: string,
+    ) => {
+      const normalizedUrl = url.trim().toLowerCase();
+      const duplicatePenalty = normalizedUrl && seenUrl.has(normalizedUrl) ? 0.25 : 0;
+      if (normalizedUrl) {
+        seenUrl.add(normalizedUrl);
+      }
+      const authority = inferAuthorityScore(sourceType, url);
+      const freshness = inferFreshnessScore(sourceType, fetched.last_commit_date, fetched.latest_version, content);
+      const coverage = inferCoverageScore(sourceType, hasDocs, hasGithub, hasCommunity);
+      const relevance = Math.min(1, relevanceBase + sourceTypeWeight(sourceType) * 0.2);
+      const rankScore = Number(
+        (
+          relevance * 0.38
+          + freshness * 0.2
+          + authority * 0.24
+          + coverage * 0.18
+          - duplicatePenalty
+        ).toFixed(4),
+      );
+
+      candidates.push({
+        id: buildSourceCandidateId(technology, sourceType, url, ordinal),
+        technology,
+        source_type: sourceType,
+        tool,
+        url,
+        title,
+        summary: buildCandidateSummary(content, fallbackSummary),
+        authority_score: Number(authority.toFixed(4)),
+        freshness_score: Number(freshness.toFixed(4)),
+        relevance_score: Number(relevance.toFixed(4)),
+        duplicate_penalty: Number(duplicatePenalty.toFixed(4)),
+        coverage_score: Number(coverage.toFixed(4)),
+        rank_score: rankScore,
+        selected: false,
+        rejection_reason: '',
+      });
     };
+
+    let ordinal = 0;
+    if (fetched.docs_url) {
+      ordinal += 1;
+      pushCandidate(
+        'official_docs',
+        fetched.docs_url,
+        `${technology} docs`,
+        fetched.docs_content,
+        'jina_reader',
+        ordinal,
+        `${technology} documentation source`,
+      );
+    }
+    if (fetched.github_url) {
+      ordinal += 1;
+      pushCandidate(
+        'github_repository',
+        fetched.github_url,
+        `${technology} repository`,
+        fetched.github_readme,
+        'github_api',
+        ordinal,
+        `${technology} repository signals`,
+      );
+    }
+    if (fetched.changelog_url) {
+      ordinal += 1;
+      pushCandidate(
+        'changelog',
+        fetched.changelog_url,
+        `${technology} changelog`,
+        fetched.recent_breaking_changes,
+        'jina_search',
+        ordinal,
+        `${technology} release/changelog notes`,
+      );
+    }
+    for (const page of fetched.community_pages) {
+      ordinal += 1;
+      pushCandidate(
+        'community_page',
+        page.url,
+        page.title || `${technology} community`,
+        page.content || page.description,
+        'jina_search',
+        ordinal,
+        `${technology} community signal`,
+      );
+    }
   }
 
-  const tokenLimit = Math.min(Math.max(1, Math.floor(maxTokens)), RESEARCH_CONTEXT_TOKEN_HARD_LIMIT);
-  const sections: string[] = [];
-  let estimatedTokens = 0;
-  let chunkCount = 0;
-
-  for (const chunk of retrieved) {
-    const block = `[${chunk.technology} via ${chunk.tool}]\n${chunk.content}`;
-    const blockTokens = estimateTokenCount(block);
-    if (chunkCount > 0 && estimatedTokens + blockTokens > tokenLimit) {
+  const ranked = [...candidates]
+    .sort((left, right) => right.rank_score - left.rank_score)
+    .map((candidate, index) => ({
+      ...candidate,
+      rank_position: index + 1,
+    }));
+  const selectedByTechnology = new Map<string, number>();
+  const selectedIds = new Set<string>();
+  for (const candidate of ranked) {
+    const current = selectedByTechnology.get(candidate.technology) || 0;
+    if (current >= RANKED_SOURCES_PER_TECHNOLOGY) {
       continue;
     }
+    selectedByTechnology.set(candidate.technology, current + 1);
+    selectedIds.add(candidate.id);
+  }
 
-    sections.push(block);
-    estimatedTokens += blockTokens;
-    chunkCount += 1;
+  const sourceCandidates: SourceCandidate[] = ranked.map((candidate) => ({
+    ...candidate,
+    selected: selectedIds.has(candidate.id),
+    rejection_reason: selectedIds.has(candidate.id) ? '' : 'ranked below per-technology selection cutoff',
+  }));
+  const rankedSources: RankedSource[] = ranked.map((candidate) => ({
+    source_id: `source_${candidate.id}`,
+    candidate_id: candidate.id,
+    technology: candidate.technology,
+    source_type: candidate.source_type,
+    tool: candidate.tool,
+    url: candidate.url,
+    title: candidate.title,
+    summary: candidate.summary,
+    rank_score: candidate.rank_score,
+    rank_position: candidate.rank_position,
+    selected: selectedIds.has(candidate.id),
+  }));
 
-    if (estimatedTokens >= tokenLimit) {
+  return { sourceCandidates, rankedSources };
+}
+
+function buildSourceNotesAndEvidencePacks(
+  rankedSources: RankedSource[],
+  chunkStore: ResearchChunk[],
+) {
+  const selectedSources = rankedSources.filter((source) => source.selected);
+  const sourceNotes: SourceNote[] = selectedSources.map((source, index) => {
+    const sourceChunks = chunkStore.filter((chunk) => chunk.source_id === source.source_id).slice(0, 4);
+    const chunkCitations = sourceChunks.map((chunk) => chunk.id);
+    const aggregateText = sourceChunks.map((chunk) => chunk.content).join(' ');
+    const confidence: SourceNote['confidence'] =
+      source.rank_score >= 0.82 ? 'high'
+      : source.rank_score >= 0.68 ? 'medium'
+      : source.rank_score >= 0.5 ? 'low'
+      : 'degraded';
+    return {
+      id: `source_note_${String(index + 1).padStart(3, '0')}`,
+      source_id: source.source_id,
+      technology: source.technology,
+      source_type: source.source_type,
+      summary: summarizeSnippet(`${source.title} ${source.summary} ${aggregateText}`, 240),
+      what_changed: summarizeSnippet(aggregateText, 200),
+      confidence,
+      chunk_citations: chunkCitations,
+    };
+  });
+
+  const topicFamilies: Array<{ topic: EvidencePack['topic']; matcher: RegExp }> = [
+    { topic: 'architecture', matcher: /\b(architecture|data model|schema|service|api|infrastructure)\b/i },
+    { topic: 'setup_configuration', matcher: /\b(setup|install|config|environment|initialize)\b/i },
+    { topic: 'integration_gotchas', matcher: /\b(gotcha|issue|bug|regression|conflict|breaking)\b/i },
+    { topic: 'deployment_concerns', matcher: /\b(deploy|release|rollout|production|hosting)\b/i },
+    { topic: 'breaking_changes', matcher: /\b(changelog|release|deprecat|breaking|migration)\b/i },
+  ];
+
+  const evidencePacks: EvidencePack[] = [];
+  const technologies = Array.from(new Set(selectedSources.map((source) => source.technology)));
+  for (const technology of technologies) {
+    const notesForTechnology = sourceNotes.filter((note) => note.technology === technology);
+    for (const family of topicFamilies) {
+      const matchedNotes = notesForTechnology.filter((note) =>
+        family.matcher.test(`${note.summary} ${note.what_changed}`),
+      );
+      if (matchedNotes.length === 0) {
+        continue;
+      }
+      const chunkCitations = Array.from(new Set(matchedNotes.flatMap((note) => note.chunk_citations)));
+      const rankScore = Number(
+        (
+          matchedNotes.reduce((sum, note) => {
+            const source = selectedSources.find((entry) => entry.source_id === note.source_id);
+            return sum + (source?.rank_score || 0);
+          }, 0) / matchedNotes.length
+        ).toFixed(4),
+      );
+      const coverage: EvidencePack['coverage'] =
+        matchedNotes.length >= 3 ? 'strong' : matchedNotes.length >= 2 ? 'thin' : 'degraded';
+      const confidence: EvidencePack['confidence'] =
+        rankScore >= 0.82 ? 'high'
+        : rankScore >= 0.68 ? 'medium'
+        : rankScore >= 0.5 ? 'low'
+        : 'degraded';
+      evidencePacks.push({
+        id: `evidence_pack_${normalizeBuilderProfileName(`${technology}-${family.topic}`)}`,
+        topic: family.topic,
+        technology,
+        summary: summarizeSnippet(
+          matchedNotes.map((note) => note.summary || note.what_changed).join(' '),
+          260,
+        ),
+        confidence,
+        coverage,
+        source_ids: Array.from(new Set(matchedNotes.map((note) => note.source_id))),
+        source_note_ids: matchedNotes.map((note) => note.id),
+        chunk_citations: chunkCitations,
+        rank_score: rankScore,
+      });
+    }
+  }
+
+  return { sourceNotes, evidencePacks };
+}
+
+function composeEvidencePackContext(packs: EvidencePack[]) {
+  return packs
+    .map((pack) =>
+      [
+        `[${pack.technology} :: ${pack.topic}]`,
+        `confidence=${pack.confidence}; coverage=${pack.coverage}; rank=${pack.rank_score.toFixed(2)}`,
+        pack.summary || 'No summary available.',
+        `citations: ${pack.chunk_citations.join(', ') || 'none'}`,
+      ].join('\n'),
+    )
+    .join('\n\n---\n\n');
+}
+
+function selectEvidencePacksForContext(
+  query: string,
+  evidencePacks: EvidencePack[],
+  contextKind: RetrievalContextKind,
+  budgetTokens: number,
+) {
+  const queryTerms = buildMatchTokens(query, contextKind);
+  const ranked = [...evidencePacks].sort((left, right) => {
+    const leftTokens = buildMatchTokens(left.topic, left.technology, left.summary);
+    const rightTokens = buildMatchTokens(right.topic, right.technology, right.summary);
+    const leftOverlap = targetsOverlap(queryTerms, leftTokens) ? 1 : 0;
+    const rightOverlap = targetsOverlap(queryTerms, rightTokens) ? 1 : 0;
+    if (rightOverlap !== leftOverlap) {
+      return rightOverlap - leftOverlap;
+    }
+    return right.rank_score - left.rank_score;
+  });
+  const selected: EvidencePack[] = [];
+  let consumedTokens = 0;
+  for (const pack of ranked) {
+    const packTokens = estimateTokenCount(`${pack.topic} ${pack.summary}`);
+    if (selected.length > 0 && consumedTokens + packTokens > Math.max(800, Math.floor(budgetTokens * 0.45))) {
+      continue;
+    }
+    selected.push(pack);
+    consumedTokens += packTokens;
+    if (selected.length >= 6) {
       break;
     }
   }
-
-  return {
-    context: sections.join('\n\n---\n\n'),
-    chunkCount,
-    totalChunks: chunkStore.length,
-    estimatedTokens,
-  };
+  return selected;
 }
 
-function retrieveStepResearchSlice(
-  steps: Batch5ResearchStep[],
-  projectStack: string,
+function retrieveEvidenceBackedResearchSlice(
+  query: string,
   chunkStore: ResearchChunk[],
-  topKPerStep = 5,
+  evidencePacks: EvidencePack[],
+  contextKind: RetrievalContextKind,
+  topK = RESEARCH_CONTEXT_TOP_K_DEFAULT,
   maxTokens = RESEARCH_CONTEXT_TOKEN_TARGET,
 ): RetrievedResearchSlice {
-  const candidates: Array<{ stepTitle: string; chunk: ResearchChunk }> = [];
-
-  for (const step of steps) {
-    const stepChunks = retrieveRelevantChunks(
-      `${step.title} ${step.category} ${projectStack}`,
-      chunkStore,
-      topKPerStep,
-    );
-    for (const chunk of stepChunks) {
-      candidates.push({ stepTitle: step.title, chunk });
-    }
-  }
-
-  if (candidates.length === 0) {
+  const tokenLimit = Math.min(Math.max(1, Math.floor(maxTokens)), RESEARCH_CONTEXT_TOKEN_HARD_LIMIT);
+  const selectedPacks = selectEvidencePacksForContext(query, evidencePacks, contextKind, tokenLimit);
+  const packChunkIds = new Set(selectedPacks.flatMap((pack) => pack.chunk_citations));
+  const preferredChunks = chunkStore.filter((chunk) => packChunkIds.has(chunk.id));
+  const candidateChunks = preferredChunks.length > 0 ? preferredChunks : chunkStore;
+  const retrieved = retrieveRelevantChunks(query, candidateChunks, topK);
+  if (retrieved.length === 0 && selectedPacks.length === 0) {
     return {
       context: '',
       chunkCount: 0,
       totalChunks: chunkStore.length,
       estimatedTokens: 0,
+      coverageStatus: 'degraded',
+      selectedEvidencePackIds: [],
+      selectedChunkIds: [],
     };
   }
 
-  const tokenLimit = Math.min(Math.max(1, Math.floor(maxTokens)), RESEARCH_CONTEXT_TOKEN_HARD_LIMIT);
   const sections: string[] = [];
-  const seen = new Set<string>();
   let estimatedTokens = 0;
+  const packContext = composeEvidencePackContext(selectedPacks);
+  if (packContext) {
+    sections.push(`Evidence packs:\n${packContext}`);
+    estimatedTokens += estimateTokenCount(packContext);
+  }
 
-  for (const candidate of candidates) {
-    const key =
-      `${candidate.stepTitle}::${candidate.chunk.source}::${candidate.chunk.tool}::${candidate.chunk.content.slice(0, 120)}`
-        .toLowerCase();
-    if (seen.has(key)) {
-      continue;
-    }
-
+  const selectedChunkIds: string[] = [];
+  for (const chunk of retrieved) {
     const block =
-      `Step: ${candidate.stepTitle}\n` +
-      `[${candidate.chunk.technology} via ${candidate.chunk.tool}]\n` +
-      candidate.chunk.content;
+      `[chunk ${chunk.id}] [${chunk.technology} via ${chunk.tool} @ ${chunk.source_type} rank=${chunk.rank_score.toFixed(2)}]\n${chunk.content}`;
     const blockTokens = estimateTokenCount(block);
     if (sections.length > 0 && estimatedTokens + blockTokens > tokenLimit) {
       continue;
     }
 
     sections.push(block);
-    seen.add(key);
     estimatedTokens += blockTokens;
+    selectedChunkIds.push(chunk.id);
 
     if (estimatedTokens >= tokenLimit) {
       break;
     }
   }
 
+  const thinCoverage =
+    selectedPacks.length < RETRIEVAL_MINIMUM_PACKS
+    || selectedChunkIds.length < Math.min(topK, 4);
+  const degradedCoverage = selectedPacks.length === 0 || selectedChunkIds.length === 0;
+
   return {
     context: sections.join('\n\n---\n\n'),
-    chunkCount: seen.size,
+    chunkCount: selectedChunkIds.length,
     totalChunks: chunkStore.length,
     estimatedTokens,
+    coverageStatus: degradedCoverage ? 'degraded' : thinCoverage ? 'thin' : 'strong',
+    selectedEvidencePackIds: selectedPacks.map((pack) => pack.id),
+    selectedChunkIds,
   };
+}
+
+function retrieveResearchSlice(
+  query: string,
+  chunkStore: ResearchChunk[],
+  evidencePacks: EvidencePack[],
+  contextKind: RetrievalContextKind,
+  topK = RESEARCH_CONTEXT_TOP_K_DEFAULT,
+  maxTokens = RESEARCH_CONTEXT_TOKEN_TARGET,
+): RetrievedResearchSlice {
+  return retrieveEvidenceBackedResearchSlice(query, chunkStore, evidencePacks, contextKind, topK, maxTokens);
+}
+
+function retrieveStepResearchSlice(
+  steps: Batch5ResearchStep[],
+  projectStack: string,
+  chunkStore: ResearchChunk[],
+  evidencePacks: EvidencePack[],
+  topKPerStep = 5,
+  maxTokens = RESEARCH_CONTEXT_TOKEN_TARGET,
+): RetrievedResearchSlice {
+  const stepQuery = steps
+    .map((step) => `${step.title} ${step.category || ''}`)
+    .join(' ');
+  return retrieveEvidenceBackedResearchSlice(
+    `${stepQuery} ${projectStack}`,
+    chunkStore,
+    evidencePacks,
+    'step_enrichment',
+    Math.max(6, topKPerStep * 2),
+    maxTokens,
+  );
 }
 
 function buildBatch2FanOutQueries(toolName: string) {
@@ -1355,10 +1878,18 @@ function buildBatch2PromptPayload(
   fetchedSources: FetchedTechnologyResearch[],
   dataQuality: Batch2FetchAndRead['data_quality'],
   chunkStore: ResearchChunk[],
+  evidencePacks: EvidencePack[],
   projectDescription: string,
 ) {
   const retrievalQuery = `${projectDescription} ${fetchedSources.map((source) => source.technology).join(' ')} setup migration compatibility breaking changes`;
-  const retrievedSlice = retrieveResearchSlice(retrievalQuery, chunkStore, 10, RESEARCH_CONTEXT_TOKEN_TARGET);
+  const retrievedSlice = retrieveResearchSlice(
+    retrievalQuery,
+    chunkStore,
+    evidencePacks,
+    'architecture',
+    10,
+    RETRIEVAL_BUDGETS.batch_2_fetch_and_read,
+  );
 
   return {
     payload: {
@@ -1382,9 +1913,18 @@ function buildBatch2PromptPayload(
           relevance: entry.relevance,
         })),
       })),
+      selected_evidence_packs: evidencePacks.slice(0, 8).map((pack) => ({
+        id: pack.id,
+        topic: pack.topic,
+        technology: pack.technology,
+        summary: pack.summary,
+        confidence: pack.confidence,
+        coverage: pack.coverage,
+      })),
       retrieved_research_context: retrievedSlice.context,
       retrieved_chunk_count: retrievedSlice.chunkCount,
       retrieved_context_estimated_tokens: retrievedSlice.estimatedTokens,
+      retrieval_coverage_status: retrievedSlice.coverageStatus,
       dataQuality,
     },
     retrievedSlice,
@@ -1394,13 +1934,39 @@ function buildBatch2PromptPayload(
 function normalizeChunkStoreEntries(chunks: Batch2FetchAndRead['chunk_store']) {
   return dedupeResearchChunks(
     chunks
-      .map((chunk) => ({
-        content: chunk.content.trim(),
-        source: chunk.source.trim(),
-        tool: chunk.tool.trim(),
-        technology: chunk.technology.trim(),
-      }))
-      .filter((chunk) => chunk.content && chunk.source && chunk.tool && chunk.technology),
+      .map((chunk, index) => {
+        const source = chunk.source.trim();
+        const technology = chunk.technology.trim();
+        const sourceId =
+          chunk.source_id?.trim()
+          || `source_${normalizeBuilderProfileName(`${technology}-${source}`) || `source_${index + 1}`}`;
+        const chunkId =
+          chunk.id?.trim()
+          || `${sourceId}::chunk-${String(index + 1).padStart(3, '0')}`;
+        const startOffset = Math.max(0, Math.floor(chunk.start_offset || 0));
+        const endOffset = Math.max(startOffset, Math.floor(chunk.end_offset || startOffset + chunk.content.length));
+        return {
+          id: chunkId,
+          source_id: sourceId,
+          content: chunk.content.trim(),
+          source,
+          source_title: chunk.source_title?.trim() || source,
+          source_type: chunk.source_type?.trim() || 'unknown',
+          tool: chunk.tool.trim(),
+          technology,
+          rank_score: Number.isFinite(chunk.rank_score) ? chunk.rank_score : 0,
+          start_offset: startOffset,
+          end_offset: endOffset,
+        };
+      })
+      .filter((chunk) =>
+        chunk.id
+        && chunk.source_id
+        && chunk.content
+        && chunk.source
+        && chunk.tool
+        && chunk.technology
+      ),
   );
 }
 
@@ -1418,41 +1984,71 @@ function resolveChunkStoreFromBatch2(batch2: Batch2FetchAndRead) {
       || primarySource;
 
     if (entry.docs_content.trim()) {
+      const url = primarySource;
+      const sourceType = inferSourceTypeFromToolLabel('batch2_docs');
       fallbackCollectedSources.push({
+        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-docs`)}`,
+        source_type: sourceType,
+        title: `${entry.technology} docs`,
+        rank_score: 0.6,
         content: entry.docs_content,
-        url: primarySource,
+        url,
         tool: 'batch2_docs',
         technology: entry.technology,
       });
     }
     if (entry.github_readme.trim()) {
+      const url = githubSource;
+      const sourceType = inferSourceTypeFromToolLabel('batch2_github');
       fallbackCollectedSources.push({
+        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-github`)}`,
+        source_type: sourceType,
+        title: `${entry.technology} repository`,
+        rank_score: 0.72,
         content: entry.github_readme,
-        url: githubSource,
+        url,
         tool: 'batch2_github',
         technology: entry.technology,
       });
     }
     if (entry.recent_breaking_changes.trim()) {
+      const url = primarySource;
+      const sourceType = inferSourceTypeFromToolLabel('batch2_breaking_changes');
       fallbackCollectedSources.push({
+        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-breaking`)}`,
+        source_type: sourceType,
+        title: `${entry.technology} breaking changes`,
+        rank_score: 0.68,
         content: entry.recent_breaking_changes,
-        url: primarySource,
+        url,
         tool: 'batch2_breaking_changes',
         technology: entry.technology,
       });
     }
     if (entry.community_sentiment.trim()) {
+      const url = primarySource;
+      const sourceType = inferSourceTypeFromToolLabel('batch2_community');
       fallbackCollectedSources.push({
+        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-community`)}`,
+        source_type: sourceType,
+        title: `${entry.technology} community sentiment`,
+        rank_score: 0.52,
         content: entry.community_sentiment,
-        url: primarySource,
+        url,
         tool: 'batch2_community',
         technology: entry.technology,
       });
     }
     if (entry.bug_report_digest.trim()) {
+      const url = primarySource;
+      const sourceType = inferSourceTypeFromToolLabel('batch2_bugs');
       fallbackCollectedSources.push({
+        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-bugs`)}`,
+        source_type: sourceType,
+        title: `${entry.technology} bug digest`,
+        rank_score: 0.58,
         content: entry.bug_report_digest,
-        url: primarySource,
+        url,
         tool: 'batch2_bugs',
         technology: entry.technology,
       });
@@ -1460,6 +2056,18 @@ function resolveChunkStoreFromBatch2(batch2: Batch2FetchAndRead) {
   }
 
   return buildResearchChunkStore(fallbackCollectedSources);
+}
+
+function resolveEvidencePacksFromBatch2(batch2: Batch2FetchAndRead) {
+  return (batch2.evidence_packs || [])
+    .map((pack) => ({
+      ...pack,
+      summary: pack.summary || '',
+      source_ids: pack.source_ids || [],
+      source_note_ids: pack.source_note_ids || [],
+      chunk_citations: pack.chunk_citations || [],
+    }))
+    .filter((pack) => Boolean(pack.id));
 }
 
 function buildMatchTokens(...values: Array<string | null | undefined>) {
@@ -3731,6 +4339,18 @@ export async function executeBatch2(
   const collectedSources: CollectedResearchSource[] = checkpoint?.data.collectedSources
     ? [...checkpoint.data.collectedSources]
     : [];
+  const sourceCandidates: SourceCandidate[] = checkpoint?.data.sourceCandidates
+    ? [...checkpoint.data.sourceCandidates]
+    : [];
+  const rankedSources: RankedSource[] = checkpoint?.data.rankedSources
+    ? [...checkpoint.data.rankedSources]
+    : [];
+  const sourceNotes: SourceNote[] = checkpoint?.data.sourceNotes
+    ? [...checkpoint.data.sourceNotes]
+    : [];
+  const evidencePacks: EvidencePack[] = checkpoint?.data.evidencePacks
+    ? [...checkpoint.data.evidencePacks]
+    : [];
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   const briefResearchCount = researchTargets.filter((target) => target.source === 'brief').length;
   const profileResearchCount = researchTargets.filter((target) => target.source === 'profile').length;
@@ -3812,6 +4432,10 @@ export async function executeBatch2(
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index, {
         researchTargets,
         fetchedSources,
+        sourceCandidates,
+        rankedSources,
+        sourceNotes,
+        evidencePacks,
         researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
         issuesFound,
         partialFailures,
@@ -4076,7 +4700,13 @@ export async function executeBatch2(
       ),
     ]);
     if (docsResult.content) {
+      const sourceId = `source_${normalizeBuilderProfileName(`${technology.name}-${docsUrl || docsResult.source}-docs`)}`;
+      const sourceType = inferSourceTypeFromToolLabel(toolLabelFromDocTool(docsResult.tool));
       collectedSources.push({
+        id: sourceId,
+        source_type: sourceType,
+        title: `${technology.name} docs`,
+        rank_score: technology.priority === 'high' ? 0.9 : technology.priority === 'medium' ? 0.75 : 0.6,
         content: docsResult.content,
         url: docsUrl || docsResult.source,
         tool: toolLabelFromDocTool(docsResult.tool),
@@ -4084,7 +4714,15 @@ export async function executeBatch2(
       });
     }
     if (githubResult.content) {
+      const sourceId = `source_${normalizeBuilderProfileName(`${technology.name}-${githubResult.source || githubUrl}-github`)}`;
+      const sourceType = inferSourceTypeFromToolLabel(toolLabelFromGithubTool(githubResult.tool));
       collectedSources.push({
+        id: sourceId,
+        source_type: sourceType,
+        title: githubRepository
+          ? `${githubRepository.owner}/${githubRepository.repo}`
+          : `${technology.name} repository`,
+        rank_score: technology.priority === 'high' ? 0.88 : technology.priority === 'medium' ? 0.74 : 0.62,
         content: githubResult.content,
         url: githubResult.source || githubUrl,
         tool: toolLabelFromGithubTool(githubResult.tool),
@@ -4098,6 +4736,10 @@ export async function executeBatch2(
       }
 
       collectedSources.push({
+        id: `source_${normalizeBuilderProfileName(`${technology.name}-${page.url}-community`)}`,
+        source_type: 'community_page',
+        title: page.title || `${technology.name} community`,
+        rank_score: technology.priority === 'high' ? 0.72 : technology.priority === 'medium' ? 0.62 : 0.52,
         content,
         url: page.url,
         tool: 'jina_search',
@@ -4137,6 +4779,10 @@ export async function executeBatch2(
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
         researchTargets,
         fetchedSources,
+        sourceCandidates,
+        rankedSources,
+        sourceNotes,
+        evidencePacks,
         researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
         issuesFound,
         partialFailures,
@@ -4155,7 +4801,26 @@ export async function executeBatch2(
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
+  const rankedArtifacts = buildRankedResearchSources(fetchedSources, projectBrief);
+  sourceCandidates.splice(0, sourceCandidates.length, ...rankedArtifacts.sourceCandidates);
+  rankedSources.splice(0, rankedSources.length, ...rankedArtifacts.rankedSources);
   const chunkStore = buildResearchChunkStore(collectedSources);
+  const evidenceArtifacts = buildSourceNotesAndEvidencePacks(rankedSources, chunkStore);
+  sourceNotes.splice(0, sourceNotes.length, ...evidenceArtifacts.sourceNotes);
+  evidencePacks.splice(0, evidencePacks.length, ...evidenceArtifacts.evidencePacks);
+  const retrievalCoverageStatus = (() => {
+    if (evidencePacks.length === 0) {
+      return 'degraded' as const;
+    }
+    const strongCount = evidencePacks.filter((pack) => pack.coverage === 'strong').length;
+    if (strongCount >= 2) {
+      return 'strong' as const;
+    }
+    if (strongCount >= 1 || evidencePacks.some((pack) => pack.coverage === 'thin')) {
+      return 'thin' as const;
+    }
+    return 'degraded' as const;
+  })();
   if (chunkStore.length > RESEARCH_CHUNK_WARN_THRESHOLD) {
     await logActivity(env, {
       projectId,
@@ -4176,6 +4841,10 @@ export async function executeBatch2(
     partial_failures: partialFailures,
     model_context_window: RESEARCH_CONTEXT_TOKEN_HARD_LIMIT,
     source_target_count: sourceTargetCount,
+    ranked_source_count: rankedSources.filter((source) => source.selected).length,
+    evidence_pack_count: evidencePacks.length,
+    retrieval_coverage_status: retrievalCoverageStatus,
+    retrieval_budget_tokens: RETRIEVAL_BUDGETS,
     used_full_context_window: false,
     truncated_to_fit_context: false,
   };
@@ -4192,6 +4861,9 @@ export async function executeBatch2(
       source: target.source,
     })),
     fetched_sources: fetchedSources,
+    source_candidates_count: sourceCandidates.length,
+    ranked_source_count: rankedSources.filter((source) => source.selected).length,
+    evidence_pack_count: evidencePacks.length,
     chunk_store_count: chunkStore.length,
     data_quality: dataQuality,
   };
@@ -4204,6 +4876,7 @@ export async function executeBatch2(
     fetchedSources,
     dataQuality,
     chunkStore,
+    evidencePacks,
     projectBrief.summary || project.description || '',
   );
   await logActivity(env, {
@@ -4213,6 +4886,18 @@ export async function executeBatch2(
     kind: 'system',
     message: `Retrieved ${retrievedSlice.chunkCount} chunks from ${retrievedSlice.totalChunks} total (estimated ${retrievedSlice.estimatedTokens.toLocaleString()} tokens) for batch 2 prompt assembly.`,
   });
+  if (retrievedSlice.coverageStatus !== 'strong') {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_2_fetch_and_read',
+      runId,
+      kind: 'warning',
+      message:
+        retrievedSlice.coverageStatus === 'degraded'
+          ? 'Evidence coverage is degraded for this run. Outputs will include lower-confidence research signaling.'
+          : 'Evidence coverage is thin for this run. Outputs will include confidence caveats where needed.',
+    });
+  }
   const prompt = `Research the following fetched technology materials and convert them into a structured corpus.
 
 ${JSON.stringify(promptPayload, null, 2)}
@@ -4289,15 +4974,21 @@ Preserve specific version and compatibility details.`;
       };
     });
     const finalSourceLedger = dedupeResearchSources(finalResearch.flatMap((entry) => entry.sources));
-    const finalDataQuality: Batch2FetchAndRead['data_quality'] = {
-      ...dataQuality,
-      urls_fetched: finalSourceLedger.length,
-      used_full_context_window: false,
-      truncated_to_fit_context: false,
-    };
+  const finalDataQuality: Batch2FetchAndRead['data_quality'] = {
+    ...dataQuality,
+    urls_fetched: finalSourceLedger.length,
+    ranked_source_count: rankedSources.filter((source) => source.selected).length,
+    evidence_pack_count: evidencePacks.length,
+    used_full_context_window: false,
+    truncated_to_fit_context: false,
+  };
     const finalOutput: Batch2FetchAndRead = {
       research: finalResearch,
       sources: finalSourceLedger,
+      source_candidates: sourceCandidates,
+      ranked_sources: rankedSources,
+      source_notes: sourceNotes,
+      evidence_packs: evidencePacks,
       data_quality: finalDataQuality,
       chunk_store: chunkStore,
     };
@@ -4356,11 +5047,14 @@ export async function executeBatch3(
   const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const projectDescription = projectBrief.summary || project.description || '';
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
+  const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const architectureResearchSlice = retrieveResearchSlice(
     `${projectDescription} database schema auth system architecture infrastructure`,
     chunkStore,
+    evidencePacks,
+    'architecture',
     8,
-    RESEARCH_CONTEXT_TOKEN_TARGET,
+    RETRIEVAL_BUDGETS.batch_3_architect,
   );
   const researchCatalog = batch2.research.map((entry) => ({
     technology: entry.technology,
@@ -4374,6 +5068,8 @@ export async function executeBatch3(
     research_catalog: researchCatalog,
     chunk_store_count: chunkStore.length,
     retrieved_chunk_count: architectureResearchSlice.chunkCount,
+    selected_evidence_packs: architectureResearchSlice.selectedEvidencePackIds,
+    retrieval_coverage_status: architectureResearchSlice.coverageStatus,
     review_feedback: '',
     review_feedback_provided: false,
   };
@@ -4393,6 +5089,18 @@ export async function executeBatch3(
     kind: 'system',
     message: `Retrieved ${architectureResearchSlice.chunkCount} chunks from ${architectureResearchSlice.totalChunks} total (estimated ${architectureResearchSlice.estimatedTokens.toLocaleString()} tokens) for architecture prompt assembly.`,
   });
+  if (architectureResearchSlice.coverageStatus !== 'strong') {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_3_architect',
+      runId,
+      kind: 'warning',
+      message:
+        architectureResearchSlice.coverageStatus === 'degraded'
+          ? 'Architecture synthesis is running with degraded evidence coverage.'
+          : 'Architecture synthesis is running with thin evidence coverage.',
+    });
+  }
 
   const systemPrompt = appendProjectBriefSystemPrompt(
     'You are Scrimble’s staff engineer architect. Use the research corpus to produce a clear architecture decision record with explicit package and service choices. Every recommendation must be grounded in the provided research data. Return only valid JSON.',
@@ -4548,17 +5256,22 @@ export async function executeBatch4(
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
   const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
+  const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const projectDescription = projectBrief.summary || '';
   const planResearchSlice = retrieveResearchSlice(
     `${projectDescription} implementation steps setup configuration`,
     chunkStore,
+    evidencePacks,
+    'plan',
     8,
-    RESEARCH_CONTEXT_TOKEN_TARGET,
+    RETRIEVAL_BUDGETS.batch_4_plan_build,
   );
   const input = {
     architecture: reviewContext.adr,
     chunk_store_count: chunkStore.length,
     retrieved_chunk_count: planResearchSlice.chunkCount,
+    selected_evidence_packs: planResearchSlice.selectedEvidencePackIds,
+    retrieval_coverage_status: planResearchSlice.coverageStatus,
     review_feedback: reviewContext.reviewFeedback,
     review_feedback_provided: reviewContext.reviewFeedbackProvided,
   };
@@ -4578,6 +5291,18 @@ export async function executeBatch4(
     kind: 'system',
     message: `Retrieved ${planResearchSlice.chunkCount} chunks from ${planResearchSlice.totalChunks} total (estimated ${planResearchSlice.estimatedTokens.toLocaleString()} tokens) for plan prompt assembly.`,
   });
+  if (planResearchSlice.coverageStatus !== 'strong') {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_4_plan_build',
+      runId,
+      kind: 'warning',
+      message:
+        planResearchSlice.coverageStatus === 'degraded'
+          ? 'Plan synthesis is running with degraded evidence coverage.'
+          : 'Plan synthesis is running with thin evidence coverage.',
+    });
+  }
 
   const systemPrompt = appendProjectBriefSystemPrompt(
     'You are Scrimble’s Product Lead and Build Architect. Batch 4 is the only authoring stage. Return one canonical structured authoring record as valid JSON.',
@@ -4633,6 +5358,12 @@ Rules:
       schemaDescription: schemaDescriptions.batch_4_plan_build,
     });
     const normalizedPlan = await withAuthoringHash(normalizePlanStructure(result.data));
+    const planQuality = evaluatePlanQuality(normalizedPlan, projectBrief, reviewContext.adr);
+    if (!planQuality.ok) {
+      throw new GenerationPipelineError(
+        `Batch 4 quality gate rejected generic/off-domain plan output: ${planQuality.findings.join(' | ')}`,
+      );
+    }
 
     await completeBatch(
       env,
@@ -4693,6 +5424,7 @@ export async function executeBatch5(
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
   const research = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const chunkStore = resolveChunkStoreFromBatch2(research);
+  const evidencePacks = resolveEvidencePacksFromBatch2(research);
   const projectStack = [project.stack || '', projectBrief.summary || project.description || '']
     .join(' ')
     .replace(/\s+/g, ' ')
@@ -4813,8 +5545,9 @@ export async function executeBatch5(
     planSteps,
     projectStack,
     chunkStore,
+    evidencePacks,
     5,
-    RESEARCH_CONTEXT_TOKEN_TARGET,
+    RETRIEVAL_BUDGETS.batch_5_enrich_steps,
   );
   const researchCatalog = research.research.map((entry) => ({
     technology: entry.technology,
@@ -4827,6 +5560,8 @@ export async function executeBatch5(
     research_catalog: researchCatalog,
     chunk_store_count: chunkStore.length,
     retrieved_chunk_count: stepResearchSlice.chunkCount,
+    selected_evidence_packs: stepResearchSlice.selectedEvidencePackIds,
+    retrieval_coverage_status: stepResearchSlice.coverageStatus,
     step_research: stepResearchContexts,
   };
 
@@ -4846,6 +5581,18 @@ export async function executeBatch5(
     kind: 'system',
     message: `Retrieved ${stepResearchSlice.chunkCount} chunks from ${stepResearchSlice.totalChunks} total (estimated ${stepResearchSlice.estimatedTokens.toLocaleString()} tokens) for step enrichment prompt assembly.`,
   });
+  if (stepResearchSlice.coverageStatus !== 'strong') {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_5_enrich_steps',
+      runId,
+      kind: 'warning',
+      message:
+        stepResearchSlice.coverageStatus === 'degraded'
+          ? 'Step enrichment is running with degraded evidence coverage.'
+          : 'Step enrichment is running with thin evidence coverage.',
+    });
+  }
 
   const systemPrompt = appendProjectBriefSystemPrompt(
     'You are Scrimble’s step enrichment agent. Enrich every step in one pass using turn-by-turn navigation guidance. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.',
@@ -4963,11 +5710,14 @@ export async function executeBatch6(
   const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
   const enrichments = await loadBatchOutput(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
+  const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const fileResearchSlice = retrieveResearchSlice(
     `${projectBrief.summary || ''} final delivery plan markdown build steps launch`,
     chunkStore,
+    evidencePacks,
+    'final_files',
     8,
-    RESEARCH_CONTEXT_TOKEN_TARGET,
+    RETRIEVAL_BUDGETS.batch_6_generate_files,
   );
   const enrichedPlan = mergePlanWithEnrichments(plan, enrichments.enrichments);
   const currentActiveStep = await loadCurrentActiveStep(env, projectId);
@@ -4976,6 +5726,8 @@ export async function executeBatch6(
     enriched_plan: enrichedPlan,
     chunk_store_count: chunkStore.length,
     retrieved_chunk_count: fileResearchSlice.chunkCount,
+    selected_evidence_packs: fileResearchSlice.selectedEvidencePackIds,
+    retrieval_coverage_status: fileResearchSlice.coverageStatus,
     review_feedback: reviewContext.reviewFeedback,
     review_feedback_provided: reviewContext.reviewFeedbackProvided,
     current_step: currentActiveStep,
@@ -4989,6 +5741,18 @@ export async function executeBatch6(
     kind: 'writing',
     message: 'Preparing your downloadable files...',
   });
+  if (fileResearchSlice.coverageStatus !== 'strong') {
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_6_generate_files',
+      runId,
+      kind: 'warning',
+      message:
+        fileResearchSlice.coverageStatus === 'degraded'
+          ? 'Final file assembly is running with degraded evidence coverage.'
+          : 'Final file assembly is running with thin evidence coverage.',
+    });
+  }
 
   // C1: Batch 6 is deterministic rendering only; fail closed on authored-record drift.
   const storedHash = plan.authoring_hash;

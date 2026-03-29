@@ -1740,6 +1740,37 @@ The Phase 12 verification pass re-scored shipped behavior against `docs/the-visi
 
 ---
 
+### 17.7 Vision/Productization Snapshot (Phase 15)
+
+- **Vision-gap audit matrix (ranked by user harm):**
+  - `navigation failure` — **blocks daily use**: users could not reliably answer "where am I / what next / what is blocked" from the default canvas.
+  - `layout / action reachability` — **breaks product promise**: `plan.md` export CTA was not consistently visible in a reliable primary action zone.
+  - `plan content quality` — **blocks daily use**: Batch 4 could accept generic/off-domain authored plans that eroded trust.
+  - `research grounding` — **breaks product promise**: authored plans could under-reflect confirmed/recommended stack signals even when research existed.
+  - `advanced-mode/editor bleed` — **looks rough but acceptable**: advanced editing controls competed with guided execution in primary view.
+- **Canvas rework (GPS behavior):** `ProjectCanvas` now prioritizes orientation and execution with a stronger "Where you are / What's next / Blocked by" framing, while keeping advanced editing available but secondary.
+- **Export reachability fix:** `Download plan.md` moved to the top workflow toolbar (`absolute inset-x-0 top-0 z-20`) with keyboard-visible focus rings, eliminating advanced-mode/scroll-trap dependency.
+- **Canonical export path enforcement:** frontend markdown assembly path was removed; export now flows through `dbService.downloadSkillFiles(project.id)` and `/projects/:id/skill-files` canonical serializer output only.
+- **Detail panel upgrade:** `DetailPanel` now leads with an "Action brief" (`Tool`, `Destination`, `Action`, `Done when`, `What this unlocks`) and surfaces low-confidence research as an explicit warning.
+- **Batch 4 quality gate:** `generation-pipeline` now rejects generic/off-domain authored plans before acceptance/export when quality heuristics detect known drift signatures, weak stack reflection, or vague non-actionable wording.
+- **Phase 15 regression suite:** added `scripts/phase15-vision-productization.assertions.ts` to guard CTA reachability, advanced-mode demotion, canonical export path, detail-panel contract, and quality-gate presence.
+
+---
+
+### 17.8 Retrieval Scale & Evidence Synthesis Snapshot (Phase 16)
+
+- Batch 2 now formalizes retrieval artifacts on top of the existing research contract: `source_candidates`, `ranked_sources`, `source_notes`, and `evidence_packs`.
+- Candidate acquisition is still facade-first (`research-facade`) but now rank-aware: each candidate is scored by relevance, freshness, authority, duplicate risk, and coverage before final selection.
+- `chunk_store` was promoted to carry first-class evidence metadata (`id`, `source_id`, `source_title`, `source_type`, `rank_score`, `start_offset`, `end_offset`) for stable citation and deterministic reuse.
+- Downstream retrieval is budget-aware and evidence-first:
+  - Batch 2, 3, 4, 5, and 6 each have explicit token budgets.
+  - Retrieval selects top evidence packs first, then ranked chunks.
+  - Coverage status is explicit (`strong` / `thin` / `degraded`) and surfaced in batch telemetry and prompt payloads.
+- Batch prompts now include selected evidence-pack summaries + chunk citations rather than treating raw fetched blobs as the primary synthesis unit.
+- `H1` export is considered complete in roadmap bookkeeping: canonical `plan.md` download is already live and no longer tracked as pending future work.
+
+---
+
 ### 18. Remaining Work
 
 **Release closeout blockers (Phase 14F):**

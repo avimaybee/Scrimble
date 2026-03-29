@@ -29,7 +29,7 @@ import DetailPanel from '../components/DetailPanel';
 import UnlockToast from '../components/ui/UnlockToast';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
-import { 
+import {
   Activity, 
   Hexagon, 
   Download, 
@@ -38,26 +38,16 @@ import {
   Check, 
   X, 
   FileJson, 
-  FileText, 
   Info, 
   RotateCcw, 
   Trash2, 
   ChevronRight,
-  Sparkles,
-  Brain,
-  LucideIcon
+  Sparkles
 } from 'lucide-react';
 import { dbService } from '../lib/db';
 import { WorkflowBriefDriftError } from '../lib/db';
-import { updatePlan } from '../lib/ai';
 import { cn } from '../lib/utils';
 import ErrorBoundary from '../components/ErrorBoundary';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 
 import StageGroup from '../components/StageGroup';
 
@@ -94,7 +84,6 @@ export default function ProjectCanvas() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
-  const [isApplyingDiff, setIsApplyingDiff] = useState(false);
   const [isDownloadingAiFiles, setIsDownloadingAiFiles] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
   const [showQuickPlanEditor, setShowQuickPlanEditor] = useState(false);
@@ -119,6 +108,43 @@ export default function ProjectCanvas() {
   const [workflowDrift, setWorkflowDrift] = useState<WorkflowBriefDrift | null>(null);
   const [pendingDriftResolution, setPendingDriftResolution] = useState<'apply_now' | 'save_for_later' | null>(null);
   const updateActivityLogRef = useRef<HTMLDivElement | null>(null);
+
+  const aiFilesReady = Boolean(project?.generation_runtime?.lifecycleStatus === 'complete');
+  const currentStep = useMemo(() => {
+    const ordered = [...appSteps].sort((left, right) => (left.order_index || 0) - (right.order_index || 0));
+    return ordered.find((step) => step.status === 'needs_review')
+      ?? ordered.find((step) => step.status === 'agent_working')
+      ?? ordered.find((step) => step.status === 'active' || step.status === 'waiting')
+      ?? ordered.find((step) => step.status === 'locked')
+      ?? null;
+  }, [appSteps]);
+
+  const currentStage = useMemo(
+    () => stages.find((stage) => stage.id === currentStep?.stage_id) || null,
+    [currentStep?.stage_id, stages],
+  );
+
+  const blockedReason = useMemo(() => {
+    if (!currentStep) {
+      return appSteps.length === 0 ? 'Plan structure is still loading.' : null;
+    }
+
+    if (currentStep.status === 'needs_review') {
+      return 'A review decision is needed before this path can continue.';
+    }
+
+    if (currentStep.status === 'agent_working') {
+      return 'Scrimble is actively working on this step right now.';
+    }
+
+    if (currentStep.status === 'locked') {
+      return 'Complete earlier steps to unlock this one.';
+    }
+
+    return null;
+  }, [appSteps.length, currentStep]);
+
+  const remainingStepCount = appSteps.filter((step) => step.status !== 'complete' && step.status !== 'skipped').length;
 
   const fetchProjectData = useCallback(async () => {
     if (!id) return;
@@ -486,45 +512,6 @@ export default function ProjectCanvas() {
     }
   };
 
-  const exportAsMarkdown = async () => {
-    if (!project) return;
-
-    let md = `# ${project.name}\n`;
-    md += `**Progress:** ${project.progress}%\n\n`;
-
-    const sortedStages = [...stages].sort((a, b) => a.order_index - b.order_index);
-
-    for (const stage of sortedStages) {
-      md += `## Stage: ${stage.title}\n\n`;
-      
-      const stageSteps = appSteps.filter(s => s.stage_id === stage.id).sort((a, b) => (a.order_index || 0) - (b.order_index || 0));
-      for (const step of stageSteps) {
-        const status = step.status === 'complete' ? '✅' 
-                     : step.status === 'skipped'  ? '⏭️' 
-                     : '⬜';
-        md += `### ${status} ${step.title}\n`;
-        if (step.objective) md += `**Goal:** ${step.objective}\n\n`;
-        if (step.done_when) md += `**Done when:** ${step.done_when}\n\n`;
-        
-        const checklistItems = await dbService.getChecklistItemsByStepId(step.id);
-        if (checklistItems.length) {
-          checklistItems.forEach(item => {
-            md += `- [${item.is_completed ? 'x' : ' '}] ${item.label}\n`;
-          });
-          md += '\n';
-        }
-      }
-    }
-
-    const blob = new Blob([md], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${project.name.replace(/\s+/g, '-').toLowerCase()}-plan.md`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
   const exportAsJSON = () => {
     if (!project) return;
     const data = {
@@ -705,51 +692,6 @@ export default function ProjectCanvas() {
     }
   }, [ensureWorkflowExists, fetchProjectData, newEdgeSourceId, newEdgeTargetId, project]);
 
-  const handleApplyAiDiff = useCallback(async () => {
-    if (!project || !updateMessage.trim()) {
-      return;
-    }
-
-    setIsApplyingDiff(true);
-    try {
-      const planSummary = stages
-        .slice()
-        .sort((left, right) => left.order_index - right.order_index)
-        .map((stage) => ({
-          id: stage.id,
-          title: stage.title,
-          type: stage.type,
-          order_index: stage.order_index,
-          steps: appSteps
-            .filter((step) => step.stage_id === stage.id)
-            .sort((left, right) => (left.order_index || 0) - (right.order_index || 0))
-            .map((step) => ({
-              id: step.id,
-              title: step.title,
-              type: step.type,
-              objective: step.objective || '',
-              why_it_matters: step.why_it_matters || '',
-              done_when: step.done_when || '',
-              suggested_tools: step.suggested_tools || '[]',
-            })),
-        }));
-
-      const diff = await updatePlan(planSummary, project.stack, updateMessage);
-      await dbService.applyPlanDiff(diff, project.id);
-      toast.success(diff.summary || 'Plan diff applied.');
-      await fetchProjectData();
-      setShowUpdateModal(false);
-      setUpdateMessage('');
-      setUpdateActivities([]);
-      setWorkflowDrift(null);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not apply this plan diff.';
-      toast.error(message);
-    } finally {
-      setIsApplyingDiff(false);
-    }
-  }, [appSteps, fetchProjectData, project, stages, updateMessage]);
-
   if (loading) {
     return (
       <div className="min-h-screen bg-bg-base flex flex-col items-center justify-center p-8">
@@ -814,39 +756,6 @@ export default function ProjectCanvas() {
     );
   }
 
-  const aiFilesReady = Boolean(project?.generation_runtime?.lifecycleStatus === 'complete');
-  const currentStep = useMemo(() => {
-    const ordered = [...appSteps].sort((left, right) => (left.order_index || 0) - (right.order_index || 0));
-    return ordered.find((step) => step.status === 'needs_review')
-      ?? ordered.find((step) => step.status === 'agent_working')
-      ?? ordered.find((step) => step.status === 'active' || step.status === 'waiting')
-      ?? ordered.find((step) => step.status === 'locked')
-      ?? null;
-  }, [appSteps]);
-  const currentStage = useMemo(
-    () => stages.find((stage) => stage.id === currentStep?.stage_id) || null,
-    [currentStep?.stage_id, stages],
-  );
-  const blockedReason = useMemo(() => {
-    if (!currentStep) {
-      return appSteps.length === 0 ? 'Plan structure is still loading.' : null;
-    }
-
-    if (currentStep.status === 'needs_review') {
-      return 'A review decision is needed before this path can continue.';
-    }
-
-    if (currentStep.status === 'agent_working') {
-      return 'Scrimble is actively working on this step right now.';
-    }
-
-    if (currentStep.status === 'locked') {
-      return 'Complete earlier steps to unlock this one.';
-    }
-
-    return null;
-  }, [appSteps.length, currentStep]);
-  const remainingStepCount = appSteps.filter((step) => step.status !== 'complete' && step.status !== 'skipped').length;
 
   return (
     <div className="flex-1 flex flex-col bg-bg-base font-sans overflow-hidden">
@@ -855,7 +764,7 @@ export default function ProjectCanvas() {
         selectedStepId ? "pr-[440px]" : "pr-0"
       )}>
         {/* Sidebar */}
-        <div className="w-[280px] bg-bg-surface border-r border-border-subtle flex flex-col shrink-0 z-10 h-full">
+        <div className="w-[320px] bg-bg-surface border-r border-border-subtle flex flex-col shrink-0 z-10 h-full">
           <div className="p-6 border-b border-border-subtle">
             <div className="flex items-start justify-between mb-1">
               {isEditingName ? (
@@ -928,12 +837,20 @@ export default function ProjectCanvas() {
             </div>
 
             <div className="mt-6 rounded-[12px] border border-border-default bg-bg-elevated/45 px-3 py-3">
-              <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Guided map</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Where you are</div>
               <div className="mt-2 text-[13px] font-medium text-text-primary">
                 {currentStep?.title || 'No active step yet'}
               </div>
               <div className="mt-1 text-[12px] text-text-secondary">
                 {currentStage ? `Stage: ${currentStage.title}` : 'Stage path will appear here.'}
+              </div>
+              <div className="mt-2 rounded-[8px] border border-border-subtle bg-bg-base/60 px-2.5 py-2">
+                <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">What&apos;s next</div>
+                <div className="mt-1 text-[12px] text-text-primary">
+                  {currentStep
+                    ? `Open "${currentStep.title}" and complete its action brief.`
+                    : 'Wait for the first generated step, then open it from the stage list.'}
+                </div>
               </div>
               <div className="mt-2 text-[11px] text-text-muted">
                 {remainingStepCount > 0 ? `${remainingStepCount} step${remainingStepCount === 1 ? '' : 's'} left on this path.` : 'All mapped steps are complete.'}
@@ -982,14 +899,14 @@ export default function ProjectCanvas() {
             </div>
           </div>
           
-          <div className="p-4 border-t border-border-subtle space-y-4">
+          <div className="border-t border-border-subtle p-4">
             <button 
               type="button"
               onClick={() => {
                 setUpdateActivities([]);
                 setShowUpdateModal(true);
               }}
-              aria-label="Open plan update"
+              aria-label="Recalculate plan from changes"
               className="group w-full flex items-center justify-between px-4 py-3 rounded-xl bg-bg-elevated border border-border-default hover:border-accent-primary/30 transition-all hover:shadow-sm"
             >
               <div className="flex items-center gap-3">
@@ -997,36 +914,17 @@ export default function ProjectCanvas() {
                   <Sparkles className="w-4 h-4" />
                 </div>
                 <div className="text-left">
-                  <div className="text-sm font-medium text-text-primary">Update plan</div>
-                  <div className="text-[10px] text-text-tertiary">Reshape the build</div>
+                  <div className="text-sm font-medium text-text-primary">Recalculate plan</div>
+                  <div className="text-[10px] text-text-tertiary">Adapt the route to your latest decisions</div>
                 </div>
               </div>
               <ChevronRight className="w-4 h-4 text-text-tertiary group-hover:translate-x-0.5 transition-transform" />
             </button>
 
-            <div className="space-y-3">
-              <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="block">
-                    <button
-                      type="button"
-                      onClick={() => void handleDownloadAiFiles()}
-                      disabled={!aiFilesReady || isDownloadingAiFiles}
-                      className="btn-primary w-full flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <Download className="w-4 h-4" />
-                      {isDownloadingAiFiles ? 'Preparing plan.md...' : 'Download plan.md'}
-                    </button>
-                  </span>
-                </TooltipTrigger>
-                {!aiFilesReady ? (
-                  <TooltipContent className="max-w-[240px] whitespace-normal px-3 py-2 text-[12px] leading-5">
-                    Plan will be ready when your project generation is complete.
-                  </TooltipContent>
-                ) : null}
-              </Tooltip>
-            </TooltipProvider>
+            <div className="mt-3 space-y-3">
+            <p className="rounded-[10px] border border-border-default bg-bg-elevated/35 px-3 py-2 text-[11px] leading-5 text-text-tertiary">
+              Export actions live in the top workflow toolbar for reliable visibility.
+            </p>
 
             <button
               type="button"
@@ -1180,30 +1078,53 @@ export default function ProjectCanvas() {
               <Trash2 className="w-4 h-4" />
               Delete project
             </button>
-
-            {isAdvancedMode ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger className="w-full flex items-center justify-center gap-2 rounded-[8px] px-4 py-2 text-sm font-medium text-text-tertiary transition-colors hover:text-text-primary">
-                  <Download className="w-4 h-4" />
-                  Export
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-[248px]">
-                  <DropdownMenuItem onClick={exportAsMarkdown} className="flex gap-2">
-                    <FileText className="w-4 h-4" />
-                    <span>Download Markdown (.md)</span>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={exportAsJSON} className="flex gap-2">
-                    <FileJson className="w-4 h-4" />
-                    <span>Download plan (.json)</span>
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ) : null}
             </div>
           </div>
         </div>
 
         <div className="flex-1 relative">
+          <div className="absolute inset-x-0 top-0 z-20 border-b border-border-subtle bg-bg-surface/95 px-5 py-3 backdrop-blur">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Workflow map</div>
+                <div className="text-[13px] text-text-secondary">
+                  {currentStage ? `${currentStage.title} · ${remainingStepCount} step${remainingStepCount === 1 ? '' : 's'} remaining` : 'Map view'}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={exportAsJSON}
+                  className="btn-ghost flex items-center gap-2 text-[12px] focus-visible:ring-2 focus-visible:ring-accent-primary focus-visible:ring-offset-2"
+                >
+                  <FileJson className="w-4 h-4" />
+                  Download JSON
+                </button>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="block">
+                        <button
+                          type="button"
+                          onClick={() => void handleDownloadAiFiles()}
+                          disabled={!aiFilesReady || isDownloadingAiFiles}
+                          className="btn-primary flex items-center gap-2 text-[12px] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:ring-2 focus-visible:ring-accent-primary focus-visible:ring-offset-2"
+                        >
+                          <Download className="w-4 h-4" />
+                          {isDownloadingAiFiles ? 'Preparing plan.md...' : 'Download plan.md'}
+                        </button>
+                      </span>
+                    </TooltipTrigger>
+                    {!aiFilesReady ? (
+                      <TooltipContent className="max-w-[240px] whitespace-normal px-3 py-2 text-[12px] leading-5">
+                        Plan will be ready when your project generation is complete.
+                      </TooltipContent>
+                    ) : null}
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+            </div>
+          </div>
           <ErrorBoundary
             fallback={
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-bg-base p-8 text-center">
@@ -1231,7 +1152,7 @@ export default function ProjectCanvas() {
               onNodeClick={handleNodeClick}
               nodeTypes={nodeTypes}
               fitView
-              className="bg-bg-base"
+              className="bg-bg-base pt-[72px]"
               minZoom={0.1}
               maxZoom={1.5}
               nodesDraggable={isAdvancedMode}
@@ -1385,7 +1306,7 @@ export default function ProjectCanvas() {
       <Dialog
         open={showUpdateModal}
         onOpenChange={(open) => {
-          if (isUpdating || isApplyingDiff) {
+          if (isUpdating) {
             return;
           }
 
@@ -1400,9 +1321,9 @@ export default function ProjectCanvas() {
       >
         <DialogContent className="sm:max-w-[560px] bg-bg-surface border-border-default shadow-modal">
           <DialogHeader>
-            <DialogTitle className="text-heading">Update your build plan</DialogTitle>
+            <DialogTitle className="text-heading">Recalculate your build plan</DialogTitle>
             <DialogDescription className="text-body">
-              Describe what changed and your plan will adapt.
+              Describe what changed and Scrimble will recalculate your route.
             </DialogDescription>
           </DialogHeader>
           
@@ -1501,7 +1422,7 @@ export default function ProjectCanvas() {
             <button 
               type="button"
               onClick={() => {
-                if (isUpdating || isApplyingDiff) {
+                if (isUpdating) {
                   return;
                 }
 
@@ -1511,25 +1432,17 @@ export default function ProjectCanvas() {
                 setShowUpdateModal(false);
               }}
               className="btn-ghost"
-              disabled={isUpdating || isApplyingDiff}
+              disabled={isUpdating}
             >
               Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleApplyAiDiff()}
-              className="btn-ghost"
-              disabled={isUpdating || isApplyingDiff || !updateMessage.trim()}
-            >
-              {isApplyingDiff ? 'Applying diff...' : 'Apply AI diff'}
             </button>
             <button 
               type="button"
               onClick={() => void handlePlanUpdate()}
               className="btn-primary"
-              disabled={isUpdating || isApplyingDiff || !updateMessage.trim()}
+              disabled={isUpdating || !updateMessage.trim()}
             >
-              {isUpdating ? 'Updating...' : 'Update'}
+              {isUpdating ? 'Recalculating...' : 'Recalculate plan'}
             </button>
           </DialogFooter>
         </DialogContent>
