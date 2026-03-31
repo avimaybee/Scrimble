@@ -2,6 +2,7 @@ import { fetchAndParse, type GitHubResearchResult, type SubrequestTracker } from
 import { persistGenerationStreamEvent } from './generation-events';
 import { getActiveMCPServer } from './mcp-servers';
 import type { Bindings, GenerationBatchName } from './types';
+import { warn } from './logger';
 
 export type ResearchResult = {
   content: string;
@@ -101,7 +102,7 @@ export async function fetchSequentially<T>(
   maxConcurrent = 1,
 ): Promise<T[]> {
   if (maxConcurrent !== 1) {
-    console.warn(`[research] fetchSequentially forcing maxConcurrent=1 (received ${maxConcurrent}).`);
+    warn('research', `fetchSequentially forcing maxConcurrent=1`, { received: maxConcurrent });
   }
 
   const results: T[] = [];
@@ -339,7 +340,7 @@ export function createResearchService(context: ResearchServiceContext): Research
         },
       });
     } catch (error) {
-      console.warn('[research] Failed to emit activity event', error);
+      warn('research', 'Failed to emit activity event', { error: error instanceof Error ? error.message : String(error) });
     }
   };
 

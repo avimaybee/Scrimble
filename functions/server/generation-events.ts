@@ -1,5 +1,6 @@
 import type { Batch3Architect } from './generation-schemas';
 import type { Bindings, GenerationBatchName } from './types';
+import { warn } from './logger';
 
 export type GenerationStreamEvent =
   | { type: 'batch_start'; batch: GenerationBatchName; label: string }
@@ -45,6 +46,13 @@ const GENERATION_EVENT_VERSION = 1 as const;
 const SSE_EVENT_NAME = 'generation_event';
 const THINKING_EVENT_WINDOW_SIZE = 60;
 const ACTIVE_THINKING_RUN_STATUSES = new Set(['queued', 'running', 'awaiting_review', 'approved']);
+
+/**
+ * Legacy event support flag.
+ * When true, allows parsing of unversioned events stored before V1 envelope migration.
+ * Can be disabled once all legacy events are migrated or expired.
+ */
+const LEGACY_EVENT_SUPPORT = true;
 
 const batchLabels: Record<GenerationBatchName, string> = {
   batch_1_research_stack: 'Identifying your stack',
@@ -229,7 +237,15 @@ function isGenerationEventEnvelopeV1(value: unknown): value is GenerationEventEn
     && !Array.isArray(candidate.payload);
 }
 
+/**
+ * Legacy event mapper — only used when LEGACY_EVENT_SUPPORT is enabled.
+ * Handles unversioned events stored before V1 envelope migration.
+ */
 function mapLegacyStoredEvent(payload: Record<string, unknown>): PersistedGenerationStreamEvent | null {
+  if (!LEGACY_EVENT_SUPPORT) {
+    return null;
+  }
+
   if (!payload.type || typeof payload.type !== 'string') {
     return null;
   }
@@ -545,7 +561,7 @@ export async function listPersistedGenerationEventsSince(
 }
 
 function logStreamWarning(message: string, payload: Record<string, unknown>) {
-  console.warn(`[generation-events] ${message}`, payload);
+  warn('generation-events', message, payload);
 }
 
 export function createGenerationSseStream(

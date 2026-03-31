@@ -324,6 +324,20 @@ export const Batch2FetchAndReadSchema = z.preprocess(
         truncated_to_fit_context: createBooleanSchema(false),
         degraded_tools: createStringArraySchema(),
         partial_failures: z.preprocess(normalizeObjectArray, z.array(partialFailureSchema)),
+        // Phase 19: Ranking transparency fields
+        ranking_weights: z.preprocess(
+          (value) => normalizeObject(value, () => ({ relevance: 0.38, freshness: 0.2, authority: 0.24, coverage: 0.18 })),
+          z.object({
+            relevance: createNumberSchema(0.38),
+            freshness: createNumberSchema(0.2),
+            authority: createNumberSchema(0.24),
+            coverage: createNumberSchema(0.18),
+          }),
+        ).optional(),
+        selection_cutoff_score: createNumberSchema(0).optional(),
+        skipped_sources_count: createNonNegativeIntSchema(0).optional(),
+        budget_exhausted: createBooleanSchema(false).optional(),
+        aggregate_tokens_consumed: createNonNegativeIntSchema(0).optional(),
       }),
     ),
   }),

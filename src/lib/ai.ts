@@ -1,6 +1,7 @@
 import { auth } from './firebase';
 import { z } from 'zod';
 import { toast } from 'sonner';
+import { error as logError, debug } from './logger';
 
 export type AIProviderType = 'gemini' | 'anthropic' | 'openai' | 'custom' | 'openrouter' | 'groq';
 
@@ -306,7 +307,7 @@ export async function testAIProvider(providerId: string): Promise<boolean> {
     });
     return result.trim().toUpperCase().includes('OK');
   } catch (error) {
-    console.error('Connection test failed:', error);
+    logError('ai-test', 'Connection test failed', { providerId, error: error instanceof Error ? error.message : String(error) });
     return false;
   }
 }
@@ -341,15 +342,15 @@ export const updatePlan = async (
     const parsed = JSON.parse(result);
     const validated = PlanDiffSchema.safeParse(parsed);
     if (!validated.success) {
-      console.error('Plan update validation failed:', validated.error);
-      console.log('Raw AI Response:', result);
+      logError('ai-plan-update', 'Plan update validation failed', { error: validated.error });
+      debug('ai-plan-update', 'Raw AI Response', { result });
       throw new Error('Something went wrong preparing your plan update. Try again.');
     }
     return validated.data;
   } catch (e) {
     if (e instanceof Error && e.message.includes('preparing your plan update')) throw e;
-    console.error('Plan update parsing error:', e);
-    console.log('Raw AI Response:', result);
+    logError('ai-plan-update', 'Plan update parsing error', { error: e instanceof Error ? e.message : String(e) });
+    debug('ai-plan-update', 'Raw AI Response', { result });
     throw new Error('Something went wrong preparing your plan update. Try again.');
   }
 };

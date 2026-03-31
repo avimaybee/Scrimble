@@ -139,14 +139,15 @@ export default function DetailPanel({
     setShowAiChat(false);
   }, [stepId]);
 
+  // Use server-parsed content if available (T1), fall back to client parsing for backward compat
   const parsedStepContent = useMemo(
-    () => parseStepContent({
+    () => step?.parsed_content ?? parseStepContent({
       navigation_links: step?.navigation_links,
       prompts: step?.prompts,
       research_footer_meta: step?.research_footer_meta,
       suggested_tools: step?.suggested_tools,
     }),
-    [step?.navigation_links, step?.prompts, step?.research_footer_meta, step?.suggested_tools],
+    [step?.parsed_content, step?.navigation_links, step?.prompts, step?.research_footer_meta, step?.suggested_tools],
   );
   const navigationLinks = parsedStepContent.navigationLinks;
   const parsedFooterMeta: StepResearchFooterMeta | null = parsedStepContent.researchFooterMeta;

@@ -1,58 +1,66 @@
+/**
+ * User-facing error and status messages.
+ *
+ * All messages should be:
+ * - Short and scannable (under 100 chars)
+ * - Action-oriented (tell user what to do)
+ * - Honest about what happened
+ */
 export const UI_COPY = {
   auth: {
-    signInFailed: 'Could not sign you in right now. Try again.',
+    signInFailed: 'Sign-in failed. Check your connection and try again, or use a different account.',
   },
   dashboard: {
-    loadProjects: 'Could not load your projects.',
-    archiveProject: 'Could not archive that project.',
-    restoreProject: 'Could not restore that project.',
-    deleteProject: 'Could not delete project.',
+    loadProjects: 'Failed to load projects. Check your connection, then refresh the page.',
+    archiveProject: 'Archive failed. Refresh and try again.',
+    restoreProject: 'Restore failed. Refresh and try again.',
+    deleteProject: 'Delete failed. Refresh and try again.',
   },
   newProject: {
-    loadPreparation: 'Could not load your saved settings. Reload and try again.',
-    reopenIntake: 'Could not reopen this intake conversation.',
-    startPlan: 'Could not start your plan. Check your AI key and try again.',
-    missingAiKey: 'You need to add an AI key first.',
-    startIntake: 'Could not start the intake conversation. Try again.',
-    sendReply: 'Could not send that reply. Try again.',
-    saveModelRoles: 'Could not save model role settings.',
+    loadPreparation: 'Failed to load saved settings. Refresh the page to continue.',
+    reopenIntake: 'Failed to reopen conversation. Refresh and try again.',
+    startPlan: 'Failed to start plan. Verify your AI key in Settings, then retry.',
+    missingAiKey: 'Add an AI key in Settings before creating a plan.',
+    startIntake: 'Failed to start conversation. Check your connection and try again.',
+    sendReply: 'Message failed to send. Check your connection and retry.',
+    saveModelRoles: 'Failed to save model roles. Refresh and try again.',
   },
   settings: {
-    loadAi: 'Could not load your AI setup right now. Try again.',
-    loadModelRoles: 'Could not load advanced model controls right now. Try again.',
-    loadResearch: 'Could not load your research connectors right now. Try again.',
-    saveAiKey: 'Could not save your AI key. Try again.',
-    removeAiKey: 'Could not remove that AI key. Try again.',
-    testAiKey: 'Could not test that AI key. Try again.',
-    saveModelRoles: 'Could not save model roles. Try again.',
-    connectResearch: 'Could not connect that research tool. Try again.',
-    updateResearch: 'Could not update that research tool. Try again.',
-    disconnectResearch: 'Could not disconnect that research tool. Try again.',
+    loadAi: 'Failed to load AI setup. Refresh the page.',
+    loadModelRoles: 'Failed to load model controls. Refresh the page.',
+    loadResearch: 'Failed to load research connectors. Refresh the page.',
+    saveAiKey: 'Failed to save AI key. Check the key format and try again.',
+    removeAiKey: 'Failed to remove AI key. Refresh and try again.',
+    testAiKey: 'Connection test failed. Verify the key and try again.',
+    saveModelRoles: 'Failed to save model roles. Refresh and try again.',
+    connectResearch: 'Failed to connect tool. Check credentials and try again.',
+    updateResearch: 'Failed to update tool. Refresh and try again.',
+    disconnectResearch: 'Failed to disconnect tool. Refresh and try again.',
   },
   generation: {
-    loadFailed: 'Could not load generation status right now.',
-    streamFailed: 'Could not connect to the generation stream.',
-    reviewLoadFailed: 'Could not load your review right now.',
-    approveReviewFailed: 'Could not approve your review right now.',
-    switchModelFailed: 'Could not switch that model right now.',
-    nudgeFailed: 'Could not check in with the runner right now.',
-    resumeFailed: 'Could not resume generation right now. Try again.',
-    cancelFailed: 'Could not cancel generation right now. Try again.',
+    loadFailed: 'Failed to load generation status. Refresh the page.',
+    streamFailed: 'Lost connection to generation stream. Refresh to reconnect.',
+    reviewLoadFailed: 'Failed to load review. Refresh and try again.',
+    approveReviewFailed: 'Approval failed. Refresh and try again.',
+    switchModelFailed: 'Failed to switch model. Try again or use a different model.',
+    nudgeFailed: 'Failed to check runner status. Refresh to see latest state.',
+    resumeFailed: 'Resume failed. Refresh and try again from the dashboard.',
+    cancelFailed: 'Cancel failed. Refresh and check generation status.',
     stalledResume:
-      'The runner stayed quiet for too long, so I asked Scrimble to resume from the last completed checkpoint.',
+      'Runner was quiet too long. Scrimble resumed from the last checkpoint.',
     degradedResearch:
-      'Research was limited for this plan — some fetches failed. You can regenerate for a deeper result.',
+      'Research was limited — some fetches failed. Regenerate for deeper results.',
   },
   detailPanel: {
-    loadStep: 'Could not load this step right now.',
-    loadProviders: 'Could not load AI providers right now.',
-    updateTask: 'Could not update that task right now.',
-    completeStep: 'Could not mark this step complete right now.',
-    reviewSubmit: 'Could not submit this review right now.',
-    aiRequest: 'Could not get an AI response right now.',
+    loadStep: 'Failed to load step details. Refresh and try again.',
+    loadProviders: 'Failed to load AI providers. Refresh the page.',
+    updateTask: 'Task update failed. Refresh and try again.',
+    completeStep: 'Failed to mark step complete. Refresh and retry.',
+    reviewSubmit: 'Review submission failed. Refresh and try again.',
+    aiRequest: 'AI request failed. Check your AI key in Settings.',
   },
   runtime: {
     migrationSensitiveFailure:
-      'The server is updating runtime data. Retry in a moment and resume from the latest checkpoint if needed.',
+      'Server is updating. Wait a moment, then retry from the latest checkpoint.',
   },
 } as const;

@@ -1,5 +1,6 @@
 import { decrypt } from '../utils/crypto';
 import type { Bindings, ProviderType } from './types';
+import { debug, info, warn, error as logError } from './logger';
 
 type StreamCallbacks = {
   onReasoningDelta?: (delta: string) => void;
@@ -400,7 +401,7 @@ export async function streamToText(
   }
 
   if (!contentBuffer && leftover.trim()) {
-    console.warn('Stream ended with no content but leftover reasoning/chunks.');
+    warn('ai-stream', 'Stream ended with no content but leftover reasoning/chunks.');
   }
 
   return contentBuffer;
@@ -542,7 +543,7 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
     extractString(value.choices?.[0]?.delta?.reasoning);
 
   if (openAiReasoning) {
-    console.log(`[AI] OpenAI reasoning extracted: ${openAiReasoning.slice(0, 100)}...`);
+    debug('ai-reasoning', 'OpenAI reasoning extracted', { preview: openAiReasoning.slice(0, 100) });
     return openAiReasoning;
   }
 
@@ -553,13 +554,13 @@ function extractReasoningFromProviderChunk(parsed: unknown): string {
       .join('') || '';
 
   if (anthropicThinking) {
-    console.log(`[AI] Anthropic thinking extracted: ${anthropicThinking.slice(0, 100)}...`);
+    debug('ai-reasoning', 'Anthropic thinking extracted', { preview: anthropicThinking.slice(0, 100) });
     return anthropicThinking;
   }
 
   const deltaThinking = extractString(value.delta?.thinking);
   if (deltaThinking) {
-    console.log(`[AI] Delta thinking extracted: ${deltaThinking.slice(0, 100)}...`);
+    debug('ai-reasoning', 'Delta thinking extracted', { preview: deltaThinking.slice(0, 100) });
   }
   return deltaThinking;
 }
@@ -1048,16 +1049,16 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
     const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
     try {
-      console.log(`${logTag} attempt ${attempt + 1}/${maxRetries + 1} starting...`);
+      debug('ai-retry', `attempt ${attempt + 1}/${maxRetries + 1} starting`, { provider: payload.providerType, model: payload.model, role: payload.role });
       const response = await callProvider({ ...payload, signal: controller.signal });
       clearTimeout(timeoutId);
 
       if (response.ok) {
-        console.log(`${logTag} attempt ${attempt + 1} succeeded (${response.status})`);
+        info('ai-retry', `attempt ${attempt + 1} succeeded`, { provider: payload.providerType, model: payload.model, status: response.status });
         return response;
       }
 
-      console.error(`${logTag} attempt ${attempt + 1} got HTTP ${response.status}`);
+      logError('ai-retry', `attempt ${attempt + 1} got HTTP ${response.status}`, { provider: payload.providerType, model: payload.model });
 
       if (response.status === 429) {
         return Response.json(
@@ -1075,7 +1076,7 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
 
       const errorPayload = await readAIErrorPayload(response);
       const diagnosticText = `${errorPayload.message || ''}\n${errorPayload.rawText}`.trim();
-      console.error(`${logTag} attempt ${attempt + 1} failure detail: HTTP ${response.status}, body: ${diagnosticText.slice(0, 500)}`);
+      logError('ai-retry', `attempt ${attempt + 1} failure detail`, { status: response.status, body: diagnosticText.slice(0, 500) });
 
       if (isRuntimeBudgetError(diagnosticText)) {
         return createAIErrorResponse(503, PIPELINE_QUOTA_EXCEEDED, RUNTIME_BUDGET_MESSAGE);
@@ -1097,7 +1098,7 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
       }
 
       if (attempt < maxRetries && (response.status >= 500 || response.status === 0 || response.status === 408)) {
-        console.warn(`${logTag} retrying after ${backoffs[attempt]}ms (server error ${response.status})...`);
+        warn('ai-retry', `retrying after ${backoffs[attempt]}ms`, { status: response.status, attempt: attempt + 1 });
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
       }
@@ -1114,7 +1115,7 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
     } catch (err) {
       clearTimeout(timeoutId);
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`${logTag} attempt ${attempt + 1} EXCEPTION: ${errMsg}`);
+      logError('ai-retry', `attempt ${attempt + 1} EXCEPTION`, { error: errMsg, provider: payload.providerType, model: payload.model });
 
       if (isAbortError(err)) {
         return createAIErrorResponse(504, 'provider_timeout', PROVIDER_TIMEOUT_MESSAGE);
@@ -1125,12 +1126,12 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
       }
 
       if (attempt < maxRetries) {
-        console.warn(`${logTag} retrying after ${backoffs[attempt]}ms...`);
+        warn('ai-retry', `retrying after ${backoffs[attempt]}ms`, { attempt: attempt + 1 });
         await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
         continue;
       }
 
-      console.error(`${logTag} ALL RETRIES EXHAUSTED. Last error: ${errMsg}`);
+      logError('ai-retry', 'ALL RETRIES EXHAUSTED', { lastError: errMsg, provider: payload.providerType, model: payload.model });
 
       const isNetworkError = 
         errMsg.includes('Network connection lost') ||
@@ -1146,7 +1147,7 @@ export async function callAIWithRetry(payload: ProviderRequestOptions): Promise<
     }
   }
 
-  console.error(`${logTag} UNREACHABLE: fell through retry loop`);
+  logError('ai-retry', 'UNREACHABLE: fell through retry loop', { provider: payload.providerType, model: payload.model });
 
   return createAIErrorResponse(503, 'provider_unavailable', PROVIDER_UNAVAILABLE_MESSAGE);
 }
@@ -1208,7 +1209,7 @@ export async function callAIText(payload: GenerateOptions): Promise<{
   // GLM-5/DeepSeek Guard: If we got reasoning but NO content, the model likely 
   // timed out or got stuck in a thought loop. Retry once with a harder nudge.
   if (!text.trim() && reasoningReceived) {
-    console.warn('[callAIText] Model returned reasoning but no content. Retrying with explicit JSON instruction...');
+    warn('ai-text', 'Model returned reasoning but no content. Retrying with explicit JSON instruction.');
     const retryPayload = {
       ...payload,
       system: (payload.system || '') + '\n\nIMPORTANT: You previously only provided reasoning. Please provide the JSON output now. Do not provide extensive reasoning.',

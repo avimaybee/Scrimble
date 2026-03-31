@@ -217,3 +217,144 @@ export type AppEnv = {
 };
 
 export type AppContext = Context<AppEnv>;
+
+// ─────────────────────────────────────────────────────────────────
+// Step Content Types (Task A3 / T1)
+// Server-side typed structures for step content fields.
+// These are parsed from JSON strings before returning in API responses.
+// ─────────────────────────────────────────────────────────────────
+
+export interface StepNavigationLink {
+  label: string;
+  url: string;
+  when: string;
+}
+
+export interface StepPrompt {
+  label: string;
+  content: string;
+}
+
+export interface StepResearchFooterMeta {
+  researched_at: string;
+  tools: string[];
+  quality?: 'live' | 'cached' | 'degraded' | 'none';
+  live_source_count?: number;
+  cached_source_count?: number;
+  degraded_sources?: string[];
+}
+
+export interface StepSuggestedTool {
+  name: string;
+  url?: string;
+  reason?: string;
+}
+
+export interface ParsedStepContent {
+  navigationLinks: StepNavigationLink[];
+  prompts: StepPrompt[];
+  researchFooterMeta: StepResearchFooterMeta | null;
+  suggestedTools: StepSuggestedTool[];
+}
+
+function safeJsonParse(raw: unknown): unknown {
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function parseNavigationLinks(raw: unknown): StepNavigationLink[] {
+  const parsed = safeJsonParse(raw);
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const e = entry as Record<string, unknown>;
+      const label = typeof e.label === 'string' ? e.label.trim() : '';
+      const url = typeof e.url === 'string' ? e.url.trim() : '';
+      const when = typeof e.when === 'string' ? e.when.trim() : '';
+      if (!label || !url) return null;
+      return { label, url, when };
+    })
+    .filter((entry): entry is StepNavigationLink => entry !== null);
+}
+
+export function parsePrompts(raw: unknown): StepPrompt[] {
+  const parsed = safeJsonParse(raw);
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const e = entry as Record<string, unknown>;
+      const label = typeof e.label === 'string' ? e.label.trim() : '';
+      const content = typeof e.content === 'string' ? e.content.trim() : '';
+      if (!label || !content) return null;
+      return { label, content };
+    })
+    .filter((entry): entry is StepPrompt => entry !== null);
+}
+
+export function parseResearchFooterMeta(raw: unknown): StepResearchFooterMeta | null {
+  const parsed = safeJsonParse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const p = parsed as Record<string, unknown>;
+  const researched_at = typeof p.researched_at === 'string' ? p.researched_at.trim() : '';
+  const tools = Array.isArray(p.tools)
+    ? p.tools.filter((t): t is string => typeof t === 'string').map((t) => t.trim()).filter(Boolean)
+    : [];
+  if (!researched_at || tools.length === 0) return null;
+
+  const validQuality = ['live', 'cached', 'degraded', 'none'] as const;
+  const quality = typeof p.quality === 'string' && validQuality.includes(p.quality as typeof validQuality[number])
+    ? (p.quality as StepResearchFooterMeta['quality'])
+    : undefined;
+  const live_source_count = typeof p.live_source_count === 'number' ? p.live_source_count : undefined;
+  const cached_source_count = typeof p.cached_source_count === 'number' ? p.cached_source_count : undefined;
+  const degraded_sources = Array.isArray(p.degraded_sources)
+    ? p.degraded_sources.filter((s): s is string => typeof s === 'string')
+    : undefined;
+
+  return {
+    researched_at,
+    tools,
+    quality,
+    live_source_count,
+    cached_source_count,
+    degraded_sources: degraded_sources?.length ? degraded_sources : undefined,
+  };
+}
+
+export function parseSuggestedTools(raw: unknown): StepSuggestedTool[] {
+  const parsed = safeJsonParse(raw);
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((entry): StepSuggestedTool | null => {
+      if (!entry || typeof entry !== 'object') return null;
+      const e = entry as Record<string, unknown>;
+      const name = typeof e.name === 'string' ? e.name.trim() : '';
+      if (!name) return null;
+      return {
+        name,
+        url: typeof e.url === 'string' ? e.url.trim() : undefined,
+        reason: typeof e.reason === 'string' ? e.reason.trim() : undefined,
+      };
+    })
+    .filter((entry): entry is StepSuggestedTool => entry !== null);
+}
+
+export function parseStepContent(step: {
+  navigation_links?: unknown;
+  prompts?: unknown;
+  research_footer_meta?: unknown;
+  suggested_tools?: unknown;
+}): ParsedStepContent {
+  return {
+    navigationLinks: parseNavigationLinks(step.navigation_links),
+    prompts: parsePrompts(step.prompts),
+    researchFooterMeta: parseResearchFooterMeta(step.research_footer_meta),
+    suggestedTools: parseSuggestedTools(step.suggested_tools),
+  };
+}

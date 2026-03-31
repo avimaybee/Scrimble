@@ -52,6 +52,7 @@ import {
   loadJsonPayloadText,
   storeJsonPayload,
 } from './checkpoint-storage';
+import { warn, error as logError } from './logger';
 
 
 import { extractGitHubRepository } from '../utils/fetch-url';
@@ -3037,7 +3038,7 @@ async function loadGenerationCheckpoint<T>(
   const record = await env.DB.prepare(`
     SELECT id, payload_inline, payload_r2_key, current_index
     FROM generation_checkpoints
-    WHERE project_id = ? AND run_id = ? AND batch_name = ?
+    WHERE project_id = ? AND run_id = ? AND batch_name = ? AND checkpoint_state = 'active'
     LIMIT 1
   `)
     .bind(projectId, runId, batchName)
@@ -3050,7 +3051,7 @@ async function loadGenerationCheckpoint<T>(
 
   const data = await loadJsonPayload<T>(env, typedRecord.payload_inline, typedRecord.payload_r2_key);
   if (!data) {
-    console.error('[GENERATION_CHECKPOINT] Missing or unreadable checkpoint payload.', {
+    logError('checkpoint-load', 'Missing or unreadable checkpoint payload', {
       projectId,
       runId,
       batchName,
@@ -3100,6 +3101,7 @@ async function saveGenerationCheckpoint<T>(
           payload_inline = ?,
           payload_r2_key = ?,
           size_bytes = ?,
+          checkpoint_state = 'active',
           updated_at = datetime("now")
       WHERE id = ?
     `)
@@ -3114,8 +3116,8 @@ async function saveGenerationCheckpoint<T>(
   } else {
     await env.DB.prepare(`
       INSERT INTO generation_checkpoints (
-        id, project_id, run_id, batch_name, current_index, payload_inline, payload_r2_key, size_bytes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, project_id, run_id, batch_name, current_index, payload_inline, payload_r2_key, size_bytes, checkpoint_state
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
     `)
       .bind(
         crypto.randomUUID(),
@@ -3139,10 +3141,12 @@ async function clearGenerationCheckpoint(
   runId: string,
   batchName: GenerationBatchName,
 ) {
+  // Mark checkpoint as completed instead of deleting (preserves audit trail)
+  // Also clean up R2 payload to save storage
   const existing = await env.DB.prepare(`
     SELECT id, payload_r2_key
     FROM generation_checkpoints
-    WHERE project_id = ? AND run_id = ? AND batch_name = ?
+    WHERE project_id = ? AND run_id = ? AND batch_name = ? AND checkpoint_state = 'active'
     LIMIT 1
   `)
     .bind(projectId, runId, batchName)
@@ -3154,7 +3158,14 @@ async function clearGenerationCheckpoint(
   }
 
   await deleteJsonPayload(env, typedExisting.payload_r2_key);
-  await env.DB.prepare('DELETE FROM generation_checkpoints WHERE id = ?')
+  await env.DB.prepare(`
+    UPDATE generation_checkpoints
+    SET checkpoint_state = 'completed',
+        payload_inline = NULL,
+        payload_r2_key = NULL,
+        updated_at = datetime("now")
+    WHERE id = ?
+  `)
     .bind(typedExisting.id)
     .run();
 }
@@ -3164,10 +3175,12 @@ export async function clearGenerationCheckpoints(
   projectId: string,
   runId?: string,
 ) {
+  // Mark active checkpoints as invalidated (for resume/approval scenarios)
+  // Delete R2 payloads to save storage
   const rows = await env.DB.prepare(`
     SELECT id, payload_r2_key
     FROM generation_checkpoints
-    WHERE project_id = ?
+    WHERE project_id = ? AND checkpoint_state = 'active'
       ${runId ? 'AND run_id = ?' : ''}
   `)
     .bind(...(runId ? [projectId, runId] : [projectId]))
@@ -3178,8 +3191,12 @@ export async function clearGenerationCheckpoints(
   }
 
   await env.DB.prepare(`
-    DELETE FROM generation_checkpoints
-    WHERE project_id = ?
+    UPDATE generation_checkpoints
+    SET checkpoint_state = 'invalidated',
+        payload_inline = NULL,
+        payload_r2_key = NULL,
+        updated_at = datetime("now")
+    WHERE project_id = ? AND checkpoint_state = 'active'
       ${runId ? 'AND run_id = ?' : ''}
   `)
     .bind(...(runId ? [projectId, runId] : [projectId]))
@@ -3383,7 +3400,7 @@ async function callAITextWithHeartbeat(
         if (!active) break;
         await touchGenerationRunHeartbeat(env, runId);
       } catch (error) {
-        console.warn('[generation-heartbeat] Failed to refresh heartbeat during AI call:', error);
+        warn('generation-heartbeat', 'Failed to refresh heartbeat during AI call', { error: error instanceof Error ? error.message : String(error) });
       }
     }
   };
@@ -3664,7 +3681,7 @@ function logBatchResponseFailure(
   stage: 'transport' | 'json' | 'schema',
   responseText: string,
 ) {
-  console.warn('[generation-ai-parse-failure]', {
+  warn('generation-ai-parse', 'AI response parse failure', {
     runType,
     stage,
     responseLength: responseText.length,
@@ -4847,6 +4864,20 @@ export async function executeBatch2(
     retrieval_budget_tokens: RETRIEVAL_BUDGETS,
     used_full_context_window: false,
     truncated_to_fit_context: false,
+    // Phase 19: Ranking transparency fields
+    ranking_weights: {
+      relevance: 0.38,
+      freshness: 0.20,
+      authority: 0.24,
+      coverage: 0.18,
+    },
+    selection_cutoff_score: rankedSources.filter((s) => s.selected).reduce(
+      (min, s) => Math.min(min, s.rank_score),
+      1,
+    ),
+    skipped_sources_count: 0,
+    budget_exhausted: false,
+    aggregate_tokens_consumed: chunkStore.reduce((sum, c) => sum + Math.ceil(c.content.length / 4), 0),
   };
 
   const input = {
@@ -5760,7 +5791,7 @@ export async function executeBatch6(
 
   if (storedHash && storedHash !== currentHash) {
     const errorMsg = `Authoring record drift detected. Batch 4 authored content changed before Batch 6 assembly. Resume from Batch 4 to regenerate canonical outputs. (Stored: ${storedHash.slice(0, 8)}, Current: ${currentHash.slice(0, 8)})`;
-    console.error(`[INVARIANT_VIOLATION] Batch 6: ${errorMsg} for project ${projectId}`);
+    logError('invariant-violation', `Batch 6: ${errorMsg}`, { projectId });
     
     await persistInvariantViolation(
       env,

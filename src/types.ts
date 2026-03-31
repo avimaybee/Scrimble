@@ -304,6 +304,8 @@ export interface Step {
   order_index: number;
   created_at: string;
   updated_at: string;
+  // Server-parsed typed content (T1: canonical step content)
+  parsed_content?: ParsedStepContent;
 }
 
 export interface Edge {

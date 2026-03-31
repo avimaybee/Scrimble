@@ -23,6 +23,7 @@ import type { Bindings, GenerationBatchName } from './types';
 import { getActiveMCPServer } from './mcp-servers';
 import { persistGenerationStreamEvent } from './generation-events';
 import { fetchAndParse, type GitHubResearchResult } from '../utils/fetch-url';
+import { warn } from './logger';
 
 // ─────────────────────────────────────────────────────────────────
 // Types
@@ -218,7 +219,7 @@ async function emitResearchEvent(
       },
     });
   } catch (error) {
-    console.warn('[research-facade] Failed to emit event:', error);
+    warn('research-facade', 'Failed to emit event', { error: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -363,7 +364,7 @@ export async function searchWeb(
         };
       }
     } catch (error) {
-      console.warn('[research-facade] Brave Search failed:', error);
+      warn('research-facade', 'Brave Search failed', { error: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -391,7 +392,7 @@ export async function searchWeb(
       };
     }
   } catch (error) {
-    console.warn('[research-facade] Jina Search failed:', error);
+    warn('research-facade', 'Jina Search failed', { error: error instanceof Error ? error.message : String(error) });
   }
 
   await emitResearchEvent(context, '⚠️', `Search for "${query}" returned no results.`);
@@ -499,7 +500,7 @@ export async function fetchDocument(
       }),
     };
   } catch (error) {
-    console.warn('[research-facade] fetchDocument failed:', error);
+    warn('research-facade', 'fetchDocument failed', { url, error: error instanceof Error ? error.message : String(error) });
     await emitResearchEvent(context, '⚠️', `Couldn't read ${url}`);
     return {
       content: '',
@@ -601,7 +602,7 @@ export async function analyzeGitHubRepo(
       }),
     };
   } catch (error) {
-    console.warn('[research-facade] analyzeGitHubRepo failed:', error);
+    warn('research-facade', 'analyzeGitHubRepo failed', { owner, repo, error: error instanceof Error ? error.message : String(error) });
     return createEmptyGitHubResponse(
       owner,
       repo,
@@ -702,7 +703,7 @@ export async function fetchLibraryDocs(
         }
       }
     } catch (error) {
-      console.warn('[research-facade] Context7 failed:', error);
+      warn('research-facade', 'Context7 failed', { library, topic, error: error instanceof Error ? error.message : String(error) });
     }
   }
 

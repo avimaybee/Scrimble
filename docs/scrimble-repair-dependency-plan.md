@@ -498,7 +498,7 @@ Relevant areas:
 - `functions/server/generation-pipeline.ts`
 - `functions/server/app.ts`
 
-### C6. Replace legacy event translation with a versioned event schema
+### [x] C6. Replace legacy event translation with a versioned event schema
 
 Depends on: A2, C3
 
@@ -521,7 +521,12 @@ Relevant areas:
 - `functions/server/generation-events.ts`
 - `src/lib/db.ts`
 
-### C7. Remove debug logging from shipped code or route it through a real logger
+- Progress update:
+  - Phase 18 implemented `GenerationEventEnvelopeV1` as the canonical versioned event schema.
+  - All event persistence now uses the versioned envelope; legacy translation is isolated in narrow read-only adapters.
+  - Validated via `scripts/phase18-foundation-hardening.assertions.ts`.
+
+### [x] C7. Remove debug logging from shipped code or route it through a real logger
 
 Depends on: C2, C3
 
@@ -545,7 +550,13 @@ Relevant areas:
 - `functions/server/generation-events.ts`
 - `functions/server/generation-pipeline.ts`
 
-### C8. Centralize persistence and checkpoint semantics
+- Progress update:
+  - Phase 18 added `functions/server/logger.ts` with level-gated structured logging.
+  - Phase 20 replaced all raw `console.*` calls in `functions/server/` with logger calls.
+  - Phase 20 added `src/lib/logger.ts` for client-side level-gated logging.
+  - All production logging now uses the shared logger contract.
+
+### [x] C8. Centralize persistence and checkpoint semantics
 
 Depends on: A2, C3, C6
 
@@ -568,6 +579,11 @@ Relevant areas:
 - `functions/server/checkpoint-storage.ts`
 - `functions/server/workflow-storage.ts`
 - `functions/server/generation-events.ts`
+
+- Progress update:
+  - Phase 18 consolidated checkpoint lifecycle in `checkpoint-policy.ts` with explicit states.
+  - Phase 18 added `generation-runtime.ts` as the single canonical runtime truth source.
+  - Checkpoint ownership, persistence semantics, and resume logic now follow one contract.
 
 ---
 
@@ -1019,7 +1035,7 @@ Depends on: B1, B2, B3, B4, B5, F2, F4
 
 Unlocks: future source-heavy research features
 
-### G1. Build source candidate acquisition and ranking
+### [x] G1. Build source candidate acquisition and ranking
 
 Problem:
 - Search returns too many pages, but the model should only see a curated subset.
@@ -1035,7 +1051,13 @@ Acceptance:
 - The model only sees a curated source set.
 - Hundreds of candidates can be processed without bloating the prompt.
 
-### G2. Add chunking and excerpt selection
+- Progress update:
+  - Phase 19 created `functions/server/research-ranking.ts` with modular ranking.
+  - `rankSourceCandidates()`, `scoreCandidate()`, `deduplicateCandidates()` exported.
+  - Explicit `ScoringWeights` (relevance 38%, freshness 20%, authority 24%, coverage 18%).
+  - Skipped/rejected candidates tracked via `SkippedSource` with explicit reasons.
+
+### [x] G2. Add chunking and excerpt selection
 
 Problem:
 - Full articles and long pages are too large to pass through the model directly.
@@ -1051,7 +1073,13 @@ Acceptance:
 - Large source sets can be handled without blowing the context window.
 - The model can still trace each answer back to the right source chunks.
 
-### G3. Add hierarchical summarization and evidence packs
+- Progress update:
+  - Phase 19 created `functions/server/research-chunks.ts` with stable chunking.
+  - `chunkDocument()`, `buildChunkStore()`, `computeChunkId()` exported.
+  - Deterministic chunk IDs using djb2 hash (Cloudflare Workers compatible).
+  - `DEFAULT_CHUNK_CONFIG`: 1600 chars, 200 overlap.
+
+### [x] G3. Add hierarchical summarization and evidence packs
 
 Problem:
 - One pass over raw articles is not enough to synthesize large source sets clearly.
@@ -1067,7 +1095,13 @@ Acceptance:
 - The final answer can point back to many sources without reloading them all.
 - Evidence remains traceable across multiple summarization layers.
 
-### G4. Add budget-aware synthesis and citation assembly
+- Progress update:
+  - Phase 19 created `functions/server/research-evidence.ts` with entity-level packs.
+  - `buildSourceNotes()`, `buildEvidencePacks()`, `buildEntityEvidencePacks()` exported.
+  - Evidence packs grouped by technology + concern (gotchas, setup, migration, etc.).
+  - Explicit `chunkCitations` and `sourceNoteIds` for citation tracing.
+
+### [x] G4. Add budget-aware synthesis and citation assembly
 
 Problem:
 - The model still needs hard limits on how much evidence it sees at once.
@@ -1082,6 +1116,13 @@ Work:
 Acceptance:
 - Hundred-source questions stay under context and still produce citeable results.
 - The system behaves like a retrieval and synthesis layer, not a giant prompt dump.
+
+- Progress update:
+  - Phase 19 created `functions/server/research-budget.ts` with budget tracking.
+  - `canAffordFetch()`, `shouldFetch()`, `reallocateUnused()` exported.
+  - Cross-batch pooling via `applyStandardCarryoverChain()`.
+  - Budget exhaustion and skipped sources tracked in `data_quality`.
+  - Validated via `scripts/phase19-retrieval-scale.assertions.ts` (25 assertions).
 
 ## 8. Artifact Export And Markdown Download
 

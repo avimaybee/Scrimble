@@ -1,4 +1,5 @@
 import type { Bindings } from './types';
+import { error as logError } from './logger';
 
 export const MAX_INLINE_JSON_BYTES = 900_000;
 
@@ -84,7 +85,7 @@ export async function loadJsonPayload<T>(
   try {
     return JSON.parse(text) as T;
   } catch (error) {
-    console.error('[checkpoint-payload-parse-failed]', {
+    logError('checkpoint-parse', 'Checkpoint payload parse failed', {
       r2Key: r2Key || null,
       inlinePayload: Boolean(inlineText),
       payloadSize: text.length,

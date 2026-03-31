@@ -80,17 +80,24 @@ import {
 import { WorkflowBriefDriftError, processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
 import {
   GENERATION_BATCHES,
+  parseStepContent,
   type AppContext,
   type AppEnv,
   type Bindings,
   type GenerationBatchName,
   type ProjectGenerationStatus,
 } from './types';
+import { warn, error as logError } from './logger';
 
 export const app = new Hono<AppEnv>().basePath('/api');
 
 app.onError((error, c) => {
-  console.error('[Hono Error]', error);
+  logError('hono-error', 'Request failed', {
+    method: c.req.method,
+    path: c.req.path,
+    errorMessage: error instanceof Error ? error.message : String(error),
+    errorName: error instanceof Error ? error.name : 'Unknown',
+  });
   const status = error instanceof z.ZodError ? 400 : 500;
   const message = error instanceof Error ? error.message : 'Internal Server Error';
   
@@ -400,6 +407,13 @@ function mapStageRow(row: any) {
 }
 
 function mapStepRow(row: any) {
+  const parsedContent = parseStepContent({
+    navigation_links: row.navigation_links,
+    prompts: row.prompts,
+    research_footer_meta: row.research_footer_meta,
+    suggested_tools: row.suggested_tools,
+  });
+
   return {
     id: row.id,
     stage_id: row.stage_id,
@@ -414,10 +428,13 @@ function mapStepRow(row: any) {
     risk_level: row.risk_level || 'low',
     objective: row.objective || '',
     why_it_matters: row.why_it_matters || '',
+    // Raw JSON strings for backward compatibility
     suggested_tools: row.suggested_tools || undefined,
     prompts: row.prompts || undefined,
     navigation_links: row.navigation_links || undefined,
     research_footer_meta: row.research_footer_meta || undefined,
+    // Parsed typed content for direct consumption
+    parsed_content: parsedContent,
     done_when: row.done_when || '',
     ai_output: row.ai_output || undefined,
     is_ai_enriched: toBoolean(row.is_ai_enriched),
@@ -716,7 +733,7 @@ app.use('*', async (c, next) => {
 
   const firebaseProjectId = optionalText(c.env.FIREBASE_PROJECT_ID) || 'scrimble-auth';
   if (!optionalText(c.env.FIREBASE_PROJECT_ID)) {
-    console.warn('[auth-config-fallback]', { key: 'FIREBASE_PROJECT_ID', using: firebaseProjectId });
+    warn('auth-config', 'FIREBASE_PROJECT_ID not set, using fallback', { using: firebaseProjectId });
   }
 
   let uid: string;
@@ -733,7 +750,7 @@ app.use('*', async (c, next) => {
     await ensureProfile(c, uid);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Profile initialization failed';
-    console.error('[auth-profile-sync-failed]', { uid, message });
+    logError('auth-profile-sync', 'Profile sync failed', { uid, message });
     return jsonError(`Failed to initialize your profile: ${message}`, 500);
   }
 
@@ -1796,7 +1813,7 @@ app.post('/projects/:id/cancel', async (c) => {
         workflowInstanceId: runId,
       });
     } catch (error) {
-      console.warn('[CANCEL] Workflow terminate failed, falling back to D1-only cancel.', {
+      warn('cancel-workflow', 'Workflow terminate failed, falling back to D1-only cancel', {
         projectId,
         runId,
         error: error instanceof Error ? error.message : String(error),
@@ -1810,7 +1827,7 @@ app.post('/projects/:id/cancel', async (c) => {
       errorMessage: 'Generation cancelled by user.',
     });
   } else {
-    console.warn(`[app/cancel] Project ${projectId} has no active run to cancel. Skipping fallback mutation.`);
+    warn('cancel-workflow', 'Project has no active run to cancel. Skipping fallback mutation.', { projectId });
   }
 
   await persistGenerationStreamEvent(c.env, {
