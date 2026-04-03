@@ -112,7 +112,7 @@ export function buildGenerationRuntimeContract(
     currentBatch: lifecycleStatus === 'running' ? runtime.currentBatch : null,
     isTerminal,
     canResume: runtime.canResume,
-    isReviewRequired: lifecycleStatus === 'awaiting_review',
+    isReviewRequired: lifecycleStatus === 'awaiting_review' || lifecycleStatus === 'awaiting_verification_review',
     providerId: runtime.run?.provider_id ?? null,
     heartbeatAt: runtime.run?.heartbeat_at ?? null,
     completedBatches: runtime.completedBatches,

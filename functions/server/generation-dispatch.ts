@@ -12,10 +12,12 @@ export type GenerationDispatchKind =
   | 'intake_confirm'
   | 'direct_create'
   | 'architecture_approval'
+  | 'verification_approval'
   | 'resume'
   | 'continuation';
 
 export const WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED = 'architecture-approved';
+export const WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED = 'verification-approved';
 
 type DispatchPayload = {
   projectId: string;
@@ -323,7 +325,10 @@ export async function sendWorkflowDispatchEvent(
     throw new Error('Workflow instance ID is required to send workflow events.');
   }
 
-  if (payload.eventType !== WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED) {
+  if (
+    payload.eventType !== WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED
+    && payload.eventType !== WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED
+  ) {
     throw new Error(`Unsupported workflow event type: ${payload.eventType}`);
   }
 
@@ -337,6 +342,10 @@ export async function sendWorkflowDispatchEvent(
     feedback: approvalPayload.feedback || '',
     preferredIde: approvalPayload.preferredIde || '',
     approved: approvalPayload.approved ?? true,
+    approvalType:
+      payload.eventType === WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED
+        ? 'verification'
+        : 'architecture',
   });
 }
 
@@ -356,6 +365,20 @@ export async function sendGenerationDispatch(
         approved: true,
         feedback: payload.reviewFeedback || '',
         preferredIde: payload.preferredIde || '',
+      },
+    });
+    return payload.workflowInstanceId || workflowInstanceIdFor(payload.projectId, payload.runId);
+  }
+
+  if (payload.kind === 'verification_approval') {
+    await sendWorkflowDispatchEvent(env, {
+      projectId: payload.projectId,
+      runId: payload.runId,
+      workflowInstanceId: payload.workflowInstanceId,
+      eventType: WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED,
+      eventPayload: {
+        approved: true,
+        feedback: payload.reviewFeedback || '',
       },
     });
     return payload.workflowInstanceId || workflowInstanceIdFor(payload.projectId, payload.runId);

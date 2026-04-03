@@ -1,4 +1,4 @@
-import type { Batch3Architect } from './generation-schemas';
+import type { Batch3Architect, Batch7Verification } from './generation-schemas';
 import type { Bindings, GenerationBatchName } from './types';
 import { warn } from './logger';
 
@@ -8,6 +8,7 @@ export type GenerationStreamEvent =
   | { type: 'thinking'; content: string }
   | { type: 'batch_complete'; batch: GenerationBatchName; duration_ms: number; progress_percent: number }
   | { type: 'checkpoint'; adr: Batch3Architect; run_id?: string }
+  | { type: 'verification_review_required'; report: Batch7Verification; run_id: string }
   | { type: 'pipeline_complete'; project_id: string }
   | { type: 'pipeline_failed'; error: string; failureClass?: string }
   | { type: 'invariant'; drift_type: string; message: string; timestamp: string };
@@ -45,7 +46,7 @@ const EVENT_POLL_INTERVAL_MS = 2_000;
 const GENERATION_EVENT_VERSION = 1 as const;
 const SSE_EVENT_NAME = 'generation_event';
 const THINKING_EVENT_WINDOW_SIZE = 60;
-const ACTIVE_THINKING_RUN_STATUSES = new Set(['queued', 'running', 'awaiting_review', 'approved']);
+const ACTIVE_THINKING_RUN_STATUSES = new Set(['queued', 'running', 'awaiting_review', 'approved', 'awaiting_verification_review']);
 
 /**
  * Legacy event support flag.
@@ -61,6 +62,7 @@ const batchLabels: Record<GenerationBatchName, string> = {
   batch_4_plan_build: 'Building your plan',
   batch_5_enrich_steps: 'Writing step details',
   batch_6_generate_files: 'Preparing your files',
+  batch_7_verify: 'Verifying consistency',
 };
 
 function asText(value: unknown, fallback = ''): string {
@@ -118,6 +120,11 @@ function eventPayloadFromStreamEvent(event: PersistedGenerationStreamEvent): Rec
       return {
         adr: event.adr,
         run_id: event.run_id ?? null,
+      };
+    case 'verification_review_required':
+      return {
+        report: event.report,
+        run_id: event.run_id,
       };
     case 'pipeline_complete':
       return {
@@ -199,6 +206,15 @@ function streamEventFromEnvelope(envelope: GenerationEventEnvelopeV1): Persisted
         adr: envelope.payload.adr as Batch3Architect,
         run_id: optionalText(envelope.payload.run_id) || undefined,
       };
+    case 'verification_review_required':
+      if (!envelope.payload.report || typeof envelope.payload.report !== 'object') {
+        return null;
+      }
+      return {
+        type: 'verification_review_required',
+        report: envelope.payload.report as Batch7Verification,
+        run_id: asText(envelope.payload.run_id),
+      };
     case 'pipeline_complete':
       return {
         type: 'pipeline_complete',
@@ -257,6 +273,7 @@ function mapLegacyStoredEvent(payload: Record<string, unknown>): PersistedGenera
     || typedPayload.type === 'thinking'
     || typedPayload.type === 'batch_complete'
     || typedPayload.type === 'checkpoint'
+    || typedPayload.type === 'verification_review_required'
     || typedPayload.type === 'pipeline_complete'
     || typedPayload.type === 'pipeline_failed'
     || typedPayload.type === 'invariant'

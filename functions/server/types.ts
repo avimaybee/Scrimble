@@ -28,6 +28,7 @@ export const GENERATION_BATCHES = [
   'batch_4_plan_build',
   'batch_5_enrich_steps',
   'batch_6_generate_files',
+  'batch_7_verify',
 ] as const;
 
 export type GenerationBatchName = (typeof GENERATION_BATCHES)[number];
@@ -37,6 +38,7 @@ export type ProjectGenerationStatus =
   | 'intake'
   | 'queued'
   | 'awaiting_review'
+  | 'awaiting_verification_review'
   | 'approved'
   | 'complete'
   | 'failed'
@@ -50,7 +52,8 @@ export type ProjectGenerationStatus =
 export type GenerationRunStatus =
   | 'queued'           // Waiting to start
   | 'running'          // Executing a batch
-  | 'awaiting_review'  // Paused at human gate
+  | 'awaiting_review'  // Paused at human gate (Architecture)
+  | 'awaiting_verification_review' // Paused at human gate (Verification)
   | 'approved'         // User approved, ready to continue
   | 'complete'         // Finished successfully
   | 'failed'           // Failed with error
@@ -95,6 +98,7 @@ export function projectStatusToRunStatus(status: ProjectGenerationStatus): Gener
   if (status === 'intake' || status === 'queued') return 'queued';
   if (status.startsWith('batch_')) return 'running';
   if (status === 'awaiting_review') return 'awaiting_review';
+  if (status === 'awaiting_verification_review') return 'awaiting_verification_review';
   if (status === 'approved') return 'approved';
   if (status === 'complete') return 'complete';
   if (status === 'failed') return 'failed';
@@ -159,6 +163,7 @@ export type WorkflowApprovalPayload = {
   feedback: string;
   preferredIde: string;
   approved: boolean;
+  approvalType?: 'architecture' | 'verification';
 };
 
 export type WorkflowServiceBindingLike = {

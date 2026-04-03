@@ -16,6 +16,7 @@ const GENERATION_BATCHES: GenerationBatchName[] = [
   'batch_4_plan_build',
   'batch_5_enrich_steps',
   'batch_6_generate_files',
+  'batch_7_verify',
 ];
 
 const TERMINAL_LIFECYCLE_STATUSES = new Set<GenerationLifecycleStatus>(['complete', 'failed', 'cancelled']);
@@ -29,6 +30,7 @@ function isGenerationLifecycleStatus(value: string | null | undefined): value is
     || value === 'queued'
     || value === 'running'
     || value === 'awaiting_review'
+    || value === 'awaiting_verification_review'
     || value === 'approved'
     || value === 'complete'
     || value === 'failed'
@@ -50,6 +52,10 @@ function toLifecycleStatusFromLegacyStatus(status: string | null | undefined): G
 
   if (status === 'awaiting_review') {
     return 'awaiting_review';
+  }
+
+  if (status === 'awaiting_verification_review') {
+    return 'awaiting_verification_review';
   }
 
   if (status === 'approved') {
@@ -96,17 +102,26 @@ export function normalizeGenerationRuntime(payload: RuntimeCompatiblePayload): G
     return runtime;
   }
 
+  const fallbackLifecycleStatus = toLifecycleStatusFromLegacyStatus(
+    (payload as RuntimeCompatiblePayload & { status?: string | null }).status,
+  );
+  const fallbackCanResume = Boolean(
+    (payload as RuntimeCompatiblePayload & { can_resume?: boolean }).can_resume,
+  );
+
   return {
     runId: null,
-    lifecycleStatus: 'intake',
+    lifecycleStatus: fallbackLifecycleStatus,
     currentBatch: null,
-    isTerminal: false,
-    canResume: false,
-    isReviewRequired: false,
+    isTerminal: TERMINAL_LIFECYCLE_STATUSES.has(fallbackLifecycleStatus),
+    canResume: fallbackCanResume,
+    isReviewRequired:
+      fallbackLifecycleStatus === 'awaiting_review'
+      || fallbackLifecycleStatus === 'awaiting_verification_review',
     providerId: null,
     heartbeatAt: null,
     completedBatches: [],
-    failureClass: null,
+    failureClass: deriveFailureClass(fallbackLifecycleStatus, fallbackCanResume),
   };
 }
 

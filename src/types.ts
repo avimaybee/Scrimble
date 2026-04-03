@@ -7,12 +7,14 @@ export type GenerationBatchName =
   | 'batch_3_architect'
   | 'batch_4_plan_build'
   | 'batch_5_enrich_steps'
-  | 'batch_6_generate_files';
+  | 'batch_6_generate_files'
+  | 'batch_7_verify';
 export type GenerationStatus =
   | GenerationBatchName
   | 'intake'
   | 'queued'
   | 'awaiting_review'
+  | 'awaiting_verification_review'
   | 'approved'
   | 'complete'
   | 'failed'
@@ -23,6 +25,7 @@ export type GenerationLifecycleStatus =
   | 'queued'
   | 'running'
   | 'awaiting_review'
+  | 'awaiting_verification_review'
   | 'approved'
   | 'complete'
   | 'failed'
@@ -368,6 +371,18 @@ export interface ArchitectureDecisionRecord {
   }>;
 }
 
+export interface Batch7Verification {
+  passed: boolean;
+  checks: Array<{
+    check_id: 'stack_drift' | 'prd_coverage' | 'enrichment_completeness' | 'link_audit';
+    passed: boolean;
+    severity: 'error' | 'warning' | 'info';
+    message: string;
+    details?: string[];
+  }>;
+  summary: string;
+}
+
 export interface ProjectGenerationBatchStartEvent {
   batch: GenerationBatchName;
   label: string;
@@ -396,6 +411,15 @@ export interface ProjectGenerationCheckpointEvent {
   run_id?: string;
 }
 
+export interface ProjectBatch7VerificationEvent {
+  type: 'verification_review_required';
+  report: Batch7Verification;
+  run_id: string;
+  projectId: string;
+  batch: 'batch_7_verify';
+  timestamp: string;
+}
+
 export interface ProjectGenerationInvariantEvent {
   drift_type: string;
   message: string;
@@ -408,6 +432,7 @@ export type GenerationStreamEventType =
   | 'thinking'
   | 'batch_complete'
   | 'checkpoint'
+  | 'verification_review_required'
   | 'pipeline_complete'
   | 'pipeline_failed'
   | 'invariant';
@@ -438,6 +463,7 @@ export interface ProjectGenerationStatusResponse {
   is_approved: boolean;
   execution_stale: boolean;
   can_resume: boolean;
+  verification_report?: Batch7Verification | null;
 }
 
 export interface ProjectIntakeMessage {

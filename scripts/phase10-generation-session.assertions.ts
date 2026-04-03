@@ -56,7 +56,7 @@ function makeStatus(overrides: Partial<ProjectGenerationStatusResponse> = {}): P
       },
     ],
     completed_batch_count: 2,
-    total_batches: 6,
+    total_batches: 7,
     progress_percent: 33,
     is_intake: false,
     is_complete: false,

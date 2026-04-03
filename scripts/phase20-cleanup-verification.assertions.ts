@@ -325,10 +325,10 @@ function assertCheckpointOwnershipHelpersExist(): AssertionResult {
 function assertStructuredPrdDocumentExists(): AssertionResult {
   const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
   const content = readFile(pipelinePath);
-  const hasBuilder = content.includes('function buildPrdDocumentMarkdown');
-  const hasPayloadField = content.includes('prd_document_markdown: buildPrdDocumentMarkdown');
+  const hasPayloadType = content.includes('prd_document_markdown: string');
+  const hasPayloadField = content.includes('prd_document_markdown: adr.prd_document_markdown');
   return assert(
-    hasBuilder && hasPayloadField,
+    hasPayloadType && hasPayloadField,
     'Architecture review payload includes generated full PRD markdown document',
   );
 }
@@ -342,6 +342,78 @@ function assertProjectGenerationRendersPrdMarkdown(): AssertionResult {
   return assert(
     hasMarkdownRenderer && hasToggle && bindsReviewPayload,
     'ProjectGeneration renders expandable full PRD markdown from review payload',
+  );
+}
+
+function assertWorkflowInvokesBatch7AndGate(): AssertionResult {
+  const workflowPath = path.join(SERVER_DIR, 'generation-workflow.ts');
+  const content = readFile(workflowPath);
+  const hasBatch7Import = content.includes('executeBatch7_verify');
+  const hasRunVerificationStep = content.includes("step.do('run-verification'");
+  const hasVerificationWait = content.includes("step.waitForEvent<VerificationApprovalEventPayload>")
+    && content.includes('WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED');
+  return assert(
+    hasBatch7Import && hasRunVerificationStep && hasVerificationWait,
+    'Workflow executes batch_7_verify and waits for verification approval event before finalization',
+  );
+}
+
+function assertWorkflowCompletedBatchQueryIncludesBatch7(): AssertionResult {
+  const workflowPath = path.join(SERVER_DIR, 'generation-workflow.ts');
+  const content = readFile(workflowPath);
+  const includesBatch7 = content.includes("'batch_7_verify'");
+  return assert(
+    includesBatch7,
+    'Workflow completed-batch query includes batch_7_verify',
+  );
+}
+
+function assertVerificationFinalizeUsesWorkflowDispatch(): AssertionResult {
+  const appPath = path.join(SERVER_DIR, 'app.ts');
+  const content = readFile(appPath);
+  const hasVerificationEvent = content.includes('WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED');
+  const dispatchesEvent = content.includes('sendWorkflowDispatchEvent(c.env')
+    && content.includes("eventType: WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED");
+  const noDirectFinalize = !content.includes('await finalizeProjectGeneration(c.env, projectId, runId);');
+  return assert(
+    hasVerificationEvent && dispatchesEvent && noDirectFinalize,
+    'Finalize endpoint dispatches verification approval event instead of directly finalizing',
+  );
+}
+
+function assertRuntimeReviewGateIncludesVerification(): AssertionResult {
+  const runtimePath = path.join(SERVER_DIR, 'generation-runtime.ts');
+  const content = readFile(runtimePath);
+  const includesVerification = content.includes("lifecycleStatus === 'awaiting_review' || lifecycleStatus === 'awaiting_verification_review'");
+  return assert(
+    includesVerification,
+    'Runtime contract marks awaiting_verification_review as review-required',
+  );
+}
+
+function assertFrontendBatch7IsVisible(): AssertionResult {
+  const sessionPath = path.join(ROOT_DIR, 'src', 'lib', 'generation-session.ts');
+  const runtimePath = path.join(ROOT_DIR, 'src', 'lib', 'generation-runtime.ts');
+  const sessionContent = readFile(sessionPath);
+  const runtimeContent = readFile(runtimePath);
+  const sessionHasBatch7 = sessionContent.includes("{ id: 'batch_7_verify', heading: 'Verifying consistency'");
+  const runtimeHasBatch7 = runtimeContent.includes("'batch_7_verify'");
+  return assert(
+    sessionHasBatch7 && runtimeHasBatch7,
+    'Frontend generation batches include batch_7_verify in session view and runtime normalizer',
+  );
+}
+
+function assertVerificationPayloadHydratesOnRefresh(): AssertionResult {
+  const appPath = path.join(SERVER_DIR, 'app.ts');
+  const uiPath = path.join(ROOT_DIR, 'src', 'pages', 'ProjectGeneration.tsx');
+  const appContent = readFile(appPath);
+  const uiContent = readFile(uiPath);
+  const statusIncludesReport = appContent.includes('verification_report: verificationReport');
+  const uiLoadsFromStatus = uiContent.includes('if (statusData.verification_report) {');
+  return assert(
+    statusIncludesReport && uiLoadsFromStatus,
+    'Verification report is returned by status API and hydrated by ProjectGeneration on refresh',
   );
 }
 
@@ -382,6 +454,12 @@ const assertions: Array<() => AssertionResult> = [
   assertCheckpointOwnershipHelpersExist,
   assertStructuredPrdDocumentExists,
   assertProjectGenerationRendersPrdMarkdown,
+  assertWorkflowInvokesBatch7AndGate,
+  assertWorkflowCompletedBatchQueryIncludesBatch7,
+  assertVerificationFinalizeUsesWorkflowDispatch,
+  assertRuntimeReviewGateIncludesVerification,
+  assertFrontendBatch7IsVisible,
+  assertVerificationPayloadHydratesOnRefresh,
 ];
 
 let passed = 0;

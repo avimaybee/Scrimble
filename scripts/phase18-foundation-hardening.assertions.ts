@@ -169,6 +169,7 @@ runTest('T6: Checkpoint policy defines configs for all batches', () => {
   assert.ok(policy.includes('batch_4_plan_build:'), 'Should have batch 4 config');
   assert.ok(policy.includes('batch_5_enrich_steps:'), 'Should have batch 5 config');
   assert.ok(policy.includes('batch_6_generate_files:'), 'Should have batch 6 config');
+  assert.ok(policy.includes('batch_7_verify:'), 'Should have batch 7 config');
 });
 
 runTest('T6: Checkpoint policy returns decision with reason', () => {

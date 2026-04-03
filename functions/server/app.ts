@@ -8,6 +8,7 @@ import { diffSchema } from '../types/diff';
 import {
   Batch2FetchAndReadSchema,
   Batch3ArchitectSchema,
+  Batch7VerificationSchema,
   Batch6GenerateFilesSchema,
   getSkillFileSortIndex,
 } from './generation-schemas';
@@ -22,6 +23,7 @@ import {
   sendWorkflowDispatchEvent,
   sendGenerationDispatch,
   WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+  WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED,
   workflowInstanceIdFor,
 } from './generation-dispatch';
 
@@ -1503,6 +1505,15 @@ app.get('/projects/:id/status', async (c) => {
     message: getBatchCompletionMessage(batchName as GenerationBatchName),
   }));
 
+  let verificationReport: unknown = null;
+  if (lifecycleStatus === 'awaiting_verification_review') {
+    try {
+      verificationReport = await loadBatchOutput(c.env, projectId, 'batch_7_verify', Batch7VerificationSchema);
+    } catch {
+      verificationReport = null;
+    }
+  }
+
   return c.json({
     project_id: projectId,
     generation_runtime: generationRuntime,
@@ -1520,6 +1531,7 @@ app.get('/projects/:id/status', async (c) => {
     is_approved: lifecycleStatus === 'approved',
     execution_stale: canResume && (executionStale || queuedResumeReady),
     can_resume: canResume,
+    verification_report: verificationReport,
     resumedAt: runtimeState.run?.updated_at,
   });
 });
@@ -1679,6 +1691,54 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
 app.post('/projects/:id/approve', handleProjectArchitectureApproval);
 app.post('/projects/:id/architecture-review', handleProjectArchitectureApproval);
 app.post('/projects/:id/architect/revise', handleProjectArchitectureRevision);
+
+const handleProjectVerificationFinalize = async (c: AppContext) => {
+  const projectId = c.req.param('id');
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+  const { generationRuntime, lifecycleStatus } = projectRuntime;
+
+  if (lifecycleStatus !== 'awaiting_verification_review') {
+    return c.json({ error: 'Project is not awaiting verification review.' }, 409);
+  }
+
+  const runId = generationRuntime.runId;
+  if (!runId) {
+    return c.json({ error: 'No active generation run found.' }, 409);
+  }
+
+  const workflowServiceError = requireWorkflowServiceBinding(c);
+  if (workflowServiceError) {
+    return workflowServiceError;
+  }
+
+  const workflowInstanceId = generationRuntime.runId;
+  const resolvedWorkflowInstanceId = (workflowInstanceId && workflowInstanceId.trim())
+    ? workflowInstanceId
+    : workflowInstanceIdFor(projectId, runId);
+
+  const body = await c.req.json().catch(() => ({}));
+  const feedback = typeof body.feedback === 'string' ? body.feedback.trim() : '';
+
+  try {
+    await sendWorkflowDispatchEvent(c.env, {
+      workflowInstanceId: resolvedWorkflowInstanceId,
+      eventType: WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED,
+      eventPayload: {
+        approved: true,
+        feedback,
+      },
+    });
+    return c.json({ success: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to finalize project.';
+    return c.json({ error: message }, 409);
+  }
+};
+
+app.post('/projects/:id/finalize', handleProjectVerificationFinalize);
 
 app.post('/projects/:id/resume', async (c) => {
   const projectId = c.req.param('id');

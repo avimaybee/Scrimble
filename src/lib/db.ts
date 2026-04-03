@@ -19,6 +19,8 @@ import {
   ProjectIntakeSession,
   Stage,
   Step,
+  Batch7Verification,
+  ProjectBatch7VerificationEvent,
   WorkflowBriefDrift,
   WorkflowUpdateActivity,
   WorkflowUpdateResult,
@@ -123,6 +125,7 @@ interface StreamProjectGenerationOptions {
   onInvariant?: (event: ProjectGenerationInvariantEvent) => void;
   onBatchCompleted?: (event: ProjectGenerationEvent) => void;
   onCheckpoint?: (event: ProjectGenerationCheckpointEvent) => void;
+  onVerificationReviewRequired?: (event: ProjectBatch7VerificationEvent) => void;
   onComplete?: () => void;
   onFailed?: (event: { message: string; failureClass: GenerationRuntime['failureClass'] }) => void;
   onConnectionStateChange?: (state: GenerationStreamConnectionState) => void;
@@ -145,6 +148,7 @@ const generationBatchLabels: Record<ProjectGenerationBatchStartEvent['batch'], s
   batch_4_plan_build: 'Building your plan',
   batch_5_enrich_steps: 'Writing step details',
   batch_6_generate_files: 'Preparing your files',
+  batch_7_verify: 'Verifying consistency',
 };
 
 type ParsedGenerationStreamEvent =
@@ -153,6 +157,7 @@ type ParsedGenerationStreamEvent =
   | { kind: 'thinking'; event: ProjectGenerationThinking }
   | { kind: 'batch_complete'; event: ProjectGenerationEvent }
   | { kind: 'checkpoint'; event: ProjectGenerationCheckpointEvent }
+  | { kind: 'verification_review_required'; event: ProjectBatch7VerificationEvent }
   | { kind: 'invariant'; event: ProjectGenerationInvariantEvent }
   | { kind: 'pipeline_complete' }
   | {
@@ -289,6 +294,22 @@ function parseGenerationStreamEvent(payload: unknown): ParsedGenerationStreamEve
         event: {
           adr: eventPayload.adr as ArchitectureDecisionRecord,
           run_id: typeof eventPayload.run_id === 'string' ? eventPayload.run_id : undefined,
+        },
+      };
+    case 'verification_review_required':
+      if (!asObject(eventPayload.report)) {
+        return { kind: 'ignored' };
+      }
+
+      return {
+        kind: 'verification_review_required',
+        event: {
+          type: 'verification_review_required',
+          report: eventPayload.report as Batch7Verification,
+          run_id: typeof eventPayload.run_id === 'string' ? eventPayload.run_id : '',
+          projectId: envelope.projectId,
+          batch: 'batch_7_verify',
+          timestamp: envelope.timestamp,
         },
       };
     case 'invariant': {
@@ -599,6 +620,43 @@ export const dbService = {
     };
   },
 
+  async finalizeProjectGeneration(projectId: string, feedback = ''): Promise<{ success: boolean }> {
+    return fetchAPI<{ success: boolean }>(`/projects/${projectId}/finalize`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    });
+  },
+
+  async getLatestVerificationReport(projectId: string): Promise<Batch7Verification> {
+    const status = await this.getProjectGenerationStatus(projectId);
+    if (status.generation_runtime?.lifecycleStatus !== 'awaiting_verification_review') {
+      throw new Error('Project is not awaiting verification review.');
+    }
+
+    return new Promise<Batch7Verification>((resolve, reject) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => {
+        controller.abort();
+        reject(new Error('Verification report is not available yet.'));
+      }, 10_000);
+
+      void this.streamProjectGeneration(projectId, {
+        signal: controller.signal,
+        onVerificationReviewRequired: (event) => {
+          window.clearTimeout(timeout);
+          controller.abort();
+          resolve(event.report);
+        },
+      }).catch((error) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        window.clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error('Failed to load verification report.'));
+      });
+    });
+  },
+
   async downloadSkillFiles(projectId: string): Promise<void> {
     const response = await fetchWithAuth(`/projects/${projectId}/skill-files`, {
       method: 'GET',
@@ -705,6 +763,9 @@ export const dbService = {
                 return;
               case 'checkpoint':
                 options.onCheckpoint?.(parsed.event);
+                return;
+              case 'verification_review_required':
+                options.onVerificationReviewRequired?.(parsed.event);
                 return;
               case 'invariant':
                 options.onInvariant?.(parsed.event);

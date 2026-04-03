@@ -11,6 +11,7 @@ import {
   Batch4PlanBuildSchema,
   Batch5EnrichStepsSchema,
   Batch6GenerateFilesSchema,
+  Batch7VerificationSchema,
   getSkillFileSortIndex,
   SKILL_FILE_NAMES,
   type Batch1ResearchStack,
@@ -19,6 +20,7 @@ import {
   type PlanAuthoringRecord,
   type Batch5EnrichSteps,
   type Batch6GenerateFiles,
+  type Batch7Verification,
   type SkillFileName,
   schemaDescriptions,
 } from './generation-schemas';
@@ -62,6 +64,7 @@ import {
   createResearchSubrequestTracker,
   RESEARCH_SUBREQUEST_LIMIT,
   resolveToolDocsEntry,
+  RESEARCH_TOOL_HANDBOOK,
   type ResearchResult,
 } from './research';
 import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
@@ -354,6 +357,7 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
   'batch_4_plan_build',
   'batch_5_enrich_steps',
   'batch_6_generate_files',
+  'batch_7_verify',
 ]);
 const ACTIVE_GENERATION_HEARTBEAT_STATUSES = Array.from(ACTIVE_GENERATION_STATUSES);
 
@@ -399,6 +403,7 @@ const batchCompletionMessages: Record<GenerationBatchName, string> = {
   batch_4_plan_build: 'Generated the full staged build plan.',
   batch_5_enrich_steps: 'Prepared AI guidance and prompts for every step.',
   batch_6_generate_files: 'Created the downloadable skill files.',
+  batch_7_verify: 'Performed consistency and quality verification.',
 };
 
 const batchSequenceIndexes = Object.fromEntries(
@@ -423,6 +428,8 @@ function getBatchWorkDescription(batchName: GenerationBatchName) {
       return 'write concrete implementation details for each step';
     case 'batch_6_generate_files':
       return 'prepare the downloadable AI companion files';
+    case 'batch_7_verify':
+      return 'verify consistency and quality of the generated outputs';
     default:
       return 'finish the current generation pass';
   }
@@ -3367,6 +3374,7 @@ type LegacyPipelineEventType =
   | 'batch_completed'
   | 'fetch_attempt'
   | 'review_required'
+  | 'verification_review_required'
   | 'generation_complete'
   | 'generation_failed';
 
@@ -5383,6 +5391,8 @@ ${JSON.stringify(researchCatalog, null, 2)}
 Retrieved research context:
 ${architectureResearchSlice.context || 'No retrieved research chunks were available for this architecture pass.'}
 
+${RESEARCH_TOOL_HANDBOOK}
+
 Produce a structured Architecture Decision Record (ADR):
 - project_name: A concise, catchy name.
 - project_type: The primary technical category (e.g., "SaaS", "Mobile App", "Internal Tool").
@@ -5910,6 +5920,8 @@ ${JSON.stringify(researchCatalog, null, 2)}
 Live step research for this chunk:
 ${researchForChunk.map((context) => formatStepResearchPrompt(context)).join('\n\n')}
 
+${RESEARCH_TOOL_HANDBOOK}
+
 For every step in the chunk, generate:
 - step_id
 - ai_output
@@ -6143,6 +6155,235 @@ export async function executeBatch6(
   }
 }
 
+export async function executeBatch7_verify(
+  env: Bindings,
+  projectId: string,
+  runId: string,
+  provider: ProviderConfig,
+  _builderProfile: LoadedBuilderProfileContext,
+  projectBrief: LoadedProjectBriefContext,
+) {
+  const startedAt = Date.now();
+  const adr = await loadBatchOutput(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
+  const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
+  const enrichments = await loadBatchOutput(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
+  const files = await loadBatchOutput(env, projectId, 'batch_6_generate_files', Batch6GenerateFilesSchema);
+
+  const input = {
+    adr_stack: adr.recommended_stack,
+    plan_step_count: plan.stages.reduce((acc, s) => acc + s.steps.length, 0),
+    enrichment_count: enrichments.enrichments.length,
+    file_count: files.files.length,
+  };
+
+  await emitBatchStart(env, projectId, runId, 'batch_7_verify');
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_7_verify',
+    runId,
+    kind: 'system',
+    message: 'Starting automated consistency and quality verification...',
+  });
+
+  const systemPrompt = appendProjectBriefSystemPrompt(
+    'You are Scrimble’s Quality Assurance Lead. Your job is to verify that the generated project outputs (ADR, Plan, Enrichments, and Files) are consistent, complete, and follow the project brief. Return only valid JSON.',
+    projectBrief.promptContext,
+  );
+
+  const prompt = `Project Brief:
+${projectBrief.summary || 'No summary provided.'}
+
+Architecture Decision Record (ADR):
+${JSON.stringify({ recommended_stack: adr.recommended_stack, data_model: adr.data_model }, null, 2)}
+
+Implementation Plan Summary:
+Stages: ${plan.stages.length}
+Total Steps: ${plan.stages.reduce((acc, s) => acc + s.steps.length, 0)}
+
+Enrichment Coverage:
+${enrichments.enrichments.length} steps have detailed AI guidance.
+
+Generated Files:
+${files.files.map((f) => f.filename).join(', ')}
+
+Please perform the following verification checks:
+1. **Stack Drift**: Does the plan and ADR strictly follow the technologies identified in research?
+2. **PRD Coverage**: Are all MVP features described in the brief accounted for in the plan?
+3. **Enrichment Completeness**: Are there any steps that lack specific technical guidance or links?
+4. **Dead Link Audit**: Do the navigation links in the enrichment steps look valid and relevant to the assigned tools?
+
+Return a verification report in this JSON format:
+{
+  "passed": boolean,
+  "checks": [
+    {
+      "check_id": "stack_drift" | "prd_coverage" | "enrichment_completeness" | "link_audit",
+      "passed": boolean,
+      "severity": "error" | "warning" | "info",
+      "message": "string",
+      "details": ["string"]
+    }
+  ],
+  "summary": "A concise summary of the overall quality and any required actions."
+}
+
+If "passed" is false, the user will be asked to review or re-run. Set "passed" to true if there are only "info" or minor "warning" issues. Set to false if there are "error" level issues that break implementation.`;
+
+  try {
+    const result = await callValidatedBatch(provider, {
+      env,
+      projectId,
+      runId,
+      runType: 'batch_7_verify',
+      role: 'fast',
+      systemPrompt,
+      prompt,
+      schema: Batch7VerificationSchema,
+      schemaDescription: schemaDescriptions.batch_7_verify,
+    });
+
+    await completeBatch(
+      env,
+      projectId,
+      runId,
+      provider,
+      'batch_7_verify',
+      input,
+      result.data,
+      result.attemptCount,
+      result.data,
+      Date.now() - startedAt,
+    );
+
+    const errorCount = result.data.checks.filter((c) => c.severity === 'error' && !c.passed).length;
+    const warningCount = result.data.checks.filter((c) => c.severity === 'warning' && !c.passed).length;
+
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_7_verify',
+      runId,
+      kind: errorCount > 0 ? 'warning' : 'complete',
+      message: `Verification complete: ${result.data.passed ? 'PASSED' : 'Review required'} (${errorCount} errors, ${warningCount} warnings).`,
+    });
+
+    // Always require a final human verification acknowledgement before completion.
+    await pauseForVerificationReview(env, projectId, runId, result.data);
+  } catch (error) {
+    const errorClass = classifyAIError(error);
+    if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
+      throw new RetryableGenerationPipelineError(error instanceof Error ? error.message : 'Batch 7 failed.', 45);
+    }
+
+    await failBatch(
+      env,
+      projectId,
+      runId,
+      provider,
+      'batch_7_verify',
+      input,
+      error,
+      2,
+    );
+    throw error;
+  }
+}
+
+export async function pauseForVerificationReview(
+  env: Bindings,
+  projectId: string,
+  runId: string,
+  report: Batch7Verification,
+) {
+  const { changes } = await updateGenerationRunStatus(env, runId, 'awaiting_verification_review');
+  if (changes === 0) {
+    return;
+  }
+
+  await logActivity(env, {
+    projectId,
+    batchName: 'batch_7_verify',
+    runId,
+    kind: 'system',
+    message: "Consistency verification flagged issues — please review the report before finalizing.",
+  });
+
+  await insertGenerationEvent(env, {
+    projectId,
+    eventType: 'verification_review_required',
+    batchName: 'batch_7_verify',
+    body: {
+      report,
+      run_id: runId,
+    },
+  });
+}
+
+export async function saveVerificationReviewApproval(
+  env: Bindings,
+  projectId: string,
+  runId: string,
+  feedback: string,
+) {
+  const timestamp = new Date().toISOString();
+  const verificationRun = await env.DB.prepare(`
+    SELECT id, input
+    FROM agent_runs
+    WHERE project_id = ?
+      AND run_id = ?
+      AND run_type = 'batch_7_verify'
+      AND status = 'complete'
+    ORDER BY sequence_index DESC, completed_at DESC
+    LIMIT 1
+  `)
+    .bind(projectId, runId)
+    .first() as { id: string; input: string | null } | null;
+
+  if (!verificationRun?.id) {
+    throw new GenerationPipelineError('Verification report is not ready yet.');
+  }
+
+  const trimmedFeedback = feedback.trim();
+  const parsedInput = parseJsonObject(verificationRun.input);
+  const nextInput = {
+    ...parsedInput,
+    verification_review_feedback: trimmedFeedback,
+    verification_review_feedback_provided: trimmedFeedback.length > 0,
+    verification_review_approved_at: timestamp,
+  };
+
+  await env.DB.prepare(`
+    UPDATE agent_runs
+    SET input = ?,
+        updated_at = datetime("now")
+    WHERE id = ?
+  `)
+    .bind(JSON.stringify(nextInput), verificationRun.id)
+    .run();
+}
+
+export async function hasApprovedVerificationReview(env: Bindings, projectId: string): Promise<boolean> {
+  const runs = await env.DB.prepare(`
+    SELECT input
+    FROM agent_runs
+    WHERE project_id = ?
+      AND run_type = 'batch_7_verify'
+      AND status = 'complete'
+    ORDER BY sequence_index DESC, completed_at DESC
+    LIMIT 1
+  `)
+    .bind(projectId)
+    .all();
+
+  for (const row of runs.results as Array<{ input: string | null }>) {
+    const parsedInput = parseJsonObject(row.input);
+    if (optionalText(parsedInput.verification_review_approved_at) !== null) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export async function pauseForArchitectureReview(env: Bindings, projectId: string, runId: string) {
   // HARDENING: Check if we already have an approval for this run
   if (await hasApprovedArchitectureReview(env, projectId)) {
@@ -6182,7 +6423,7 @@ export async function finalizeProjectGeneration(env: Bindings, projectId: string
   await clearGenerationCheckpoints(env, projectId, runId);
   await logActivity(env, {
     projectId,
-    batchName: 'batch_6_generate_files',
+    batchName: 'batch_7_verify',
     runId,
     kind: 'complete',
     message: 'Everything is ready — opening your canvas.',
@@ -6252,6 +6493,16 @@ export async function resolvePipelineStatusToRun(
   // 6. Generate Files
   if (!completedBatches.includes('batch_6_generate_files') || !(await hasOutput('batch_6_generate_files'))) {
     return 'batch_5_enrich_steps';
+  }
+
+  // 7. Verify
+  if (!completedBatches.includes('batch_7_verify') || !(await hasOutput('batch_7_verify'))) {
+    return 'batch_6_generate_files';
+  }
+
+  // Human Gate: Verification Approval
+  if (!(await hasApprovedVerificationReview(env, projectId))) {
+    return 'awaiting_verification_review';
   }
 
   return 'complete';

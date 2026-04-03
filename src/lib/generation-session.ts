@@ -19,6 +19,7 @@ export const GENERATION_BATCHES: Array<{
   { id: 'batch_4_plan_build', heading: 'Building your plan', shortLabel: 'Plan' },
   { id: 'batch_5_enrich_steps', heading: 'Writing step details', shortLabel: 'Steps' },
   { id: 'batch_6_generate_files', heading: 'Preparing your files', shortLabel: 'Files' },
+  { id: 'batch_7_verify', heading: 'Verifying consistency', shortLabel: 'Verify' },
 ];
 
 const RESUMABLE_FAILURE_CLASSES = new Set<Exclude<GenerationFailureClass, null>>([

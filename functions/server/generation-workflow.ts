@@ -14,10 +14,13 @@ import {
   executeBatch4,
   executeBatch5,
   executeBatch6,
+  executeBatch7_verify,
   finalizeProjectGeneration,
   hasApprovedArchitectureReview,
+  hasApprovedVerificationReview,
   loadBatchOutput,
   pauseForArchitectureReview,
+  saveVerificationReviewApproval,
   resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
   type ProviderConfig,
@@ -26,7 +29,10 @@ import { getGenerationRuntimeState, updateGenerationRunStatus } from './generati
 import { loadProjectBriefContext } from './project-briefs';
 import { loadBuilderProfileContext } from './user-tools';
 import { saveToR2, loadFromR2 } from './workflow-storage';
-import { WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED } from './generation-dispatch';
+import {
+  WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED,
+  WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED,
+} from './generation-dispatch';
 import type {
   Bindings,
   GenerationBatchName,
@@ -77,6 +83,11 @@ type GenerationPayload = {
 type ReviewApprovalEventPayload = {
   feedback: string;
   preferredIde: string;
+  approved: boolean;
+};
+
+type VerificationApprovalEventPayload = {
+  feedback: string;
   approved: boolean;
 };
 
@@ -154,7 +165,7 @@ async function getCompletedGenerationBatches(env: Bindings, projectId: string) {
     FROM agent_runs
     WHERE project_id = ?
       AND status = 'complete'
-      AND run_type IN ('batch_1_research_stack', 'batch_2_fetch_and_read', 'batch_3_architect', 'batch_4_plan_build', 'batch_5_enrich_steps', 'batch_6_generate_files')
+      AND run_type IN ('batch_1_research_stack', 'batch_2_fetch_and_read', 'batch_3_architect', 'batch_4_plan_build', 'batch_5_enrich_steps', 'batch_6_generate_files', 'batch_7_verify')
     ORDER BY created_at ASC
   `)
     .bind(projectId)
@@ -680,9 +691,72 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
 
       state = await resolveCurrentStatusToRun(this.env, projectId);
 
+      if (state.statusToRun === 'batch_6_generate_files') {
+        await step.do('run-verification', {
+          retries: { limit: 2, delay: '15 seconds', backoff: 'exponential' },
+          timeout: '15 minutes',
+        }, async () => {
+          await assertActiveRun(this.env, projectId, runId);
+          await executeBatch7_verify(this.env, projectId, runId, fastProvider, builderProfile, projectBrief);
+          return null;
+        });
+      }
+
+      state = await resolveCurrentStatusToRun(this.env, projectId);
+
       if (
-        state.statusToRun === 'batch_6_generate_files'
-        || (state.statusToRun === 'complete' && state.currentStatus !== 'complete')
+        state.statusToRun === 'awaiting_verification_review'
+        && !(await hasApprovedVerificationReview(this.env, projectId))
+      ) {
+        await assertActiveRun(this.env, projectId, runId);
+
+        const verificationEvent = await step.waitForEvent<VerificationApprovalEventPayload>(
+          'await-verification-approval',
+          {
+            type: WORKFLOW_EVENT_TYPE_VERIFICATION_APPROVED,
+            timeout: '24 hours',
+          },
+        );
+
+        if (!verificationEvent.approved) {
+          await step.do('cancel-after-verification-review', async () => {
+            await markProjectCancelled(
+              this.env,
+              projectId,
+              runId,
+              verificationEvent.feedback?.trim() || 'Verification review was not approved by the builder.',
+            );
+            return null;
+          });
+          return;
+        }
+
+        await step.do('persist-verification-feedback', async () => {
+          await saveVerificationReviewApproval(this.env, projectId, runId, verificationEvent.feedback || '');
+          await persistGenerationStreamEvent(this.env, {
+            projectId,
+            runId,
+            batchName: 'batch_7_verify',
+            event: {
+              type: 'activity',
+              icon: '✦',
+              message:
+                verificationEvent.feedback?.trim()
+                  ? 'Verification approved with your notes — finalizing your project now.'
+                  : 'Verification approved — finalizing your project now.',
+              timestamp: new Date().toISOString(),
+            },
+          });
+          return null;
+        });
+
+      }
+
+      state = await resolveCurrentStatusToRun(this.env, projectId);
+
+      if (
+        state.statusToRun === 'complete'
+        && state.currentStatus !== 'complete'
       ) {
         await step.do('finalise', async () => {
           await assertActiveRun(this.env, projectId, runId);

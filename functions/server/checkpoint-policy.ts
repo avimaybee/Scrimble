@@ -73,6 +73,12 @@ const BATCH_CHECKPOINT_CONFIGS: Record<GenerationBatchName, CheckpointBatchConfi
     checkpointInterval: 0, // No checkpointing for file generation
     supportsCheckpoint: false,
   },
+  batch_7_verify: {
+    maxBudget: 35,
+    subrequestReserve: 5,
+    checkpointInterval: 0, // No checkpointing for verification
+    supportsCheckpoint: false,
+  },
 };
 
 export function getCheckpointConfig(batchName: GenerationBatchName): CheckpointBatchConfig {

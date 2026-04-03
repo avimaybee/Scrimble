@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import {
   BookOpenText,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   ChevronRight,
@@ -15,11 +16,14 @@ import {
   Hexagon,
   LoaderCircle,
   MessageSquare,
+  RefreshCcw,
   Search,
   Settings,
+  ShieldCheck,
   Sparkles,
   TriangleAlert,
   XCircle,
+  Zap,
 } from 'lucide-react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -59,6 +63,8 @@ import type {
   ProjectGenerationInvariantEvent,
   ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
+  Batch7Verification,
+  ProjectBatch7VerificationEvent,
 } from '../types';
 
 const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
@@ -352,6 +358,8 @@ export default function ProjectGeneration() {
   const [showAllResearchSources, setShowAllResearchSources] = useState(false);
   const [hasPreparationCompleted, setHasPreparationCompleted] = useState(!initialPreparationState);
   const [generationPreparation] = useState<GenerationPreparationState | null>(initialPreparationState);
+  const [verificationReport, setVerificationReport] = useState<Batch7Verification | null>(null);
+  const [isFinalizing, setIsFinalizing] = useState(false);
   const [streamConnectionKey, setStreamConnectionKey] = useState(0);
   const [streamConnectionState, setStreamConnectionState] = useState<GenerationStreamConnectionState>('connecting');
   const [lastProgressAt, setLastProgressAt] = useState<string | null>(null);
@@ -365,6 +373,7 @@ export default function ProjectGeneration() {
   const feedbackRef = useRef<HTMLTextAreaElement | null>(null);
   const statusRef = useRef<ProjectGenerationStatusResponse | null>(null);
   const reviewDataRef = useRef<ArchitectureReviewResponse | null>(null);
+  const verificationReportRef = useRef<Batch7Verification | null>(null);
 
   const applyStatusUpdate = useCallback((
     updater:
@@ -389,6 +398,10 @@ export default function ProjectGeneration() {
   useEffect(() => {
     reviewDataRef.current = reviewData;
   }, [reviewData]);
+
+  useEffect(() => {
+    verificationReportRef.current = verificationReport;
+  }, [verificationReport]);
 
   const noteProgressTimestamp = useCallback((timestamp: string | null | undefined) => {
     setLastProgressAt((previous) => pickLatestTimestamp(previous, timestamp));
@@ -511,6 +524,9 @@ export default function ProjectGeneration() {
     setProject(projectData);
     applyStatusUpdate(statusData);
     noteProgressTimestamp(statusData.generation_runtime?.heartbeatAt);
+    if (statusData.verification_report) {
+      setVerificationReport(statusData.verification_report);
+    }
 
     setShowResumeBadge(statusData.generation_runtime?.canResume === true && statusData.execution_stale);
 
@@ -520,6 +536,21 @@ export default function ProjectGeneration() {
 
     if ((statusData.generation_runtime?.isReviewRequired ?? false) && (!currentReviewData || currentReviewData.project_id !== id)) {
       void loadReviewData();
+    }
+
+    if (
+      statusData.generation_runtime?.lifecycleStatus === 'awaiting_verification_review'
+      && !statusData.verification_report
+      && !verificationReportRef.current
+    ) {
+      try {
+        const report = await dbService.getLatestVerificationReport(id);
+        setVerificationReport(report);
+      } catch {
+        // Verification report may not be immediately available during a transition.
+      }
+    } else if (verificationReportRef.current && statusData.generation_runtime?.lifecycleStatus !== 'awaiting_verification_review') {
+      setVerificationReport(null);
     }
 
     const isFailed = statusData.generation_runtime?.lifecycleStatus === 'failed';
@@ -789,6 +820,23 @@ export default function ProjectGeneration() {
           );
           void loadReviewData();
         },
+        onVerificationReviewRequired: (event) => {
+          setVerificationReport(event.report);
+          applyStatusUpdate((previous) =>
+            previous
+              ? {
+                  ...previous,
+                  generation_runtime: previous.generation_runtime
+                    ? {
+                        ...previous.generation_runtime,
+                        lifecycleStatus: 'awaiting_verification_review',
+                        isReviewRequired: true,
+                      }
+                    : previous.generation_runtime,
+                }
+              : previous,
+          );
+        },
         onComplete: () => {
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
@@ -901,7 +949,8 @@ export default function ProjectGeneration() {
   const completedBatchCount = session.completedBatchCount;
   const resolvedCurrentBatchIndex = session.currentBatchIndex;
   const currentBatch = GENERATION_BATCHES[resolvedCurrentBatchIndex] || GENERATION_BATCHES[0];
-  const showReviewPanel = Boolean(isReviewRequired && !isComplete && !isFailed);
+  const showReviewPanel = Boolean(isReviewRequired && !isComplete && !isFailed && lifecycleStatus !== 'awaiting_verification_review');
+  const showVerificationPanel = Boolean((isReviewRequired || verificationReport) && !isComplete && !isFailed && (lifecycleStatus === 'awaiting_verification_review' || !!verificationReport));
   const showPreparationScreen = Boolean(generationPreparation && !hasPreparationCompleted);
   const latestProgressTimestamp = pickLatestTimestamp(
     lastProgressAt,
@@ -942,7 +991,7 @@ export default function ProjectGeneration() {
     ? `${GENERATION_BATCHES.length} of ${GENERATION_BATCHES.length} stages complete`
     : `${completedBatchCount} of ${GENERATION_BATCHES.length} stages complete`;
   const runnerStatusHeadline = showReviewPanel
-    ? 'Waiting for your review'
+    ? (lifecycleStatus === 'awaiting_verification_review' ? 'Waiting for your final approval' : 'Waiting for your review')
     : isComplete
       ? 'Generation finished'
       : isFailed
@@ -961,7 +1010,9 @@ export default function ProjectGeneration() {
                       ? 'Waiting on the current model or tool call'
                     : `Stage ${Math.min(resolvedCurrentBatchIndex + 1, GENERATION_BATCHES.length)} is actively running`;
   const runnerStatusDetail = showReviewPanel
-    ? 'Approve the architecture when it looks right, then Scrimble will continue immediately.'
+    ? (lifecycleStatus === 'awaiting_verification_review'
+      ? 'Review the verification report and finalize to complete your project.'
+      : 'Approve the architecture when it looks right, then Scrimble will continue immediately.')
     : isComplete
       ? 'All generation stages are done and the final project handoff is ready.'
       : quietDurationMs >= RUNNER_WAITING_LABEL_THRESHOLD_MS && streamConnectionState === 'live'
@@ -1326,6 +1377,22 @@ export default function ProjectGeneration() {
       setIsCancelling(false);
     }
   }, [applyStatusUpdate, id, isCancelling]);
+ 
+  const handleFinalizeProject = useCallback(async () => {
+    if (!id || isFinalizing) return;
+    setIsFinalizing(true);
+    try {
+      const result = await dbService.finalizeProjectGeneration(id, '');
+      if (result.success) {
+        toast.success('Verification approved. Finalizing your project...');
+        void reconnectLiveFeed();
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to finalize project.');
+    } finally {
+      setIsFinalizing(false);
+    }
+  }, [id, isFinalizing, reconnectLiveFeed]);
 
   useEffect(() => {
     if (!showResumeBadge || autoRecoveryFailed || isAutoRecovering || isResuming) {
@@ -1414,6 +1481,99 @@ export default function ProjectGeneration() {
                     <ExternalLink className="h-4 w-4 text-accent-primary" />
                   </a>
                 ) : null}
+              </div>
+            </motion.div>
+          ) : showVerificationPanel ? (
+            <motion.div
+              key="verification-panel"
+              initial={{ y: 24, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
+              className="w-full max-w-[820px] text-left"
+            >
+              <div className="overflow-hidden rounded-[28px] border border-border-default/80 bg-[linear-gradient(180deg,rgba(30,29,27,0.98),rgba(18,17,16,0.98))] shadow-panel backdrop-blur-sm">
+                <div className="relative px-6 py-7 sm:px-8 md:px-10 md:py-10">
+                  <div className="pointer-events-none absolute inset-x-0 top-0 h-24 bg-[radial-gradient(circle_at_top,rgba(235,94,40,0.12),transparent_72%)]" />
+                  <div className="relative">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Quality Check</div>
+                    <h1 className="mt-4 max-w-[620px] font-serif text-[32px] leading-[1.1] tracking-[-0.03em] text-text-primary">
+                      Ready to finalize your project?
+                    </h1>
+                    <p className="mt-4 max-w-[620px] font-sans text-[15px] leading-[1.7] text-text-secondary">
+                      I&apos;ve completed the generation and verified the implementation against your requirements.
+                    </p>
+
+                    {verificationReport && (
+                      <div className="mt-8 space-y-4">
+                        <div className="grid gap-4 sm:grid-cols-2">
+                           {(verificationReport.checks || []).map(check => {
+                             const Icon = check.check_id === 'stack_drift' ? ShieldCheck : 
+                                         check.check_id === 'prd_coverage' ? CheckCircle2 :
+                                         check.check_id === 'enrichment_completeness' ? Zap :
+                                         ShieldCheck;
+                             
+                             return (
+                               <div key={check.check_id} className="rounded-[18px] border border-border-subtle/50 bg-bg-surface/30 p-4 font-sans">
+                                 <div className="flex items-center gap-2 mb-3">
+                                   <Icon className={cn("h-4 w-4", check.passed ? "text-status-secure" : check.severity === 'error' ? "text-status-warning" : "text-text-tertiary")} />
+                                   <span className="font-serif text-[16px] text-text-primary capitalize">
+                                     {check.check_id.replace(/_/g, ' ')}
+                                   </span>
+                                 </div>
+                                 <p className="text-[13px] leading-relaxed text-text-secondary">{check.message}</p>
+                                 {(check.details || []).length > 0 && (
+                                   <div className="mt-3 space-y-1.5 border-t border-border-subtle/30 pt-3">
+                                     {check.details!.map((detail, idx) => (
+                                       <div key={idx} className="flex gap-2 text-[12px] leading-relaxed">
+                                         <span className="text-text-muted select-none">•</span>
+                                         <span className={cn(check.passed ? "text-text-muted" : "text-status-warning/80")}>
+                                           {detail}
+                                         </span>
+                                       </div>
+                                     ))}
+                                   </div>
+                                 )}
+                               </div>
+                             );
+                           })}
+                        </div>
+
+                        <div className="rounded-[18px] border border-border-subtle/50 bg-bg-surface/40 p-4 text-center">
+                           <p className="font-sans text-[14px] text-text-secondary italic">
+                             &quot;{verificationReport.summary}&quot;
+                           </p>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="mt-10 flex flex-col sm:flex-row items-center gap-4">
+                      <button
+                        type="button"
+                        disabled={isFinalizing || isResuming}
+                        onClick={handleFinalizeProject}
+                        className="btn-primary w-full sm:w-auto flex h-12 items-center justify-center gap-2 px-8 text-[15px]"
+                      >
+                        {isFinalizing ? (
+                          <LoaderCircle className="h-5 w-5 animate-spin" />
+                        ) : (
+                          <Sparkles className="h-5 w-5" />
+                        )}
+                        <span>{isFinalizing ? 'Finalizing...' : 'Finalize & View Project'}</span>
+                      </button>
+                      
+                      <button
+                        type="button"
+                        disabled={isFinalizing || isResuming || isAutoRecovering}
+                        onClick={handleResume}
+                        className="w-full sm:w-auto flex h-12 items-center justify-center gap-2 rounded-full border border-border-default bg-bg-surface/40 px-6 font-sans text-[14px] font-medium text-text-secondary transition-colors hover:border-accent-border/40 hover:bg-bg-surface/60 hover:text-text-primary"
+                      >
+                        <RefreshCcw className={cn("h-4 w-4", isResuming && "animate-spin")} />
+                        <span>Re-run verification</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
             </motion.div>
           ) : showReviewPanel ? (

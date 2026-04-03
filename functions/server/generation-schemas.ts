@@ -634,6 +634,32 @@ export const Batch6GenerateFilesSchema = z.preprocess(
   }),
 );
 
+export const Batch7VerificationSchema = z.preprocess(
+  (value) => normalizeObject(value, () => ({})),
+  z.object({
+    passed: createBooleanSchema(false),
+    checks: z.preprocess(
+      normalizeObjectArray,
+      z.array(
+        z.preprocess(
+          (entry) => normalizeObject(entry, () => ({})),
+          z.object({
+            check_id: createRequiredTextSchema('unnamed_check'),
+            passed: createBooleanSchema(false),
+            severity: z.preprocess(
+              (value) => normalizeText(value, 'info').toLowerCase(),
+              z.enum(['error', 'warning', 'info']),
+            ),
+            message: createRequiredTextSchema('No message provided.'),
+            details: createStringArraySchema().optional(),
+          }),
+        ),
+      ),
+    ),
+    summary: createRequiredTextSchema('Verification complete.'),
+  }),
+);
+
 export const schemaDescriptions = {
   batch_1_research_stack:
     '{ technologies: [{ name: string, docs_url: url, github_url: url, changelog_url: url, community_search_results?: [{ title, url, description }], breaking_change_search_results?: [{ title, url, description }] }] }',
@@ -648,6 +674,8 @@ export const schemaDescriptions = {
     '{ enrichments: [{ step_id: string, ai_output: string, done_when?: string, research_footer_meta?: { researched_at: string, tools: string[], quality?: "live"|"cached"|"degraded"|"none", live_source_count?: number, cached_source_count?: number, degraded_sources?: string[] }, navigation_links?: [{ label: string, url: string, when: string }], prompts: [{ label: string, content: string }] }] }',
   batch_6_generate_files:
     '{ files: [{ filename: "plan.md", content: string }] }',
+  batch_7_verify:
+    '{ passed: boolean, checks: [{ check_id: string, passed: boolean, severity: "error"|"warning"|"info", message: string, details?: string[] }], summary: string }',
 } as const;
 
 export type Batch1ResearchStack = z.infer<typeof Batch1ResearchStackSchema>;
@@ -657,3 +685,4 @@ export type PlanAuthoringRecord = z.infer<typeof PlanAuthoringRecordSchema>;
 export type Batch4PlanBuild = z.infer<typeof Batch4PlanBuildSchema>;
 export type Batch5EnrichSteps = z.infer<typeof Batch5EnrichStepsSchema>;
 export type Batch6GenerateFiles = z.infer<typeof Batch6GenerateFilesSchema>;
+export type Batch7Verification = z.infer<typeof Batch7VerificationSchema>;

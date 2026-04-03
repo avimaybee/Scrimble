@@ -69,6 +69,35 @@ export const TOOL_DOCS_MAP: Record<string, ToolDocsEntry> = {
   lovable: { docs: 'https://docs.lovable.dev' },
 };
 
+export const RESEARCH_TOOL_HANDBOOK = `
+# Scrimble Research Tool Handbook
+
+This handbook describes the research tools available during the generation process and how to interpret their outputs.
+
+## Available Tools
+
+1. **Jina Reader (r.jina.ai)**: Fetches the full markdown content of a specific URL. Best for official documentation and deep technical specs.
+2. **Jina Search (s.jina.ai)**: Performs a web search and returns multiple markdown snippets. Best for broad technology trends, community sentiment, and finding relevant GitHub repos.
+3. **GitMCP / GitHub API**: Fetches repository metadata, READMEs, and recent issue/release activity. Best for assessing project health and maintenance status.
+4. **Cloudflare Scrape**: A fallback mechanism for fetching content when Jina Reader is blocked or fails.
+
+## Interpretation Guidelines
+
+### Source Reliability Tiers
+- **Tier 1 (Highest Trust)**: Official documentation (r.jina.ai) and GitHub READMEs (GitMCP). Use these for syntax, API contracts, and setup instructions.
+- **Tier 2 (Contextual Trust)**: GitHub issues/releases. Use these for assessing bugs, breaking changes, and version stability.
+- **Tier 3 (Supporting Evidence)**: Community blog posts and search snippets. Use these for deployment patterns and "gotchas" not covered in official docs.
+
+### Reliability & Freshness Signals
+- **Maintenance Level**: If the \`last_commit_date\` is > 12 months ago, be cautious. It may be unmaintained.
+- **Breaking Changes**: Pay close attention to \`recent_breaking_changes\` or \`bug_report_digest\`. If a technology is in a major version transition (e.g. v3 to v4), ensure the suggested steps use the latest patterns.
+- **Empty Docs Fallback**: If \`docs_content\` is empty or looks like a 404, the tech might be a Single Page App (SPA) that Jina struggled to render. Fall back to \`github_readme\` and community sentiment for technical details.
+- **Sentiment**: If \`community_sentiment\` is negative or mentions "bloat" or "deprecated", reconsider its placement in the 'Architecture Decision Record' or add specific mitigations in the 'Gotchas' section.
+
+### Verification of Knowledge
+When the research result contains a 'summary' or 'insight', treat it as a synthesis. Always cross-reference multiple sources if the 'confidence' or 'quality' is marked as 'degraded' or 'none'.
+`;
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const CF_SCRAPE_ENDPOINT = 'https://gateway.ai.cloudflare.com/v1/scrape';
 
