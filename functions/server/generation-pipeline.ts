@@ -4672,8 +4672,79 @@ export async function executeBatch2(
     });
   }
 
+  const readSkipRequestState = async () => {
+    const row = await env.DB.prepare(`
+      SELECT skip_target_requested, skip_target_name
+      FROM generation_runs
+      WHERE id = ?
+      LIMIT 1
+    `)
+      .bind(runId)
+      .first() as Record<string, unknown> | null;
+
+    return {
+      skipRequested: toBoolean(row?.skip_target_requested),
+      skipTargetName: optionalText(row?.skip_target_name),
+    };
+  };
+
+  const clearSkipRequestState = async () => {
+    await env.DB.prepare(`
+      UPDATE generation_runs
+      SET skip_target_requested = 0,
+          skip_target_name = NULL,
+          updated_at = datetime("now")
+      WHERE id = ?
+    `)
+      .bind(runId)
+      .run();
+  };
+
   for (let index = startIndex; index < researchTargets.length; index += 1) {
     const technology = researchTargets[index];
+
+    const { skipRequested, skipTargetName } = await readSkipRequestState();
+    if (skipRequested && (!skipTargetName || skipTargetName === technology.name)) {
+      await clearSkipRequestState();
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        runId,
+        kind: 'warning',
+        message: `Skipped ${technology.name} per user request.`,
+      });
+
+      await persistGenerationStreamEvent(env, {
+        projectId,
+        runId,
+        batchName: 'batch_2_fetch_and_read',
+        event: {
+          type: 'research_target_status',
+          targetName: technology.name,
+          currentIndex: index + 1,
+          totalTargets: researchTargets.length,
+          status: 'skipped',
+          timestamp: new Date().toISOString(),
+        }
+      });
+      continue;
+    }
+
+    await persistGenerationStreamEvent(env, {
+      projectId,
+      runId,
+      batchName: 'batch_2_fetch_and_read',
+      event: {
+        type: 'research_target_status',
+        targetName: technology.name,
+        currentIndex: index + 1,
+        totalTargets: researchTargets.length,
+        status: 'active',
+        timestamp: new Date().toISOString(),
+      }
+    });
+
     await logActivity(env, {
       projectId,
       batchName: 'batch_2_fetch_and_read',
@@ -4686,6 +4757,35 @@ export async function executeBatch2(
           ? `Researching your saved tool ${technology.name} before anything else...`
           : `Researching ${technology.name} with every source you've connected...`,
     });
+
+    // If skip was requested while this target is active, abort before expensive fetches.
+    const skipDuringActive = await readSkipRequestState();
+    if (skipDuringActive.skipRequested && (!skipDuringActive.skipTargetName || skipDuringActive.skipTargetName === technology.name)) {
+      await clearSkipRequestState();
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        runId,
+        kind: 'warning',
+        message: `Skipped ${technology.name} per user request.`,
+      });
+
+      await persistGenerationStreamEvent(env, {
+        projectId,
+        runId,
+        batchName: 'batch_2_fetch_and_read',
+        event: {
+          type: 'research_target_status',
+          targetName: technology.name,
+          currentIndex: index + 1,
+          totalTargets: researchTargets.length,
+          status: 'skipped',
+          timestamp: new Date().toISOString(),
+        },
+      });
+      continue;
+    }
 
     // Check budget before starting research for this technology.
     // This guard prevents runaway fetching if something goes wrong with tracking.
@@ -5029,6 +5129,38 @@ export async function executeBatch2(
     });
 
     processedThisInvocation += 1;
+
+    const currentChunkStore = buildResearchChunkStore(collectedSources);
+    const currentRankedArtifacts = buildRankedResearchSources(fetchedSources, projectBrief);
+    const currentEvidenceArtifacts = buildSourceNotesAndEvidencePacks(currentRankedArtifacts.rankedSources, currentChunkStore);
+    
+    await persistGenerationStreamEvent(env, {
+      projectId,
+      runId,
+      batchName: 'batch_2_fetch_and_read',
+      event: {
+        type: 'research_telemetry',
+        chunkCount: currentChunkStore.length,
+        evidencePackCount: currentEvidenceArtifacts.evidencePacks.length,
+        tokensConsumed: Math.floor(currentChunkStore.reduce((sum, chunk) => sum + chunk.content.length, 0) / 4),
+        timestamp: new Date().toISOString(),
+      }
+    });
+
+    await persistGenerationStreamEvent(env, {
+      projectId,
+      runId,
+      batchName: 'batch_2_fetch_and_read',
+      event: {
+        type: 'research_target_status',
+        targetName: technology.name,
+        currentIndex: index + 1,
+        totalTargets: researchTargets.length,
+        status: 'completed',
+        sourcesFound: technologySources.length,
+        timestamp: new Date().toISOString(),
+      }
+    });
 
     const hasMoreWork = index + 1 < researchTargets.length;
     const processedCount = index + 1;

@@ -11,7 +11,9 @@ export type GenerationStreamEvent =
   | { type: 'verification_review_required'; report: Batch7Verification; run_id: string }
   | { type: 'pipeline_complete'; project_id: string }
   | { type: 'pipeline_failed'; error: string; failureClass?: string }
-  | { type: 'invariant'; drift_type: string; message: string; timestamp: string };
+  | { type: 'invariant'; drift_type: string; message: string; timestamp: string }
+  | { type: 'research_telemetry'; chunkCount: number; evidencePackCount: number; tokensConsumed: number; timestamp: string }
+  | { type: 'research_target_status'; targetName: string; currentIndex: number; totalTargets: number; status: 'pending' | 'active' | 'completed' | 'skipped' | 'failed'; sourcesFound?: number; timestamp: string };
 
 type PersistedGenerationEventType = GenerationStreamEvent['type'];
 
@@ -141,6 +143,22 @@ function eventPayloadFromStreamEvent(event: PersistedGenerationStreamEvent): Rec
         message: event.message,
         timestamp: event.timestamp,
       };
+    case 'research_telemetry':
+      return {
+        chunkCount: event.chunkCount,
+        evidencePackCount: event.evidencePackCount,
+        tokensConsumed: event.tokensConsumed,
+        timestamp: event.timestamp,
+      };
+    case 'research_target_status':
+      return {
+        targetName: event.targetName,
+        currentIndex: event.currentIndex,
+        totalTargets: event.totalTargets,
+        status: event.status,
+        sourcesFound: event.sourcesFound ?? null,
+        timestamp: event.timestamp,
+      };
   }
 }
 
@@ -233,6 +251,34 @@ function streamEventFromEnvelope(envelope: GenerationEventEnvelopeV1): Persisted
         message: asText(envelope.payload.message),
         timestamp: asText(envelope.payload.timestamp, envelope.timestamp),
       };
+    case 'research_telemetry':
+      return {
+        type: 'research_telemetry',
+        chunkCount: asNumber(envelope.payload.chunkCount, 0),
+        evidencePackCount: asNumber(envelope.payload.evidencePackCount, 0),
+        tokensConsumed: asNumber(envelope.payload.tokensConsumed, 0),
+        timestamp: asText(envelope.payload.timestamp, envelope.timestamp),
+      };
+    case 'research_target_status': {
+      const rawStatus = asText(envelope.payload.status, 'pending');
+      const status = rawStatus === 'active'
+        || rawStatus === 'completed'
+        || rawStatus === 'skipped'
+        || rawStatus === 'failed'
+        ? rawStatus
+        : 'pending';
+      return {
+        type: 'research_target_status',
+        targetName: asText(envelope.payload.targetName),
+        currentIndex: asNumber(envelope.payload.currentIndex, 0),
+        totalTargets: asNumber(envelope.payload.totalTargets, 0),
+        status,
+        sourcesFound: envelope.payload.sourcesFound === null
+          ? undefined
+          : asNumber(envelope.payload.sourcesFound, 0),
+        timestamp: asText(envelope.payload.timestamp, envelope.timestamp),
+      };
+    }
     default:
       return null;
   }
@@ -277,6 +323,8 @@ function mapLegacyStoredEvent(payload: Record<string, unknown>): PersistedGenera
     || typedPayload.type === 'pipeline_complete'
     || typedPayload.type === 'pipeline_failed'
     || typedPayload.type === 'invariant'
+    || typedPayload.type === 'research_telemetry'
+    || typedPayload.type === 'research_target_status'
   ) {
     return typedPayload;
   }

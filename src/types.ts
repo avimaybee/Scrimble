@@ -426,6 +426,22 @@ export interface ProjectGenerationInvariantEvent {
   timestamp: string;
 }
 
+export interface ProjectGenerationResearchTelemetryEvent {
+  chunkCount: number;
+  evidencePackCount: number;
+  tokensConsumed: number;
+  timestamp: string;
+}
+
+export interface ProjectGenerationResearchTargetStatusEvent {
+  targetName: string;
+  currentIndex: number;
+  totalTargets: number;
+  status: 'pending' | 'active' | 'completed' | 'skipped' | 'failed';
+  sourcesFound?: number;
+  timestamp: string;
+}
+
 export type GenerationStreamEventType =
   | 'batch_start'
   | 'activity'
@@ -435,7 +451,9 @@ export type GenerationStreamEventType =
   | 'verification_review_required'
   | 'pipeline_complete'
   | 'pipeline_failed'
-  | 'invariant';
+  | 'invariant'
+  | 'research_telemetry'
+  | 'research_target_status';
 
 export interface GenerationStreamEventEnvelopeV1 {
   version: 1;

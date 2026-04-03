@@ -417,6 +417,50 @@ function assertVerificationPayloadHydratesOnRefresh(): AssertionResult {
   );
 }
 
+function assertSkipFlagOwnedByGenerationRuns(): AssertionResult {
+  const appPath = path.join(SERVER_DIR, 'app.ts');
+  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
+  const migrationPath = path.join(ROOT_DIR, 'migrations', '0029_generation_runs_skip_flag.sql');
+  const appContent = readFile(appPath);
+  const pipelineContent = readFile(pipelinePath);
+  const migrationExists = fileExists(migrationPath);
+  const migrationContent = migrationExists ? readFile(migrationPath) : '';
+
+  const appWritesGenerationRuns = appContent.includes('UPDATE generation_runs')
+    && appContent.includes('skip_target_requested = 1');
+  const pipelineReadsGenerationRuns = pipelineContent.includes('FROM generation_runs')
+    && pipelineContent.includes('skip_target_requested')
+    && pipelineContent.includes('skip_target_name');
+  const migrationAddsColumns = migrationContent.includes('ALTER TABLE generation_runs ADD COLUMN skip_target_requested')
+    && migrationContent.includes('ALTER TABLE generation_runs ADD COLUMN skip_target_name');
+
+  return assert(
+    appWritesGenerationRuns && pipelineReadsGenerationRuns && migrationAddsColumns,
+    'Skip-request ownership is centralized in generation_runs with migration-backed columns',
+  );
+}
+
+function assertTelemetryEventsRoundTripInEnvelope(): AssertionResult {
+  const eventsPath = path.join(SERVER_DIR, 'generation-events.ts');
+  const content = readFile(eventsPath);
+
+  const payloadSerialization = content.includes("case 'research_telemetry'")
+    && content.includes("case 'research_target_status'")
+    && content.includes('chunkCount: event.chunkCount')
+    && content.includes('targetName: event.targetName');
+  const payloadDeserialization = content.includes("type: 'research_telemetry'")
+    && content.includes("type: 'research_target_status'")
+    && content.includes('envelope.payload.chunkCount')
+    && content.includes('envelope.payload.targetName');
+  const legacySupport = content.includes("typedPayload.type === 'research_telemetry'")
+    && content.includes("typedPayload.type === 'research_target_status'");
+
+  return assert(
+    payloadSerialization && payloadDeserialization && legacySupport,
+    'Research telemetry and target-status events round-trip through canonical envelope and legacy mapper',
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Run All Assertions
 // ─────────────────────────────────────────────────────────────────
@@ -460,6 +504,8 @@ const assertions: Array<() => AssertionResult> = [
   assertRuntimeReviewGateIncludesVerification,
   assertFrontendBatch7IsVisible,
   assertVerificationPayloadHydratesOnRefresh,
+  assertSkipFlagOwnedByGenerationRuns,
+  assertTelemetryEventsRoundTripInEnvelope,
 ];
 
 let passed = 0;

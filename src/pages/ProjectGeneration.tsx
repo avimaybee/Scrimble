@@ -353,6 +353,8 @@ export default function ProjectGeneration() {
   const [revisionInput, setRevisionInput] = useState('');
   const [isManualEditing, setIsManualEditing] = useState(false);
   const [manualEditValue, setManualEditValue] = useState('');
+  const [researchTelemetry, setResearchTelemetry] = useState<{ chunkCount: number; evidencePackCount: number; tokensConsumed: number } | null>(null);
+  const [researchTargetStatus, setResearchTargetStatus] = useState<Record<string, { currentIndex: number; totalTargets: number; status: 'pending' | 'active' | 'completed' | 'skipped' | 'failed'; sourcesFound?: number }>>({});
   const [hasEditedReview, setHasEditedReview] = useState(false);
   const [isResearchDisclosureOpen, setIsResearchDisclosureOpen] = useState(false);
   const [showAllResearchSources, setShowAllResearchSources] = useState(false);
@@ -819,6 +821,20 @@ export default function ProjectGeneration() {
               : previous,
           );
           void loadReviewData();
+        },
+        onResearchTelemetry: (event) => {
+          setResearchTelemetry(event);
+        },
+        onResearchTargetStatus: (event) => {
+          setResearchTargetStatus((prev) => ({
+            ...prev,
+            [event.targetName]: {
+              currentIndex: event.currentIndex,
+              totalTargets: event.totalTargets,
+              status: event.status,
+              sourcesFound: event.sourcesFound,
+            }
+          }));
         },
         onVerificationReviewRequired: (event) => {
           setVerificationReport(event.report);
@@ -2054,51 +2070,209 @@ export default function ProjectGeneration() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.28, ease: EASE_OUT_EXPO }}
-              className="flex w-full max-w-[640px] flex-col items-center text-center"
+              className={cn(
+                "flex w-full flex-col items-center",
+                currentBatch.id === 'batch_2_fetch_and_read'
+                  ? "max-w-[1200px] lg:grid lg:grid-cols-[1fr_380px] lg:items-start lg:gap-8 lg:text-left"
+                  : "max-w-[640px] text-center"
+              )}
             >
-              <AnimatePresence mode="wait">
-                <motion.h1
-                  key={currentBatch.id}
-                  initial={{ y: 8, opacity: 0 }}
-                  animate={{ y: 0, opacity: 1 }}
-                  exit={{ y: -8, opacity: 0 }}
-                  transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
-                  className="mb-8 text-[clamp(34px,6vw,52px)] font-serif leading-[1.02] tracking-[-0.03em] text-text-primary"
-                >
-                  {currentBatch.heading}
-                </motion.h1>
-              </AnimatePresence>
-              <div className="mb-5 flex items-center justify-center gap-2 font-mono text-[11px] leading-5 text-text-muted">
-                <button
-                  type="button"
-                  onClick={() => handleOpenModelModal('fast')}
-                  className={cn(
-                    "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
-                    currentBatch.id.includes('research') || currentBatch.id.includes('fetch') 
-                      ? "border-accent-primary/30 bg-accent-primary/5 text-accent-soft ring-1 ring-accent-primary/10" 
-                      : ""
-                  )}
-                >
-                  <span className="opacity-60">Fast:</span>
-                  <span className="font-medium text-text-secondary group-hover:text-accent-soft">{modelRoleDisplay.fast}</span>
-                </button>
-                <span className="opacity-30">·</span>
-                <button
-                  type="button"
-                  onClick={() => handleOpenModelModal('deep')}
-                  className={cn(
-                    "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
-                    !currentBatch.id.includes('research') && !currentBatch.id.includes('fetch')
-                      ? "border-status-secure/30 bg-status-secure/5 text-status-secure-dim ring-1 ring-status-secure/10"
-                      : ""
-                  )}
-                >
-                  <span className="opacity-60">Deep:</span>
-                  <span className="font-medium text-text-secondary group-hover:text-status-secure-dim">{modelRoleDisplay.deep}</span>
-                </button>
-              </div>
+              {currentBatch.id === 'batch_2_fetch_and_read' ? (
+                <div className="flex w-full flex-col gap-6">
+                  {/* Left Column: Live Research Dashboard */}
+                  <div>
+                    <AnimatePresence mode="wait">
+                      <motion.h1
+                        key={currentBatch.id}
+                        initial={{ y: 8, opacity: 0 }}
+                        animate={{ y: 0, opacity: 1 }}
+                        exit={{ y: -8, opacity: 0 }}
+                        transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
+                        className="mb-6 text-[clamp(34px,6vw,42px)] font-serif leading-[1.02] tracking-[-0.03em] text-text-primary"
+                      >
+                        {currentBatch.heading}
+                      </motion.h1>
+                    </AnimatePresence>
 
-              <div className="mb-6 w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
+                    <div className="rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-6 shadow-panel backdrop-blur-sm">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                        Target Queue
+                      </div>
+                      <div className="mt-4 flex flex-col gap-3">
+                        {Object.entries(researchTargetStatus).length === 0 ? (
+                          <div className="text-[13px] text-text-muted">Loading research targets...</div>
+                        ) : (
+                          Object.entries(researchTargetStatus).map(([targetName, target]) => {
+                            const isPending = target.status === 'pending';
+                            const isActive = target.status === 'active';
+                            const isCompleted = target.status === 'completed';
+                            const isSkipped = target.status === 'skipped';
+
+                            return (
+                              <motion.div
+                                key={targetName}
+                                layout
+                                initial={{ opacity: 0, y: 10 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                className={cn(
+                                  "relative flex flex-col overflow-hidden rounded-[14px] border px-4 transition-colors",
+                                  isActive
+                                    ? "border-accent-primary/30 bg-accent-primary/5 py-4"
+                                    : isCompleted
+                                      ? "border-border-subtle bg-bg-base/40 py-3 opacity-70 hover:opacity-100"
+                                      : isSkipped
+                                        ? "border-border-subtle bg-bg-base/20 py-3 opacity-50"
+                                        : "border-border-default/40 bg-bg-base/30 py-3 opacity-60"
+                                )}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <div className="flex items-center gap-3">
+                                    {isActive ? (
+                                      <LoaderCircle className="h-4 w-4 animate-spin text-accent-primary" />
+                                    ) : isCompleted ? (
+                                      <CheckCircle2 className="h-4 w-4 text-status-secure" />
+                                    ) : isSkipped ? (
+                                      <XCircle className="h-4 w-4 text-text-muted" />
+                                    ) : (
+                                      <div className="h-4 w-4 rounded-full border-2 border-border-default" />
+                                    )}
+                                    <span className={cn(
+                                      "font-sans text-[14px] font-medium",
+                                      isActive ? "text-text-primary" : "text-text-secondary"
+                                    )}>
+                                      {targetName}
+                                    </span>
+                                  </div>
+                                  
+                                  {isActive && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void dbService.skipCurrentResearchTarget(id, { targetName })}
+                                      className="rounded-full border border-border-subtle bg-bg-base px-3 py-1 font-sans text-[11px] font-medium text-text-tertiary transition-colors hover:border-text-secondary hover:text-text-primary"
+                                    >
+                                      Skip
+                                    </button>
+                                  )}
+                                  {(isCompleted || isSkipped) && target.sourcesFound !== undefined && (
+                                    <span className="font-mono text-[11px] text-text-tertiary">
+                                      {isSkipped ? 'Skipped' : `${target.sourcesFound} sources`}
+                                    </span>
+                                  )}
+                                </div>
+
+                                {isActive && (
+                                  <motion.div
+                                    initial={{ height: 0, opacity: 0 }}
+                                    animate={{ height: 'auto', opacity: 1 }}
+                                    className="mt-4 border-t border-border-subtle/50 pt-4"
+                                  >
+                                    <div className="grid grid-cols-3 gap-4">
+                                      <div className="flex flex-col gap-1">
+                                        <span className="font-mono text-[10px] uppercase text-text-muted">Sources</span>
+                                        <span className="font-sans text-[18px] font-medium text-text-primary">
+                                          {target.sourcesFound || 0}
+                                        </span>
+                                      </div>
+                                      <div className="flex flex-col gap-1">
+                                        <span className="font-mono text-[10px] uppercase text-text-muted">Chunks</span>
+                                        <span className="font-sans text-[18px] font-medium text-text-primary">
+                                          {researchTelemetry?.chunkCount || 0}
+                                        </span>
+                                      </div>
+                                      <div className="flex flex-col gap-1">
+                                        <span className="font-mono text-[10px] uppercase text-text-muted">Evidence</span>
+                                        <span className="font-sans text-[18px] font-medium text-text-primary">
+                                          {researchTelemetry?.evidencePackCount || 0}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  </motion.div>
+                                )}
+                              </motion.div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <AnimatePresence mode="wait">
+                  <motion.h1
+                    key={currentBatch.id}
+                    initial={{ y: 8, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    exit={{ y: -8, opacity: 0 }}
+                    transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
+                    className="mb-8 text-[clamp(34px,6vw,52px)] font-serif leading-[1.02] tracking-[-0.03em] text-text-primary"
+                  >
+                    {currentBatch.heading}
+                  </motion.h1>
+                </AnimatePresence>
+              )}
+
+              <div className={cn(
+                "flex flex-col",
+                currentBatch.id === 'batch_2_fetch_and_read' ? "w-full gap-6" : "w-full items-center text-center"
+              )}>
+                {currentBatch.id !== 'batch_2_fetch_and_read' && (
+                  <div className="mb-5 flex items-center justify-center gap-2 font-mono text-[11px] leading-5 text-text-muted">
+                    <button
+                      type="button"
+                      onClick={() => handleOpenModelModal('fast')}
+                      className={cn(
+                        "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
+                        currentBatch.id.includes('research') || currentBatch.id.includes('fetch') 
+                          ? "border-accent-primary/30 bg-accent-primary/5 text-accent-soft ring-1 ring-accent-primary/10" 
+                          : ""
+                      )}
+                    >
+                      <span className="opacity-60">Fast:</span>
+                      <span className="font-medium text-text-secondary group-hover:text-accent-soft">{modelRoleDisplay.fast}</span>
+                    </button>
+                    <span className="opacity-30">·</span>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenModelModal('deep')}
+                      className={cn(
+                        "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
+                        !currentBatch.id.includes('research') && !currentBatch.id.includes('fetch')
+                          ? "border-status-secure/30 bg-status-secure/5 text-status-secure-dim ring-1 ring-status-secure/10"
+                          : ""
+                      )}
+                    >
+                      <span className="opacity-60">Deep:</span>
+                      <span className="font-medium text-text-secondary group-hover:text-status-secure-dim">{modelRoleDisplay.deep}</span>
+                    </button>
+                  </div>
+                )}
+
+                {currentBatch.id === 'batch_2_fetch_and_read' && (
+                  <div className="w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-5 shadow-panel backdrop-blur-sm">
+                    <div className="mb-3 flex items-center justify-between">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                        Token Budget
+                      </div>
+                      <div className="font-mono text-[11px] text-text-secondary">
+                        {researchTelemetry?.tokensConsumed || 0} / 8000
+                      </div>
+                    </div>
+                    <div className="h-2 w-full overflow-hidden rounded-full bg-bg-base/80">
+                      <div 
+                        className={cn(
+                          "h-full transition-all duration-500",
+                          (researchTelemetry?.tokensConsumed || 0) > 7000 ? "bg-status-warning" : "bg-accent-primary"
+                        )}
+                        style={{ width: `${Math.min(100, ((researchTelemetry?.tokensConsumed || 0) / 8000) * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className={cn(
+                  "w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-4 shadow-panel backdrop-blur-sm",
+                  currentBatch.id === 'batch_2_fetch_and_read' ? "text-left" : "mb-6 text-left"
+                )}>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div>
                     <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
@@ -2400,6 +2574,7 @@ export default function ProjectGeneration() {
                   ) : null}
                 </>
               )}
+            </div>
             </motion.div>
           )}
         </AnimatePresence>

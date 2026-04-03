@@ -1552,6 +1552,46 @@ app.get('/projects/:id/architecture-review', async (c) => {
   }
 });
 
+const handleSkipCurrentResearchTarget = async (c: AppContext) => {
+  const projectId = c.req.param('id');
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const { generationRuntime, lifecycleStatus } = projectRuntime;
+  const runId = generationRuntime.runId;
+  if (lifecycleStatus !== 'running' || !runId) {
+    return c.json({ error: 'Project is not currently running.' }, 409);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const targetName = typeof body.targetName === 'string' && body.targetName.trim()
+    ? body.targetName.trim()
+    : null;
+
+  try {
+    await c.env.DB.prepare(`
+      UPDATE generation_runs
+      SET skip_target_requested = 1,
+          skip_target_name = ?,
+          updated_at = datetime("now")
+      WHERE id = ?
+    `)
+      .bind(targetName, runId)
+      .run();
+    
+    return c.json({
+      success: true,
+      message: targetName
+        ? `Skip requested for ${targetName}.`
+        : 'Skip requested.',
+    });
+  } catch (error) {
+    return c.json({ error: 'Failed to request skip.' }, 500);
+  }
+};
+
 const handleProjectArchitectureRevision = async (c: AppContext) => {
   const projectId = c.req.param('id');
   const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
@@ -1691,6 +1731,7 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
 app.post('/projects/:id/approve', handleProjectArchitectureApproval);
 app.post('/projects/:id/architecture-review', handleProjectArchitectureApproval);
 app.post('/projects/:id/architect/revise', handleProjectArchitectureRevision);
+app.post('/projects/:id/research/skip-current', handleSkipCurrentResearchTarget);
 
 const handleProjectVerificationFinalize = async (c: AppContext) => {
   const projectId = c.req.param('id');

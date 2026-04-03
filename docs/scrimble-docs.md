@@ -1,9 +1,9 @@
 # Scrimble — Complete Project Documentation
 ### The Research-First Build Companion for Solo Builders
-*Version 6.0 — March 2026 — Reflecting Phase 13 release-candidate state*
+*Version 6.1 — April 2026 — Reflecting Batch 7 Verification & Research Telemetry*
 
 > [!NOTE]
-> Version 6.0 — Reflects the release-candidate state through Phase 13, including canonical runtime ownership, versioned event transport, and go-live gate readiness docs.
+> Version 6.1 — Reflects the end-to-end implementation of Batch 7 Consistency Verification, Research Telemetry dashboard, and the dual-gate human-in-the-loop architecture.
 
 ---
 
@@ -987,6 +987,7 @@ Project creation dispatches a dedicated generation run. The flow is as follows:
 5. **Batch 4 (Plan Build)**: Generates the sequence of steps and stages.
 6. **Batch 5 (Enrich)**: Populates steps with turn-by-turn navigation, tool-specific instructions, and prompts.
 7. **Batch 6 (File Generation)**: Generates the skill files for IDE implementation.
+8. **Batch 7 (Verify)**: Performs comprehensive consistency, stack-integrity, and PRD-alignment checks. Pauses for final human approval at the **Verification Gate**.
 
 Each batch executes in order with **Smart Caps** to ensure extreme thoroughness without reckless resource usage:
 - **Infrastructure Safety**: 1-hour (3600s) maximum execution window for background tasks.
@@ -998,9 +999,11 @@ Each batch executes in order with **Smart Caps** to ensure extreme thoroughness 
 - **Output Freedom**: Up to 16,384 tokens per AI response to provide headroom for models with extensive reasoning/thinking blocks (e.g., GLM-5, DeepSeek-R1).
 - **Thought-Only Guard**: If a model exhausts its output window with reasoning but provides no JSON content, the system automatically triggers a single "JSON-only" retry.
 
-### Research Facade & Subrequest Tracking
+### Research Facade, Telemetry & Subrequest Tracking
 Research is no longer performed directly by batches. Instead, all tools (documentation, GitHub, web search) are routed through the `ResearchFacade`.
 - **Subrequest Tracker**: All fetches (even across multiple tools) share a single `SubrequestTracker` instance within a batch, ensuring strict enforcement of Cloudflare's 50-subrequest per-step limit.
+- **Research Telemetry**: The system now emits real-time `research_telemetry` and `research_target_status` events during Batch 2. This allows the UI to surface live counters for chunks found, evidence packs created, and token consumption against the budget.
+- **Target Skipping**: Builders can explicitly skip a research target (a specific technology or tool) via a "Skip" request from the UI. This sets `generation_runs.skip_target_requested` (and optional `skip_target_name`) for the active run, and Batch 2 checks it before and during each target cycle so skip requests apply to the currently active target when possible.
 - **Durable Logging**: Parallel and sequential research fetches generate `activity` events, rendering a research footer that cites specific tools and sources used for each plan step.
 - **Shadow Mode Ready**: The facade supports shadow-mode comparisons between legacy and new research toolsets without impacting the production generation path.
 - **Unified Updates**: Plan updates use the same research facade for mini-research passes, ensuring parity between initial generation and mid-build changes.
@@ -1026,21 +1029,20 @@ Scrimble strictly uses technical, engineering-focused icons (Lucide React) to ma
 - **Action/Trigger**: `Zap`
 - *Prohibited: Any whimsical, magic, sparkle, or glitter-themed icons.*
 
-The Cosmos of SSE events lives in `/api/projects/:id/generation-stream`. 
-That route creates a `TransformStream` that replays `project_generation_events` since the last seen ID, keeps the connection alive with a `: ping` every 20 seconds, and polls D1 on a short interval so the Pages request can see fresh events written by the separate background worker runtime.
+### Observability & SSE Streaming
+The "Heartbeat" of Scrimble lives in `/api/projects/:id/generation-stream`. This route delivers a high-integrity event stream using `TransformStream` and Cloudflare D1 persistence.
 
-Durable generation events now use a canonical versioned envelope (`version: 1`) with stable fields: `eventType`, `projectId`, `runId`, `batch`, `timestamp`, and `payload`. The backend emits `event: generation_event` for persisted stream records, and the frontend stream adapter parses this envelope directly.
-
-To handle high-frequency reasoning deltas, Scrimble uses a **Throttled Emitter** (`createThrottledThinkingEmitter`) that buffers incoming tokens and persists `thinking` events in the same canonical envelope as other generation events. Thinking persistence is bounded to a rolling window for the active run and is cleared on terminal completion/failure/cancel so reconnects are truthful without implying long-term permanence.
+- **Durable Events**: `batch_start`, `activity`, `batch_complete`, `checkpoint`, and terminal `pipeline_complete`/`failed` tags are persisted in D1. Reconnecting clients receive a replay of all missed events via `Last-Event-ID`.
+- **Transient Reasoning**: High-frequency `thinking` deltas are emitted using a **Throttled Emitter**. To protect IP and maintain a clean state, reasoning tokens are replayed only for active runs and are physically purged from D1 on terminal completion.
+- **Connection Lifecycle**: The server sends a `: ping` every 20 seconds to keep edge proxies alive. On completion, the system explicitly calls `writer.close()` to prevent "ghost" polling.
+- **Progress Synchronization**: Every `batch_complete` event includes a `progress_percent` metric, ensuring the UI progress bar perfectly mirrors backend completion.
 
 > [!IMPORTANT]
-> Cloudflare Workflow limits shape pipeline structure:
-> - Free plan supports **50 subrequests per `step.do()` invocation** (fresh budget per step).
-> - Free plan supports **1,024 workflow steps** total.
-> - Step return payloads are constrained, so Scrimble stores large state in R2 and returns R2 keys only.
-> - Architecture review uses `step.waitForEvent(...)` rather than polling D1.
+> **Cloudflare Workflow Constraints**:
+> - **Subrequest Limits**: 50 subrequests per `step.do()` invocation (fresh budget per batch).
+> - **State Management**: Large payloads (research corpora, plans) are stored in R2; workflow steps only pass lightweight R2 keys and database IDs.
+> - **Human Gating**: Architecture and Verification reviews use `step.waitForEvent(...)`, pausing the workflow until a user action is recorded via the API.
 
-On terminal events (`pipeline_complete`, `pipeline_failed`), the system explicitly calls `writer.close()` after the final flush to ensure the browser strictly severs the connection and doesn't leave "ghost" streams polling the edge.
 
 
 
@@ -1120,44 +1122,25 @@ interface AIProvider {
 
 ### Agentic Generation Pipeline
 
-`GenerationWorkflow` now executes every generation run as explicit Workflow steps. Each of the six batches:
+`GenerationWorkflow` executes the generation run as explicit, checkpointed steps. Each batch follows a strict execution contract:
+1. **Context Loading**: Reads the state of the previous batch from D1/R2.
+2. **AI Reasoning**: Dispatches a single BYOK AI call (routing to Fast/Deep role) with real-time `thinking` emission.
+3. **Execution**: Performs the primary batch task (e.g., Doc fetch, Plan synthesis, File generation).
+4. **Validation & Persistence**: Validates output with Zod, writes to `agent_runs`, and updates the project checkpoint.
+5. **Event Signaling**: Emits a durable SSE event to update all connected clients.
 
-1. Reads the previous batch output from `agent_runs`.
-2. Dispatches a single BYOK AI call (streaming reasoning tokens into canonical `thinking` events).
-3. Validates the JSON response with Zod and retries once if validation fails.
-4. Writes results back into `agent_runs` and persists large payloads to R2 so checkpoints stay lightweight.
-5. Touches `generation_runs.lifecycle_status` (and `current_batch`) as soon as the batch starts so status polling stays truthful.
-6. Emits a durable SSE event (`batch_start`, `activity`, `batch_complete`, etc.) so `/api/projects/:id/generation-stream` can replay history + stream real-time deltas.
-
-The workflow keeps running even if all tabs are closed: it stores checkpoints in D1, persists large payloads to R2, and resumes deterministically with step-level retries/timeouts. Generation is workflow-only, with `WORKFLOW_SERVICE` as the single dispatch path from Pages Functions.
-
-Batch 2 (`fetch_and_read`) now goes through a Worker-side tools layer: direct URL fetches remain available through `fetchUrl`, GitHub analysis/issues use the GitHub research connection when present (or fall back to the public API), Context7 can inject live docs, and Brave Search can surface current migration chatter or community gotchas. The research layer now uses lightweight in-memory RAG: fetched content is chunked, stored in `chunk_store`, and downstream prompts consume retrieved top-k slices instead of full/truncated blobs. Every tool call emits an `activity` SSE event, and every AI call now parses streamed chunks in real time: `reasoning_content` forwards to transient `thinking` SSE events immediately, while only `content` is appended to the local buffer. 
+**Phase-Specific Insights**:
+- **Batch 2 (Research)**: Uses the `ResearchFacade` for multi-source acquisition (Context7, GitHub, Brave). Implements **In-Memory RAG** where fetched content is chunked and ranked by relevance; downstream prompts consume only the top-k relevant packs.
+- **Batch 5 (Enrichment)**: Performs targeted deep-dives for each step in the plan, pulling live platform docs and security chatter to ensure actionable guidance.
+- **Batch 6 (Generation)**: Produces the six canonical skill files (`.mdc`, `CLAUDE.md`, etc.) based on the approved architecture and enriched plan.
+- **Batch 7 (Verification)**: Final consistency check across all generated artifacts before allowing project finalization.
 
 **Resilience Features**:
-- **Reasoning-Only Guard**: Models with high-effort reasoning (GLM-5, DeepSeek-R1) can sometimes exhaust their output limit with thought alone. If the stream closes with reasoning but an empty JSON body, the system triggers a single retry with a "JSON-only, no reasoning" system prompt override.
-- **Thinking Window Purge**: To protect intellectual property and avoid misleading permanence, the active run keeps only a bounded rolling thinking window; terminal completion/failure/cancel clears the thinking window from replay.
-- **JSON Security**: The `extractJSON()` utility strips markdown fences and handles malformed-buffer edge cases where transport metadata might leak into the response.
+- **Reasoning-Only Guard**: If a model provides reasoning but an empty JSON body (GLM-5/DeepSeek edge case), the system automatically triggers a "JSON-only" retry.
+- **JSON Security**: The `extractJSON()` utility sanitizes AI output, removing markdown fences and handling malformed buffer tails.
 
-Step enrichment is now deeper too: auth steps fetch security/session docs plus recent vulnerability chatter, database steps pull schema+migration references, deployment steps read platform docs/issues/checklists, and payment steps pull live Stripe checkout + webhook guidance before the AI writes the final step artifact. Batch 6 (`generate_files`) receives the approved architecture record, the full enriched plan, and any review feedback to produce the six required skill files (`.cursor/rules/scrimble-project.mdc`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.windsurfrules`, `scrimble-context.md`, `scrimble-mcp.json`). These artifacts are stored in D1 and served via `/api/projects/:id/skill-files` as a JSZip download when the plan is ready.
 
-Batch 2 also records a `research_sources` ledger (tool, source URL, one-line summary) and a `data_quality` object (`has_brave_search`, `has_github_token`, `has_context7`, `technologies_researched`, `urls_fetched`, `issues_found`) so the architecture checkpoint can explain which tools were consulted, how deep the research went, and which sources the agent actually read.
-
-### Research architecture comparison
-
-| # | Area | Current Scrimble | What Big Players Do | Proposed Change | Complexity |
-|---|---|---|---|---|---|
-| 1 | Research architecture | Fetch docs then dump/truncate into prompts | Fetch broad, chunk, retrieve only relevant slices per call | Lightweight in-memory RAG in Batch 2 with reusable `chunk_store` | Medium |
-| 2 | Context limits | Model-specific char caps | Relevance-first budgets, model-agnostic | Remove model lookup/caps; target retrieved research slices around 6-8k tokens | Low |
-| 3 | Search strategy | Shared policy (`setup` / `errors` / `release_notes` / `deployment`) | Query fan-out by subtopic | Keep exactly 1 targeted query per tool/family using canonical `buildResearchQuery(...)`, max 8 words | Low |
-| 4 | Source selection | Fetch everything then trim | Rank relevance earlier | Score/merge candidate results before inclusion in the fetch corpus | Low |
-| 5 | Fetch orchestration | Partially parallel | Fully parallel | Enforce strict sequential fetches across docs/github/search (no cross-tool Promise.all) | Low |
-| 6 | Chunking strategy | Character truncation | Recursive split with overlap | Recursive chunking over `['\n\n', '\n', '. ', ' ']` with overlap and dedupe | Low |
-| 7 | Relevance retrieval | Broad context in every prompt | Similarity-based selective retrieval | Keyword + TF-IDF-style retrieval (no embeddings API) for fast, zero-cost ranking | Medium |
-| 8 | Per-batch assembly | Shared broad research blob | Batch-specific slices | Batch 3/4/5/6 each retrieve task-specific chunk slices | Medium |
-| 9 | Model context detection | Hardcoded lookup table | Not needed with focused retrieval | Remove model context window lookup for research budgeting | Low |
-| 10 | Research quality signal | Tool badges only | Inline evidence with relevance | Persist chunk-level context and surface retrieval counts in activity logs | Low |
-
-The backend emits durable `batch_start`, `activity`, `thinking`, `batch_complete`, `checkpoint`, `pipeline_complete`, and `pipeline_failed` events inside the versioned `generation_event` envelope. The `/api/projects/:id/generation-stream` route always replays missed events first using `Last-Event-ID`, then polls D1 for new rows every ~2 seconds so background-written updates still flow even though the browser and background runner live in separate runtimes. Thinking replay is limited to active runs and bounded history; terminal runs no longer replay stale reasoning.
+### Observability & Streaming Architecture
 
 ### Durable Checkpoints & Dispatch Safety
 
@@ -1184,7 +1167,9 @@ Certain steps are **gates** (`is_gate = 1`). At a gate:
 7. User can: **Approve** (agent continues) / **Edit** (modify AI output, then approve) / **Reject** (agent retries with feedback)
 8. On approval: step status → `complete`, downstream steps unlock, agent continues
 
-After `batch_3_architect` finishes, the pipeline halts automatically. The project’s canonical `generation_runs.lifecycle_status` becomes `awaiting_review`, the SSE stream emits a `checkpoint` event carrying the architecture decision record, and the generation screen switches from the activity feed into the review panel. Feedback, edits, and the preferred IDE choice are persisted with the `batch_3_architect` run and are sent to batches 4‑6. The next leg (`batch_4_plan_build`) is dispatched only after the user hits “Looks right, build my plan,” so the AI always honors the human checkpoint before continuing.
+After `batch_3_architect` and `batch_7_verify`, the pipeline halts automatically. The project’s canonical `generation_runs.lifecycle_status` becomes `awaiting_review` or `awaiting_verification_review`, and the generation screen switches into the respective review panel. 
+
+The **Architecture Gate** (Batch 3) focuses on the recommended stack and data model, while the **Verification Gate** (Batch 7) focuses on final plan consistency, enrichment quality, and file alignment. Finalization is only possible after the user explicitely approves the verification report.
 
 **Gate review API:**
 ```typescript
@@ -1193,6 +1178,7 @@ Body: {
   decision: 'approve' | 'reject',
   feedback?: string,       // shown to AI on retry
   edited_output?: string   // if user edited the AI content
+  approvalType?: 'architecture' | 'verification' // added to route to correct workflow event
 }
 ```
 
@@ -1200,8 +1186,8 @@ Body: {
 - Security and authentication steps
 - "Go live" / deployment steps
 - Any step that makes external API calls or database changes
-- Architecture decisions that affect all downstream work
-
+- Architecture decisions that affect all downstream work (Batch 3)
+- Final verification report (Batch 7)
 ### Plan updates with live research
 Natural-language plan updates now post to `/api/workflows/:id/update`, which streams a mini activity feed straight back into the update modal. The server analyzes what changed, performs MCP-powered mini research for any newly mentioned technologies (Context7 docs, GitHub analysis + releases/issues, Brave Search chatter when connected), generates the JSON diff, applies it, and immediately re-enriches every affected step before signaling completion. Every phase emits a chronological event (`🔍 Reading Railway documentation...`, `✅ Research complete`, `🔄 Updating your plan...`, `✅ 4 steps updated`) so the builder can follow the work, and the final bundle includes the refreshed research metadata and `research_sources` ledger that feeds the architecture review badges and step footers.
 
@@ -1384,24 +1370,31 @@ If no AI provider is configured, `/new` blocks submission and shows a direct "Yo
 
 **On submit → Generating screen:**
 - Before the activity feed begins, a short "Getting ready to research" transition screen appears when the user arrives from `/new`. It lists the active research depth for this run (`Web search`, `GitHub — authenticated/public only`, `Live docs via Context7`) using the same green/muted badge styling as the architecture review panel. If any optional tools are missing, the screen lingers for ~2.5s and links to `/settings#mcp-servers`; if everything is connected it crossfades out immediately.
-- Full-screen, vertically centered layout with the pulsing Scrimble mark (animated opacity pulse, 2s loop) and `bg-base`.
-- The main heading swaps between the six batch labels (`Identifying your stack`, `Reading the docs`, `Designing your architecture`, `Building your plan`, `Writing step details`, `Preparing your files`) using AnimatePresence as each `batch_start` SSE event arrives.
+- **Research Dashboard (Batch 2)**: During the research phase, the screen pivots to a dual-pane dashboard.
+  - **Target Queue**: A live list of technologies and topics being researched, showing `pending`, `active`, `skipped`, or `completed` states.
+  - **Real-time Metrics**: Live counters for data points found, including `Sources Found`, `Chunks Processed`, and `Evidence Packs Created`.
+  - **Token Budget**: A visual progress bar tracking token consumption against the research budget (e.g., 0 / 8000 tokens).
+  - **Interactive Controls**: A "Skip" button allows the builder to bypass a specific research target if they know it's irrelevant.
+- Full-screen, vertically centered layout with the pulsing Scrimble mark (animated opacity pulse, 2s loop) and `bg-base` for other batches.
+- The main heading swaps between the seven batch labels (`Identifying your stack`, `Reading the docs`, `Designing your architecture`, `Building your plan`, `Writing step details`, `Preparing your files`, `Verifying project consistency`) using AnimatePresence as each `batch_start` SSE event arrives.
 - A single-line **Currently working** row sits above the historical log. It uses a 3px paprika pulse dot and slightly brighter type to show the latest live message in real time. Streaming `thinking` deltas land here first, and when the next activity arrives the previous live line animates up into the history below.
 - A scrollable activity log (max-height 280px) streams persisted events (`activity`, `batch_complete`, `checkpoint`, `pipeline_failed`) with icons (🔍, 📦, ⚠️, 🏗️, ✅, 📝), timestamps (HH:MM:SS JetBrains Mono), and auto-scroll behavior. Each durable event carries an SSE `id:` from D1, the frontend tracks the latest seen event ID and a rendered-ID set, and reconnects after ~2 seconds with `Last-Event-ID` so replayed history never duplicates in the UI.
-- A six-dot progress indicator (connected line) mirrors the batch order. Completed dots glow emerald, the current batch glows paprika with a halo, and pending dots stay muted. Labels beneath each dot match the batch short names.
+- A seven-dot progress indicator (connected line) mirrors the batch order. Completed dots glow emerald, the current batch glows paprika with a halo, and pending dots stay muted. Labels beneath each dot match the batch short names.
 - **Persistent AI Model Selection**: Interactive buttons for both "Fast" and "Deep" models are pinned to the generation summary area. These buttons allow the builder to view the active model (formatted as "Provider — Model") and open a selection modal to swap providers or models mid-run.
-- Estimated time remaining counts down from 12 minutes and recalculates dynamically as each `batch_complete` event reports `duration_ms`.
+- Estimated time remaining counts down from 15 minutes and recalculates dynamically as each `batch_complete` event reports `duration_ms`.
 - A `Stop generation` control sits inside the connection bar (XCircle icon). It fires `POST /api/projects/:id/cancel`, cancels the run in D1, attempts to terminate the active workflow instance, and surfaces a cancelled banner with “Resume from checkpoint” and “Back to dashboard” actions so checkpoints are preserved after a manual halt.
 
 When a run is cancelled via the stop control the generation screen switches into the “Generation stopped” banner state: a muted XCircle explains that checkpoints remain intact, offers to resume or exit to the dashboard, and quietly marks the run `cancelled` so the backend can reject duplicate runners while the frontend keeps the builder in control.
 - If a builder returns to `/project/:id` while generation is still running (or while the architecture checkpoint is waiting), the canvas route redirects them back to `/project/:id/generating`, the screen reloads the status from `generation_runs`, reconnects to the SSE stream, and reconstructs the full generation state from replayed events before resuming live updates.
 
-**Review checkpoint**
-- When `batch_3_architect` emits a `checkpoint` SSE event, AnimatePresence crossfades the activity feed into the review panel (y: 24 → 0, opacity: 0 → 1). The panel shows:
+**Review checkpoints**
+- **Architecture Gate (Batch 3)**: When `batch_3_architect` emits a `checkpoint` SSE event, AnimatePresence crossfades the activity feed into the review panel (y: 24 → 0, opacity: 0 → 1).
+- **Verification Gate (Batch 7)**: When `batch_7_verify` finishes, the pipeline enters its second mandatory human gate. This panel displays a detailed quality report covering stack drift, feature coverage, and link audits. Finalization is only enabled once the user acknowledges the report.
+- The panels show:
   - "Your stack" grid of stack cards (name + package@version + reason + optional gotcha tooltip).
   - "How it's structured" data-model summary (table name + column list).
   - Feedback textarea (DM Sans 14px) for adjustments and preference buttons for `cursor`, `windsurf`, `vscode`, `claude_desktop`.
-  - "Let me adjust" (ghost) and "Looks right, build my plan →" (paprika) buttons. Approval sends the workflow `architecture-approved` event with feedback so batch 4 can continue; the panel stays until approved.
+  - "Let me adjust" (ghost) and "Looks right, build my plan →" (paprika) buttons (for Architecture) or "Finalize project" (for Verification). Approval sends the workflow event with feedback.
   - A Research depth row lives above the stack grid, displaying badges such as `[✓ Web search]`, `[✓ GitHub — authenticated]`, or `[✗ Brave Search — not connected]`. Connected badges follow the mint style (`bg-[rgba(52,211,153,0.1)]`, `border-[rgba(52,211,153,0.2)]`, `text-[#34d399]`, checkmark icon), while offline tools use a muted grey treatment (`bg-[rgba(204,197,185,0.05)]`, `border-[rgba(204,197,185,0.1)]`, `text-[var(--text-muted)]`, X icon, "not connected" suffix). Below the badges, a JetBrains Mono 11px line reads "Researched {n} technologies across {m} sources." If fewer than two tools were connected, a quiet amber nudge appears beneath: "Connect more research tools in Settings for deeper analysis next time." (Links to `/settings#mcp-servers`.)
 - A collapsible "What I read" disclosure expands to show every source the agent consulted: each entry now includes tool icon/label, truncated URL, `chars_read`, relevance tier (`high|medium|low`), and a one-line insight summary from the research ledger.
 - If the SSE stream reports `pipeline_failed`, the review screen surfaces the error message and a "Try again" button that reconnects the stream.
@@ -1544,9 +1537,6 @@ The **Workspace Profile** is the personalization engine that makes Scrimble's re
 - **Subscriptions**: Other tools and services the user pays for.
 - **AI Models**: Preferred models for planning and coding.
 
-> [!IMPORTANT]
-> **Current Status**: While the UI for the profile exists, the deep integration between this data and the Batch 2 Research Agent is not yet fully implemented. This is a high-priority roadmap item.
-
 ---
 
 ### 15.8 AI Keys & Research Tools (`/settings`)
@@ -1639,145 +1629,59 @@ If your stream reader loop uses `while (true)` and relies solely on `!done` from
 
 ## 17. Build Status
 
-### ✅ Phase 1-5 Migration Complete (Architecture Stabilization)
-- **Phase 1-3**: Decoupled `projects` from `generation_runs`, centralized research via `ResearchFacade`.
-- **Phase 4**: Canonical Write Boundary. Removed direct project mutations; unified state management in `generation-runtime.ts`.
-- **Phase 5**: Workflow Unification & Retry Layer. Collapsed `workflow-update.ts` into the main pipeline; implemented the four-class `classifyAIError` retry system.
-- **SSE Stream Stabilization**: Durable generation events replayed via polling; high-frequency `thinking` deltas emitted transiently.
-- **Dual-Write Decommissioned**: All legacy mutation bridges removed; read-path standardized.
+### ✅ Core Features (Completed)
 
-### ✅ Complete
-- Firebase Auth (Google OAuth) + protected routes (Zustand authStore)
-- Cloudflare D1 schema (controlled by `001_initial_schema.sql`)
-- Firebase JWT verification in Pages Functions (fixed "iss" claim logic)
-- Security Headers (CSP, X-Frame-Options, etc.) on all API routes
-- React Flow canvas with custom StepCard components and status-driven visuals
-- AI Robustness: Outbound retry logic and structured error mapping
-- Optimistic UI: Checklist toggles, step completion, and panel transitions
-- Step detail panel with section-level loading shimmers
-- Dashboard with project cards, progress calculation, and empty states
-- **Infinite Spine Timeline**: Transitioned project view from a graph canvas to a linear, high-focus vertical timeline.
-- **Onboarding Journey**: Dedicated `WelcomeModal` and `OnboardingChecklist` to guide users through AI key and profile setup.
-- **Route Handling**: Logical `PlanRoute` for deep-linking into active work.
-- **Landing Page Overhaul**: Refined animation/layout pass with real navigation/contact links and placeholder social-proof content removed.
-- **Auth Page Redesign**: Split-screen layout with branded visuals, animated state transitions, improved error handling.
-- **Settings Page Expansion**: Builder profile management, AI provider configuration, MCP server connections, preference toggles.
-- **New UI Components**: `InlineError` for inline validation, `NewProjectModal` for streamlined project creation, `Sidebar` for project navigation.
-- **Onboarding Store**: Zustand store for tracking onboarding completion state.
-- **Formatting Utilities**: `formatStepCount`, `roundPercent` helpers for consistent number display.
-- **CSS Design System Expansion**: Extended design tokens for timeline, onboarding, and component states.
-- Natural language project intake → AI plan generation
-- **Interactive AI Model Selection**: Refined the model selection UI on the New Project page and implemented persistent, interactive selection (mid-run switching) on the Project Generation page.
-- **Intake Answer Tracking**: Restored the conversational intake style and implemented historical answer tracking to ensure the generation pipeline has full context of user decisions.
-- **Research Ledger Enhancements**: Improved the Batch 2 research manifest to prioritize tools from the Builder Profile and record detailed source metadata in a research ledger.
-- AI key management with custom provider URL hints
-- AI step enrichment ( Gemini/OpenAI integration + D1 persistence)
-- AI plan update (natural language diffing + D1 mutation)
-- Sequential 6-batch generation pipeline (research stack → fetch/read → architect → plan build → enrich → file generation) with single-AI-call batches, Zod validation, `agent_runs` auditing, and SSE event persistence so the frontend always knows what the agent is doing.
-- **Robustness & Privacy (Latest Updates)**:
-  - **Lightweight RAG Retrieval**: Batch 2 chunks fetched research into a reusable in-memory corpus and downstream batches pull top-k relevant chunks instead of truncating large blobs.
-  - **Reasoning Guards**: Automatic JSON-only retry if a model emits only thoughts and no content (GLM-5/DeepSeek protection).
-  - **Privacy Purge**: Reasoning data is physically deleted from D1 on batch/pipeline completion or project deletion.
-  - **Pipeline Fallthrough Prevention**: Individual `executeBatch` functions now propagate errors by throwing a `GenerationPipelineError`. This prevents the pipeline from falling through to subsequent batches and masking the root cause with "Missing output" errors.
-  - **Improved Retry Flow**: Backend `/resume` resets the project status to `queued` and clears error flags, allowing workflow dispatch to continue from the latest recoverable status.
-  - **Dispatch Safety & R2 Checkpoints**: Workflow dispatch is service-bound and guarded against stale state, while the worker stores checkpoints in D1 plus the R2 bucket `scrimble` (S3 API `https://275802114da3095a634457ef16168244.r2.cloudflarestorage.com/scrimble`) to preserve durable history without D1 payload bloat.
-  - **Provider Pinning & Retrieval Assembly**: The workflow enforces the BYOK provider assigned to the run (no silent fallbacks), and Batch 2 now assembles provider prompts from retrieved chunk subsets so large research corpora remain stable without prompt-budget overflow failures.
-  - **Degradation Transparency**: Tool failures raise `ToolExecutionError`, feed `degraded_tools`/`partial_failures`, and the UI badges research depth to explain when Brave Search, Context7, GitHub, or other sources were unavailable.
-- **Query Hygiene + Scope Guardrails**: Research-layer search queries are now sanitized, short (≤8 words), and category-based (`setup` / `errors` / `changelog` with year), with no raw project-description interpolation. Batch 2 additionally excludes workspace profile IDE/AI tools from documentation fetch targets.
-- **Canonical Schema Contract**: Production/runtime schema truth is now `migrations/0026_full_canonical_rebuild.sql`; release gating verifies behavior and contract integrity against that canonical state.
-- Natural-language plan updates now stream through `/api/workflows/:id/update`, emitting mini activity events while the server performs change analysis, runs MCP-powered docs/issue/search research for newly mentioned technologies, generates/applies the diff, and automatically re-enriches affected steps before signaling completion.
-- **SSE Streaming Overhaul**: Durable generation events are persisted in D1 and replayed via polling; `thinking` events now use the same canonical envelope, persist in a bounded rolling window, replay for active runs only, and are cleared from live replay on terminal outcomes.
-- **Connection Safety**: Implemented strict stream lifecycle management; `writer.close()` is now guaranteed on all terminal pipeline events and server-side cleanups.
-- **UI Transparency**: Introduced `Skeleton` and `ThinkingBubble` components across the dashboard and project canvas to maintain transparency during agent work.
-- Research depth badges and the "Researched {date} using {tools}" footer inject transparency into the detail panel and architecture review, highlighting when Context7, Brave Search, or GitHub were used and nudging builders to connect any missing tools for deeper next-time results.
-- Live generation screen now streams durable `batch_start`, `activity`, `batch_complete`, `checkpoint`, `pipeline_failed` events plus transient `thinking` deltas: animated batch headings, a dedicated “Currently working” live line, icon-coded history entries, a six-dot progress tracker, ETA recalculations, and a Sonner success toast/failure state with auto-nav. The review gate panel crossfades in on `checkpoint`.
-- Frontend tab-close resilience now uses `localStorage['scrimble_active_generation']`: generation pages set it while a run is active, and Dashboard auto-redirects back to `/project/:id/generating` if that run is still in progress or awaiting review.
-- Canvas sidebar exposes a "Download AI files" button with download icon, hint text ("Paste these into your IDE…"), and tooltip-disabled state until the files are ready.
-- Human-in-the-loop review panel (Approve/Reject gates)
-- Tiered Export system (Markdown + JSON)
-- Stage cluster groups on canvas (React Flow `parentNode`)
-- Agent working states (sweep animations) and needs-review states (amber pulse)
-- First-time user guide (contextual tooltips)
-- Project renaming and archiving
-- **Manual stop & resume**: The generation screen now exposes a `Stop generation` button that calls `/api/projects/:id/cancel`, marks the run cancelled, and terminates the active workflow instance when available.
-- **Workflow Infrastructure**: The primary generation runtime now runs on Cloudflare Workflows with step-level retries/timeouts, `step.waitForEvent` review gating, and R2-backed large-state indirection.
-- **Provider Management**: Implemented AI provider removal with confirmation dialogs and active-check safety guards.
-- **Provider Test Connection**: Added a "Test" button to each AI provider card in Settings that validates the API key works before saving, with inline error display using `InlineError` component and retry capability.
-- **Schema reconciliation**: Migration `010_schema_reconciliation.sql` adds the missing `workflow_id` columns to `steps`, `stages`, and `edges`, and drops the erstwhile `project_generation_live_state` table.
-- **Checklist Interactions**: Added `updateChecklistItem` to db client allowing full checklist item mutations (labels, requirement status) beyond simple toggles.
-- **SSE Progress Sync**: Added `progress_percent` metric to `batch_complete` events in the generation pipeline to ensure the client-side progress bar perfectly reflects backend generation state.
-- **Review Flapping Fixes**: Hardened the approval/resume flow to prevent status oscillation.
-- **Thinking Stream Diagnostics (March 2026)**: Added temporary diagnostics across the thinking event flow during runtime-stream investigation.
-- **Phase 7 — Fallback Chain Transparency**:
-  - Batch 2 now persists a structured research source ledger (`tool`, `url`, `title`, `chars_read`, `relevance`, `insight`) and carries it through the architecture review payload.
-  - The architecture review disclosure ("What I read") renders that ledger directly, including character counts and relevance labels for each source.
-  - Architecture review now surfaces an amber limited-research notice when fewer than 3 sources are fetched successfully.
-  - The generation screen now shows model-role transparency under the batch heading: `Using [fast model] for research · [deep model] for generation`.
+**Auth & Infrastructure**
+- **Unified Identity**: Firebase Auth (Google OAuth) + JWT verification in Cloudflare Pages.
+- **D1 Canonical Schema**: High-integrity relational storage with automated migration path.
+- **R2 Checkpoints**: Large-state indirection (research, plans, artifacts) to Cloudflare R2 bucket.
+- **Workflow Middleware**: Service-bound dispatch to the `scrimble-consumer` worker runtime.
+- **Security Guardrails**: Content-Security-Policy (CSP), SRI, and masked key storage (AES-256).
 
-  - The pipeline now adds a `[MODEL_RESOLUTION] Role: …` activity line so the transcript shows exactly which provider/model resolved before each batch, and it surfaces the `No model configured for role: {role}. Please set your models in Settings.` error instead of silently defaulting to GLM when a fast/deep slot is missing.
-  - Step enrichment now stores per-step research footer metadata and the step detail drawer renders a dedicated JetBrains Mono footer from metadata instead of appending footer text into `ai_output`.
-  - Migration added: `016_step_research_footer_metadata.sql` (`steps.research_footer_meta`).
+**AI & Research (The Scrimble Engine)**
+- **Research Facade**: Centralized tool orchestration for Context7 docs, GitHub analysis, and Brave Search.
+- **Lightweight RAG**: In-memory chunking and TF-IDF-style retrieval for targeted context window usage.
+- **Recursive Generation**: Sequential 7-batch pipeline (Research → Architect → Plan → Enrich → File Gen → Verify).
+- **Dual-Model Routing**: Configurable "Fast" vs "Deep" model roles for performance optimization.
+- **Research Telemetry**: Live dashboard during research phase showing sources, chunks, and token budget.
+- **Target Skipping**: Builders can explicitly bypass specific documentation fetches via the UI.
+- **Reasoning Persistence**: `thinking` events are replayed with a rolling window for active runs.
 
-### 17.5 Vision Audit Snapshot (Phase 12)
+**Workflow & Execution**
+- **Human-in-the-Loop Gates**: Mandatory human checkpoints for Architecture (Batch 3) and Verification (Batch 7).
+- **Durable Progress**: State-aware résumé and retry system with per-step timeouts/budgets.
+- **Plan Updates**: Natural-language diffing with automated research/re-enrichment for existing plans.
+- **Skill File Generation**: Automated production of `.mdc`, `.windsurfrules`, and context files for IDEs.
+- **SSE Stream Adapter**: Resilient backend event stream with replay, heartbeats, and terminal server-side severing.
 
-The Phase 12 verification pass re-scored shipped behavior against `docs/the-vision.md`:
-
-1. **Deep research**: Query generation is now centralized and stack-specific (`setup/errors/release_notes/deployment` families), with retrieval input precedence (`builder_profile > project_stack > inferred`) applied across generation + workflow update paths.
-2. **Turn-by-turn navigation**: Detail panel now consumes canonical typed step content directly for primary execution guidance, evidence quality, and done criteria.
-3. **Forcing function**: Runtime-native lifecycle + checkpoint/resume semantics remain enforced across review, failure, cancel, and resume transitions.
-4. **Workspace profile as intelligence engine**: Profile and confirmed stack now shape the research graph deterministically instead of acting like soft metadata.
-5. **Daily re-entry clarity**: Dashboard + generation session adapters remain runtime-driven and actionable (review/resume/working states), with no legacy-status branching.
-6. **Living plan updates**: Workflow update path uses the same retrieval/query policy contract as initial generation, keeping post-intake plan updates stack-specific and consistent.
+**UI & Product Experience**
+- **Infinite Spine Timeline**: High-focus vertical orientation for project execution.
+- **Dashboard Hub**: Daily re-entry greeting with actionable "Next Up" primary prompts.
+- **Guided Canvas**: Progress-first map view with secondary "Advanced mode" for mutation.
+- **Step Detail Drawer**: Enriched execution guidance (Tool, Destination, Action) with live streaming.
+- **Onboarding Pathway**: Guided `WelcomeModal` and `OnboardingChecklist` for first-run friction reduction.
+- **Visual Design System**: Warm-editorial dark mode with Framer Motion staggers and paprika accents.
 
 ---
 
-### 17.6 Release Candidate Gate Snapshot (Phase 13)
-
-- Added release-candidate runbook: `docs/release-candidate-go-live.md` with paired deploy order (Pages + consumer), rollback policy, smoke gates, and go/no-go criteria aligned to canonical `0026`.
-- Added schema/runtime safety assertions: `scripts/phase13-release-candidate.assertions.ts` plus Phase 14D/14E reliability guards.
-- Standardized user-facing error copy on Auth, Dashboard, New Project, and Project Generation via `src/lib/ui-copy.ts`.
-- Confirmed canonical runtime ownership remains `generation_runs` + `projects.current_generation_run_id` under the `0026` canonical rebuild contract.
-
----
-
-### 17.7 Vision/Productization Snapshot (Phase 15)
-
-- **Vision-gap audit matrix (ranked by user harm):**
-  - `navigation failure` — **blocks daily use**: users could not reliably answer "where am I / what next / what is blocked" from the default canvas.
-  - `layout / action reachability` — **breaks product promise**: `plan.md` export CTA was not consistently visible in a reliable primary action zone.
-  - `plan content quality` — **blocks daily use**: Batch 4 could accept generic/off-domain authored plans that eroded trust.
-  - `research grounding` — **breaks product promise**: authored plans could under-reflect confirmed/recommended stack signals even when research existed.
-  - `advanced-mode/editor bleed` — **looks rough but acceptable**: advanced editing controls competed with guided execution in primary view.
-- **Canvas rework (GPS behavior):** `ProjectCanvas` now prioritizes orientation and execution with a stronger "Where you are / What's next / Blocked by" framing, while keeping advanced editing available but secondary.
-- **Export reachability fix:** `Download plan.md` moved to the top workflow toolbar (`absolute inset-x-0 top-0 z-20`) with keyboard-visible focus rings, eliminating advanced-mode/scroll-trap dependency.
-- **Canonical export path enforcement:** frontend markdown assembly path was removed; export now flows through `dbService.downloadSkillFiles(project.id)` and `/projects/:id/skill-files` canonical serializer output only.
-- **Detail panel upgrade:** `DetailPanel` now leads with an "Action brief" (`Tool`, `Destination`, `Action`, `Done when`, `What this unlocks`) and surfaces low-confidence research as an explicit warning.
-- **Batch 4 quality gate:** `generation-pipeline` now rejects generic/off-domain authored plans before acceptance/export when quality heuristics detect known drift signatures, weak stack reflection, or vague non-actionable wording.
-- **Phase 15 regression suite:** added `scripts/phase15-vision-productization.assertions.ts` to guard CTA reachability, advanced-mode demotion, canonical export path, detail-panel contract, and quality-gate presence.
-
----
-
-### 17.8 Retrieval Scale & Evidence Synthesis Snapshot (Phase 16)
-
-- Batch 2 now formalizes retrieval artifacts on top of the existing research contract: `source_candidates`, `ranked_sources`, `source_notes`, and `evidence_packs`.
-- Candidate acquisition is still facade-first (`research-facade`) but now rank-aware: each candidate is scored by relevance, freshness, authority, duplicate risk, and coverage before final selection.
-- `chunk_store` was promoted to carry first-class evidence metadata (`id`, `source_id`, `source_title`, `source_type`, `rank_score`, `start_offset`, `end_offset`) for stable citation and deterministic reuse.
-- Downstream retrieval is budget-aware and evidence-first:
-  - Batch 2, 3, 4, 5, and 6 each have explicit token budgets.
-  - Retrieval selects top evidence packs first, then ranked chunks.
-  - Coverage status is explicit (`strong` / `thin` / `degraded`) and surfaced in batch telemetry and prompt payloads.
-- Batch prompts now include selected evidence-pack summaries + chunk citations rather than treating raw fetched blobs as the primary synthesis unit.
-- `H1` export is considered complete in roadmap bookkeeping: canonical `plan.md` download is already live and no longer tracked as pending future work.
+### Pipeline Maturity (Incremental Snapshots)
+*The system has evolved through several reliability and vision-alignment phases:*
+- **V1-V3 (Stabilization)**: Decoupled projects from runs; established the Canonical Write Boundary; unified the retry layer.
+- **V4-V5 (Research Scale)**: Implemented `ResearchFacade`; added lightweight RAG; introduced subrequest guardrails.
+- **V6 (Observability & QA)**: Added transient reasoning streams; implemented Batch 7 Verification; finalized the dual-gate human-in-the-loop architecture.
 
 ---
 
 ### 18. Remaining Work
 
-**Release closeout blockers (Phase 14F):**
-- Paired runtime deploy validation (Pages + `worker-consumer`) with first event + first heartbeat confirmation.
-- Mobile/narrow viewport verification for Dashboard, Generation, Canvas, Detail Panel, and Settings.
-- Large-project performance benchmark (`100+` steps) and measured bottleneck fixes if needed.
-- Monitoring window checks for `pipeline_failed`, protocol mismatch, stale heartbeat-less runs, and D1 contract regressions.
+**Release closeout blockers (Phase 14F - COMPLETE):**
+- [x] Batch 7 Consistency Verification gate implemented end-to-end.
+- [x] Research Telemetry (chunks/tokens/budget) dashboard live.
+- [x] Target Skipping functionality operational.
+- [ ] Paired runtime deploy validation (Pages + `worker-consumer`) with first event + first heartbeat confirmation.
+- [ ] Mobile/narrow viewport verification for Dashboard, Generation, Canvas, Detail Panel, and Settings.
+- [ ] Large-project performance benchmark (`100+` steps).
+- [ ] Monitoring window checks for `pipeline_failed` and D1 contract regressions.
 
 ---
 
@@ -1831,5 +1735,5 @@ Error: Network connection lost. Retrying automatically in 45 seconds (1/3).
 
 ---
 
-*Scrimble Documentation v5.5 — March 2026*
+*Scrimble Documentation v6.1 — April 2026*
 *This document supersedes all previous versions.*

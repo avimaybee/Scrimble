@@ -14,6 +14,8 @@ import {
   ProjectGenerationCheckpointEvent,
   ProjectGenerationEvent,
   ProjectGenerationInvariantEvent,
+  ProjectGenerationResearchTargetStatusEvent,
+  ProjectGenerationResearchTelemetryEvent,
   ProjectGenerationThinking,
   ProjectGenerationStatusResponse,
   ProjectIntakeSession,
@@ -129,6 +131,8 @@ interface StreamProjectGenerationOptions {
   onComplete?: () => void;
   onFailed?: (event: { message: string; failureClass: GenerationRuntime['failureClass'] }) => void;
   onConnectionStateChange?: (state: GenerationStreamConnectionState) => void;
+  onResearchTelemetry?: (event: ProjectGenerationResearchTelemetryEvent) => void;
+  onResearchTargetStatus?: (event: ProjectGenerationResearchTargetStatusEvent) => void;
 }
 
 interface StreamStepEnrichmentOptions {
@@ -159,6 +163,8 @@ type ParsedGenerationStreamEvent =
   | { kind: 'checkpoint'; event: ProjectGenerationCheckpointEvent }
   | { kind: 'verification_review_required'; event: ProjectBatch7VerificationEvent }
   | { kind: 'invariant'; event: ProjectGenerationInvariantEvent }
+  | { kind: 'research_telemetry'; event: ProjectGenerationResearchTelemetryEvent }
+  | { kind: 'research_target_status'; event: ProjectGenerationResearchTargetStatusEvent }
   | { kind: 'pipeline_complete' }
   | {
       kind: 'pipeline_failed';
@@ -324,6 +330,46 @@ function parseGenerationStreamEvent(payload: unknown): ParsedGenerationStreamEve
         event: {
           drift_type: driftType,
           message,
+          timestamp: typeof eventPayload.timestamp === 'string' ? eventPayload.timestamp : envelope.timestamp,
+        },
+      };
+    }
+    case 'research_telemetry': {
+      const chunkCount = typeof eventPayload.chunkCount === 'number' ? eventPayload.chunkCount : 0;
+      const evidencePackCount = typeof eventPayload.evidencePackCount === 'number' ? eventPayload.evidencePackCount : 0;
+      const tokensConsumed = typeof eventPayload.tokensConsumed === 'number' ? eventPayload.tokensConsumed : 0;
+      
+      return {
+        kind: 'research_telemetry',
+        event: {
+          chunkCount,
+          evidencePackCount,
+          tokensConsumed,
+          timestamp: typeof eventPayload.timestamp === 'string' ? eventPayload.timestamp : envelope.timestamp,
+        },
+      };
+    }
+    case 'research_target_status': {
+      const targetName = typeof eventPayload.targetName === 'string' ? eventPayload.targetName : '';
+      const currentIndex = typeof eventPayload.currentIndex === 'number' ? eventPayload.currentIndex : 0;
+      const totalTargets = typeof eventPayload.totalTargets === 'number' ? eventPayload.totalTargets : 0;
+      const rawStatus = typeof eventPayload.status === 'string' ? eventPayload.status : 'pending';
+      const status: ProjectGenerationResearchTargetStatusEvent['status'] =
+        rawStatus === 'active'
+          || rawStatus === 'completed'
+          || rawStatus === 'skipped'
+          || rawStatus === 'failed'
+          ? rawStatus
+          : 'pending';
+      
+      return {
+        kind: 'research_target_status',
+        event: {
+          targetName,
+          currentIndex,
+          totalTargets,
+          status,
+          sourcesFound: typeof eventPayload.sourcesFound === 'number' ? eventPayload.sourcesFound : undefined,
           timestamp: typeof eventPayload.timestamp === 'string' ? eventPayload.timestamp : envelope.timestamp,
         },
       };
@@ -518,6 +564,18 @@ export const dbService = {
   async nudgeProjectGeneration(id: string): Promise<{ success: boolean; message: string; nudgedAt?: string }> {
     return fetchAPI(`/projects/${id}/nudge`, {
       method: 'POST',
+    });
+  },
+
+  async skipCurrentResearchTarget(
+    id: string,
+    options: { targetName?: string } = {},
+  ): Promise<{ success: boolean; message: string }> {
+    return fetchAPI(`/projects/${id}/research/skip-current`, {
+      method: 'POST',
+      body: JSON.stringify({
+        targetName: options.targetName ?? null,
+      }),
     });
   },
 
@@ -769,6 +827,12 @@ export const dbService = {
                 return;
               case 'invariant':
                 options.onInvariant?.(parsed.event);
+                return;
+              case 'research_telemetry':
+                options.onResearchTelemetry?.(parsed.event);
+                return;
+              case 'research_target_status':
+                options.onResearchTargetStatus?.(parsed.event);
                 return;
               case 'pipeline_complete':
                 reachedTerminalEvent = true;
