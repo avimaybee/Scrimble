@@ -63,6 +63,7 @@ import {
   hasApprovedArchitectureReview,
   loadBatchOutput,
   resolvePipelineStatusToRun,
+  reviseArchitectureReview,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 import {
@@ -1539,6 +1540,39 @@ app.get('/projects/:id/architecture-review', async (c) => {
   }
 });
 
+const handleProjectArchitectureRevision = async (c: AppContext) => {
+  const projectId = c.req.param('id');
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  const { lifecycleStatus } = projectRuntime;
+  if (lifecycleStatus !== 'awaiting_review') {
+    return c.json({ error: 'Surgical revisions are only allowed during architecture review.' }, 409);
+  }
+
+  const uid = c.get('uid');
+  const body = await c.req.json().catch(() => ({}));
+  
+  try {
+    const updatedPayload = await reviseArchitectureReview(
+      c.env,
+      projectId,
+      uid,
+      {
+        instruction: body.instruction as string | undefined,
+        manualMarkdown: body.manual_markdown as string | undefined,
+      },
+    );
+
+    return c.json(updatedPayload);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to revise architecture.';
+    return c.json({ error: message }, 503);
+  }
+};
+
 const handleProjectArchitectureApproval = async (c: AppContext) => {
   const projectId = c.req.param('id');
   const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
@@ -1644,6 +1678,7 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
 
 app.post('/projects/:id/approve', handleProjectArchitectureApproval);
 app.post('/projects/:id/architecture-review', handleProjectArchitectureApproval);
+app.post('/projects/:id/architect/revise', handleProjectArchitectureRevision);
 
 app.post('/projects/:id/resume', async (c) => {
   const projectId = c.req.param('id');

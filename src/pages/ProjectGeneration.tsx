@@ -3,16 +3,20 @@ import { AnimatePresence, motion } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import {
   BookOpenText,
+  Check,
   ChevronDown,
   ChevronUp,
   ChevronRight,
+  Edit2,
   ExternalLink,
   FileDown,
   Github,
   Globe,
   Hexagon,
   LoaderCircle,
+  MessageSquare,
   Search,
+  Settings,
   Sparkles,
   TriangleAlert,
   XCircle,
@@ -339,6 +343,10 @@ export default function ProjectGeneration() {
   const [isLoading, setIsLoading] = useState(true);
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
+  const [isRevising, setIsRevising] = useState(false);
+  const [revisionInput, setRevisionInput] = useState('');
+  const [isManualEditing, setIsManualEditing] = useState(false);
+  const [manualEditValue, setManualEditValue] = useState('');
   const [hasEditedReview, setHasEditedReview] = useState(false);
   const [isResearchDisclosureOpen, setIsResearchDisclosureOpen] = useState(false);
   const [showAllResearchSources, setShowAllResearchSources] = useState(false);
@@ -1144,6 +1152,29 @@ export default function ProjectGeneration() {
     }
   }, [applyStatusUpdate, id, reviewFeedback, syncProjectState]);
 
+  const handleRevise = useCallback(async (options: { instruction?: string; manualMarkdown?: string }) => {
+    if (!id) return;
+
+    setError('');
+    setIsRevising(true);
+
+    try {
+      const updated = await dbService.reviseArchitectureReview(id, {
+        instruction: options.instruction,
+        manual_markdown: options.manualMarkdown,
+      });
+      setReviewData(updated);
+      reviewDataRef.current = updated;
+      setRevisionInput('');
+      setIsManualEditing(false);
+      toast.success('Architecture and PRD updated successfully.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to revise architecture.');
+    } finally {
+      setIsRevising(false);
+    }
+  }, [id]);
+
   useEffect(() => {
     if (!id) {
       return;
@@ -1438,42 +1469,127 @@ export default function ProjectGeneration() {
                             <section className="py-7">
                               <div className="flex items-center justify-between">
                                 <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Product requirements (PRD)</div>
-                                <button
-                                  type="button"
-                                  onClick={handleDownloadPRD}
-                                  className="group flex items-center gap-1.5 rounded-full border border-border-default/60 bg-bg-surface/40 px-3 py-1.5 font-sans text-[11px] font-medium text-text-tertiary transition-colors hover:border-accent-border/40 hover:text-accent-soft"
-                                >
-                                  <FileDown className="h-3.5 w-3.5 transition-transform group-hover:-translate-y-0.5" />
-                                  <span>Download .md</span>
-                                </button>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (!isManualEditing) {
+                                        setManualEditValue(reviewData.prd_document_markdown);
+                                      }
+                                      setIsManualEditing(!isManualEditing);
+                                    }}
+                                    className={cn(
+                                      "group flex items-center gap-1.5 rounded-full border border-border-default/60 bg-bg-surface/40 px-3 py-1.5 font-sans text-[11px] font-medium transition-colors",
+                                      isManualEditing 
+                                        ? "border-accent-border/60 text-accent-soft"
+                                        : "text-text-tertiary hover:border-accent-border/40 hover:text-accent-soft"
+                                    )}
+                                  >
+                                    <Edit2 className="h-3.5 w-3.5" />
+                                    <span>{isManualEditing ? 'Cancel editing' : 'Edit manually'}</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={handleDownloadPRD}
+                                    className="group flex items-center gap-1.5 rounded-full border border-border-default/60 bg-bg-surface/40 px-3 py-1.5 font-sans text-[11px] font-medium text-text-tertiary transition-colors hover:border-accent-border/40 hover:text-accent-soft"
+                                  >
+                                    <FileDown className="h-3.5 w-3.5 transition-transform group-hover:-translate-y-0.5" />
+                                    <span>Download .md</span>
+                                  </button>
+                                </div>
                               </div>
 
                               <div className="mt-5 rounded-[14px] border border-border-subtle/70 bg-bg-base/45">
-                                <button
-                                  type="button"
-                                  onClick={() => setIsPrdExpanded((previous) => !previous)}
-                                  className="flex w-full items-center justify-between px-4 py-3 text-left"
-                                >
-                                  <span className="font-sans text-[13px] font-medium text-text-primary">
-                                    {isPrdExpanded ? 'Hide full PRD document' : 'Show full PRD document'}
-                                  </span>
-                                  {isPrdExpanded ? (
-                                    <ChevronUp className="h-4 w-4 text-text-tertiary" />
-                                  ) : (
-                                    <ChevronDown className="h-4 w-4 text-text-tertiary" />
-                                  )}
-                                </button>
-
-                                {isPrdExpanded ? (
-                                  <div className="border-t border-border-subtle/70 px-4 py-6">
-                                    <div className="markdown-content">
-                                      <ReactMarkdown>{reviewData.prd_document_markdown}</ReactMarkdown>
+                                {isManualEditing ? (
+                                  <div className="p-4">
+                                    <textarea
+                                      value={manualEditValue}
+                                      onChange={(e) => setManualEditValue(e.target.value)}
+                                      className="min-h-[400px] w-full resize-y rounded-[12px] border border-border-default bg-bg-base/82 p-4 font-mono text-[13px] leading-6 text-text-primary outline-none focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
+                                      placeholder="Edit the PRD markdown directly..."
+                                    />
+                                    <div className="mt-4 flex justify-end">
+                                      <button
+                                        type="button"
+                                        disabled={isRevising}
+                                        onClick={() => void handleRevise({ manualMarkdown: manualEditValue })}
+                                        className="btn-primary flex items-center gap-2 px-4 py-2 text-[13px]"
+                                      >
+                                        {isRevising ? (
+                                          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                                        ) : (
+                                          <Check className="h-3.5 w-3.5" />
+                                        )}
+                                        {isRevising ? 'Saving edits...' : 'Save manual edits'}
+                                      </button>
                                     </div>
                                   </div>
-                                ) : null}
+                                ) : (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => setIsPrdExpanded((previous) => !previous)}
+                                      className="flex w-full items-center justify-between px-4 py-3 text-left"
+                                    >
+                                      <span className="font-sans text-[13px] font-medium text-text-primary">
+                                        {isPrdExpanded ? 'Hide full PRD document' : 'Show full PRD document'}
+                                      </span>
+                                      {isPrdExpanded ? (
+                                        <ChevronUp className="h-4 w-4 text-text-tertiary" />
+                                      ) : (
+                                        <ChevronDown className="h-4 w-4 text-text-tertiary" />
+                                      )}
+                                    </button>
+
+                                    {isPrdExpanded ? (
+                                      <div className="border-t border-border-subtle/70 px-4 py-6">
+                                        <div className="markdown-content">
+                                          <ReactMarkdown>{reviewData.prd_document_markdown}</ReactMarkdown>
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </>
+                                )}
                               </div>
                             </section>
                           ) : null}
+
+                          <div className="border-t border-border-subtle" />
+
+                          <section className="py-7">
+                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Request surgical change</div>
+                            <div className="relative mt-4">
+                              <textarea
+                                value={revisionInput}
+                                onChange={(e) => setRevisionInput(e.target.value)}
+                                placeholder="e.g. Change database to Postgres, Add an admin dashboard, Remove Stripe integration..."
+                                className="min-h-[100px] w-full resize-none rounded-[16px] border border-border-default bg-bg-base/82 pb-14 pl-4 pr-4 pt-4 font-sans text-[15px] leading-[1.7] text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-primary/70 focus:ring-2 focus:ring-accent-primary/20"
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                                    void handleRevise({ instruction: revisionInput });
+                                  }
+                                }}
+                              />
+                              <div className="absolute bottom-3 right-3 flex items-center gap-2">
+                                <span className="hidden font-sans text-[11px] text-text-tertiary sm:inline-block">
+                                  ⌘ + Enter to send
+                                </span>
+                                <button
+                                  type="button"
+                                  disabled={isRevising || !revisionInput.trim()}
+                                  onClick={() => void handleRevise({ instruction: revisionInput })}
+                                  className="flex h-9 items-center gap-2 rounded-full bg-accent-primary px-4 font-sans text-[13px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+                                >
+                                  {isRevising ? (
+                                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <MessageSquare className="h-4 w-4" />
+                                  )}
+                                  <span>{isRevising ? 'Revising...' : 'Request change'}</span>
+                                </button>
+                              </div>
+                            </div>
+                          </section>
 
                           <div className="border-t border-border-subtle" />
 

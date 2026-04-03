@@ -577,6 +577,13 @@ export const dbService = {
     return fetchAPI<ArchitectureReviewResponse>(`/projects/${projectId}/architecture-review`);
   },
 
+  async reviseArchitectureReview(projectId: string, payload: { instruction?: string; manual_markdown?: string }): Promise<ArchitectureReviewResponse> {
+    return fetchAPI<ArchitectureReviewResponse>(`/projects/${projectId}/architect/revise`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
   async approveArchitectureReview(projectId: string, feedback: string, preferredIde = ''): Promise<{
     success: boolean;
     generation_runtime: GenerationRuntime;

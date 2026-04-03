@@ -3666,6 +3666,80 @@ export async function getArchitectureReviewPayload(env: Bindings, projectId: str
   return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2);
 }
 
+export async function reviseArchitectureReview(
+  env: Bindings,
+  projectId: string,
+  userId: string,
+  payload: { instruction?: string; manualMarkdown?: string },
+) {
+  const context = await loadArchitectureReviewContext(env, projectId);
+  const builderProfile = await loadBuilderProfileContext(userId, env);
+  const projectBrief = await loadProjectBriefContext(env, projectId, userId);
+  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+
+  const providerId = context.providerId;
+  if (!providerId) {
+    throw new GenerationPipelineError('No provider ID found for this project.');
+  }
+  const provider = await getProvider(env, providerId);
+
+  let systemPrompt = '';
+  let prompt = '';
+
+  if (payload.instruction) {
+    systemPrompt =
+      'You are Scrimble’s architecture revision agent. Your job is to surgically update the provided Architecture and PRD JSON object based on the user’s specific request.\n' +
+      '- ONLY modify the fields that are directly impacted by the user’s request.\n' +
+      '- Preserve all other data exactly as it is.\n' +
+      '- Ensure all relationships remain consistent (e.g., if removing a feature, remove its related functional requirements and data models).\n' +
+      '- Return ONLY valid JSON matching the provided schema. No markdown fences.';
+    prompt = `Current Architecture JSON:
+${JSON.stringify(context.adr, null, 2)}
+
+User request:
+${payload.instruction}
+
+Update the JSON accordingly. Return ONLY valid JSON.`;
+  } else if (payload.manualMarkdown) {
+    systemPrompt =
+      'You are Scrimble’s architecture sync agent. The user has manually edited the PRD Markdown. Your job is to reverse-engineer their text changes back into the structured JSON.\n' +
+      '- If they added a table in the text, add it to the `data_model` JSON array.\n' +
+      '- If they removed a feature, remove related functional requirements and integrations.\n' +
+      '- Ensure the JSON perfectly reflects the new Markdown reality.\n' +
+      '- Return ONLY valid JSON matching the provided schema. No markdown fences.';
+    prompt = `Current Architecture JSON:
+${JSON.stringify(context.adr, null, 2)}
+
+New PRD Markdown (user edited):
+${payload.manualMarkdown}
+
+Update the JSON to match the new Markdown content. Return ONLY valid JSON.`;
+  } else {
+    throw new GenerationPipelineError('No revision instruction or manual markdown provided.');
+  }
+
+  const result = await callValidatedBatch(provider, {
+    env,
+    projectId,
+    runId: context.runId,
+    runType: 'batch_3_architect',
+    role: 'fast',
+    systemPrompt,
+    prompt,
+    schema: Batch3ArchitectSchema,
+    schemaDescription: schemaDescriptions.batch_3_architect,
+  });
+
+  const architectRun = await loadBatchRunRecord(env, projectId, 'batch_3_architect');
+  const storage = await storeJsonPayload(env, `projects/${projectId}/architect`, result.data, architectRun?.output_r2_key);
+
+  await env.DB.prepare('UPDATE agent_runs SET output = ?, output_r2_key = ?, updated_at = datetime("now") WHERE id = ?')
+    .bind(storage.inlineText, storage.r2Key, context.runId)
+    .run();
+
+  return buildArchitectureReviewPayload(projectId, result.data, context.input, batch2);
+}
+
 export async function saveArchitectureReviewApproval(
   env: Bindings,
   projectId: string,
