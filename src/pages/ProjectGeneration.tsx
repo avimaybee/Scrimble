@@ -2081,21 +2081,20 @@ export default function ProjectGeneration() {
                 <div className="flex w-full flex-col gap-6">
                   {/* Left Column: Live Research Dashboard */}
                   <div>
-                    <AnimatePresence mode="wait">
+                    <div className="mb-10 border-l-[3px] border-accent-primary/20 pl-8">
                       <motion.h1
                         key={currentBatch.id}
-                        initial={{ y: 8, opacity: 0 }}
-                        animate={{ y: 0, opacity: 1 }}
-                        exit={{ y: -8, opacity: 0 }}
-                        transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
-                        className="mb-6 text-[clamp(34px,6vw,42px)] font-serif leading-[1.02] tracking-[-0.03em] text-text-primary"
+                        initial={{ opacity: 0, x: -12 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ duration: 0.45, ease: EASE_OUT_EXPO }}
+                        className="text-[clamp(36px,7vw,46px)] font-serif leading-[0.95] tracking-[-0.04em] text-text-primary"
                       >
                         {currentBatch.heading}
                       </motion.h1>
-                    </AnimatePresence>
+                    </div>
 
-                    <div className="rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-6 shadow-panel backdrop-blur-sm">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                    <div className="w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-7 shadow-premium backdrop-blur-md">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
                         Target Queue
                       </div>
                       <div className="mt-4 flex flex-col gap-3">
@@ -2115,14 +2114,14 @@ export default function ProjectGeneration() {
                                 initial={{ opacity: 0, y: 10 }}
                                 animate={{ opacity: 1, y: 0 }}
                                 className={cn(
-                                  "relative flex flex-col overflow-hidden rounded-[14px] border px-4 transition-colors",
+                                  "relative flex flex-col overflow-hidden rounded-[16px] border px-5 transition-all duration-300",
                                   isActive
-                                    ? "border-accent-primary/30 bg-accent-primary/5 py-4"
+                                    ? "shimmer-sweep border-accent-primary/40 bg-accent-primary/[0.03] py-5 shadow-premium"
                                     : isCompleted
-                                      ? "border-border-subtle bg-bg-base/40 py-3 opacity-70 hover:opacity-100"
+                                      ? "border-border-subtle/60 bg-bg-base/30 py-4 opacity-80"
                                       : isSkipped
-                                        ? "border-border-subtle bg-bg-base/20 py-3 opacity-50"
-                                        : "border-border-default/40 bg-bg-base/30 py-3 opacity-60"
+                                        ? "border-border-subtle/40 bg-bg-base/20 py-4 opacity-50"
+                                        : "border-border-default/30 bg-bg-base/20 py-4 opacity-60"
                                 )}
                               >
                                 <div className="flex items-center justify-between">
@@ -2145,13 +2144,13 @@ export default function ProjectGeneration() {
                                   </div>
                                   
                                   {isActive && (
-                                    <button
-                                      type="button"
-                                      onClick={() => void dbService.skipCurrentResearchTarget(id, { targetName })}
-                                      className="rounded-full border border-border-subtle bg-bg-base px-3 py-1 font-sans text-[11px] font-medium text-text-tertiary transition-colors hover:border-text-secondary hover:text-text-primary"
-                                    >
-                                      Skip
-                                    </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => void dbService.skipCurrentResearchTarget(id, { targetName })}
+                                        className="rounded-full border border-border-default/40 bg-bg-base/40 px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-text-muted transition-all hover:border-text-muted hover:text-text-secondary"
+                                      >
+                                        Skip
+                                      </button>
                                   )}
                                   {(isCompleted || isSkipped) && target.sourcesFound !== undefined && (
                                     <span className="font-mono text-[11px] text-text-tertiary">
@@ -2248,50 +2247,54 @@ export default function ProjectGeneration() {
                 )}
 
                 {currentBatch.id === 'batch_2_fetch_and_read' && (
-                  <div className="w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-5 shadow-panel backdrop-blur-sm">
-                    <div className="mb-3 flex items-center justify-between">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
+                  <div className="w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-6 shadow-premium backdrop-blur-md">
+                    <div className="mb-4 flex items-center justify-between">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
                         Token Budget
                       </div>
-                      <div className="font-mono text-[11px] text-text-secondary">
-                        {researchTelemetry?.tokensConsumed || 0} / 8000
+                      <div className="font-mono text-[11px] font-medium text-text-secondary tabular-nums">
+                        {researchTelemetry?.tokensConsumed || 0} <span className="text-text-muted">/ 8000</span>
                       </div>
                     </div>
-                    <div className="h-2 w-full overflow-hidden rounded-full bg-bg-base/80">
+                    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-bg-base/60">
                       <div 
                         className={cn(
-                          "h-full transition-all duration-500",
+                          "relative h-full transition-all duration-700 ease-out-expo shadow-[0_0_8px_rgba(235,94,40,0.3)]",
                           (researchTelemetry?.tokensConsumed || 0) > 7000 ? "bg-status-warning" : "bg-accent-primary"
                         )}
                         style={{ width: `${Math.min(100, ((researchTelemetry?.tokensConsumed || 0) / 8000) * 100)}%` }}
-                      />
+                      >
+                        <div className="tip-glow" />
+                      </div>
                     </div>
                   </div>
                 )}
 
                 <div className={cn(
-                  "w-full rounded-[18px] border border-border-default/80 bg-bg-surface/72 p-4 shadow-panel backdrop-blur-sm",
+                  "w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-6 shadow-premium backdrop-blur-md",
                   currentBatch.id === 'batch_2_fetch_and_read' ? "text-left" : "mb-6 text-left"
                 )}>
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div>
-                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                      Stage progress
+                <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="flex-1">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
+                      Phase Progress
                     </div>
-                    <div className="mt-2 font-serif text-[24px] tracking-[-0.02em] text-text-primary">
+                    <div className="mt-3 font-serif text-[26px] leading-tight tracking-[-0.03em] text-text-primary">
                       {stageCounterLabel}
                     </div>
-                    <div className="mt-2 font-sans text-[13px] leading-6 text-text-secondary">
-                      {runnerStatusHeadline}
-                    </div>
-                    <div className="font-sans text-[12px] leading-5 text-text-tertiary">
-                      {runnerStatusDetail}
+                    <div className="mt-3 flex flex-col gap-1">
+                      <div className="font-sans text-[13px] font-medium leading-relaxed text-text-secondary">
+                        {runnerStatusHeadline}
+                      </div>
+                      <div className="font-sans text-[12px] leading-relaxed text-text-tertiary/80">
+                        {runnerStatusDetail}
+                      </div>
                     </div>
                   </div>
-                  <div className="rounded-[12px] border border-border-subtle bg-bg-base/60 px-3 py-2 text-right">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Current stage</div>
-                    <div className="mt-1 font-sans text-[13px] font-medium text-text-primary">
-                      {isComplete ? 'Complete' : `${Math.min(resolvedCurrentBatchIndex + 1, GENERATION_BATCHES.length)} / ${GENERATION_BATCHES.length}`}
+                  <div className="shrink-0 flex flex-col items-end gap-1">
+                    <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">Stage</div>
+                    <div className="font-sans text-[14px] font-semibold tracking-tight text-text-primary">
+                      {isComplete ? 'Complete' : `${Math.min(resolvedCurrentBatchIndex + 1, GENERATION_BATCHES.length)} of ${GENERATION_BATCHES.length}`}
                     </div>
                   </div>
                 </div>
@@ -2311,7 +2314,9 @@ export default function ProjectGeneration() {
                               className="absolute inset-y-0 left-[-30%] w-1/2 rounded-full bg-[linear-gradient(90deg,rgba(235,94,40,0),rgba(235,94,40,0.95),rgba(235,94,40,0))]"
                               animate={{ x: ['0%', '190%'] }}
                               transition={{ duration: 1.6, ease: 'easeInOut', repeat: Infinity }}
-                            />
+                            >
+                              <div className="tip-glow h-[200%] w-20 opacity-40" />
+                            </motion.div>
                           ) : null}
                         </div>
                         <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-tertiary">
@@ -2328,9 +2333,9 @@ export default function ProjectGeneration() {
                   <div className="flex items-start gap-3">
                     <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-text-muted" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Generation stopped</div>
-                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        You cancelled this generation run. Checkpoints from completed stages are preserved.
+                      <div className="font-serif text-[24px] tracking-[-0.03em] text-text-primary">Generation paused</div>
+                      <p className="mt-2 font-sans text-[14px] leading-relaxed text-text-secondary">
+                        Generation stopped by user. All progress has been checkpointed.
                       </p>
                     </div>
                   </div>
@@ -2357,17 +2362,12 @@ export default function ProjectGeneration() {
                   <div className="flex items-start gap-3">
                     <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
                     <div>
-                          <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The generation runner needs attention</div>
-                          <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                            {error || status.generation_error || 'Project generation failed.'}
+                          <div className="font-serif text-[24px] tracking-[-0.03em] text-text-primary">Runner interrupted</div>
+                          <p className="mt-2 font-sans text-[14px] leading-relaxed text-text-secondary">
+                            {error || status.generation_error || 'An unexpected error occurred during generation.'}
                           </p>
-                          {status?.generation_runtime?.failureClass === 'quality_gate' ? (
-                            <p className="mt-2 font-sans text-[13px] leading-6 text-status-warning">
-                              Your Stage 3 approval succeeded. Batch 4 failed a quality gate and stopped before producing a safe plan.
-                            </p>
-                          ) : null}
-                          <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
-                            Durable checkpoints are preserved as each stage completes, so resuming picks up from the latest finished checkpoint instead of starting over.
+                          <p className="mt-2 font-sans text-[13px] leading-relaxed text-text-tertiary/70">
+                            Checkpoints are preserved. Resuming will restart from the last successful stage.
                           </p>
                     </div>
                   </div>
@@ -2384,19 +2384,19 @@ export default function ProjectGeneration() {
                   <div className="flex items-start gap-3">
                     <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">Rechecking the runner</div>
-                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        The runner stayed quiet for longer than expected, so I&apos;m requesting a checkpoint resume now.
+                      <div className="font-serif text-[24px] tracking-[-0.03em] text-text-primary">Re-syncing runner</div>
+                      <p className="mt-2 font-sans text-[14px] leading-relaxed text-text-secondary">
+                        Runner inactive for {'>'}30s. Requesting checkpoint resume...
                       </p>
                     </div>
                   </div>
                 </div>
               ) : (
                 <>
-                  <div className="w-full rounded-[16px] border border-border-default/80 bg-bg-surface/72 p-4 text-left shadow-panel backdrop-blur-sm">
-                    <div className="border-b border-border-subtle pb-4">
-                      <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">
-                        Live transcript
+                  <div className="w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-6 text-left shadow-premium backdrop-blur-md">
+                    <div className="border-b border-border-subtle/40 pb-5">
+                      <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
+                        Live Transcript
                       </div>
                       <AnimatePresence mode="wait" initial={false}>
                         {liveActivity ? (
@@ -2410,16 +2410,14 @@ export default function ProjectGeneration() {
                           >
                             <motion.span
                               aria-hidden="true"
-                              className="mt-[10px] h-[3px] w-[3px] shrink-0 rounded-full bg-accent-primary"
-                              animate={{ opacity: [0.45, 1, 0.45], scale: [1, 1.8, 1] }}
-                              transition={{ duration: 1.4, ease: 'easeInOut', repeat: Infinity }}
+                              className="glow-heartbeat mt-[10px] h-[3px] w-[3px] shrink-0 rounded-full bg-accent-primary"
                             />
                             <span
                               title={formatFeedMessage(liveActivity, { prefixThinking: false })}
                               className={cn(
-                                'block min-w-0 flex-1 whitespace-pre-wrap break-words text-[14px] leading-6 text-text-primary',
+                                'block min-w-0 flex-1 whitespace-pre-wrap break-words text-[14px] leading-relaxed text-text-primary',
                                 liveActivity.kind === 'thinking'
-                                  ? 'max-h-[168px] overflow-y-auto rounded-[12px] bg-bg-base/52 px-3 py-3 font-mono text-[13px] text-text-primary/92'
+                                  ? 'max-h-[168px] overflow-y-auto rounded-[12px] border border-white/5 bg-[#0a0a0a]/60 px-4 py-4 font-mono text-[13px] text-text-primary/95 shadow-inner backdrop-blur-sm'
                                   : 'font-sans font-medium tracking-[-0.01em]',
                               )}
                             >
@@ -2454,9 +2452,9 @@ export default function ProjectGeneration() {
                         />
                         {connectionMeta.label}
                       </span>
-                      <span className="text-[12px] text-text-muted">{connectionMeta.copy}</span>
-                      <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
-                      <span className="text-[12px] text-text-muted">{runnerStatusHeadline}</span>
+                      <span className="text-[12px] text-text-muted/80">{connectionMeta.copy}</span>
+                      <span className="h-1 w-1 rounded-full bg-border-default/40" />
+                      <span className="text-[12px] font-medium text-text-secondary">{runnerStatusHeadline}</span>
                       {latestProgressTimestamp ? (
                         <>
                           <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
@@ -2516,11 +2514,11 @@ export default function ProjectGeneration() {
                           {activityFeed.map((entry) => (
                             <motion.div
                               key={entry.key}
-                              initial={{ opacity: 0, y: -10 }}
+                              initial={{ opacity: 0, y: -8 }}
                               animate={{ opacity: 1, y: 0 }}
                               exit={{ opacity: 0, y: -4 }}
-                              transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
-                              className="flex items-start gap-3 py-2"
+                              transition={{ duration: 0.2, ease: EASE_OUT_EXPO }}
+                              className="flex items-start gap-4 py-3"
                             >
                               <span className={cn('mt-[1px] text-base leading-none', getActivityToneClass(entry.icon))} aria-hidden="true">
                                 {entry.icon}
@@ -2532,7 +2530,7 @@ export default function ProjectGeneration() {
                                 className={cn(
                                   'min-w-0 flex-1 text-[13px] leading-6',
                                   entry.kind === 'thinking'
-                                    ? 'font-mono text-text-primary/88'
+                                    ? 'font-mono text-text-primary/75 bg-bg-base/32 px-2.5 py-2 rounded-[10px] leading-relaxed border border-white/5'
                                     : 'font-sans text-text-secondary',
                                 )}
                               >

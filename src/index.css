@@ -63,8 +63,8 @@
 
   --shadow-step: 0 0 0 1px var(--color-border-default), 0 4px 24px rgba(0,0,0,0.2);
   --shadow-step-active: 0 0 0 1px var(--color-accent-border), 0 4px 20px rgba(235,94,40,0.10);
-  --shadow-panel: 0 8px 40px rgba(0,0,0,0.4);
-  --shadow-modal: 0 24px 80px rgba(0,0,0,0.6);
+  --shadow-panel: 0 1px 1px rgba(0,0,0,0.1), 0 10px 20px rgba(0,0,0,0.2), 0 20px 40px rgba(0,0,0,0.3);
+  --shadow-premium: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 0 0 1px rgba(204, 197, 185, 0.05), 0 1px 2px rgba(0,0,0,0.1), 0 12px 24px rgba(0,0,0,0.2), 0 32px 64px -12px rgba(0,0,0,0.4);
   --shadow-nav: 0 18px 42px rgba(0, 0, 0, 0.42);
 }
 
@@ -185,6 +185,62 @@ body {
   border-radius: 2px;
   flex-shrink: 0;
   background: var(--color-accent-primary);
+}
+
+.shadow-premium {
+  box-shadow: var(--shadow-premium);
+}
+
+.border-glass {
+  border: 1px solid var(--color-border-default);
+  backdrop-filter: blur(12px);
+}
+
+.glow-heartbeat {
+  animation: glow-heartbeat 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes glow-heartbeat {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.3); }
+}
+
+.tip-glow {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  width: 16px;
+  height: 160%;
+  transform: translate(50%, -50%);
+  background: radial-gradient(circle, var(--color-accent-primary) 0%, transparent 80%);
+  filter: blur(4px);
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
+
+.shimmer-sweep {
+  position: relative;
+  overflow: hidden;
+}
+
+.shimmer-sweep::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.03),
+    rgba(255, 255, 255, 0.08),
+    rgba(255, 255, 255, 0.03),
+    transparent
+  );
+  animation: shimmer-sweep 2.5s infinite;
+}
+
+@keyframes shimmer-sweep {
+  100% { transform: translateX(100%); }
 }
 
 /* Display styles for Hero */
