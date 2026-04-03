@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
+import ReactMarkdown from 'react-markdown';
 import {
   BookOpenText,
   ChevronDown,
   ChevronUp,
   ChevronRight,
   ExternalLink,
+  FileDown,
   Github,
   Globe,
   Hexagon,
@@ -321,6 +323,7 @@ export default function ProjectGeneration() {
   const [activityFeed, setActivityFeed] = useState<ActivityFeedItem[]>([]);
   const [currentActivity, setCurrentActivity] = useState<ActivityFeedItem | null>(null);
   const [reviewData, setReviewData] = useState<ArchitectureReviewResponse | null>(null);
+  const [isPrdExpanded, setIsPrdExpanded] = useState(true);
   const [reviewFeedback, setReviewFeedback] = useState('');
   const [error, setError] = useState('');
   const [isResuming, setIsResuming] = useState(false);
@@ -1078,18 +1081,30 @@ export default function ProjectGeneration() {
     [reviewData],
   );
   const hasPrdContent = useMemo(
-    () =>
-      Boolean(
-        reviewData
-        && (
-          reviewData.prd_problem_statement
-          || reviewData.prd_user_personas.length > 0
-          || reviewData.prd_core_user_journeys.length > 0
-          || reviewData.prd_functional_requirements.length > 0
-        ),
-      ),
+    () => Boolean(reviewData?.prd_document_markdown?.trim()),
     [reviewData],
   );
+
+  const hasStructuredPrdDocument = useMemo(
+    () => Boolean(reviewData?.prd_document_markdown?.trim()),
+    [reviewData?.prd_document_markdown],
+  );
+
+  const handleDownloadPRD = useCallback(() => {
+    if (!reviewData?.prd_document_markdown) return;
+
+    const blob = new Blob([reviewData.prd_document_markdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${reviewData.project_name.toLowerCase().replace(/\s+/g, '_')}_prd.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    toast.success('PRD downloaded as Markdown.');
+  }, [reviewData]);
 
   const handleApproveReview = useCallback(async () => {
     if (!id) {
@@ -1421,131 +1436,39 @@ export default function ProjectGeneration() {
 
                           {hasPrdContent ? (
                             <section className="py-7">
-                              <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Product requirements (PRD)</div>
-                              <div className="mt-4 space-y-6">
-                                <div>
-                                  <div className="font-sans text-[13px] font-medium text-text-primary">Problem statement</div>
-                                  <p className="mt-2 max-w-[760px] font-sans text-[14px] leading-7 text-text-secondary">
-                                    {reviewData.prd_problem_statement}
-                                  </p>
-                                </div>
+                              <div className="flex items-center justify-between">
+                                <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Product requirements (PRD)</div>
+                                <button
+                                  type="button"
+                                  onClick={handleDownloadPRD}
+                                  className="group flex items-center gap-1.5 rounded-full border border-border-default/60 bg-bg-surface/40 px-3 py-1.5 font-sans text-[11px] font-medium text-text-tertiary transition-colors hover:border-accent-border/40 hover:text-accent-soft"
+                                >
+                                  <FileDown className="h-3.5 w-3.5 transition-transform group-hover:-translate-y-0.5" />
+                                  <span>Download .md</span>
+                                </button>
+                              </div>
 
-                                <div className="grid gap-4 md:grid-cols-2">
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">User personas</div>
-                                    <div className="mt-2 space-y-3">
-                                      {reviewData.prd_user_personas.map((persona) => (
-                                        <div key={persona.name} className="rounded-[12px] border border-border-subtle/60 bg-bg-base/40 px-3 py-3">
-                                          <div className="font-sans text-[13px] font-medium text-text-primary">{persona.name}</div>
-                                          <div className="mt-1 font-sans text-[12px] leading-6 text-text-tertiary">{persona.context}</div>
-                                          <div className="mt-2 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">Goals</div>
-                                          <ul className="mt-1 list-disc space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
-                                            {persona.goals.map((goal) => (
-                                              <li key={goal}>{goal}</li>
-                                            ))}
-                                          </ul>
-                                          <div className="mt-2 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">Pains</div>
-                                          <ul className="mt-1 list-disc space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
-                                            {persona.pains.map((pain) => (
-                                              <li key={pain}>{pain}</li>
-                                            ))}
-                                          </ul>
-                                        </div>
-                                      ))}
+                              <div className="mt-5 rounded-[14px] border border-border-subtle/70 bg-bg-base/45">
+                                <button
+                                  type="button"
+                                  onClick={() => setIsPrdExpanded((previous) => !previous)}
+                                  className="flex w-full items-center justify-between px-4 py-3 text-left"
+                                >
+                                  <span className="font-sans text-[13px] font-medium text-text-primary">
+                                    {isPrdExpanded ? 'Hide full PRD document' : 'Show full PRD document'}
+                                  </span>
+                                  {isPrdExpanded ? (
+                                    <ChevronUp className="h-4 w-4 text-text-tertiary" />
+                                  ) : (
+                                    <ChevronDown className="h-4 w-4 text-text-tertiary" />
+                                  )}
+                                </button>
+
+                                {isPrdExpanded ? (
+                                  <div className="border-t border-border-subtle/70 px-4 py-6">
+                                    <div className="markdown-content">
+                                      <ReactMarkdown>{reviewData.prd_document_markdown}</ReactMarkdown>
                                     </div>
-                                  </div>
-
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">Core user journeys</div>
-                                    <div className="mt-2 space-y-3">
-                                      {reviewData.prd_core_user_journeys.map((journey) => (
-                                        <div key={journey.name} className="rounded-[12px] border border-border-subtle/60 bg-bg-base/40 px-3 py-3">
-                                          <div className="font-sans text-[13px] font-medium text-text-primary">{journey.name}</div>
-                                          <ol className="mt-2 list-decimal space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
-                                            {journey.steps.map((step) => (
-                                              <li key={step}>{step}</li>
-                                            ))}
-                                          </ol>
-                                          <div className="mt-2 font-sans text-[12px] leading-6 text-status-secure">Outcome: {journey.outcome}</div>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  </div>
-                                </div>
-
-                                <div className="grid gap-4 md:grid-cols-2">
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">Functional requirements</div>
-                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
-                                      {reviewData.prd_functional_requirements.map((item) => (
-                                        <li key={item}>{item}</li>
-                                      ))}
-                                    </ul>
-                                  </div>
-
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">Non-functional requirements</div>
-                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
-                                      {reviewData.prd_non_functional_requirements.map((item) => (
-                                        <li key={item}>{item}</li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                </div>
-
-                                <div className="grid gap-4 md:grid-cols-2">
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">Scope boundaries — in</div>
-                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
-                                      {reviewData.prd_scope_in.map((item) => (
-                                        <li key={item}>{item}</li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">Scope boundaries — out</div>
-                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
-                                      {reviewData.prd_scope_out.map((item) => (
-                                        <li key={item}>{item}</li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                </div>
-
-                                <div>
-                                  <div className="font-sans text-[13px] font-medium text-text-primary">Acceptance criteria</div>
-                                  <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
-                                    {reviewData.prd_acceptance_criteria.map((item) => (
-                                      <li key={item}>{item}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-
-                                <div>
-                                  <div className="font-sans text-[13px] font-medium text-text-primary">Launch milestones</div>
-                                  <div className="mt-2 space-y-3">
-                                    {reviewData.prd_launch_milestones.map((milestone) => (
-                                      <div key={milestone.milestone} className="rounded-[12px] border border-border-subtle/60 bg-bg-base/40 px-3 py-3">
-                                        <div className="font-sans text-[13px] font-medium text-text-primary">{milestone.milestone}</div>
-                                        <div className="mt-1 font-sans text-[12px] leading-6 text-text-tertiary">{milestone.objective}</div>
-                                        <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
-                                          {milestone.exit_criteria.map((item) => (
-                                            <li key={item}>{item}</li>
-                                          ))}
-                                        </ul>
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-
-                                {reviewData.prd_open_questions.length > 0 ? (
-                                  <div>
-                                    <div className="font-sans text-[13px] font-medium text-text-primary">Open questions</div>
-                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
-                                      {reviewData.prd_open_questions.map((item) => (
-                                        <li key={item}>{item}</li>
-                                      ))}
-                                    </ul>
                                   </div>
                                 ) : null}
                               </div>

@@ -300,6 +300,51 @@ function assertLegacyAdaptersDocumented(): AssertionResult {
   );
 }
 
+function assertResumeCheckpointTransferWired(): AssertionResult {
+  const appPath = path.join(SERVER_DIR, 'app.ts');
+  const content = readFile(appPath);
+  const hasTransferCall = content.includes('transferActiveGenerationCheckpoints(c.env, projectId, previousRunId, runId)');
+  const hasInvalidateCall = content.includes('invalidateActiveCheckpointsExceptRun(c.env, projectId, runId)');
+  return assert(
+    hasTransferCall && hasInvalidateCall,
+    'Resume path transfers active checkpoints to new run and invalidates stale active ownership',
+  );
+}
+
+function assertCheckpointOwnershipHelpersExist(): AssertionResult {
+  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
+  const content = readFile(pipelinePath);
+  const hasTransferHelper = content.includes('export async function transferActiveGenerationCheckpoints');
+  const hasInvalidateHelper = content.includes('export async function invalidateActiveCheckpointsExceptRun');
+  return assert(
+    hasTransferHelper && hasInvalidateHelper,
+    'Checkpoint ownership helpers exist in generation-pipeline.ts',
+  );
+}
+
+function assertStructuredPrdDocumentExists(): AssertionResult {
+  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
+  const content = readFile(pipelinePath);
+  const hasBuilder = content.includes('function buildPrdDocumentMarkdown');
+  const hasPayloadField = content.includes('prd_document_markdown: buildPrdDocumentMarkdown');
+  return assert(
+    hasBuilder && hasPayloadField,
+    'Architecture review payload includes generated full PRD markdown document',
+  );
+}
+
+function assertProjectGenerationRendersPrdMarkdown(): AssertionResult {
+  const generationPath = path.join(ROOT_DIR, 'src', 'pages', 'ProjectGeneration.tsx');
+  const content = readFile(generationPath);
+  const hasMarkdownRenderer = content.includes('ReactMarkdown');
+  const hasToggle = content.includes('Show full PRD document');
+  const bindsReviewPayload = content.includes('reviewData.prd_document_markdown');
+  return assert(
+    hasMarkdownRenderer && hasToggle && bindsReviewPayload,
+    'ProjectGeneration renders expandable full PRD markdown from review payload',
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Run All Assertions
 // ─────────────────────────────────────────────────────────────────
@@ -333,6 +378,10 @@ const assertions: Array<() => AssertionResult> = [
   // T7: Dead Code
   assertNoOrphanedExports,
   assertLegacyAdaptersDocumented,
+  assertResumeCheckpointTransferWired,
+  assertCheckpointOwnershipHelpersExist,
+  assertStructuredPrdDocumentExists,
+  assertProjectGenerationRendersPrdMarkdown,
 ];
 
 let passed = 0;

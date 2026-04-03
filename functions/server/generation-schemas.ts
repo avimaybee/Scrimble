@@ -439,78 +439,7 @@ export const Batch3ArchitectSchema = z.preprocess(
         ),
       ),
     ),
-    prd: z.preprocess(
-      (entry) => normalizeObject(entry, () => ({})),
-      z.object({
-        problem_statement: createRequiredTextSchema('Define the user problem in concrete, domain-specific language.'),
-        user_personas: z.preprocess(
-          (value) => {
-            const normalized = normalizeObjectArray(value);
-            return normalized.length > 0 ? normalized : [{}];
-          },
-          z.array(
-            z.preprocess(
-              (entry) => normalizeObject(entry, () => ({})),
-              z.object({
-                name: createRequiredTextSchema('Primary user'),
-                context: createRequiredTextSchema('Usage context is not specified yet.'),
-                goals: createRequiredStringArraySchema(['Clarify primary outcomes for this user persona.']),
-                pains: createRequiredStringArraySchema(['Clarify the friction this persona faces today.']),
-              }),
-            ),
-          ),
-        ),
-        core_user_journeys: z.preprocess(
-          (value) => {
-            const normalized = normalizeObjectArray(value);
-            return normalized.length > 0 ? normalized : [{}];
-          },
-          z.array(
-            z.preprocess(
-              (entry) => normalizeObject(entry, () => ({})),
-              z.object({
-                name: createRequiredTextSchema('Primary user journey'),
-                steps: createRequiredStringArraySchema(['Define the user steps from start to successful outcome.']),
-                outcome: createRequiredTextSchema('Define the successful end state for this journey.'),
-              }),
-            ),
-          ),
-        ),
-        functional_requirements: createRequiredStringArraySchema([
-          'Define concrete V1 product capabilities as testable functional requirements.',
-        ]),
-        non_functional_requirements: createRequiredStringArraySchema([
-          'Define reliability, security, and operational quality requirements for V1.',
-        ]),
-        scope_boundaries: z.preprocess(
-          (value) => normalizeObject(value, () => ({})),
-          z.object({
-            in_scope: createRequiredStringArraySchema(['Define explicit V1 in-scope deliverables.']),
-            out_of_scope: createRequiredStringArraySchema(['Define explicit out-of-scope items for V1.']),
-          }),
-        ),
-        acceptance_criteria: createRequiredStringArraySchema([
-          'Define concrete acceptance criteria that can be verified before launch.',
-        ]),
-        launch_milestones: z.preprocess(
-          (value) => {
-            const normalized = normalizeObjectArray(value);
-            return normalized.length > 0 ? normalized : [{}];
-          },
-          z.array(
-            z.preprocess(
-              (entry) => normalizeObject(entry, () => ({})),
-              z.object({
-                milestone: createRequiredTextSchema('Milestone'),
-                objective: createRequiredTextSchema('Milestone objective'),
-                exit_criteria: createRequiredStringArraySchema(['Define explicit exit criteria for this milestone.']),
-              }),
-            ),
-          ),
-        ),
-        open_questions: createStringArraySchema(),
-      }),
-    ),
+    prd_document_markdown: createRequiredTextSchema('Full PRD Markdown document following the 10-section structure.'),
   }),
 );
 
@@ -711,7 +640,7 @@ export const schemaDescriptions = {
   batch_2_fetch_and_read:
     '{ research: [{ technology: string, docs_content: string, github_readme: string, latest_version: string, last_commit_date: string, open_issues_count: number, recent_breaking_changes: string, repo_health_summary?: string, community_sentiment?: string, bug_report_digest?: string, sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }] }], sources?: [{ technology?, url, tool, title?, summary?, insight?, chars_read?, relevance? }], source_candidates?: [{ id: string, technology: string, source_type: string, url?: string, rank_score?: number, selected?: boolean }], ranked_sources?: [{ source_id: string, candidate_id: string, technology: string, source_type: string, rank_score?: number, rank_position?: number, selected?: boolean }], source_notes?: [{ id: string, source_id: string, technology: string, summary?: string, confidence?: "high"|"medium"|"low"|"degraded", chunk_citations?: string[] }], evidence_packs?: [{ id: string, topic: string, technology: string, summary?: string, confidence?: "high"|"medium"|"low"|"degraded", coverage?: "strong"|"thin"|"degraded", source_note_ids?: string[], chunk_citations?: string[] }], chunk_store?: [{ id?: string, source_id?: string, content: string, source: string, source_title?: string, source_type?: string, tool: string, technology: string, rank_score?: number, start_offset?: number, end_offset?: number }], data_quality?: { has_brave_search: boolean, has_github_token: boolean, has_context7: boolean, technologies_researched: number, urls_fetched: number, issues_found: number, model_context_window?: number, source_target_count?: number, ranked_source_count?: number, evidence_pack_count?: number, retrieval_coverage_status?: "strong"|"thin"|"degraded", retrieval_budget_tokens?: { batch_2_fetch_and_read?: number, batch_3_architect?: number, batch_4_plan_build?: number, batch_5_enrich_steps?: number, batch_6_generate_files?: number }, used_full_context_window?: boolean, truncated_to_fit_context?: boolean, degraded_tools?: string[], partial_failures?: [{ tool: string, technology?: string, message: string }] } }',
   batch_3_architect:
-    '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }], prd: { problem_statement: string, user_personas: [{ name, context, goals: string[], pains: string[] }], core_user_journeys: [{ name, steps: string[], outcome: string }], functional_requirements: string[], non_functional_requirements: string[], scope_boundaries: { in_scope: string[], out_of_scope: string[] }, acceptance_criteria: string[], launch_milestones: [{ milestone, objective, exit_criteria: string[] }], open_questions: string[] } }',
+    '{ project_name: string, project_type: string, project_summary: string, how_it_connects: string, recommended_stack: { frontend, backend, auth, database, payments, email, deploy }, data_model: [{ table, columns: [{ name, type, nullable?, notes? }], relationships: string[] }], integrations: [{ service, purpose, package_name, version }], security_surface: [{ concern, approach }], gotchas: [{ technology, issue, mitigation }], prd_document_markdown: string }',
   batch_4_plan_build:
     '{ project_name: string, project_type: string, problem: string, solution: string, target_user: string, mvp_scope: string, done_when: string, architecture_notes: string, data_model_notes: string, authoring_hash?: string, stages: [{ id, title, type, order_index, steps: [{ id, title, type, category?, objective?, why_it_matters?, risk_level?, is_gate?, is_milestone?, milestone_label?, done_when?, suggested_tools?: string[], checklist?: [{ id, label, is_required? }] }] }], edges?: [{ id, source_step_id, target_step_id, edge_type? }] }',
 

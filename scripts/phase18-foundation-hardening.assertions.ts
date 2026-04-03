@@ -141,6 +141,15 @@ runTest('T5: Checkpoint clear sets completed/invalidated state', () => {
   assert.ok(pipeline.includes("checkpoint_state = 'invalidated'"), 'clearGenerationCheckpoints should set invalidated');
 });
 
+runTest('T5: Resume transfers active checkpoints to new run ownership', () => {
+  const app = read('functions/server/app.ts');
+  const pipeline = read('functions/server/generation-pipeline.ts');
+  assert.ok(app.includes('transferActiveGenerationCheckpoints'), 'resume path should call transferActiveGenerationCheckpoints');
+  assert.ok(app.includes('invalidateActiveCheckpointsExceptRun'), 'resume path should invalidate stale active checkpoint ownership');
+  assert.ok(pipeline.includes('export async function transferActiveGenerationCheckpoints'), 'pipeline should export transfer helper');
+  assert.ok(pipeline.includes('export async function invalidateActiveCheckpointsExceptRun'), 'pipeline should export invalidate helper');
+});
+
 // ─────────────────────────────────────────────────────────────────
 // T6: Centralized Checkpoint Policy
 // ─────────────────────────────────────────────────────────────────

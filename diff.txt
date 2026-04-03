@@ -1,0 +1,722 @@
+diff --git a/functions/server/app.ts b/functions/server/app.ts
+index 559aeb1..83652ef 100644
+--- a/functions/server/app.ts
++++ b/functions/server/app.ts
+@@ -56,6 +56,8 @@ import {
+ } from './project-briefs';
+ import {
+   clearGenerationCheckpoints,
++  transferActiveGenerationCheckpoints,
++  invalidateActiveCheckpointsExceptRun,
+   getArchitectureReviewPayload,
+   getBatchCompletionMessage,
+   hasApprovedArchitectureReview,
+@@ -1689,12 +1691,21 @@ app.post('/projects/:id/resume', async (c) => {
+       .run();
+   }
+ 
++  const previousRunId = generationRuntime.runId || null;
+   const runId = crypto.randomUUID();
+   
+   // Phase 4: Use createGenerationRun
+   await createGenerationRun(c.env, projectId, runId, providerId || null);
+ 
+   try {
++    if (previousRunId) {
++      // Resume semantics: checkpoints belong to run continuity.
++      await transferActiveGenerationCheckpoints(c.env, projectId, previousRunId, runId);
++    }
++
++    // Keep one active checkpoint owner per project/run continuity.
++    await invalidateActiveCheckpointsExceptRun(c.env, projectId, runId);
++
+     await sendGenerationDispatch(c.env, {
+       projectId,
+       userId: c.get('uid'),
+@@ -1705,7 +1716,6 @@ app.post('/projects/:id/resume', async (c) => {
+       targetStatus: resumeStatus,
+     });
+ 
+-    await clearGenerationCheckpoints(c.env, projectId, runId);
+   } catch (error) {
+     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
+     
+diff --git a/functions/server/generation-pipeline.ts b/functions/server/generation-pipeline.ts
+index 5504fa6..67e5dd8 100644
+--- a/functions/server/generation-pipeline.ts
++++ b/functions/server/generation-pipeline.ts
+@@ -156,6 +156,7 @@ export type ArchitectureReviewPayload = {
+   project_name: string;
+   project_type: string;
+   project_summary: string;
++  prd_document_markdown: string;
+   prd_problem_statement: string;
+   prd_user_personas: Array<{
+     name: string;
+@@ -200,6 +201,413 @@ type ArchitectureReviewContext = {
+   providerId?: string;
+ };
+ 
++function formatBulletList(items: string[], fallback: string) {
++  const normalized = items
++    .map((item) => item.trim())
++    .filter(Boolean);
++  if (normalized.length === 0) {
++    return `- ${fallback}`;
++  }
++
++  return normalized.map((item) => `- ${item}`).join('\n');
++}
++
++function formatChecklist(items: string[], fallback: string) {
++  const normalized = items
++    .map((item) => item.trim())
++    .filter(Boolean);
++  if (normalized.length === 0) {
++    return `- [ ] ${fallback}`;
++  }
++
++  return normalized.map((item) => `- [ ] ${item}`).join('\n');
++}
++
++function buildPrdDocumentMarkdown(adr: Batch3Architect, reviewFeedback: string, reviewFeedbackProvided: boolean) {
++  const personas = adr.prd.user_personas
++    .filter((persona) => persona.name.trim() || persona.context.trim())
++    .map((persona, index) => {
++      const title = persona.name.trim() || `Persona ${index + 1}`;
++      const who = persona.context.trim() || 'Role/context to be confirmed.';
++      const goal = persona.goals[0]?.trim() || 'Primary goal to be confirmed.';
++      const pain = persona.pains[0]?.trim() || 'Primary pain to be confirmed.';
++      return [
++        `${index + 1}. **${title}**`,
++        `   - Who: ${who}`,
++        `   - Goal: ${goal}`,
++        `   - Pain: ${pain}`,
++        '   - Context: Daily/weekly usage context to be confirmed with the builder.',
++      ].join('\n');
++    })
++    .join('\n');
++
++  const journeys = adr.prd.core_user_journeys
++    .filter((journey) => journey.name.trim() || journey.steps.length > 0 || journey.outcome.trim())
++    .map((journey, index) => {
++      const trigger = journey.steps[0]?.trim() || 'Builder identifies a concrete need.';
++      const entry = journey.steps[1]?.trim() || 'Builder opens Scrimble and selects the active project.';
++      const coreLoop = journey.steps.slice(2, 5).map((step) => step.trim()).filter(Boolean);
++      const loopLine = coreLoop.length > 0 ? coreLoop.join(' → ') : 'Review architecture → approve/refine → continue build';
++      const exit = journey.outcome.trim() || 'Builder reaches a validated milestone with actionable next steps.';
++      return [
++        `${index + 1}. **${journey.name.trim() || `Journey ${index + 1}`}**`,
++        `   - Trigger: ${trigger}`,
++        `   - Entry: ${entry}`,
++        `   - Core loop: ${loopLine}`,
++        `   - Exit: ${exit}`,
++        '   - Return trigger: A new requirement, bug, or release change requires another guided build pass.',
++      ].join('\n');
++    })
++    .join('\n');
++
++  const goals = adr.prd.functional_requirements.slice(0, 3).map((goal, index) => `- G${index + 1}: ${goal}`);
++  const successMetrics = [
++    adr.prd.acceptance_criteria[0],
++    adr.prd.acceptance_criteria[1],
++    adr.prd.non_functional_requirements[0],
++  ]
++    .map((metric) => metric?.trim())
++    .filter(Boolean)
++    .map((metric) => `- ${metric}`);
++
++  const failureSignals = [
++    'Resume/retry loops without advancing batch progress.',
++    'Generated PRD content contains placeholders instead of project-specific statements.',
++    'Checkpointed runs cannot continue from the latest completed batch.',
++  ];
++
++  const featureAcceptance = formatChecklist(
++    adr.prd.acceptance_criteria.slice(0, 6),
++    'Given a valid project brief, when generation runs, then a complete build plan is produced with no placeholder sections.',
++  );
++
++  const stackRows = [
++    ['Frontend', adr.recommended_stack.frontend],
++    ['Backend', adr.recommended_stack.backend],
++    ['Database', adr.recommended_stack.database],
++    ['Auth', adr.recommended_stack.auth],
++    ['AI/ML', 'Configured provider pair (fast + deep models)'],
++    ['Infra', adr.recommended_stack.deploy],
++    ['Monitoring', 'Structured runtime logs + persisted generation events'],
++  ]
++    .map(([label, value]) => `- ${label}: ${value}`)
++    .join('\n');
++
++  const dataModels = adr.data_model.length > 0
++    ? adr.data_model.map((table) => {
++      const cols = table.columns
++        .map((column) => `  - ${column.name}: ${column.type}${column.nullable ? ' | nullable' : ' | required'}${column.notes ? ` | ${column.notes}` : ''}`)
++        .join('\n');
++      const rels = table.relationships.length > 0
++        ? `  Relationships: ${table.relationships.join('; ')}`
++        : '  Relationships: none declared';
++      return `${table.table}\n${cols}\n${rels}`;
++    }).join('\n\n')
++    : 'No canonical table definitions were returned.';
++
++  const apiContracts = [
++    '[POST] /api/projects/:id/approve',
++    'Auth: required',
++    'Request body: { feedback?: string, preferredIde?: string }',
++    'Response 200: { success: boolean, generation_runtime: GenerationRuntime }',
++    'Errors: 400 invalid payload, 404 project not found, 409 invalid review state, 503 dispatch failed',
++    '',
++    '[POST] /api/projects/:id/resume',
++    'Auth: required',
++    'Request body: { providerId?: string, description?: string }',
++    'Response 200: { success: boolean, generation_runtime: GenerationRuntime, resumedAt: string }',
++    'Errors: 404 project not found, 409 run not resumable, 503 dispatch failed',
++  ].join('\n');
++
++  const integrations = adr.integrations.length > 0
++    ? adr.integrations.map((integration) => {
++      return `- ${integration.service}: ${integration.purpose} (package: ${integration.package_name}@${integration.version})`;
++    }).join('\n')
++    : '- No external integrations declared.';
++
++  const envVars = [
++    '- FIREBASE_PROJECT_ID: Firebase project used for session verification.',
++    '- ENCRYPTION_KEY: Encryption key for provider/API secrets at rest.',
++    '- LOG_LEVEL: Runtime log verbosity (debug/info/warn/error).',
++    '- WORKFLOW_SERVICE: Cloudflare service binding for generation workflow RPC.',
++  ].join('\n');
++
++  const architectureDecisions = [
++    '- Decision: Workflow-driven generation runtime with durable checkpoints.',
++    '  Reason: Supports long-running builds under Cloudflare runtime limits and allows safe resume.',
++    '- Decision: Canonical event envelope (versioned) for persisted + live stream events.',
++    '  Reason: Keeps replay/live consumers on one normalized contract and avoids branching drift.',
++    '- Decision: Backend-authoritative runtime state contract.',
++    '  Reason: Eliminates UI-owned run truth and ensures refresh/reopen consistency.',
++  ].join('\n');
++
++  const navStructure = [
++    '- Dashboard: shows active project + resume target derived from backend runtime.',
++    '- Project generation: stage progress, live transcript, review panel, resume/cancel controls.',
++    '- Settings: provider keys, model roles, research tool integrations.',
++  ].join('\n');
++
++  const screenSpecs = [
++    'Screen: Project generation — /projects/:id/generate',
++    'Purpose: Track end-to-end generation progress and handle review/retry checkpoints.',
++    'Entry points: Dashboard continue CTA, new project confirm.',
++    'Layout: Stage progress header, live transcript, status/recovery panel, review surface at architecture gate.',
++    'Components: Stage progress rail, transcript feed, review cards, retry/resume actions.',
++    'States: Empty = no transcript yet; Loading = reconnecting feed; Error = runner needs attention; Populated = live events visible.',
++    'Interactions: "Looks right, build my plan" dispatches approval; "Try again" calls resume from checkpoint.',
++    'Edge cases: stale runner, runtime-limit failure, missing provider, awaiting-review hold state.',
++  ].join('\n');
++
++  const milestones = adr.prd.launch_milestones.length > 0
++    ? adr.prd.launch_milestones.slice(0, 4).map((milestone, index) => {
++      const phase = index;
++      const phaseTitle =
++        phase === 0 ? 'Phase 0 — Setup [estimate]' :
++          phase === 1 ? 'Phase 1 — Core [estimate]' :
++            phase === 2 ? 'Phase 2 — Full product [estimate]' :
++              'Phase 3 — Launch [estimate]';
++      const checklist = formatChecklist(
++        milestone.exit_criteria,
++        milestone.objective || 'Milestone exit criteria to be defined.',
++      );
++      return `${phaseTitle}\n${checklist}\nCheckpoint: ${milestone.objective || 'Exit criteria met.'}`;
++    }).join('\n\n')
++    : [
++      'Phase 0 — Setup [estimate]',
++      '- [ ] Repo scaffolding',
++      '- [ ] Auth setup',
++      '- [ ] DB setup + initial schema',
++      '- [ ] CI/CD pipeline',
++      'Checkpoint: generation pipeline starts and writes canonical runtime state.',
++    ].join('\n');
++
++  const risks = adr.gotchas.length > 0
++    ? adr.gotchas.slice(0, 3).map((gotcha) => {
++      return [
++        `- ${gotcha.issue}`,
++        '  - Likelihood: Medium',
++        '  - Impact: Medium',
++        `  - Mitigation: ${gotcha.mitigation}`,
++      ].join('\n');
++    }).join('\n')
++    : [
++      '- Runtime budget exhaustion during source-heavy research',
++      '  - Likelihood: Medium',
++      '  - Impact: High',
++      '  - Mitigation: durable checkpoints + resume from latest completed checkpoint',
++    ].join('\n');
++
++  const openQuestions = (adr.prd.open_questions.length > 0 ? adr.prd.open_questions : ['No unresolved questions provided by the model.'])
++    .map((question) => [
++      `- Q: ${question}`,
++      '  Owner: Builder',
++      '  Deadline: Before Phase 1',
++      '  Status: Open',
++    ].join('\n'))
++    .join('\n');
++
++  const assumptions = [
++    '- Approved architecture remains the source of truth for stack and data model choices.',
++    '- Resume/retry always continues from durable checkpoints and never restarts finished batches.',
++    '- Review panel PRD should be fully specified before plan generation proceeds.',
++  ].join('\n');
++
++  const constraints = [
++    '- Must run within Cloudflare Worker runtime/subrequest limits.',
++    '- Must preserve canonical event + runtime contracts (no legacy branching in main path).',
++    '- Must not rely on browser localStorage as runtime source of truth.',
++  ].join('\n');
++
++  const glossary = [
++    '- Generation run: One execution of the six-batch pipeline for a project.',
++    '- Checkpoint: Durable saved progress pointer + payload for resumable batches.',
++    '- ADR: Architecture Decision Record generated at review gate.',
++  ].join('\n');
++
++  const references = [
++    '- Internal architecture review payload (batch_3_architect output).',
++    '- Canonical generation runtime contract and event envelope.',
++    '- Retrieved research sources attached to this run.',
++  ].join('\n');
++
++  const schemaDump = adr.data_model.length > 0
++    ? adr.data_model.map((table) => {
++      const cols = table.columns
++        .map((column) => `  ${column.name} ${column.type}${column.nullable ? '' : ' NOT NULL'}`)
++        .join(',\n');
++      return `CREATE TABLE ${table.table} (\n${cols}\n);`;
++    }).join('\n\n')
++    : '-- No schema dump available from ADR.';
++
++  const changelog = [
++    `v1.0 — ${new Date().toISOString().slice(0, 10)} — Initial draft`,
++  ].join('\n');
++
++  return [
++    'Section 1 — Overview',
++    `App name: ${adr.project_name}`,
++    `One-liner: ${(adr.project_summary || adr.how_it_connects).split(/[.!?]/).map((line) => line.trim()).find(Boolean) || 'Project summary to be confirmed.'}`,
++    'Status: Draft',
++    'Author: Scrimble',
++    `Last updated: ${new Date().toISOString().slice(0, 10)}`,
++    'Version: v1.0',
++    '',
++    'TL;DR for agent:',
++    `${adr.project_summary}`,
++    '',
++    'Section 2 — Problem statement',
++    'The problem:',
++    adr.prd.problem_statement,
++    'Who experiences it:',
++    formatBulletList(adr.prd.user_personas.map((persona) => `${persona.name}: ${persona.context}`), 'Primary builders using Scrimble-generated plans.'),
++    'Current workarounds:',
++    formatBulletList(adr.prd.core_user_journeys.flatMap((journey) => journey.steps.slice(0, 2)), 'Manual docs switching and ad hoc planning documents.'),
++    'Root cause:',
++    'Planning artifacts are inconsistent, runtime context drifts, and checkpoint/retry behavior is opaque.',
++    'Why now:',
++    'The generation workflow and retrieval substrate are already in place, so strict PRD quality and resumability can now be enforced.',
++    '',
++    'Section 3 — Goals & success metrics',
++    'Primary goal:',
++    'Provide a build-ready, testable PRD and execution plan that can be resumed safely after runtime interruptions.',
++    'Goals:',
++    ...(goals.length > 0 ? goals : ['- G1: Produce a complete, implementation-ready PRD.']),
++    'Anti-goals (what this product does NOT do):',
++    '- Not a visual redesign initiative.',
++    '- Will not expand retrieval surface area beyond current contracts in this phase.',
++    'Success metrics:',
++    ...(successMetrics.length > 0 ? successMetrics : ['- Architecture + plan generation completes with no placeholder sections.']),
++    'Failure signals:',
++    ...failureSignals.map((line) => `- ${line}`),
++    '',
++    'Section 4 — Users & personas',
++    'Primary persona:',
++    personas || '1. **Primary builder**\n   - Who: Product-minded developer\n   - Goal: Ship reliable implementation plan\n   - Pain: Incomplete AI-generated specs\n   - Context: Uses Scrimble during planning and execution',
++    'Secondary persona (if any):',
++    '1. **Technical collaborator**\n   - Who: Engineer reviewing architecture and implementation steps\n   - Goal: Validate technical feasibility quickly\n   - Pain: Ambiguous requirements and missing acceptance criteria\n   - Context: Reviews generated plan before development starts',
++    'User journey (for each persona):',
++    journeys || '1. **Core journey**\n   - Trigger: Project idea needs concrete implementation path\n   - Entry: Dashboard continue/build\n   - Core loop: Review architecture → approve/refine → execute stages\n   - Exit: Launch-ready plan with explicit done signals\n   - Return trigger: New scope or failure recovery',
++    'Non-users (explicitly out of scope):',
++    '- Teams seeking a generic project management board without AI generation.',
++    '',
++    'Section 5 — Features & requirements (the most critical section)',
++    'Feature: Architecture review & PRD authoring',
++    'Priority: P0',
++    'Description:',
++    'The system generates a complete architecture review and PRD artifact, then pauses for human approval before planning continues.',
++    'User stories:',
++    '- As a builder, I want a complete PRD structure so that I can approve a build plan without guessing.',
++    '- As a collaborator, I want explicit acceptance criteria so that engineering can execute with fewer clarifications.',
++    'Functional requirements:',
++    formatBulletList(adr.prd.functional_requirements, 'System must generate a complete PRD with concrete requirements.'),
++    'Non-functional requirements:',
++    formatBulletList(adr.prd.non_functional_requirements, 'Reliability and security requirements must be explicit and testable.'),
++    'Acceptance criteria (agent uses these as done signals):',
++    featureAcceptance,
++    'Edge cases & error states:',
++    '- What happens if runtime budget is exceeded? Generation stops with retryable error and resumes from checkpoint.',
++    '- What happens if review is pending? Resume is blocked until approval event is received.',
++    '- What happens if provider key is invalid? Resume/start returns actionable provider error.',
++    'Out of scope for this feature:',
++    '- UI redesign and visual polish.',
++    '',
++    'Feature: Checkpointed retry/resume pipeline',
++    'Priority: P0',
++    'Description:',
++    'Long-running batches persist durable checkpoint state so retry/resume continues from latest saved progress instead of restarting completed work.',
++    'User stories:',
++    '- As a builder, I want retry to continue from my last checkpoint so runtime limits do not waste progress.',
++    'Functional requirements:',
++    '- FR1: System must persist checkpoint payloads for resumable batches.',
++    '- FR2: System must load active checkpoint by run + batch during resume.',
++    '- FR3: System must clear/invalidate stale checkpoint ownership on run transitions.',
++    'Non-functional requirements:',
++    '- Performance: Resume request responds quickly without replaying finished batches.',
++    '- Reliability: Resume should be deterministic under repeated retries.',
++    '- Security: Checkpoint payloads stay in project-owned storage only.',
++    '- Accessibility: Recovery actions are available in the generation UI.',
++    '- Scalability: Works across large source sets without losing progress.',
++    'Acceptance criteria (agent uses these as done signals):',
++    '- [ ] Given a failed run at batch 5, when the user retries, then generation resumes from latest checkpointed index.',
++    '- [ ] Given completed batch outputs, when resume starts, then workflow skips already-complete batches.',
++    '- [ ] Given stale active checkpoints from old runs, when resume starts, then stale checkpoints are invalidated.',
++    'Edge cases & error states:',
++    '- Missing checkpoint payload returns explicit checkpoint corruption error.',
++    '- Missing provider configuration blocks resume with actionable message.',
++    '- Workflow dispatch failure marks run failed with retryable guidance.',
++    'Out of scope for this feature:',
++    '- Introducing new retrieval providers or product features.',
++    '',
++    'Section 6 — Technical architecture',
++    'Tech stack:',
++    stackRows,
++    'Data models:',
++    dataModels,
++    'API contracts (for each endpoint):',
++    apiContracts,
++    'External integrations:',
++    integrations,
++    'Environment variables required:',
++    envVars,
++    'Key architectural decisions:',
++    architectureDecisions,
++    '',
++    'Section 7 — UX & design specs',
++    'Design principles:',
++    '- Clarity before polish: make runtime state and next actions explicit.',
++    '- Honest systems: surface degraded states and recovery paths directly.',
++    '- Builder confidence: every critical action has observable completion signals.',
++    'Navigation structure:',
++    navStructure,
++    'Screen specs (for each screen):',
++    screenSpecs,
++    'Design tokens (if not using a framework\'s defaults):',
++    '- Colors: use existing design system tokens in src/index.css',
++    '- Typography: serif headings + sans body + mono labels per current app style',
++    '- Spacing: existing spacing scale and section rhythm',
++    '- Breakpoints: mobile/tablet/desktop via existing responsive classes',
++    'Accessibility requirements:',
++    '- Recovery buttons must be keyboard accessible and have clear status text.',
++    '- Status panels must preserve readable contrast and semantic headings.',
++    '',
++    'Section 8 — Build plan & milestones',
++    milestones,
++    '',
++    'Dependencies between phases:',
++    '- Phase 0 setup must complete before core generation work.',
++    '- Review approval must complete before plan generation continues.',
++    '- Batch 5 completion is required before final file generation.',
++    '',
++    'Section 9 — Risks & open questions',
++    'Risks:',
++    risks,
++    'Open questions (things that must be answered before building):',
++    openQuestions,
++    'Assumptions (things you\'re treating as true without confirmation):',
++    assumptions,
++    'Constraints (hard limits the agent must not violate):',
++    constraints,
++    '',
++    'Section 10 — Appendix',
++    'Glossary:',
++    glossary,
++    'Reference materials:',
++    references,
++    'Full schema dump (if applicable):',
++    schemaDump,
++    'Change log:',
++    changelog,
++    '',
++    'The two rules that make a PRD agent-proof',
++    'Completeness over conciseness. Over-specify and keep implementation requirements explicit.',
++    'Acceptance criteria are the contract. Every critical feature includes concrete Given/When/Then-style done signals.',
++    '',
++    reviewFeedbackProvided && reviewFeedback.trim()
++      ? `Review feedback incorporated:\n${reviewFeedback.trim()}`
++      : '',
++  ].filter(Boolean).join('\n\n');
++}
++
+ type PlanStepEnrichment = Batch5EnrichSteps['enrichments'][number];
+ 
+ type EnrichedPlanStep = PlanAuthoringRecord['stages'][number]['steps'][number] & {
+@@ -2589,6 +2997,7 @@ function buildArchitectureReviewPayload(
+     project_summary:
+       optionalText(adr.project_summary)
+       || `${adr.project_name} is being built around the selected stack and the research-backed architecture recommendations.`,
++    prd_document_markdown: buildPrdDocumentMarkdown(adr, reviewFeedback, reviewFeedbackProvided),
+     prd_problem_statement: adr.prd.problem_statement,
+     prd_user_personas: adr.prd.user_personas.map((persona) => ({
+       name: persona.name || 'Primary user',
+@@ -3363,7 +3772,81 @@ export async function clearGenerationCheckpoints(
+     WHERE project_id = ? AND checkpoint_state = 'active'
+       ${runId ? 'AND run_id = ?' : ''}
+   `)
+-    .bind(...(runId ? [projectId, runId] : [projectId]))
++      .bind(...(runId ? [projectId, runId] : [projectId]))
++      .run();
++}
++
++export async function transferActiveGenerationCheckpoints(
++  env: Bindings,
++  projectId: string,
++  fromRunId: string,
++  toRunId: string,
++) {
++  if (!fromRunId || !toRunId || fromRunId === toRunId) {
++    return;
++  }
++
++  const targetRows = await env.DB.prepare(`
++    SELECT id, payload_r2_key
++    FROM generation_checkpoints
++    WHERE project_id = ? AND run_id = ? AND checkpoint_state = 'active'
++  `)
++    .bind(projectId, toRunId)
++    .all();
++
++  for (const row of targetRows.results as Array<{ id: string; payload_r2_key: string | null }>) {
++    await deleteJsonPayload(env, row.payload_r2_key);
++  }
++
++  if ((targetRows.results as Array<unknown>).length > 0) {
++    await env.DB.prepare(`
++      UPDATE generation_checkpoints
++      SET checkpoint_state = 'invalidated',
++          payload_inline = NULL,
++          payload_r2_key = NULL,
++          updated_at = datetime("now")
++      WHERE project_id = ? AND run_id = ? AND checkpoint_state = 'active'
++    `)
++      .bind(projectId, toRunId)
++      .run();
++  }
++
++  await env.DB.prepare(`
++    UPDATE generation_checkpoints
++    SET run_id = ?,
++        updated_at = datetime("now")
++    WHERE project_id = ? AND run_id = ? AND checkpoint_state = 'active'
++  `)
++    .bind(toRunId, projectId, fromRunId)
++    .run();
++}
++
++export async function invalidateActiveCheckpointsExceptRun(
++  env: Bindings,
++  projectId: string,
++  keepRunId: string,
++) {
++  const staleRows = await env.DB.prepare(`
++    SELECT id, payload_r2_key
++    FROM generation_checkpoints
++    WHERE project_id = ? AND run_id <> ? AND checkpoint_state = 'active'
++  `)
++    .bind(projectId, keepRunId)
++    .all();
++
++  for (const row of staleRows.results as Array<{ id: string; payload_r2_key: string | null }>) {
++    await deleteJsonPayload(env, row.payload_r2_key);
++  }
++
++  await env.DB.prepare(`
++    UPDATE generation_checkpoints
++    SET checkpoint_state = 'invalidated',
++        payload_inline = NULL,
++        payload_r2_key = NULL,
++        updated_at = datetime("now")
++    WHERE project_id = ? AND run_id <> ? AND checkpoint_state = 'active'
++  `)
++    .bind(projectId, keepRunId)
+     .run();
+ }
+ 
+diff --git a/scripts/phase18-foundation-hardening.assertions.ts b/scripts/phase18-foundation-hardening.assertions.ts
+index 6a860ac..2058cd6 100644
+--- a/scripts/phase18-foundation-hardening.assertions.ts
++++ b/scripts/phase18-foundation-hardening.assertions.ts
+@@ -141,6 +141,15 @@ runTest('T5: Checkpoint clear sets completed/invalidated state', () => {
+   assert.ok(pipeline.includes("checkpoint_state = 'invalidated'"), 'clearGenerationCheckpoints should set invalidated');
+ });
+ 
++runTest('T5: Resume transfers active checkpoints to new run ownership', () => {
++  const app = read('functions/server/app.ts');
++  const pipeline = read('functions/server/generation-pipeline.ts');
++  assert.ok(app.includes('transferActiveGenerationCheckpoints'), 'resume path should call transferActiveGenerationCheckpoints');
++  assert.ok(app.includes('invalidateActiveCheckpointsExceptRun'), 'resume path should invalidate stale active checkpoint ownership');
++  assert.ok(pipeline.includes('export async function transferActiveGenerationCheckpoints'), 'pipeline should export transfer helper');
++  assert.ok(pipeline.includes('export async function invalidateActiveCheckpointsExceptRun'), 'pipeline should export invalidate helper');
++});
++
+ // ─────────────────────────────────────────────────────────────────
+ // T6: Centralized Checkpoint Policy
+ // ─────────────────────────────────────────────────────────────────
+diff --git a/scripts/phase20-cleanup-verification.assertions.ts b/scripts/phase20-cleanup-verification.assertions.ts
+index dacc6de..6b403b5 100644
+--- a/scripts/phase20-cleanup-verification.assertions.ts
++++ b/scripts/phase20-cleanup-verification.assertions.ts
+@@ -300,6 +300,51 @@ function assertLegacyAdaptersDocumented(): AssertionResult {
+   );
+ }
+ 
++function assertResumeCheckpointTransferWired(): AssertionResult {
++  const appPath = path.join(SERVER_DIR, 'app.ts');
++  const content = readFile(appPath);
++  const hasTransferCall = content.includes('transferActiveGenerationCheckpoints(c.env, projectId, previousRunId, runId)');
++  const hasInvalidateCall = content.includes('invalidateActiveCheckpointsExceptRun(c.env, projectId, runId)');
++  return assert(
++    hasTransferCall && hasInvalidateCall,
++    'Resume path transfers active checkpoints to new run and invalidates stale active ownership',
++  );
++}
++
++function assertCheckpointOwnershipHelpersExist(): AssertionResult {
++  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
++  const content = readFile(pipelinePath);
++  const hasTransferHelper = content.includes('export async function transferActiveGenerationCheckpoints');
++  const hasInvalidateHelper = content.includes('export async function invalidateActiveCheckpointsExceptRun');
++  return assert(
++    hasTransferHelper && hasInvalidateHelper,
++    'Checkpoint ownership helpers exist in generation-pipeline.ts',
++  );
++}
++
++function assertStructuredPrdDocumentExists(): AssertionResult {
++  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
++  const content = readFile(pipelinePath);
++  const hasBuilder = content.includes('function buildPrdDocumentMarkdown');
++  const hasPayloadField = content.includes('prd_document_markdown: buildPrdDocumentMarkdown');
++  return assert(
++    hasBuilder && hasPayloadField,
++    'Architecture review payload includes generated full PRD markdown document',
++  );
++}
++
++function assertProjectGenerationRendersPrdMarkdown(): AssertionResult {
++  const generationPath = path.join(ROOT_DIR, 'src', 'pages', 'ProjectGeneration.tsx');
++  const content = readFile(generationPath);
++  const hasMarkdownRenderer = content.includes('ReactMarkdown');
++  const hasToggle = content.includes('Show full PRD document');
++  const bindsReviewPayload = content.includes('reviewData.prd_document_markdown');
++  return assert(
++    hasMarkdownRenderer && hasToggle && bindsReviewPayload,
++    'ProjectGeneration renders expandable full PRD markdown from review payload',
++  );
++}
++
+ // ─────────────────────────────────────────────────────────────────
+ // Run All Assertions
+ // ─────────────────────────────────────────────────────────────────
+@@ -333,6 +378,10 @@ const assertions: Array<() => AssertionResult> = [
+   // T7: Dead Code
+   assertNoOrphanedExports,
+   assertLegacyAdaptersDocumented,
++  assertResumeCheckpointTransferWired,
++  assertCheckpointOwnershipHelpersExist,
++  assertStructuredPrdDocumentExists,
++  assertProjectGenerationRendersPrdMarkdown,
+ ];
+ 
+ let passed = 0;
+diff --git a/src/pages/ProjectGeneration.tsx b/src/pages/ProjectGeneration.tsx
+index 732c151..2bb147d 100644
+--- a/src/pages/ProjectGeneration.tsx
++++ b/src/pages/ProjectGeneration.tsx
+@@ -1,5 +1,6 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { AnimatePresence, motion } from 'framer-motion';
++import ReactMarkdown from 'react-markdown';
+ import {
+   BookOpenText,
+   ChevronDown,
+@@ -321,6 +322,7 @@ export default function ProjectGeneration() {
+   const [activityFeed, setActivityFeed] = useState<ActivityFeedItem[]>([]);
+   const [currentActivity, setCurrentActivity] = useState<ActivityFeedItem | null>(null);
+   const [reviewData, setReviewData] = useState<ArchitectureReviewResponse | null>(null);
++  const [isPrdExpanded, setIsPrdExpanded] = useState(true);
+   const [reviewFeedback, setReviewFeedback] = useState('');
+   const [error, setError] = useState('');
+   const [isResuming, setIsResuming] = useState(false);
+@@ -1091,6 +1093,11 @@ export default function ProjectGeneration() {
+     [reviewData],
+   );
+ 
++  const hasStructuredPrdDocument = useMemo(
++    () => Boolean(reviewData?.prd_document_markdown?.trim()),
++    [reviewData?.prd_document_markdown],
++  );
++
+   const handleApproveReview = useCallback(async () => {
+     if (!id) {
+       return;
+@@ -1422,6 +1429,31 @@ export default function ProjectGeneration() {
+                           {hasPrdContent ? (
+                             <section className="py-7">
+                               <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Product requirements (PRD)</div>
++                              {hasStructuredPrdDocument ? (
++                                <div className="mt-4 rounded-[14px] border border-border-subtle/70 bg-bg-base/45">
++                                  <button
++                                    type="button"
++                                    onClick={() => setIsPrdExpanded((previous) => !previous)}
++                                    className="flex w-full items-center justify-between px-4 py-3 text-left"
++                                  >
++                                    <span className="font-sans text-[13px] font-medium text-text-primary">
++                                      {isPrdExpanded ? 'Hide full PRD document' : 'Show full PRD document'}
++                                    </span>
++                                    {isPrdExpanded ? (
++                                      <ChevronUp className="h-4 w-4 text-text-muted" />
++                                    ) : (
++                                      <ChevronDown className="h-4 w-4 text-text-muted" />
++                                    )}
++                                  </button>
++                                  {isPrdExpanded ? (
++                                    <div className="border-t border-border-subtle/70 px-4 py-4">
++                                      <div className="prose prose-invert max-w-none text-[13px] leading-6 text-text-secondary">
++                                        <ReactMarkdown>{reviewData.prd_document_markdown}</ReactMarkdown>
++                                      </div>
++                                    </div>
++                                  ) : null}
++                                </div>
++                              ) : null}
+                               <div className="mt-4 space-y-6">
+                                 <div>
+                                   <div className="font-sans text-[13px] font-medium text-text-primary">Problem statement</div>
+diff --git a/src/types.ts b/src/types.ts
+index 861d94f..a7a7b3d 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -618,6 +618,7 @@ export interface ArchitectureReviewResponse {
+   project_name: string;
+   project_type: string;
+   project_summary: string;
++  prd_document_markdown: string;
+   prd_problem_statement: string;
+   prd_user_personas: Array<{
+     name: string;

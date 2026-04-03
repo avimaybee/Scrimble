@@ -156,29 +156,7 @@ export type ArchitectureReviewPayload = {
   project_name: string;
   project_type: string;
   project_summary: string;
-  prd_problem_statement: string;
-  prd_user_personas: Array<{
-    name: string;
-    context: string;
-    goals: string[];
-    pains: string[];
-  }>;
-  prd_core_user_journeys: Array<{
-    name: string;
-    steps: string[];
-    outcome: string;
-  }>;
-  prd_functional_requirements: string[];
-  prd_non_functional_requirements: string[];
-  prd_scope_in: string[];
-  prd_scope_out: string[];
-  prd_acceptance_criteria: string[];
-  prd_launch_milestones: Array<{
-    milestone: string;
-    objective: string;
-    exit_criteria: string[];
-  }>;
-  prd_open_questions: string[];
+  prd_document_markdown: string;
   how_it_connects: string;
   recommended_stack: Batch3Architect['recommended_stack'];
   stack_cards: ArchitectureReviewStackCard[];
@@ -199,6 +177,8 @@ type ArchitectureReviewContext = {
   reviewFeedbackProvided: boolean;
   providerId?: string;
 };
+
+
 
 type PlanStepEnrichment = Batch5EnrichSteps['enrichments'][number];
 
@@ -354,6 +334,8 @@ type Batch5ResearchStep = Pick<
 type Batch5CheckpointData = {
   steps: Batch5ResearchStep[];
   stepResearchContexts: StepResearchContext[];
+  completedEnrichments?: PlanStepEnrichment[];
+  phase?: 'research' | 'enrichment';
 };
 
 type GenerationCheckpointRecord = {
@@ -1007,49 +989,10 @@ function evaluatePlanQuality(
     findings.push('Plan drifted into a Scrimble/self-referential product framing not requested in the brief.');
   }
 
-  const normalizedProblemStatement = (adr.prd.problem_statement || '').trim().toLowerCase();
-  const isGenericProblemStatement =
-    normalizedProblemStatement.length < 60
-    || normalizedProblemStatement.includes('not specified')
-    || normalizedProblemStatement.includes('to be determined')
-    || normalizedProblemStatement.includes('define')
-    || normalizedProblemStatement.includes('clarify');
-  if (isGenericProblemStatement) {
-    findings.push('PRD problem statement is too generic and not production-ready.');
+  const prdLength = (adr.prd_document_markdown || '').length;
+  if (prdLength < 1000) {
+    findings.push('PRD Markdown document is suspiciously short.');
   }
-
-  if ((adr.prd.user_personas || []).length < 2) {
-    findings.push('PRD must include at least 2 user personas.');
-  }
-
-  if ((adr.prd.core_user_journeys || []).length < 2) {
-    findings.push('PRD must include at least 2 core user journeys.');
-  }
-
-  if ((adr.prd.functional_requirements || []).length < 8) {
-    findings.push('PRD must include at least 8 functional requirements.');
-  }
-
-  if ((adr.prd.non_functional_requirements || []).length < 5) {
-    findings.push('PRD must include at least 5 non-functional requirements.');
-  }
-
-  if ((adr.prd.acceptance_criteria || []).length < 8) {
-    findings.push('PRD must include at least 8 acceptance criteria.');
-  }
-
-  if ((adr.prd.launch_milestones || []).length < 3) {
-    findings.push('PRD must include at least 3 launch milestones.');
-  }
-
-  if ((adr.prd.scope_boundaries?.in_scope || []).length < 4) {
-    findings.push('PRD in-scope boundaries are too thin.');
-  }
-
-  if ((adr.prd.scope_boundaries?.out_of_scope || []).length < 3) {
-    findings.push('PRD out-of-scope boundaries are too thin.');
-  }
-
   return {
     ok: findings.length === 0,
     findings,
@@ -2589,29 +2532,7 @@ function buildArchitectureReviewPayload(
     project_summary:
       optionalText(adr.project_summary)
       || `${adr.project_name} is being built around the selected stack and the research-backed architecture recommendations.`,
-    prd_problem_statement: adr.prd.problem_statement,
-    prd_user_personas: adr.prd.user_personas.map((persona) => ({
-      name: persona.name || 'Primary user',
-      context: persona.context || 'Usage context not specified.',
-      goals: persona.goals || [],
-      pains: persona.pains || [],
-    })),
-    prd_core_user_journeys: adr.prd.core_user_journeys.map((journey) => ({
-      name: journey.name || 'Primary journey',
-      steps: journey.steps || [],
-      outcome: journey.outcome || 'Successful outcome not specified.',
-    })),
-    prd_functional_requirements: adr.prd.functional_requirements,
-    prd_non_functional_requirements: adr.prd.non_functional_requirements,
-    prd_scope_in: adr.prd.scope_boundaries.in_scope,
-    prd_scope_out: adr.prd.scope_boundaries.out_of_scope,
-    prd_acceptance_criteria: adr.prd.acceptance_criteria,
-    prd_launch_milestones: adr.prd.launch_milestones.map((milestone) => ({
-      milestone: milestone.milestone || 'Milestone',
-      objective: milestone.objective || 'Objective not specified.',
-      exit_criteria: milestone.exit_criteria || [],
-    })),
-    prd_open_questions: adr.prd.open_questions,
+    prd_document_markdown: adr.prd_document_markdown,
     how_it_connects:
       optionalText(adr.how_it_connects)
       || 'The interface talks to the application backend, the backend writes to the core database, and the supporting services handle the surrounding workflows.',
@@ -3363,7 +3284,81 @@ export async function clearGenerationCheckpoints(
     WHERE project_id = ? AND checkpoint_state = 'active'
       ${runId ? 'AND run_id = ?' : ''}
   `)
-    .bind(...(runId ? [projectId, runId] : [projectId]))
+      .bind(...(runId ? [projectId, runId] : [projectId]))
+      .run();
+}
+
+export async function transferActiveGenerationCheckpoints(
+  env: Bindings,
+  projectId: string,
+  fromRunId: string,
+  toRunId: string,
+) {
+  if (!fromRunId || !toRunId || fromRunId === toRunId) {
+    return;
+  }
+
+  const targetRows = await env.DB.prepare(`
+    SELECT id, payload_r2_key
+    FROM generation_checkpoints
+    WHERE project_id = ? AND run_id = ? AND checkpoint_state = 'active'
+  `)
+    .bind(projectId, toRunId)
+    .all();
+
+  for (const row of targetRows.results as Array<{ id: string; payload_r2_key: string | null }>) {
+    await deleteJsonPayload(env, row.payload_r2_key);
+  }
+
+  if ((targetRows.results as Array<unknown>).length > 0) {
+    await env.DB.prepare(`
+      UPDATE generation_checkpoints
+      SET checkpoint_state = 'invalidated',
+          payload_inline = NULL,
+          payload_r2_key = NULL,
+          updated_at = datetime("now")
+      WHERE project_id = ? AND run_id = ? AND checkpoint_state = 'active'
+    `)
+      .bind(projectId, toRunId)
+      .run();
+  }
+
+  await env.DB.prepare(`
+    UPDATE generation_checkpoints
+    SET run_id = ?,
+        updated_at = datetime("now")
+    WHERE project_id = ? AND run_id = ? AND checkpoint_state = 'active'
+  `)
+    .bind(toRunId, projectId, fromRunId)
+    .run();
+}
+
+export async function invalidateActiveCheckpointsExceptRun(
+  env: Bindings,
+  projectId: string,
+  keepRunId: string,
+) {
+  const staleRows = await env.DB.prepare(`
+    SELECT id, payload_r2_key
+    FROM generation_checkpoints
+    WHERE project_id = ? AND run_id <> ? AND checkpoint_state = 'active'
+  `)
+    .bind(projectId, keepRunId)
+    .all();
+
+  for (const row of staleRows.results as Array<{ id: string; payload_r2_key: string | null }>) {
+    await deleteJsonPayload(env, row.payload_r2_key);
+  }
+
+  await env.DB.prepare(`
+    UPDATE generation_checkpoints
+    SET checkpoint_state = 'invalidated',
+        payload_inline = NULL,
+        payload_r2_key = NULL,
+        updated_at = datetime("now")
+    WHERE project_id = ? AND run_id <> ? AND checkpoint_state = 'active'
+  `)
+    .bind(projectId, keepRunId)
     .run();
 }
 
@@ -5330,16 +5325,19 @@ Produce a structured Architecture Decision Record (ADR):
 
 - security_surface: Critical concerns and mitigation strategies.
 - gotchas: Explicit technology-specific warnings (technology, issue, mitigation) derived from the "recent_breaking_changes" and "bug_report_digest" in the research corpus.
-- prd:
-  - problem_statement: 2-4 sentences describing the exact user and business problem in domain-specific language.
-  - user_personas: Array of persona objects with { name, context, goals[], pains[] }.
-  - core_user_journeys: Array with { name, steps[], outcome } mapping critical end-to-end flows.
-  - functional_requirements: Array of concrete, testable product requirements for V1.
-  - non_functional_requirements: Array covering performance, security, reliability, observability, and compliance expectations.
-  - scope_boundaries: { in_scope: string[], out_of_scope: string[] } with explicit boundaries.
-  - acceptance_criteria: Array of concrete launch gates the team can verify.
-  - launch_milestones: Array with { milestone, objective, exit_criteria[] } that sequences delivery.
-  - open_questions: Array of unresolved decisions that require user confirmation.
+- prd_document_markdown: A comprehensive Product Requirements Document formatted in Markdown. 
+  It MUST follow this exact 10-section format:
+  1. Overview (App name, one-liner, TL;DR)
+  2. Problem statement (The problem, who experiences it, current workarounds, root cause, why now)
+  3. Goals & success metrics (Primary goal, anti-goals, failure signals)
+  4. Users & personas (Primary/Secondary context, goals, pains, user journeys)
+  5. Features & requirements (CRITICAL: Every feature must include Priority, User stories, Functional & Non-functional requirements, Edge cases, and Acceptance criteria as Given/When/Then statements)
+  6. Technical architecture (Tech stack, data models, API contracts, integrations)
+  7. UX & design specs (Principles, navigation, screen specs)
+  8. Build plan & milestones (Phases 0-4 with clear checkpoints)
+  9. Risks & open questions (Assumptions, constraints)
+  10. Appendix
+  Output MUST be a single plain markdown string. Over-specify rather than under-specify. Accept criteria must be Given/When/Then.
 
 Base every single recommendation on the provided research corpus. If a technology was not researched in Batch 2, do not recommend it unless it is a standard browser feature.`;
 
@@ -5645,12 +5643,14 @@ export async function executeBatch5(
     .replace(/\s+/g, ' ')
     .trim()
     || 'web app';
+
   const checkpoint = await loadGenerationCheckpoint<Batch5CheckpointData>(
     env,
     projectId,
     runId,
     'batch_5_enrich_steps',
   );
+  
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   const researchManifest = buildResearchManifest(
     builderProfile,
@@ -5660,102 +5660,133 @@ export async function executeBatch5(
       inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean),
     },
   );
+
+  const currentPhase = checkpoint?.data.phase || 'research';
   const planSteps = checkpoint?.data.steps || flattenPlanSteps(plan);
   const stepResearchContexts: StepResearchContext[] = checkpoint?.data.stepResearchContexts
     ? [...checkpoint.data.stepResearchContexts]
     : [];
+  const completedEnrichments: PlanStepEnrichment[] = checkpoint?.data.completedEnrichments
+    ? [...checkpoint.data.completedEnrichments]
+    : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
+  
   const subrequestTracker = createResearchSubrequestTracker({
     initialCount: 0,
-    limit: 40, // Cloudflare standard limit is 50
+    limit: 40,
   });
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
-  await logActivity(env, {
-    projectId,
-    batchName: 'batch_5_enrich_steps',
-    runId,
-    kind: 'fetch',
-    message: 'Refreshing every step with live docs, issues, and current implementation notes...',
-  });
 
-  if (checkpoint) {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'system',
-      message: `Resuming step research at step ${Math.min(startIndex + 1, planSteps.length)} of ${planSteps.length}.`,
-    });
-  }
-
-  for (let index = startIndex; index < planSteps.length; index += 1) {
-    const step = planSteps[index];
-
-    await maybeTouchGenerationHeartbeat(env, projectId, runId);
-
+  // --- PHASE 1: RESEARCH ---
+  if (currentPhase === 'research') {
     await logActivity(env, {
       projectId,
       batchName: 'batch_5_enrich_steps',
       runId,
       kind: 'fetch',
-      message: `Refreshing ${step.title} with live docs and current implementation notes...`,
+      message: 'Refreshing every step with live docs, issues, and current implementation notes...',
     });
 
-    const stepResearch = await collectStepResearchContext({
-      env,
-      userId: project.user_id,
-      stepId: step.id,
-      stepTitle: step.title,
-      stepObjective: step.objective,
-      stepWhyItMatters: step.why_it_matters,
-      stepCategory: step.category,
-      stepDoneWhen: step.done_when,
-      stepIsGate: step.is_gate,
-      adr,
-      research,
-      batchName: 'batch_5_enrich_steps',
-      projectId,
-      connectedTools,
-      researchManifest,
-      runId,
-      subrequestTracker,
-    });
-
-    stepResearchContexts.push(stepResearch);
-
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'fetch',
-      message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
-    });
-
-    // Standard overhead for current step (heartbeat, logs)
-    subrequestTracker.count += 3;
-
-    const normalizedCheckpointStepInterval = Math.max(1, checkpointStepInterval);
-    const shouldCheckpoint = (index + 1 < planSteps.length) && (
-      (index + 1 - startIndex) >= normalizedCheckpointStepInterval || // Process groups safely within one turn
-      subrequestTracker.count >= 32 // Or when near subrequest limit (40 - 8 reserve)
-    );
-
-    if (shouldCheckpoint) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
-        steps: planSteps,
-        stepResearchContexts,
-      });
+    if (checkpoint) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_5_enrich_steps',
         runId,
         kind: 'system',
-        message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing from the latest checkpoint...`,
+        message: `Resuming step research at step ${Math.min(startIndex + 1, planSteps.length)} of ${planSteps.length}.`,
       });
-      return 'checkpointed';
     }
+
+    for (let index = startIndex; index < planSteps.length; index += 1) {
+      const step = planSteps[index];
+      await maybeTouchGenerationHeartbeat(env, projectId, runId);
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_5_enrich_steps',
+        runId,
+        kind: 'fetch',
+        message: `Refreshing ${step.title} with live docs and current implementation notes...`,
+      });
+
+      const stepResearch = await collectStepResearchContext({
+        env,
+        userId: project.user_id,
+        stepId: step.id,
+        stepTitle: step.title,
+        stepObjective: step.objective,
+        stepWhyItMatters: step.why_it_matters,
+        stepCategory: step.category,
+        stepDoneWhen: step.done_when,
+        stepIsGate: step.is_gate,
+        adr,
+        research,
+        batchName: 'batch_5_enrich_steps',
+        projectId,
+        connectedTools,
+        researchManifest,
+        runId,
+        subrequestTracker,
+      });
+
+      stepResearchContexts.push(stepResearch);
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_5_enrich_steps',
+        runId,
+        kind: 'fetch',
+        message: `${step.title} research refreshed — ${stepResearch.docs.length} sources, ${stepResearch.issues.length} issues.`,
+      });
+
+      subrequestTracker.count += 3;
+
+      const shouldCheckpoint = (index + 1 < planSteps.length) && (
+        (index + 1 - startIndex) >= checkpointStepInterval || 
+        subrequestTracker.count >= 32
+      );
+
+      if (shouldCheckpoint) {
+        await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
+          steps: planSteps,
+          stepResearchContexts,
+          phase: 'research',
+        });
+        return 'checkpointed';
+      }
+    }
+
+    // Transition to enrichment phase
+    await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', 0, {
+      steps: planSteps,
+      stepResearchContexts,
+      completedEnrichments: [],
+      phase: 'enrichment',
+    });
+    
+    await logActivity(env, {
+      projectId,
+      batchName: 'batch_5_enrich_steps',
+      runId,
+      kind: 'system',
+      message: 'Step research complete. Transitioning to chunked AI enrichment...',
+    });
+    
+    return 'checkpointed';
   }
+
+  // --- PHASE 2: ENRICHMENT ---
+  const enrichmentStartIndex = startIndex;
+  const enrichmentEndIndex = Math.min(enrichmentStartIndex + checkpointStepInterval, planSteps.length);
+  const stepsToEnrich = planSteps.slice(enrichmentStartIndex, enrichmentEndIndex);
+  
+  if (stepsToEnrich.length === 0) {
+    // Should not happen if logic is correct, but safety first
+    await clearGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps');
+    return 'complete';
+  }
+
   const stepResearchSlice = retrieveStepResearchSlice(
     planSteps,
     projectStack,
@@ -5764,88 +5795,65 @@ export async function executeBatch5(
     5,
     RETRIEVAL_BUDGETS.batch_5_enrich_steps,
   );
+
   const researchCatalog = research.research.map((entry) => ({
     technology: entry.technology,
     latest_version: entry.latest_version,
     open_issues_count: entry.open_issues_count,
     sources: entry.sources.slice(0, 2).map((source) => source.url),
   }));
+
+  const researchForChunk = stepResearchContexts.filter(ctx => 
+    stepsToEnrich.some(s => s.id === ctx.stepId)
+  );
+
   const input = {
-    plan,
+    plan_chunk: stepsToEnrich,
     research_catalog: researchCatalog,
-    chunk_store_count: chunkStore.length,
-    retrieved_chunk_count: stepResearchSlice.chunkCount,
-    selected_evidence_packs: stepResearchSlice.selectedEvidencePackIds,
-    retrieval_coverage_status: stepResearchSlice.coverageStatus,
-    step_research: stepResearchContexts,
+    step_research: researchForChunk,
   };
 
   await touchGenerationRunHeartbeat(env, runId);
-
   await logActivity(env, {
     projectId,
     batchName: 'batch_5_enrich_steps',
     runId,
     kind: 'writing',
-    message: 'Writing step details for every part of the plan...',
+    message: `Writing step details for steps ${enrichmentStartIndex + 1} to ${enrichmentEndIndex} of ${planSteps.length}...`,
   });
-  await logActivity(env, {
-    projectId,
-    batchName: 'batch_5_enrich_steps',
-    runId,
-    kind: 'system',
-    message: `Retrieved ${stepResearchSlice.chunkCount} chunks from ${stepResearchSlice.totalChunks} total (estimated ${stepResearchSlice.estimatedTokens.toLocaleString()} tokens) for step enrichment prompt assembly.`,
-  });
-  if (stepResearchSlice.coverageStatus !== 'strong') {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'warning',
-      message:
-        stepResearchSlice.coverageStatus === 'degraded'
-          ? 'Step enrichment is running with degraded evidence coverage.'
-          : 'Step enrichment is running with thin evidence coverage.',
-    });
-  }
 
   const systemPrompt = appendProjectBriefSystemPrompt(
-    'You are Scrimble’s step enrichment agent. Enrich every step in one pass using turn-by-turn navigation guidance. Reference the exact technologies, services, and versions from the plan and research. Return only valid JSON.',
+    'You are Scrimble’s step enrichment agent. Enrich the provided PLAN CHUNK using turn-by-turn navigation guidance. Reference the exact technologies, services, and versions from the research. Return only valid JSON.',
     projectBrief.promptContext,
   );
-  const prompt = `Plan:
-${JSON.stringify(plan, null, 2)}
+
+  const prompt = `Plan Chunk (Steps to Enrich):
+${JSON.stringify(stepsToEnrich, null, 2)}
 
 Researched technology catalog:
 ${JSON.stringify(researchCatalog, null, 2)}
 
-Retrieved step-targeted research context:
-${stepResearchSlice.context || 'No retrieved chunks were available for the current step set.'}
+Live step research for this chunk:
+${researchForChunk.map((context) => formatStepResearchPrompt(context)).join('\n\n')}
 
-Live step research:
-${stepResearchContexts.map((context) => formatStepResearchPrompt(context)).join('\n\n')}
-
-For every step, generate:
+For every step in the chunk, generate:
 - step_id
 - ai_output
 - done_when
 - navigation_links: [{ label, url, when }]
 - prompts: [{ label, content }]
 
-The ai_output must follow this standard:
+The ai_output must:
 - Lead with WHERE to go: exact tool, URL, or interface.
-- Follow with WHAT to do there: specific actions, not concepts.
-- End with WHAT to bring back when marking the step done.
+- Follow with WHAT to do there: specific actions.
+- End with WHAT to bring back.
 - Reference the user's actual tools by name.
 - Keep it to a maximum of 3 paragraphs.
-- If an AI coding prompt is needed, include the exact prompt but keep prompts as a small part.
 
-done_when must be concrete and verifiable, never subjective.
-Use the live documentation provided to generate specific, current guidance.
-Reference actual function names, hook names, and config options from the docs.
-If any open bugs were found, mention them in the ai_output and explain the workaround.
-For each step, obey any requirements array included in the live step research context.
-Populate navigation_links from the researched docs URLs so the user can click directly into setup pages.`;
+Return exactly this shape:
+{
+  "enrichments": [...]
+}`;
 
   try {
     const result = await callValidatedBatch(provider, {
@@ -5859,12 +5867,27 @@ Populate navigation_links from the researched docs URLs so the user can click di
       schema: Batch5EnrichStepsSchema,
       schemaDescription: schemaDescriptions.batch_5_enrich_steps,
     });
+
+    completedEnrichments.push(...result.data.enrichments);
+
+    if (enrichmentEndIndex < planSteps.length) {
+      await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', enrichmentEndIndex, {
+        steps: planSteps,
+        stepResearchContexts,
+        completedEnrichments,
+        phase: 'enrichment',
+      });
+      return 'checkpointed';
+    }
+
+    // Finalize
     const stepResearchById = new Map(stepResearchContexts.map((context) => [context.stepId, context] as const));
     const finalEnrichments = ensureCompleteStepEnrichments(
       planSteps,
       stepResearchById,
-      result.data.enrichments,
+      completedEnrichments,
     );
+    
     const finalResult: Batch5EnrichSteps = {
       enrichments: finalEnrichments,
     };
@@ -5878,10 +5901,11 @@ Populate navigation_links from the researched docs URLs so the user can click di
       'batch_5_enrich_steps',
       input,
       finalResult,
-      result.attemptCount,
+      1,
       finalResult,
       Date.now() - startedAt,
     );
+    
     await applyStepEnrichments(env, projectId, finalResult.enrichments);
     await logActivity(env, {
       projectId,
@@ -5890,12 +5914,12 @@ Populate navigation_links from the researched docs URLs so the user can click di
       kind: 'complete',
       message: `Step details complete — ${finalResult.enrichments.length} steps enriched.`,
     });
+    
     return 'complete';
   } catch (error) {
     const errorClass = classifyAIError(error);
     if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
-      const errorMessage = error instanceof Error ? error.message : 'Batch 5 failed.';
-      throw new RetryableGenerationPipelineError(errorMessage, 45);
+      throw new RetryableGenerationPipelineError(error instanceof Error ? error.message : 'Batch 5 failed.', 45);
     }
 
     await failBatch(
@@ -5908,6 +5932,7 @@ Populate navigation_links from the researched docs URLs so the user can click di
       error,
       2,
     );
+    throw error;
   }
 }
 

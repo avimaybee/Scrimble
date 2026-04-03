@@ -56,6 +56,8 @@ import {
 } from './project-briefs';
 import {
   clearGenerationCheckpoints,
+  transferActiveGenerationCheckpoints,
+  invalidateActiveCheckpointsExceptRun,
   getArchitectureReviewPayload,
   getBatchCompletionMessage,
   hasApprovedArchitectureReview,
@@ -1689,12 +1691,21 @@ app.post('/projects/:id/resume', async (c) => {
       .run();
   }
 
+  const previousRunId = generationRuntime.runId || null;
   const runId = crypto.randomUUID();
   
   // Phase 4: Use createGenerationRun
   await createGenerationRun(c.env, projectId, runId, providerId || null);
 
   try {
+    if (previousRunId) {
+      // Resume semantics: checkpoints belong to run continuity.
+      await transferActiveGenerationCheckpoints(c.env, projectId, previousRunId, runId);
+    }
+
+    // Keep one active checkpoint owner per project/run continuity.
+    await invalidateActiveCheckpointsExceptRun(c.env, projectId, runId);
+
     await sendGenerationDispatch(c.env, {
       projectId,
       userId: c.get('uid'),
@@ -1705,7 +1716,6 @@ app.post('/projects/:id/resume', async (c) => {
       targetStatus: resumeStatus,
     });
 
-    await clearGenerationCheckpoints(c.env, projectId, runId);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to queue project generation.';
     
