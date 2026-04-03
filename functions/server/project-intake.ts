@@ -86,6 +86,8 @@ export async function runProjectIntakeTurn(options: {
   projectId?: string;
 }) {
   const builderProfile = await loadBuilderProfileContext(options.userId, options.env);
+  const isVagueRequest = options.rawDescription.trim().split(/\s+/).length <= 4;
+  const shouldForceClarification = isVagueRequest || options.messages.length <= 1;
   const systemPrompt = `You are Scrimble's project intake agent. Your job is to understand what the builder wants to create well enough that a research pipeline can fetch the exact right documentation, libraries, and community knowledge before building their plan.
 
 Builder profile (what they already have):
@@ -111,6 +113,8 @@ RULES:
   READY: {one paragraph brief summarizing what you now understand}
 - Tone: direct, warm, curious. Like a smart colleague who genuinely wants to understand before diving in.
 - Never use bullet points. Never use forms. Just conversation.
+- Never default to describing Scrimble itself, Scrimble Core, or any self-referential platform unless the builder explicitly asks for Scrimble by name.
+- If the builder is vague or empty, keep the conversation domain-neutral and continue clarifying instead of inventing a product domain.
 
 Return ONLY valid JSON in this shape:
 {
@@ -145,7 +149,11 @@ When ready is false, agent_reply must be exactly one focused conversational ques
   const prompt = `Conversation so far:
   ${formatTranscript(options.messages)}
   
-  Update the structured brief from the full conversation, not just the last message.`;
+  Update the structured brief from the full conversation, not just the last message.
+  
+  ${shouldForceClarification
+    ? 'The conversation is still vague. Set ready=false and ask one concrete clarification question.'
+    : 'Only set ready=true when the brief is concrete enough to execute without guessing.'}`;
 
   const { text } = await callAIText({
     providerType: options.provider.providerType,
@@ -163,7 +171,7 @@ When ready is false, agent_reply must be exactly one focused conversational ques
     parsed.brief,
     builderProfile.declaredTools.map((tool) => tool.name),
   );
-  const ready = parsed.ready || parsed.agent_reply.startsWith('READY:');
+  const ready = (parsed.ready || parsed.agent_reply.startsWith('READY:')) && !shouldForceClarification;
   const readySummary = buildProjectBriefSummary({
     raw_description: options.rawDescription,
     what_it_is: structuredBrief.what_it_is,

@@ -219,6 +219,7 @@ async function markProjectCancelled(
 ) {
   await updateGenerationRunStatus(env, runId, 'cancelled', {
     errorMessage: reason,
+    failureClass: 'cancelled',
   });
 
   await persistGenerationStreamEvent(env, {
@@ -227,6 +228,7 @@ async function markProjectCancelled(
     event: {
       type: 'pipeline_failed',
       error: reason,
+      failureClass: 'cancelled',
     },
   });
   await resetGenerationThinkingState(env, projectId, null);
@@ -238,8 +240,11 @@ async function markProjectFailed(
   runId: string,
   reason: string,
 ) {
+  const normalizedReason = reason.toLowerCase();
+  const failureClass = normalizedReason.includes('quality gate rejected') ? 'quality_gate' : 'run_failed';
   await updateGenerationRunStatus(env, runId, 'failed', {
     errorMessage: reason,
+    failureClass,
   });
 
   await persistGenerationStreamEvent(env, {
@@ -248,6 +253,7 @@ async function markProjectFailed(
     event: {
       type: 'pipeline_failed',
       error: reason,
+      failureClass,
     },
   });
   await resetGenerationThinkingState(env, projectId, null);

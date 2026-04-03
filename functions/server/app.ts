@@ -526,12 +526,23 @@ async function buildIntakeResponse(c: AppContext, projectId: string) {
   });
   const latestAgentMessage = [...messages].reverse().find((message) => message.role === 'agent') || null;
   const ready = latestAgentMessage?.content.startsWith('READY:') || false;
+  const latestThinkingMessage = [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === 'agent'
+        && message.content.startsWith('[thinking] ')
+        && message.content.replace('[thinking] ', '').trim().length > 0,
+    );
 
   return {
     project_id: projectId,
     generation_runtime: generationRuntime,
     ready,
     agent_message: latestAgentMessage?.content || '',
+    agent_thinking: latestThinkingMessage
+      ? latestThinkingMessage.content.replace('[thinking] ', '').trim()
+      : '',
     questions: [],
     current_question: null,
     current_question_index: 0,
@@ -620,6 +631,7 @@ async function getOwnedProjectWithProgress(c: AppContext, projectId: string) {
       gr.lifecycle_status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
       gr.id as canonical_run_id,
       gr.error_message as canonical_run_error,
+      gr.failure_class as canonical_run_failure_class,
       gr.current_batch as canonical_run_current_batch,
       gr.workflow_instance_id as canonical_run_workflow_instance_id,
       gr.started_at as canonical_run_started_at,
@@ -1109,6 +1121,7 @@ app.get('/projects', async (c) => {
       gr.lifecycle_status as canonical_run_status, gr.provider_id as canonical_run_provider_id, gr.heartbeat_at as canonical_run_heartbeat_at,
       gr.id as canonical_run_id,
       gr.error_message as canonical_run_error,
+      gr.failure_class as canonical_run_failure_class,
       gr.current_batch as canonical_run_current_batch,
       gr.workflow_instance_id as canonical_run_workflow_instance_id,
       gr.started_at as canonical_run_started_at,
@@ -1184,14 +1197,21 @@ app.post('/intake/start', async (c) => {
     conversationTurns: 0,
   });
 
+  let intakeThinkingBuffer = '';
   const intakeTurn = await runProjectIntakeTurn({
     env: c.env,
     userId: c.get('uid'),
     rawDescription: description,
     messages: await listProjectIntakeMessages(c.env, id),
     provider: providerContext,
+    onThinking: (delta) => {
+      intakeThinkingBuffer += delta;
+    },
   });
 
+  if (intakeThinkingBuffer.trim()) {
+    await appendProjectIntakeMessage(c.env, id, 'agent', `[thinking] ${intakeThinkingBuffer.trim()}`);
+  }
   await appendProjectIntakeMessage(c.env, id, 'agent', intakeTurn.agentReply);
   await upsertProjectBrief(c.env, {
     projectId: id,
@@ -1237,14 +1257,21 @@ app.post('/intake/:id/respond', async (c) => {
   const brief = await getProjectBrief(c.env, projectId);
   const conversationTurns = (brief?.conversation_turns || 0) + 1;
 
+  let intakeThinkingBuffer = '';
   const intakeTurn = await runProjectIntakeTurn({
     env: c.env,
     userId: c.get('uid'),
     rawDescription: asText(project.description, ''),
     messages,
     provider: providerContext,
+    onThinking: (delta) => {
+      intakeThinkingBuffer += delta;
+    },
   });
 
+  if (intakeThinkingBuffer.trim()) {
+    await appendProjectIntakeMessage(c.env, projectId, 'agent', `[thinking] ${intakeThinkingBuffer.trim()}`);
+  }
   await appendProjectIntakeMessage(c.env, projectId, 'agent', intakeTurn.agentReply);
   await upsertProjectBrief(c.env, {
     projectId,
@@ -1825,6 +1852,7 @@ app.post('/projects/:id/cancel', async (c) => {
   if (runId) {
     await updateGenerationRunStatus(c.env, runId, 'cancelled', {
       errorMessage: 'Generation cancelled by user.',
+      failureClass: 'cancelled',
     });
   } else {
     warn('cancel-workflow', 'Project has no active run to cancel. Skipping fallback mutation.', { projectId });
@@ -1836,6 +1864,7 @@ app.post('/projects/:id/cancel', async (c) => {
     event: {
       type: 'pipeline_failed',
       error: 'Generation cancelled by user.',
+      failureClass: 'cancelled',
     },
   });
   await resetGenerationThinkingState(c.env, projectId, null);

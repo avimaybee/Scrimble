@@ -808,10 +808,13 @@ export default function ProjectGeneration() {
           }
           void syncProjectState().finally(() => scheduleProjectNavigation());
         },
-        onFailed: (message) => {
+        onFailed: ({ message, failureClass }) => {
           replaceCurrentActivity(null);
           noteProgressTimestamp(new Date().toISOString());
-          setError(message);
+          const displayMessage = failureClass === 'quality_gate'
+            ? `Plan quality gate failed after approval: ${message}`
+            : message;
+          setError(displayMessage);
           applyStatusUpdate((previous) =>
             previous
               ? {
@@ -823,11 +826,11 @@ export default function ProjectGeneration() {
                       currentBatch: null,
                       isTerminal: true,
                       isReviewRequired: false,
-                      failureClass: 'run_failed',
+                      failureClass: failureClass || 'run_failed',
                     }
                     : previous.generation_runtime,
                   is_failed: true,
-                  generation_error: message,
+                  generation_error: displayMessage,
                 }
               : previous,
           );
@@ -1072,6 +1075,19 @@ export default function ProjectGeneration() {
   }, [reviewData, showAllResearchSources]);
   const hasHiddenResearchSources = useMemo(
     () => Boolean(reviewData && reviewData.research_sources.length > MAX_VISIBLE_RESEARCH_SOURCES),
+    [reviewData],
+  );
+  const hasPrdContent = useMemo(
+    () =>
+      Boolean(
+        reviewData
+        && (
+          reviewData.prd_problem_statement
+          || reviewData.prd_user_personas.length > 0
+          || reviewData.prd_core_user_journeys.length > 0
+          || reviewData.prd_functional_requirements.length > 0
+        ),
+      ),
     [reviewData],
   );
 
@@ -1400,6 +1416,141 @@ export default function ProjectGeneration() {
                               {reviewData.project_summary}
                             </p>
                           </section>
+
+                          <div className="border-t border-border-subtle" />
+
+                          {hasPrdContent ? (
+                            <section className="py-7">
+                              <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Product requirements (PRD)</div>
+                              <div className="mt-4 space-y-6">
+                                <div>
+                                  <div className="font-sans text-[13px] font-medium text-text-primary">Problem statement</div>
+                                  <p className="mt-2 max-w-[760px] font-sans text-[14px] leading-7 text-text-secondary">
+                                    {reviewData.prd_problem_statement}
+                                  </p>
+                                </div>
+
+                                <div className="grid gap-4 md:grid-cols-2">
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">User personas</div>
+                                    <div className="mt-2 space-y-3">
+                                      {reviewData.prd_user_personas.map((persona) => (
+                                        <div key={persona.name} className="rounded-[12px] border border-border-subtle/60 bg-bg-base/40 px-3 py-3">
+                                          <div className="font-sans text-[13px] font-medium text-text-primary">{persona.name}</div>
+                                          <div className="mt-1 font-sans text-[12px] leading-6 text-text-tertiary">{persona.context}</div>
+                                          <div className="mt-2 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">Goals</div>
+                                          <ul className="mt-1 list-disc space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
+                                            {persona.goals.map((goal) => (
+                                              <li key={goal}>{goal}</li>
+                                            ))}
+                                          </ul>
+                                          <div className="mt-2 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">Pains</div>
+                                          <ul className="mt-1 list-disc space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
+                                            {persona.pains.map((pain) => (
+                                              <li key={pain}>{pain}</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">Core user journeys</div>
+                                    <div className="mt-2 space-y-3">
+                                      {reviewData.prd_core_user_journeys.map((journey) => (
+                                        <div key={journey.name} className="rounded-[12px] border border-border-subtle/60 bg-bg-base/40 px-3 py-3">
+                                          <div className="font-sans text-[13px] font-medium text-text-primary">{journey.name}</div>
+                                          <ol className="mt-2 list-decimal space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
+                                            {journey.steps.map((step) => (
+                                              <li key={step}>{step}</li>
+                                            ))}
+                                          </ol>
+                                          <div className="mt-2 font-sans text-[12px] leading-6 text-status-secure">Outcome: {journey.outcome}</div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="grid gap-4 md:grid-cols-2">
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">Functional requirements</div>
+                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
+                                      {reviewData.prd_functional_requirements.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">Non-functional requirements</div>
+                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
+                                      {reviewData.prd_non_functional_requirements.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                </div>
+
+                                <div className="grid gap-4 md:grid-cols-2">
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">Scope boundaries — in</div>
+                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
+                                      {reviewData.prd_scope_in.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">Scope boundaries — out</div>
+                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
+                                      {reviewData.prd_scope_out.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                </div>
+
+                                <div>
+                                  <div className="font-sans text-[13px] font-medium text-text-primary">Acceptance criteria</div>
+                                  <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
+                                    {reviewData.prd_acceptance_criteria.map((item) => (
+                                      <li key={item}>{item}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+
+                                <div>
+                                  <div className="font-sans text-[13px] font-medium text-text-primary">Launch milestones</div>
+                                  <div className="mt-2 space-y-3">
+                                    {reviewData.prd_launch_milestones.map((milestone) => (
+                                      <div key={milestone.milestone} className="rounded-[12px] border border-border-subtle/60 bg-bg-base/40 px-3 py-3">
+                                        <div className="font-sans text-[13px] font-medium text-text-primary">{milestone.milestone}</div>
+                                        <div className="mt-1 font-sans text-[12px] leading-6 text-text-tertiary">{milestone.objective}</div>
+                                        <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[12px] leading-6 text-text-secondary">
+                                          {milestone.exit_criteria.map((item) => (
+                                            <li key={item}>{item}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                {reviewData.prd_open_questions.length > 0 ? (
+                                  <div>
+                                    <div className="font-sans text-[13px] font-medium text-text-primary">Open questions</div>
+                                    <ul className="mt-2 list-disc space-y-1 pl-5 font-sans text-[13px] leading-6 text-text-secondary">
+                                      {reviewData.prd_open_questions.map((item) => (
+                                        <li key={item}>{item}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : null}
+                              </div>
+                            </section>
+                          ) : null}
 
                           <div className="border-t border-border-subtle" />
 
@@ -1833,13 +1984,18 @@ export default function ProjectGeneration() {
                   <div className="flex items-start gap-3">
                     <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
                     <div>
-                      <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The generation runner needs attention</div>
-                      <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
-                        {error || status.generation_error || 'Project generation failed.'}
-                      </p>
-                      <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
-                        Durable checkpoints are preserved as each stage completes, so resuming picks up from the latest finished checkpoint instead of starting over.
-                      </p>
+                          <div className="font-serif text-[24px] tracking-[-0.02em] text-text-primary">The generation runner needs attention</div>
+                          <p className="mt-2 font-sans text-[14px] leading-6 text-text-secondary">
+                            {error || status.generation_error || 'Project generation failed.'}
+                          </p>
+                          {status?.generation_runtime?.failureClass === 'quality_gate' ? (
+                            <p className="mt-2 font-sans text-[13px] leading-6 text-status-warning">
+                              Your Stage 3 approval succeeded. Batch 4 failed a quality gate and stopped before producing a safe plan.
+                            </p>
+                          ) : null}
+                          <p className="mt-2 font-sans text-[13px] leading-6 text-text-tertiary">
+                            Durable checkpoints are preserved as each stage completes, so resuming picks up from the latest finished checkpoint instead of starting over.
+                          </p>
                     </div>
                   </div>
                   <button

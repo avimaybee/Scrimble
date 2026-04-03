@@ -28,7 +28,7 @@ export type GenerationLifecycleStatus =
   | 'failed'
   | 'cancelled';
 
-export type GenerationFailureClass = 'run_failed' | 'stalled' | 'cancelled' | null;
+export type GenerationFailureClass = 'run_failed' | 'stalled' | 'cancelled' | 'quality_gate' | null;
 
 export interface GenerationRuntime {
   runId: string | null;
@@ -618,6 +618,29 @@ export interface ArchitectureReviewResponse {
   project_name: string;
   project_type: string;
   project_summary: string;
+  prd_problem_statement: string;
+  prd_user_personas: Array<{
+    name: string;
+    context: string;
+    goals: string[];
+    pains: string[];
+  }>;
+  prd_core_user_journeys: Array<{
+    name: string;
+    steps: string[];
+    outcome: string;
+  }>;
+  prd_functional_requirements: string[];
+  prd_non_functional_requirements: string[];
+  prd_scope_in: string[];
+  prd_scope_out: string[];
+  prd_acceptance_criteria: string[];
+  prd_launch_milestones: Array<{
+    milestone: string;
+    objective: string;
+    exit_criteria: string[];
+  }>;
+  prd_open_questions: string[];
   how_it_connects: string;
   recommended_stack: {
     frontend: string;

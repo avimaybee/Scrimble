@@ -124,7 +124,7 @@ interface StreamProjectGenerationOptions {
   onBatchCompleted?: (event: ProjectGenerationEvent) => void;
   onCheckpoint?: (event: ProjectGenerationCheckpointEvent) => void;
   onComplete?: () => void;
-  onFailed?: (message: string) => void;
+  onFailed?: (event: { message: string; failureClass: GenerationRuntime['failureClass'] }) => void;
   onConnectionStateChange?: (state: GenerationStreamConnectionState) => void;
 }
 
@@ -155,7 +155,11 @@ type ParsedGenerationStreamEvent =
   | { kind: 'checkpoint'; event: ProjectGenerationCheckpointEvent }
   | { kind: 'invariant'; event: ProjectGenerationInvariantEvent }
   | { kind: 'pipeline_complete' }
-  | { kind: 'pipeline_failed'; message: string }
+  | {
+      kind: 'pipeline_failed';
+      message: string;
+      failureClass: GenerationRuntime['failureClass'];
+    }
   | { kind: 'ignored' };
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -309,6 +313,13 @@ function parseGenerationStreamEvent(payload: unknown): ParsedGenerationStreamEve
       return {
         kind: 'pipeline_failed',
         message: typeof eventPayload.error === 'string' ? eventPayload.error : 'Project generation failed.',
+        failureClass:
+          eventPayload.failureClass === 'quality_gate'
+          || eventPayload.failureClass === 'run_failed'
+          || eventPayload.failureClass === 'stalled'
+          || eventPayload.failureClass === 'cancelled'
+            ? eventPayload.failureClass
+            : 'run_failed',
       };
     default:
       return { kind: 'ignored' };
@@ -324,7 +335,22 @@ function normalizeProjectStatus(status: ProjectGenerationStatusResponse): Projec
 }
 
 function normalizeIntakeSession(session: ProjectIntakeSession): ProjectIntakeSession {
-  return session;
+  const latestThinking = [...session.messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === 'agent'
+        && message.content.startsWith('[thinking] ')
+        && message.content.replace('[thinking] ', '').trim().length > 0,
+    );
+
+  return {
+    ...session,
+    messages: session.messages.filter((message) => !message.content.startsWith('[thinking] ')),
+    agent_thinking: latestThinking
+      ? latestThinking.content.replace('[thinking] ', '').trim()
+      : session.agent_thinking?.trim() || undefined,
+  };
 }
 
 function extractStepEnrichmentStreamText(parsed: unknown): string {
@@ -682,7 +708,10 @@ export const dbService = {
                 return;
               case 'pipeline_failed':
                 reachedTerminalEvent = true;
-                options.onFailed?.(parsed.message);
+                options.onFailed?.({
+                  message: parsed.message,
+                  failureClass: parsed.failureClass,
+                });
                 return;
               case 'ignored':
               default:
@@ -691,7 +720,10 @@ export const dbService = {
           } catch {
             if (currentEvent === 'pipeline_failed') {
               reachedTerminalEvent = true;
-              options.onFailed?.('Project generation failed.');
+              options.onFailed?.({
+                message: 'Project generation failed.',
+                failureClass: 'run_failed',
+              });
             }
           } finally {
             currentEvent = 'message';

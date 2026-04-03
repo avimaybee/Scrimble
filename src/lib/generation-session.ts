@@ -23,6 +23,7 @@ export const GENERATION_BATCHES: Array<{
 
 const RESUMABLE_FAILURE_CLASSES = new Set<Exclude<GenerationFailureClass, null>>([
   'run_failed',
+  'quality_gate',
   'stalled',
   'cancelled',
 ]);

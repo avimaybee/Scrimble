@@ -40,7 +40,7 @@ export interface GenerationRuntimeState {
 
 export type GenerationLifecycleStatus = 'intake' | GenerationRunStatus;
 
-export type GenerationFailureClass = 'run_failed' | 'stalled' | 'cancelled' | null;
+export type GenerationFailureClass = 'run_failed' | 'stalled' | 'cancelled' | 'quality_gate' | null;
 
 export interface GenerationRuntimeContract {
   runId: string | null;
@@ -65,6 +65,28 @@ function asOptionalString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function resolveFailureClass(
+  lifecycleStatus: GenerationLifecycleStatus,
+  runFailureClass: string | null,
+  errorMessage: string | null,
+): GenerationFailureClass {
+  if (lifecycleStatus === 'cancelled') {
+    return 'cancelled';
+  }
+
+  if (lifecycleStatus !== 'failed') {
+    return null;
+  }
+
+  const normalizedFailureClass = (runFailureClass || '').trim().toLowerCase();
+  const normalizedError = (errorMessage || '').trim().toLowerCase();
+  if (normalizedFailureClass === 'quality_gate' || normalizedError.includes('quality gate rejected')) {
+    return 'quality_gate';
+  }
+
+  return 'run_failed';
+}
+
 export function isTerminalLifecycleStatus(status: GenerationLifecycleStatus): boolean {
   return TERMINAL_LIFECYCLE_STATUSES.has(status);
 }
@@ -75,12 +97,12 @@ export function buildGenerationRuntimeContract(
   const lifecycleStatus: GenerationLifecycleStatus = runtime.run?.status ?? 'intake';
   const isTerminal = isTerminalLifecycleStatus(lifecycleStatus);
 
-  let failureClass: GenerationFailureClass = null;
-  if (lifecycleStatus === 'failed') {
-    failureClass = 'run_failed';
-  } else if (lifecycleStatus === 'cancelled') {
-    failureClass = 'cancelled';
-  } else if (!isTerminal && runtime.canResume && runtime.isStale) {
+  let failureClass: GenerationFailureClass = resolveFailureClass(
+    lifecycleStatus,
+    runtime.run?.failure_class || null,
+    runtime.run?.error_message || null,
+  );
+  if (!isTerminal && runtime.canResume && runtime.isStale) {
     failureClass = 'stalled';
   }
 
@@ -112,6 +134,7 @@ export async function getGenerationRuntimeState(
       gr.current_batch,
       gr.provider_id,
       gr.heartbeat_at,
+      gr.failure_class,
       gr.error_message,
       gr.started_at,
       gr.completed_at,
@@ -128,6 +151,7 @@ export async function getGenerationRuntimeState(
     current_batch: string | null;
     provider_id: string | null;
     heartbeat_at: string | null;
+    failure_class: string | null;
     error_message: string | null;
     started_at: string | null;
     completed_at: string | null;
@@ -147,6 +171,7 @@ export async function getGenerationRuntimeState(
     current_batch: runResult.current_batch as GenerationBatchName | null,
     provider_id: runResult.provider_id || null,
     heartbeat_at: runResult.heartbeat_at || null,
+    failure_class: runResult.failure_class || null,
     error_message: runResult.error_message || null,
     started_at: runResult.started_at || new Date().toISOString(),
     completed_at: runResult.completed_at || null,
@@ -271,8 +296,8 @@ export async function createGenerationRun(
   await env.DB.batch([
     env.DB.prepare(`
       INSERT INTO generation_runs (
-        id, project_id, run_id, lifecycle_status, provider_id, heartbeat_at, started_at, created_at, updated_at
-      ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+        id, project_id, run_id, lifecycle_status, provider_id, heartbeat_at, failure_class, started_at, created_at, updated_at
+      ) VALUES (?, ?, ?, 'queued', ?, ?, NULL, ?, ?, ?)
     `).bind(runId, projectId, runId, providerId, now, now, now, now),
     env.DB.prepare(`
       UPDATE projects
@@ -290,6 +315,7 @@ export async function createGenerationRun(
     current_batch: null,
     provider_id: providerId,
     heartbeat_at: now,
+    failure_class: null,
     error_message: null,
     started_at: now,
     completed_at: null,
@@ -305,6 +331,7 @@ export async function updateGenerationRunStatus(
   options: {
     currentBatch?: GenerationBatchName | null;
     errorMessage?: string | null;
+    failureClass?: string | null;
     workflowInstanceId?: string | null;
     providerId?: string | null;
   } = {},
@@ -317,6 +344,11 @@ export async function updateGenerationRunStatus(
     UPDATE generation_runs
     SET lifecycle_status = ?,
         current_batch = ?,
+        failure_class = CASE
+          WHEN ? IS NOT NULL THEN ?
+          WHEN ? = 'failed' THEN failure_class
+          ELSE NULL
+        END,
         error_message = COALESCE(?, error_message),
         workflow_instance_id = COALESCE(?, workflow_instance_id),
         provider_id = COALESCE(?, provider_id),
@@ -326,6 +358,9 @@ export async function updateGenerationRunStatus(
   `).bind(
     status,
     options.currentBatch ?? null,
+    options.failureClass ?? null,
+    options.failureClass ?? null,
+    status,
     options.errorMessage ?? null,
     options.workflowInstanceId ?? null,
     options.providerId ?? null,
@@ -377,6 +412,7 @@ export function mapProjectRowToResponse(row: any): any {
       current_batch: asOptionalString(row.canonical_run_current_batch) as GenerationBatchName | null,
       provider_id: asOptionalString(row.canonical_run_provider_id),
       heartbeat_at: asOptionalString(row.canonical_run_heartbeat_at),
+      failure_class: asOptionalString(row.canonical_run_failure_class),
       error_message: asOptionalString(row.canonical_run_error),
       started_at: asOptionalString(row.canonical_run_started_at) || now,
       completed_at: asOptionalString(row.canonical_run_completed_at),

@@ -299,7 +299,9 @@ export function buildProjectBriefSummary(brief: Pick<
   | 'v1_scope'
   | 'constraints'
 >) {
-  const lead = brief.what_it_is || brief.raw_description || 'This project';
+  const rawLead = brief.what_it_is || brief.raw_description || 'This project';
+  const normalizedLead = rawLead.trim();
+  const lead = normalizedLead ? normalizedLead : 'This project';
   const audience = brief.who_its_for ? ` for ${brief.who_its_for}` : '';
   const problem = brief.problem_solved ? ` It solves ${brief.problem_solved}.` : '';
   const scope =
@@ -324,7 +326,7 @@ export function createFallbackStructuredBrief(
   const existingTools = dedupeText([...(options?.existingTools || []), ...parseProjectStackValues(options?.stackValue)]);
 
   return {
-    what_it_is: rawDescription,
+    what_it_is: rawDescription.trim() || 'A domain-neutral product idea that still needs clarification.',
     who_its_for: '',
     problem_solved: '',
     v1_scope: {

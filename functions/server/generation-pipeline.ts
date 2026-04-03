@@ -156,6 +156,29 @@ export type ArchitectureReviewPayload = {
   project_name: string;
   project_type: string;
   project_summary: string;
+  prd_problem_statement: string;
+  prd_user_personas: Array<{
+    name: string;
+    context: string;
+    goals: string[];
+    pains: string[];
+  }>;
+  prd_core_user_journeys: Array<{
+    name: string;
+    steps: string[];
+    outcome: string;
+  }>;
+  prd_functional_requirements: string[];
+  prd_non_functional_requirements: string[];
+  prd_scope_in: string[];
+  prd_scope_out: string[];
+  prd_acceptance_criteria: string[];
+  prd_launch_milestones: Array<{
+    milestone: string;
+    objective: string;
+    exit_criteria: string[];
+  }>;
+  prd_open_questions: string[];
   how_it_connects: string;
   recommended_stack: Batch3Architect['recommended_stack'];
   stack_cards: ArchitectureReviewStackCard[];
@@ -358,7 +381,7 @@ const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
 const BATCH2_SOURCE_TARGET_COUNT = 10;
-const BATCH2_SEARCH_RESULT_LIMIT = 1;
+const BATCH2_SEARCH_RESULT_LIMIT = 3;
 const RESEARCH_CHUNK_SIZE_CHARS = 1_600;
 const RESEARCH_CHUNK_OVERLAP_CHARS = 200;
 const RESEARCH_CHUNK_WARN_THRESHOLD = 10_000;
@@ -385,6 +408,7 @@ const GENERIC_PLAN_PHRASES = [
 ];
 const PLAN_QUALITY_MIN_STACK_MATCHES = 2;
 const lastHeartbeatTouchByProject = new Map<string, number>();
+const BATCH2_FANOUT_QUERY_FAMILIES = ['setup', 'release_notes', 'errors'] as const;
 
 const batchCompletionMessages: Record<GenerationBatchName, string> = {
   batch_1_research_stack: 'Mapped the implied stack and source URLs.',
@@ -679,6 +703,124 @@ function inferSourceTypeFromToolLabel(tool: string): CollectedResearchSource['so
   return 'official_docs';
 }
 
+function createCollectedSourceFromText(payload: {
+  technology: string;
+  url: string;
+  tool: string;
+  title: string;
+  content: string;
+  rankScore: number;
+}): CollectedResearchSource | null {
+  const content = payload.content.trim();
+  const url = payload.url.trim();
+  if (!content || !url) {
+    return null;
+  }
+
+  return {
+    id: `source_${normalizeBuilderProfileName(`${payload.technology}-${url}-${payload.tool}`)}`,
+    source_type: inferSourceTypeFromToolLabel(payload.tool),
+    title: payload.title,
+    rank_score: payload.rankScore,
+    content,
+    url,
+    tool: payload.tool,
+    technology: payload.technology,
+  };
+}
+
+function collectFallbackResearchSources(entry: Batch2FetchAndRead['research'][number]) {
+  const primarySource = entry.sources.find((source) => source.url)?.url || `batch2://research/${entry.technology}`;
+  const githubSource =
+    entry.sources.find((source) => source.url && source.url.toLowerCase().includes('github.com'))?.url
+    || primarySource;
+  const fallbackSources: CollectedResearchSource[] = [];
+  const seen = new Set<string>();
+
+  const pushSource = (source: CollectedResearchSource | null) => {
+    if (!source) {
+      return;
+    }
+    const dedupeKey = `${source.tool}::${source.url}`.toLowerCase();
+    if (seen.has(dedupeKey)) {
+      return;
+    }
+    seen.add(dedupeKey);
+    fallbackSources.push(source);
+  };
+
+  pushSource(
+    createCollectedSourceFromText({
+      technology: entry.technology,
+      url: primarySource,
+      tool: 'batch2_docs',
+      title: `${entry.technology} docs`,
+      content: entry.docs_content,
+      rankScore: 0.6,
+    }),
+  );
+  pushSource(
+    createCollectedSourceFromText({
+      technology: entry.technology,
+      url: githubSource,
+      tool: 'batch2_github',
+      title: `${entry.technology} repository`,
+      content: entry.github_readme,
+      rankScore: 0.72,
+    }),
+  );
+  pushSource(
+    createCollectedSourceFromText({
+      technology: entry.technology,
+      url: primarySource,
+      tool: 'batch2_breaking_changes',
+      title: `${entry.technology} breaking changes`,
+      content: entry.recent_breaking_changes,
+      rankScore: 0.68,
+    }),
+  );
+  pushSource(
+    createCollectedSourceFromText({
+      technology: entry.technology,
+      url: primarySource,
+      tool: 'batch2_community',
+      title: `${entry.technology} community sentiment`,
+      content: entry.community_sentiment,
+      rankScore: 0.52,
+    }),
+  );
+  pushSource(
+    createCollectedSourceFromText({
+      technology: entry.technology,
+      url: primarySource,
+      tool: 'batch2_bugs',
+      title: `${entry.technology} bug digest`,
+      content: entry.bug_report_digest,
+      rankScore: 0.58,
+    }),
+  );
+
+  for (const source of entry.sources) {
+    const url = source.url.trim();
+    const content = (source.insight || source.summary || source.title || '').trim();
+    if (!url || !content) {
+      continue;
+    }
+    pushSource(
+      createCollectedSourceFromText({
+        technology: entry.technology,
+        url,
+        tool: source.tool || 'batch2_source',
+        title: source.title || `${entry.technology} source`,
+        content,
+        rankScore: source.relevance === 'high' ? 0.7 : source.relevance === 'low' ? 0.45 : 0.58,
+      }),
+    );
+  }
+
+  return fallbackSources;
+}
+
 function formatCharCount(chars: number | undefined, fallback: number) {
   let value = fallback;
   if (typeof chars === 'number' && Number.isFinite(chars)) {
@@ -777,13 +919,34 @@ function countStackMatchesInPlan(
   stackTerms: string[],
 ) {
   const normalizedPlan = planText.toLowerCase();
+  const normalizedWords = normalizedPlan.split(/[^a-z0-9@.+#/-]+/).filter(Boolean);
   return stackTerms.reduce((count, term) => {
     const normalizedTerm = term.toLowerCase().trim();
     if (!normalizedTerm || normalizedTerm.length < 3) {
       return count;
     }
-    return normalizedPlan.includes(normalizedTerm) ? count + 1 : count;
+    const exactWordMatch = normalizedWords.includes(normalizedTerm);
+    const packageTail = normalizedTerm.includes('/') ? normalizedTerm.split('/').at(-1) || '' : '';
+    const packageTailMatch = packageTail.length >= 3 && normalizedWords.includes(packageTail);
+    const normalizedNoPunct = normalizedTerm.replace(/[^a-z0-9]+/g, '');
+    const compactWordMatch =
+      normalizedNoPunct.length >= 3
+      && normalizedWords.some((word) => word.replace(/[^a-z0-9]+/g, '') === normalizedNoPunct);
+    const partialMatch =
+      normalizedPlan.includes(normalizedTerm)
+      || (packageTail.length >= 3 && normalizedPlan.includes(packageTail));
+
+    return exactWordMatch || packageTailMatch || compactWordMatch || partialMatch ? count + 1 : count;
   }, 0);
+}
+
+function isSelfReferentialPlanDrift(planText: string, briefSummary: string) {
+  const normalizedPlan = planText.toLowerCase();
+  const normalizedBrief = briefSummary.toLowerCase();
+  const selfKeywords = ['scrimble', 'scrimble core', 'build scrimble', 'scrimble platform'];
+  const planHasSelfKeyword = includesAnyNormalizedPhrase(normalizedPlan, selfKeywords);
+  const briefAllowsSelfKeyword = includesAnyNormalizedPhrase(normalizedBrief, selfKeywords);
+  return planHasSelfKeyword && !briefAllowsSelfKeyword;
 }
 
 function extractStackTermsForPlanQuality(
@@ -838,6 +1001,53 @@ function evaluatePlanQuality(
     && !includesAnyNormalizedPhrase(normalizedBriefSummary, ['music', 'audio', 'stream'])
   ) {
     findings.push('Plan drifted toward unrelated domain content compared with the project brief.');
+  }
+
+  if (isSelfReferentialPlanDrift(planText, projectBrief.summary)) {
+    findings.push('Plan drifted into a Scrimble/self-referential product framing not requested in the brief.');
+  }
+
+  const normalizedProblemStatement = (adr.prd.problem_statement || '').trim().toLowerCase();
+  const isGenericProblemStatement =
+    normalizedProblemStatement.length < 60
+    || normalizedProblemStatement.includes('not specified')
+    || normalizedProblemStatement.includes('to be determined')
+    || normalizedProblemStatement.includes('define')
+    || normalizedProblemStatement.includes('clarify');
+  if (isGenericProblemStatement) {
+    findings.push('PRD problem statement is too generic and not production-ready.');
+  }
+
+  if ((adr.prd.user_personas || []).length < 2) {
+    findings.push('PRD must include at least 2 user personas.');
+  }
+
+  if ((adr.prd.core_user_journeys || []).length < 2) {
+    findings.push('PRD must include at least 2 core user journeys.');
+  }
+
+  if ((adr.prd.functional_requirements || []).length < 8) {
+    findings.push('PRD must include at least 8 functional requirements.');
+  }
+
+  if ((adr.prd.non_functional_requirements || []).length < 5) {
+    findings.push('PRD must include at least 5 non-functional requirements.');
+  }
+
+  if ((adr.prd.acceptance_criteria || []).length < 8) {
+    findings.push('PRD must include at least 8 acceptance criteria.');
+  }
+
+  if ((adr.prd.launch_milestones || []).length < 3) {
+    findings.push('PRD must include at least 3 launch milestones.');
+  }
+
+  if ((adr.prd.scope_boundaries?.in_scope || []).length < 4) {
+    findings.push('PRD in-scope boundaries are too thin.');
+  }
+
+  if ((adr.prd.scope_boundaries?.out_of_scope || []).length < 3) {
+    findings.push('PRD out-of-scope boundaries are too thin.');
   }
 
   return {
@@ -1182,11 +1392,14 @@ function createResearchSource(
   insight?: string,
 ): Batch2FetchAndRead['sources'][number] {
   const summarizedInsight = summarizeSnippet(insight || summary, 220);
+  const normalizedTechnology = normalizeBuilderProfileName(technology) || 'unknown-technology';
+  const normalizedTool = normalizeBuilderProfileName(tool) || 'source';
+  const resolvedUrl = url.trim() || `research://${normalizedTechnology}/${normalizedTool}`;
 
   return {
     technology,
     tool,
-    url,
+    url: resolvedUrl,
     title,
     summary: summarizeSnippet(summary),
     insight: summarizedInsight,
@@ -1872,7 +2085,9 @@ function retrieveStepResearchSlice(
 }
 
 function buildBatch2FanOutQueries(toolName: string) {
-  return [buildResearchQuery({ technology: toolName, family: 'setup' })];
+  return BATCH2_FANOUT_QUERY_FAMILIES.map((family) =>
+    buildResearchQuery({ technology: toolName, family }),
+  );
 }
 
 function buildBatch2PromptPayload(
@@ -1979,81 +2194,7 @@ function resolveChunkStoreFromBatch2(batch2: Batch2FetchAndRead) {
 
   const fallbackCollectedSources: CollectedResearchSource[] = [];
   for (const entry of batch2.research) {
-    const primarySource = entry.sources.find((source) => source.url)?.url || `batch2://research/${entry.technology}`;
-    const githubSource =
-      entry.sources.find((source) => source.url && source.url.toLowerCase().includes('github.com'))?.url
-      || primarySource;
-
-    if (entry.docs_content.trim()) {
-      const url = primarySource;
-      const sourceType = inferSourceTypeFromToolLabel('batch2_docs');
-      fallbackCollectedSources.push({
-        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-docs`)}`,
-        source_type: sourceType,
-        title: `${entry.technology} docs`,
-        rank_score: 0.6,
-        content: entry.docs_content,
-        url,
-        tool: 'batch2_docs',
-        technology: entry.technology,
-      });
-    }
-    if (entry.github_readme.trim()) {
-      const url = githubSource;
-      const sourceType = inferSourceTypeFromToolLabel('batch2_github');
-      fallbackCollectedSources.push({
-        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-github`)}`,
-        source_type: sourceType,
-        title: `${entry.technology} repository`,
-        rank_score: 0.72,
-        content: entry.github_readme,
-        url,
-        tool: 'batch2_github',
-        technology: entry.technology,
-      });
-    }
-    if (entry.recent_breaking_changes.trim()) {
-      const url = primarySource;
-      const sourceType = inferSourceTypeFromToolLabel('batch2_breaking_changes');
-      fallbackCollectedSources.push({
-        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-breaking`)}`,
-        source_type: sourceType,
-        title: `${entry.technology} breaking changes`,
-        rank_score: 0.68,
-        content: entry.recent_breaking_changes,
-        url,
-        tool: 'batch2_breaking_changes',
-        technology: entry.technology,
-      });
-    }
-    if (entry.community_sentiment.trim()) {
-      const url = primarySource;
-      const sourceType = inferSourceTypeFromToolLabel('batch2_community');
-      fallbackCollectedSources.push({
-        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-community`)}`,
-        source_type: sourceType,
-        title: `${entry.technology} community sentiment`,
-        rank_score: 0.52,
-        content: entry.community_sentiment,
-        url,
-        tool: 'batch2_community',
-        technology: entry.technology,
-      });
-    }
-    if (entry.bug_report_digest.trim()) {
-      const url = primarySource;
-      const sourceType = inferSourceTypeFromToolLabel('batch2_bugs');
-      fallbackCollectedSources.push({
-        id: `source_${normalizeBuilderProfileName(`${entry.technology}-${url}-bugs`)}`,
-        source_type: sourceType,
-        title: `${entry.technology} bug digest`,
-        rank_score: 0.58,
-        content: entry.bug_report_digest,
-        url,
-        tool: 'batch2_bugs',
-        technology: entry.technology,
-      });
-    }
+    fallbackCollectedSources.push(...collectFallbackResearchSources(entry));
   }
 
   return buildResearchChunkStore(fallbackCollectedSources);
@@ -2448,6 +2589,29 @@ function buildArchitectureReviewPayload(
     project_summary:
       optionalText(adr.project_summary)
       || `${adr.project_name} is being built around the selected stack and the research-backed architecture recommendations.`,
+    prd_problem_statement: adr.prd.problem_statement,
+    prd_user_personas: adr.prd.user_personas.map((persona) => ({
+      name: persona.name || 'Primary user',
+      context: persona.context || 'Usage context not specified.',
+      goals: persona.goals || [],
+      pains: persona.pains || [],
+    })),
+    prd_core_user_journeys: adr.prd.core_user_journeys.map((journey) => ({
+      name: journey.name || 'Primary journey',
+      steps: journey.steps || [],
+      outcome: journey.outcome || 'Successful outcome not specified.',
+    })),
+    prd_functional_requirements: adr.prd.functional_requirements,
+    prd_non_functional_requirements: adr.prd.non_functional_requirements,
+    prd_scope_in: adr.prd.scope_boundaries.in_scope,
+    prd_scope_out: adr.prd.scope_boundaries.out_of_scope,
+    prd_acceptance_criteria: adr.prd.acceptance_criteria,
+    prd_launch_milestones: adr.prd.launch_milestones.map((milestone) => ({
+      milestone: milestone.milestone || 'Milestone',
+      objective: milestone.objective || 'Objective not specified.',
+      exit_criteria: milestone.exit_criteria || [],
+    })),
+    prd_open_questions: adr.prd.open_questions,
     how_it_connects:
       optionalText(adr.how_it_connects)
       || 'The interface talks to the application backend, the backend writes to the core database, and the supporting services handle the surrounding workflows.',
@@ -3834,6 +3998,9 @@ async function failBatch(
   attemptCount: number,
 ): Promise<never> {
   const message = error instanceof Error ? error.message : String(error);
+  const normalizedMessage = message.toLowerCase();
+  const isQualityGateFailure = normalizedMessage.includes('quality gate rejected');
+  const resolvedFailureClass = isQualityGateFailure ? 'quality_gate' : classifyAIError(error);
   
   await insertAgentRun(env, {
     projectId,
@@ -3850,6 +4017,7 @@ async function failBatch(
 
   const { changes } = await updateGenerationRunStatus(env, runId, 'failed', {
     errorMessage: message,
+    failureClass: resolvedFailureClass,
   });
   if (changes === 0) {
     throw staleGenerationRunError(projectId, runId, `failing ${runType}`);
@@ -3862,7 +4030,7 @@ async function failBatch(
     body: {
       batch: runType,
       error: message,
-      failureClass: classifyAIError(error),
+      failureClass: resolvedFailureClass,
       message: `Failed during ${runType}.`,
       status: 'failed',
     },
@@ -5162,6 +5330,16 @@ Produce a structured Architecture Decision Record (ADR):
 
 - security_surface: Critical concerns and mitigation strategies.
 - gotchas: Explicit technology-specific warnings (technology, issue, mitigation) derived from the "recent_breaking_changes" and "bug_report_digest" in the research corpus.
+- prd:
+  - problem_statement: 2-4 sentences describing the exact user and business problem in domain-specific language.
+  - user_personas: Array of persona objects with { name, context, goals[], pains[] }.
+  - core_user_journeys: Array with { name, steps[], outcome } mapping critical end-to-end flows.
+  - functional_requirements: Array of concrete, testable product requirements for V1.
+  - non_functional_requirements: Array covering performance, security, reliability, observability, and compliance expectations.
+  - scope_boundaries: { in_scope: string[], out_of_scope: string[] } with explicit boundaries.
+  - acceptance_criteria: Array of concrete launch gates the team can verify.
+  - launch_milestones: Array with { milestone, objective, exit_criteria[] } that sequences delivery.
+  - open_questions: Array of unresolved decisions that require user confirmation.
 
 Base every single recommendation on the provided research corpus. If a technology was not researched in Batch 2, do not recommend it unless it is a standard browser feature.`;
 
@@ -5367,6 +5545,12 @@ Rules:
 - This is the only authored artifact. Do not include prd_markdown.
 - stages/edges must represent only MVP scope.
 - suggested_tools must reference specific packages/versions from the ADR.
+- The authored plan must explicitly reflect PRD depth from Batch 3:
+  - Include personas and user journeys in stage/step objectives where relevant.
+  - Translate functional and non-functional requirements into concrete implementation and validation steps.
+  - Reflect explicit scope boundaries (in-scope and out-of-scope) inside objectives and done_when criteria.
+  - Preserve acceptance criteria as measurable done_when checkpoints.
+  - Include launch milestones as explicit milestone steps.
 - Include mandatory milestones as gate steps:
   1. "MVP complete" — sits at the end of the build stage. Prompt: "Your core product is built. Before we move to testing and launch — does everything work the way you expected?"
   2. "Ready to launch" — sits at the end of the deploy stage. Prompt: "Everything is live. Take a moment to check it yourself before we call this done."

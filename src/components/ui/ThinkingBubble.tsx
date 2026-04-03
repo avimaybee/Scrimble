@@ -9,6 +9,9 @@ interface ThinkingBubbleProps {
 }
 
 export function ThinkingBubble({ content, isStreaming, className }: ThinkingBubbleProps) {
+  const normalizedContent = content?.trim() || '';
+  const hasContent = normalizedContent.length > 0;
+
   return (
     <div className={cn("flex flex-col gap-2 max-w-[85%]", className)}>
       <div className="flex items-center gap-2 text-xs font-mono text-color-text-tertiary uppercase tracking-wider">
@@ -38,14 +41,18 @@ export function ThinkingBubble({ content, isStreaming, className }: ThinkingBubb
         <div className="absolute -left-2 top-4 w-1 h-3/4 bg-accent-primary opacity-20 group-hover:opacity-40 transition-opacity rounded-full" />
         
         <div className="bg-bg-surface border border-border-default rounded-panel p-4 shadow-panel backdrop-blur-sm">
-          {content ? (
+          {hasContent ? (
             <div className="text-sm leading-relaxed text-text-secondary whitespace-pre-wrap italic">
-              {content}
+              {normalizedContent}
             </div>
-          ) : (
+          ) : isStreaming ? (
             <div className="flex items-center gap-3 text-sm text-text-tertiary italic">
               <Brain className="w-4 h-4 animate-pulse" />
               <span>Analyzing context and preparing next steps...</span>
+            </div>
+          ) : (
+            <div className="text-sm text-text-tertiary italic">
+              No model reasoning was emitted for this turn.
             </div>
           )}
         </div>

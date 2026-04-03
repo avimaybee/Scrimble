@@ -75,6 +75,7 @@ export type GenerationRun = {
   // Runtime tracking
   provider_id: string | null;
   heartbeat_at: string | null;
+  failure_class?: string | null;
   
   // Error handling
   error_message: string | null;
