@@ -69,6 +69,10 @@ import {
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 import {
+  ensureGenerationRunSkipColumns,
+  isMissingGenerationRunSkipColumnsError,
+} from './generation-skip-schema';
+import {
   runProjectIntakeTurn,
 } from './project-intake';
 import { applyPlanDiffToProject } from './plan-diff';
@@ -1571,15 +1575,40 @@ const handleSkipCurrentResearchTarget = async (c: AppContext) => {
     : null;
 
   try {
-    await c.env.DB.prepare(`
-      UPDATE generation_runs
-      SET skip_target_requested = 1,
-          skip_target_name = ?,
-          updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(targetName, runId)
-      .run();
+    try {
+      await c.env.DB.prepare(`
+        UPDATE generation_runs
+        SET skip_target_requested = 1,
+            skip_target_name = ?,
+            updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(targetName, runId)
+        .run();
+    } catch (error) {
+      if (!isMissingGenerationRunSkipColumnsError(error)) {
+        throw error;
+      }
+
+      const healed = await ensureGenerationRunSkipColumns(c.env, {
+        projectId,
+        runId,
+        route: '/projects/:id/research/skip-current',
+      });
+      if (!healed) {
+        throw error;
+      }
+
+      await c.env.DB.prepare(`
+        UPDATE generation_runs
+        SET skip_target_requested = 1,
+            skip_target_name = ?,
+            updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(targetName, runId)
+        .run();
+    }
     
     return c.json({
       success: true,

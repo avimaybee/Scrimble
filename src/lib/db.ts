@@ -586,6 +586,13 @@ export const dbService = {
     return response;
   },
 
+  async skipProjectGenerationBatch(id: string): Promise<{ success: boolean }> {
+    const response = await fetchAPI<{ success: boolean }>(`/projects/${id}/research/skip-current`, {
+      method: 'POST',
+    });
+    return response;
+  },
+
   async getProjectsByUserId(): Promise<Project[]> {
     const projects = await fetchAPI<Project[]>('/projects');
     return projects.map(normalizeProject);

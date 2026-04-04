@@ -461,6 +461,73 @@ function assertTelemetryEventsRoundTripInEnvelope(): AssertionResult {
   );
 }
 
+function assertSkipColumnsAutoHealGuardExists(): AssertionResult {
+  const schemaPath = path.join(SERVER_DIR, 'generation-skip-schema.ts');
+  const appPath = path.join(SERVER_DIR, 'app.ts');
+  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
+  const schemaExists = fileExists(schemaPath);
+  if (!schemaExists) {
+    return assert(false, 'generation-skip-schema.ts exists for runtime auto-heal');
+  }
+
+  const schemaContent = readFile(schemaPath);
+  const appContent = readFile(appPath);
+  const pipelineContent = readFile(pipelinePath);
+
+  const hasEnsureFn = schemaContent.includes('export async function ensureGenerationRunSkipColumns');
+  const hasMissingColumnDetection = schemaContent.includes('no such column: skip_target_requested');
+  const appUsesGuard = appContent.includes('ensureGenerationRunSkipColumns')
+    && appContent.includes('isMissingGenerationRunSkipColumnsError');
+  const pipelineUsesGuard = pipelineContent.includes('ensureGenerationRunSkipColumns')
+    && pipelineContent.includes('isMissingGenerationRunSkipColumnsError');
+
+  return assert(
+    hasEnsureFn && hasMissingColumnDetection && appUsesGuard && pipelineUsesGuard,
+    'Runtime auto-heal guard exists for missing generation_runs skip columns',
+  );
+}
+
+function assertResearchFacadeTracksSubrequestsWithoutDoubleCounting(): AssertionResult {
+  const facadePath = path.join(SERVER_DIR, 'research-facade.ts');
+  const content = readFile(facadePath);
+
+  const fetchDocumentUsesTracker = content.includes('fetchAndParse(url, {')
+    && content.includes('subrequestTracker: context.subrequestTracker');
+  const githubUsesTracker = content.includes('fetchAndParse(`https://github.com/${owner}/${repo}`, {')
+    && content.includes('githubToken: githubToken || undefined,')
+    && content.includes('subrequestTracker: context.subrequestTracker,');
+  const noManualDocumentRecord = !content.includes("await emitResearchEvent(context, '📄', `Reading ${url}...`);\n  recordSubrequest(context.subrequestTracker);");
+  const noManualGithubRecord = !content.includes("await emitResearchEvent(context, '📦', `Analyzing ${owner}/${repo}...`);\n  recordSubrequest(context.subrequestTracker);");
+  const searchHasSecondGuard = content.includes('// Fallback to Jina Search')
+    && content.includes('if (!canMakeSubrequest(context.subrequestTracker)) {');
+
+  return assert(
+    fetchDocumentUsesTracker
+      && githubUsesTracker
+      && noManualDocumentRecord
+      && noManualGithubRecord
+      && searchHasSecondGuard,
+    'Research facade relies on fetch-layer subrequest tracking without double counting and guards fallback search budget',
+  );
+}
+
+function assertBatch2RetryUsesCanonicalRuntimeLimitMessage(): AssertionResult {
+  const pipelinePath = path.join(SERVER_DIR, 'generation-pipeline.ts');
+  const aiPath = path.join(SERVER_DIR, 'ai.ts');
+  const pipelineContent = readFile(pipelinePath);
+  const aiContent = readFile(aiPath);
+
+  const pipelineImportsMessage = pipelineContent.includes('RUNTIME_BUDGET_MESSAGE');
+  const batch2UsesMessage = pipelineContent.includes("const errorMessage = errorClass === 'orchestration'")
+    && pipelineContent.includes('? RUNTIME_BUDGET_MESSAGE');
+  const aiExportsMessage = aiContent.includes('export { RUNTIME_BUDGET_MESSAGE };');
+
+  return assert(
+    pipelineImportsMessage && batch2UsesMessage && aiExportsMessage,
+    'Batch 2 orchestration retries surface canonical Cloudflare runtime-limit resume guidance',
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Run All Assertions
 // ─────────────────────────────────────────────────────────────────
@@ -506,6 +573,9 @@ const assertions: Array<() => AssertionResult> = [
   assertVerificationPayloadHydratesOnRefresh,
   assertSkipFlagOwnedByGenerationRuns,
   assertTelemetryEventsRoundTripInEnvelope,
+  assertSkipColumnsAutoHealGuardExists,
+  assertResearchFacadeTracksSubrequestsWithoutDoubleCounting,
+  assertBatch2RetryUsesCanonicalRuntimeLimitMessage,
 ];
 
 let passed = 0;

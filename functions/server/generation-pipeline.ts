@@ -39,12 +39,17 @@ import {
   resetGenerationThinkingState,
 } from './generation-events';
 import {
+  ensureGenerationRunSkipColumns,
+  isMissingGenerationRunSkipColumnsError,
+} from './generation-skip-schema';
+import {
   callAIText,
   classifyAIError,
   containsReasoningMarkers,
   containsStreamTransportMarkers,
   extractJSON,
   getProvider,
+  RUNTIME_BUDGET_MESSAGE,
   RetryableAIError,
   type GenerationFailureClass,
 } from './ai';
@@ -4673,14 +4678,38 @@ export async function executeBatch2(
   }
 
   const readSkipRequestState = async () => {
-    const row = await env.DB.prepare(`
-      SELECT skip_target_requested, skip_target_name
-      FROM generation_runs
-      WHERE id = ?
-      LIMIT 1
-    `)
-      .bind(runId)
-      .first() as Record<string, unknown> | null;
+    let row: Record<string, unknown> | null = null;
+    try {
+      row = await env.DB.prepare(`
+        SELECT skip_target_requested, skip_target_name
+        FROM generation_runs
+        WHERE id = ?
+        LIMIT 1
+      `)
+        .bind(runId)
+        .first() as Record<string, unknown> | null;
+    } catch (error) {
+      if (!isMissingGenerationRunSkipColumnsError(error)) {
+        throw error;
+      }
+
+      const healed = await ensureGenerationRunSkipColumns(env, { projectId, runId, stage: 'read' });
+      if (!healed) {
+        return {
+          skipRequested: false,
+          skipTargetName: null,
+        };
+      }
+
+      row = await env.DB.prepare(`
+        SELECT skip_target_requested, skip_target_name
+        FROM generation_runs
+        WHERE id = ?
+        LIMIT 1
+      `)
+        .bind(runId)
+        .first() as Record<string, unknown> | null;
+    }
 
     return {
       skipRequested: toBoolean(row?.skip_target_requested),
@@ -4689,15 +4718,36 @@ export async function executeBatch2(
   };
 
   const clearSkipRequestState = async () => {
-    await env.DB.prepare(`
-      UPDATE generation_runs
-      SET skip_target_requested = 0,
-          skip_target_name = NULL,
-          updated_at = datetime("now")
-      WHERE id = ?
-    `)
-      .bind(runId)
-      .run();
+    try {
+      await env.DB.prepare(`
+        UPDATE generation_runs
+        SET skip_target_requested = 0,
+            skip_target_name = NULL,
+            updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(runId)
+        .run();
+    } catch (error) {
+      if (!isMissingGenerationRunSkipColumnsError(error)) {
+        throw error;
+      }
+
+      const healed = await ensureGenerationRunSkipColumns(env, { projectId, runId, stage: 'clear' });
+      if (!healed) {
+        return;
+      }
+
+      await env.DB.prepare(`
+        UPDATE generation_runs
+        SET skip_target_requested = 0,
+            skip_target_name = NULL,
+            updated_at = datetime("now")
+        WHERE id = ?
+      `)
+        .bind(runId)
+        .run();
+    }
   };
 
   for (let index = startIndex; index < researchTargets.length; index += 1) {
@@ -5425,7 +5475,10 @@ Preserve specific version and compatibility details.`;
   } catch (error) {
     const errorClass = classifyAIError(error);
     if (errorClass === 'transport_provider_transient' || errorClass === 'orchestration') {
-      const errorMessage = error instanceof Error ? error.message : 'Batch 2 failed.';
+      const rawMessage = error instanceof Error ? error.message : 'Batch 2 failed.';
+      const errorMessage = errorClass === 'orchestration'
+        ? RUNTIME_BUDGET_MESSAGE
+        : rawMessage;
       throw new RetryableGenerationPipelineError(errorMessage, 45);
     }
 

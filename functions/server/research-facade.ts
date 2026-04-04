@@ -328,6 +328,15 @@ export async function searchWeb(
   const braveToken = await getMCPToken(context, 'brave-search');
   if (braveToken) {
     try {
+      if (!canMakeSubrequest(context.subrequestTracker)) {
+        return {
+          results: [],
+          metadata: createMetadata('failed', 'failed', {
+            degradationReason: 'Subrequest limit reached',
+          }),
+          query,
+        };
+      }
       recordSubrequest(context.subrequestTracker);
       const endpoint = new URL('https://api.search.brave.com/res/v1/web/search');
       endpoint.searchParams.set('q', query);
@@ -370,6 +379,15 @@ export async function searchWeb(
 
   // Fallback to Jina Search
   try {
+    if (!canMakeSubrequest(context.subrequestTracker)) {
+      return {
+        results: [],
+        metadata: createMetadata('failed', 'failed', {
+          degradationReason: 'Subrequest limit reached',
+        }),
+        query,
+      };
+    }
     recordSubrequest(context.subrequestTracker);
     const jinaUrl = `https://s.jina.ai/${encodeURIComponent(query)}`;
     const response = await fetchWithTimeout(jinaUrl, {
@@ -457,10 +475,11 @@ export async function fetchDocument(
   }
 
   await emitResearchEvent(context, '📄', `Reading ${url}...`);
-  recordSubrequest(context.subrequestTracker);
 
   try {
-    const result = await fetchAndParse(url);
+    const result = await fetchAndParse(url, {
+      subrequestTracker: context.subrequestTracker,
+    });
 
     if (result.kind === 'document') {
       return {
@@ -561,13 +580,13 @@ export async function analyzeGitHubRepo(
   }
 
   await emitResearchEvent(context, '📦', `Analyzing ${owner}/${repo}...`);
-  recordSubrequest(context.subrequestTracker);
 
   const githubToken = await getMCPToken(context, 'github');
 
   try {
     const result = await fetchAndParse(`https://github.com/${owner}/${repo}`, {
       githubToken: githubToken || undefined,
+      subrequestTracker: context.subrequestTracker,
     });
 
     if (result.kind !== 'github_repo') {

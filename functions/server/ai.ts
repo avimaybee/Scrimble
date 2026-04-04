@@ -816,6 +816,7 @@ const PROVIDER_UPSTREAM_MESSAGE = 'Your AI provider had a temporary upstream err
 const RUNTIME_BUDGET_MESSAGE =
   'Scrimble hit a Cloudflare runtime limit while researching your project. Resume generation to continue from the latest checkpoint.';
 export const PIPELINE_QUOTA_EXCEEDED = 'PIPELINE_QUOTA_EXCEEDED';
+export { RUNTIME_BUDGET_MESSAGE };
 
 export class RetryableAIError extends Error {
   constructor(

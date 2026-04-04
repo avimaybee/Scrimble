@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import {
   BookOpenText,
+  Brain,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -29,6 +30,7 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip';
 import FullscreenStatus from '../components/ui/FullscreenStatus';
+import { LiveResearchDashboard } from '../components/generation/LiveResearchDashboard';
 import {
   Dialog,
   DialogContent,
@@ -1336,6 +1338,20 @@ export default function ProjectGeneration() {
 
   const [isNudging, setIsNudging] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [isSkipping, setIsSkipping] = useState(false);
+
+  const handleSkipResearch = useCallback(async () => {
+    if (!id || isSkipping) return;
+    setIsSkipping(true);
+    try {
+      await dbService.skipProjectGenerationBatch(id);
+      toast.success('Skip signal sent to engine.');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Skip failed.');
+    } finally {
+      setIsSkipping(false);
+    }
+  }, [id, isSkipping]);
 
   const isRunningLifecycle = session.isRunningLifecycle;
   const handleCheckIn = useCallback(async () => {
@@ -2070,509 +2086,92 @@ export default function ProjectGeneration() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.28, ease: EASE_OUT_EXPO }}
-              className={cn(
-                "flex w-full flex-col items-center",
-                currentBatch.id === 'batch_2_fetch_and_read'
-                  ? "max-w-[1200px] lg:grid lg:grid-cols-[1fr_380px] lg:items-start lg:gap-8 lg:text-left"
-                  : "max-w-[640px] text-center"
-              )}
+              className="w-full flex flex-col items-center"
             >
-              {currentBatch.id === 'batch_2_fetch_and_read' ? (
-                <div className="flex w-full flex-col gap-6">
-                  {/* Left Column: Live Research Dashboard */}
-                  <div>
-                    <div className="mb-10 border-l-[3px] border-accent-primary/20 pl-8">
-                      <motion.h1
-                        key={currentBatch.id}
-                        initial={{ opacity: 0, x: -12 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        transition={{ duration: 0.45, ease: EASE_OUT_EXPO }}
-                        className="text-[clamp(36px,7vw,46px)] font-serif leading-[0.95] tracking-[-0.04em] text-text-primary"
-                      >
-                        {currentBatch.heading}
-                      </motion.h1>
-                    </div>
-
-                    <div className="w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-7 shadow-premium backdrop-blur-md">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
-                        Target Queue
-                      </div>
-                      <div className="mt-4 flex flex-col gap-3">
-                        {Object.entries(researchTargetStatus).length === 0 ? (
-                          <div className="text-[13px] text-text-muted">Loading research targets...</div>
-                        ) : (
-                          Object.entries(researchTargetStatus).map(([targetName, target]) => {
-                            const isPending = target.status === 'pending';
-                            const isActive = target.status === 'active';
-                            const isCompleted = target.status === 'completed';
-                            const isSkipped = target.status === 'skipped';
-
-                            return (
-                              <motion.div
-                                key={targetName}
-                                layout
-                                initial={{ opacity: 0, y: 10 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                className={cn(
-                                  "relative flex flex-col overflow-hidden rounded-[16px] border px-5 transition-all duration-300",
-                                  isActive
-                                    ? "shimmer-sweep border-accent-primary/40 bg-accent-primary/[0.03] py-5 shadow-premium"
-                                    : isCompleted
-                                      ? "border-border-subtle/60 bg-bg-base/30 py-4 opacity-80"
-                                      : isSkipped
-                                        ? "border-border-subtle/40 bg-bg-base/20 py-4 opacity-50"
-                                        : "border-border-default/30 bg-bg-base/20 py-4 opacity-60"
-                                )}
-                              >
-                                <div className="flex items-center justify-between">
-                                  <div className="flex items-center gap-3">
-                                    {isActive ? (
-                                      <LoaderCircle className="h-4 w-4 animate-spin text-accent-primary" />
-                                    ) : isCompleted ? (
-                                      <CheckCircle2 className="h-4 w-4 text-status-secure" />
-                                    ) : isSkipped ? (
-                                      <XCircle className="h-4 w-4 text-text-muted" />
-                                    ) : (
-                                      <div className="h-4 w-4 rounded-full border-2 border-border-default" />
-                                    )}
-                                    <span className={cn(
-                                      "font-sans text-[14px] font-medium",
-                                      isActive ? "text-text-primary" : "text-text-secondary"
-                                    )}>
-                                      {targetName}
-                                    </span>
-                                  </div>
-                                  
-                                  {isActive && (
-                                      <button
-                                        type="button"
-                                        onClick={() => void dbService.skipCurrentResearchTarget(id, { targetName })}
-                                        className="rounded-full border border-border-default/40 bg-bg-base/40 px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-text-muted transition-all hover:border-text-muted hover:text-text-secondary"
-                                      >
-                                        Skip
-                                      </button>
-                                  )}
-                                  {(isCompleted || isSkipped) && target.sourcesFound !== undefined && (
-                                    <span className="font-mono text-[11px] text-text-tertiary">
-                                      {isSkipped ? 'Skipped' : `${target.sourcesFound} sources`}
-                                    </span>
-                                  )}
-                                </div>
-
-                                {isActive && (
-                                  <motion.div
-                                    initial={{ height: 0, opacity: 0 }}
-                                    animate={{ height: 'auto', opacity: 1 }}
-                                    className="mt-4 border-t border-border-subtle/50 pt-4"
-                                  >
-                                    <div className="grid grid-cols-3 gap-4">
-                                      <div className="flex flex-col gap-1">
-                                        <span className="font-mono text-[10px] uppercase text-text-muted">Sources</span>
-                                        <span className="font-sans text-[18px] font-medium text-text-primary">
-                                          {target.sourcesFound || 0}
-                                        </span>
-                                      </div>
-                                      <div className="flex flex-col gap-1">
-                                        <span className="font-mono text-[10px] uppercase text-text-muted">Chunks</span>
-                                        <span className="font-sans text-[18px] font-medium text-text-primary">
-                                          {researchTelemetry?.chunkCount || 0}
-                                        </span>
-                                      </div>
-                                      <div className="flex flex-col gap-1">
-                                        <span className="font-mono text-[10px] uppercase text-text-muted">Evidence</span>
-                                        <span className="font-sans text-[18px] font-medium text-text-primary">
-                                          {researchTelemetry?.evidencePackCount || 0}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  </motion.div>
-                                )}
-                              </motion.div>
-                            );
-                          })
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <AnimatePresence mode="wait">
-                  <motion.h1
-                    key={currentBatch.id}
-                    initial={{ y: 8, opacity: 0 }}
-                    animate={{ y: 0, opacity: 1 }}
-                    exit={{ y: -8, opacity: 0 }}
-                    transition={{ duration: 0.32, ease: EASE_OUT_EXPO }}
-                    className="mb-8 text-[clamp(34px,6vw,52px)] font-serif leading-[1.02] tracking-[-0.03em] text-text-primary"
-                  >
-                    {currentBatch.heading}
-                  </motion.h1>
-                </AnimatePresence>
-              )}
-
               <div className={cn(
-                "flex flex-col",
-                currentBatch.id === 'batch_2_fetch_and_read' ? "w-full gap-6" : "w-full items-center text-center"
+                "w-full flex flex-col gap-8",
+                currentBatch.id === 'batch_2_fetch_and_read' ? "max-w-[1240px]" : "max-w-[840px]"
               )}>
-                {currentBatch.id !== 'batch_2_fetch_and_read' && (
-                  <div className="mb-5 flex items-center justify-center gap-2 font-mono text-[11px] leading-5 text-text-muted">
-                    <button
-                      type="button"
-                      onClick={() => handleOpenModelModal('fast')}
-                      className={cn(
-                        "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
-                        currentBatch.id.includes('research') || currentBatch.id.includes('fetch') 
-                          ? "border-accent-primary/30 bg-accent-primary/5 text-accent-soft ring-1 ring-accent-primary/10" 
-                          : ""
-                      )}
-                    >
-                      <span className="opacity-60">Fast:</span>
-                      <span className="font-medium text-text-secondary group-hover:text-accent-soft">{modelRoleDisplay.fast}</span>
-                    </button>
-                    <span className="opacity-30">·</span>
-                    <button
-                      type="button"
-                      onClick={() => handleOpenModelModal('deep')}
-                      className={cn(
-                        "group flex items-center gap-1.5 rounded-full border border-border-default/50 bg-bg-surface/40 px-3 py-0.5 transition-all hover:border-accent-primary/40 hover:bg-bg-surface/60",
-                        !currentBatch.id.includes('research') && !currentBatch.id.includes('fetch')
-                          ? "border-status-secure/30 bg-status-secure/5 text-status-secure-dim ring-1 ring-status-secure/10"
-                          : ""
-                      )}
-                    >
-                      <span className="opacity-60">Deep:</span>
-                      <span className="font-medium text-text-secondary group-hover:text-status-secure-dim">{modelRoleDisplay.deep}</span>
-                    </button>
+                {currentBatch.id === 'batch_2_fetch_and_read' ? (
+                  <div className="w-[100vw] relative left-1/2 right-1/2 -ml-[50vw] -mr-[50vw]">
+                     <LiveResearchDashboard
+                        status={status}
+                        events={streamEvents}
+                        onSkip={handleSkipResearch}
+                        isSkipping={isSkipping}
+                        activityFeed={activityFeed}
+                     />
                   </div>
-                )}
+                ) : (
+                  <div className="flex flex-col items-center py-16">
+                     <AnimatePresence mode="wait">
+                        <motion.h1
+                          key={currentBatch.id}
+                          initial={{ y: 20, opacity: 0 }}
+                          animate={{ y: 0, opacity: 1 }}
+                          className="mb-12 text-[clamp(40px,8vw,64px)] font-serif italic text-text-primary"
+                        >
+                          {currentBatch.heading}
+                        </motion.h1>
+                     </AnimatePresence>
 
-                {currentBatch.id === 'batch_2_fetch_and_read' && (
-                  <div className="w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-6 shadow-premium backdrop-blur-md">
-                    <div className="mb-4 flex items-center justify-between">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
-                        Token Budget
-                      </div>
-                      <div className="font-mono text-[11px] font-medium text-text-secondary tabular-nums">
-                        {researchTelemetry?.tokensConsumed || 0} <span className="text-text-muted">/ 8000</span>
-                      </div>
-                    </div>
-                    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-bg-base/60">
-                      <div 
-                        className={cn(
-                          "relative h-full transition-all duration-700 ease-out-expo shadow-[0_0_8px_rgba(235,94,40,0.3)]",
-                          (researchTelemetry?.tokensConsumed || 0) > 7000 ? "bg-status-warning" : "bg-accent-primary"
+                     <div className="w-full max-w-[720px] rounded-[40px] border-glass bg-bg-surface/50 p-16 shadow-premium backdrop-blur-xl border border-white/5">
+                        {isCancelled ? (
+                           <div className="text-left">
+                              <h2 className="font-serif text-[38px] text-text-primary italic">Suspended</h2>
+                              <button onClick={handleResume} className="btn-primary mt-8 px-12 py-5">Resume Engine</button>
+                           </div>
+                        ) : isFailed ? (
+                           <div className="text-left">
+                              <h2 className="font-serif text-[38px] text-text-primary italic">Execution Fault</h2>
+                              <button onClick={handleResume} className="btn-primary mt-8 px-12 py-5">Restore Context</button>
+                           </div>
+                        ) : (
+                           <div className="flex flex-col items-center gap-8">
+                              <div className="h-3 w-3 rounded-full bg-accent-primary glow-heartbeat" />
+                              <span className="font-sans font-black text-[30px] text-text-primary tracking-tighter">
+                                 {liveActivity ? formatFeedMessage(liveActivity) : getPlaceholderMessage(status, currentBatch.id)}
+                              </span>
+                           </div>
                         )}
-                        style={{ width: `${Math.min(100, ((researchTelemetry?.tokensConsumed || 0) / 8000) * 100)}%` }}
-                      >
-                        <div className="tip-glow" />
-                      </div>
-                    </div>
+                     </div>
                   </div>
                 )}
 
-                <div className={cn(
-                  "w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-6 shadow-premium backdrop-blur-md",
-                  currentBatch.id === 'batch_2_fetch_and_read' ? "text-left" : "mb-6 text-left"
-                )}>
-                <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="flex-1">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
-                      Phase Progress
-                    </div>
-                    <div className="mt-3 font-serif text-[26px] leading-tight tracking-[-0.03em] text-text-primary">
-                      {stageCounterLabel}
-                    </div>
-                    <div className="mt-3 flex flex-col gap-1">
-                      <div className="font-sans text-[13px] font-medium leading-relaxed text-text-secondary">
-                        {runnerStatusHeadline}
+                {/* Progress Bar */}
+                <div className="w-full rounded-[40px] border-glass bg-bg-surface/40 p-12 shadow-premium backdrop-blur-xl border border-white/5">
+                   <div className="flex flex-col gap-10 lg:flex-row lg:items-end lg:justify-between px-4">
+                      <div className="flex-1 text-left">
+                         <div className="section-label mb-4 uppercase tracking-[0.3em] !text-accent-primary text-[11px]">System.Status</div>
+                         <h2 className="font-serif text-[40px] text-text-primary italic font-black">{stageCounterLabel}</h2>
                       </div>
-                      <div className="font-sans text-[12px] leading-relaxed text-text-tertiary/80">
-                        {runnerStatusDetail}
+                      <div className="font-sans text-[44px] font-black tracking-tighter text-text-primary leading-none">
+                         {(resolvedCurrentBatchIndex + 1).toString().padStart(2, '0')} <span className="text-text-muted/15 font-bold text-[28px]">/ {GENERATION_BATCHES.length.toString().padStart(2, '0')}</span>
                       </div>
-                    </div>
-                  </div>
-                  <div className="shrink-0 flex flex-col items-end gap-1">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">Stage</div>
-                    <div className="font-sans text-[14px] font-semibold tracking-tight text-text-primary">
-                      {isComplete ? 'Complete' : `${Math.min(resolvedCurrentBatchIndex + 1, GENERATION_BATCHES.length)} of ${GENERATION_BATCHES.length}`}
-                    </div>
-                  </div>
-                </div>
+                   </div>
 
-                <div className="mt-4 grid grid-cols-6 gap-2">
-                  {GENERATION_BATCHES.map((batch, index) => {
-                    const isStageComplete = index < completedBatchCount || isComplete;
-                    const isCurrent = !isStageComplete && index === resolvedCurrentBatchIndex && !isFailed && isRunningLifecycle;
-
-                    return (
-                      <div key={`progress-${batch.id}`} className="space-y-2">
-                        <div className="relative h-2 overflow-hidden rounded-full bg-bg-base">
-                          {isStageComplete ? (
-                            <div className="h-full w-full rounded-full bg-status-secure" />
-                          ) : isCurrent ? (
-                            <motion.div
-                              className="absolute inset-y-0 left-[-30%] w-1/2 rounded-full bg-[linear-gradient(90deg,rgba(235,94,40,0),rgba(235,94,40,0.95),rgba(235,94,40,0))]"
-                              animate={{ x: ['0%', '190%'] }}
-                              transition={{ duration: 1.6, ease: 'easeInOut', repeat: Infinity }}
-                            >
-                              <div className="tip-glow h-[200%] w-20 opacity-40" />
-                            </motion.div>
-                          ) : null}
-                        </div>
-                        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-tertiary">
-                          {batch.shortLabel}
-                        </div>
+                   <div className="mt-14 flex w-full flex-col gap-8">
+                      <div className="flex w-full gap-2.5 px-2">
+                         {GENERATION_BATCHES.map((batch, index) => {
+                            const isStageComplete = index < completedBatchCount || isComplete;
+                            const isCurrent = !isStageComplete && index === resolvedCurrentBatchIndex && !isFailed && isRunningLifecycle;
+                            return (
+                               <div key={`pipeline-seg-${batch.id}`} className="relative h-[8px] flex-1 overflow-hidden rounded-full bg-bg-base/70 lg:h-[10px]">
+                                  {(isStageComplete || isCurrent) && (
+                                     <motion.div 
+                                        className={cn("h-full", isStageComplete ? "bg-status-secure" : "bg-accent-primary")}
+                                        initial={{ width: "0%" }}
+                                        animate={{ width: "100%" }}
+                                        transition={{ duration: 1.8, ease: EASE_OUT_EXPO }}
+                                     />
+                                  )}
+                               </div>
+                            );
+                         })}
                       </div>
-                    );
-                  })}
+                   </div>
                 </div>
               </div>
-
-              {isCancelled ? (
-                <div className="w-full rounded-[16px] border border-border-default/70 bg-bg-surface/60 p-6 text-left shadow-panel backdrop-blur-sm">
-                  <div className="flex items-start gap-3">
-                    <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-text-muted" />
-                    <div>
-                      <div className="font-serif text-[24px] tracking-[-0.03em] text-text-primary">Generation paused</div>
-                      <p className="mt-2 font-sans text-[14px] leading-relaxed text-text-secondary">
-                        Generation stopped by user. All progress has been checkpointed.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="mt-5 flex gap-3">
-                    <button
-                      type="button"
-                      onClick={handleResume}
-                      disabled={isResuming}
-                      className="btn-primary"
-                    >
-                      {isResuming ? 'Resuming…' : 'Resume from checkpoint'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => navigate('/dashboard')}
-                      className="btn-ghost"
-                    >
-                      Back to dashboard
-                    </button>
-                  </div>
-                </div>
-              ) : isFailed && !isAutoRecovering ? (
-                <div className="w-full rounded-[16px] border border-status-warning/30 bg-status-warning/10 p-6 text-left shadow-panel backdrop-blur-sm">
-                  <div className="flex items-start gap-3">
-                    <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
-                    <div>
-                          <div className="font-serif text-[24px] tracking-[-0.03em] text-text-primary">Runner interrupted</div>
-                          <p className="mt-2 font-sans text-[14px] leading-relaxed text-text-secondary">
-                            {error || status.generation_error || 'An unexpected error occurred during generation.'}
-                          </p>
-                          <p className="mt-2 font-sans text-[13px] leading-relaxed text-text-tertiary/70">
-                            Checkpoints are preserved. Resuming will restart from the last successful stage.
-                          </p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleResume}
-                    className="btn-primary mt-5"
-                  >
-                    Try again
-                  </button>
-                </div>
-              ) : isAutoRecovering ? (
-                <div className="w-full rounded-[16px] border border-[rgba(244,187,102,0.24)] bg-[rgba(244,187,102,0.08)] p-6 text-left shadow-panel backdrop-blur-sm">
-                  <div className="flex items-start gap-3">
-                    <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-status-warning" />
-                    <div>
-                      <div className="font-serif text-[24px] tracking-[-0.03em] text-text-primary">Re-syncing runner</div>
-                      <p className="mt-2 font-sans text-[14px] leading-relaxed text-text-secondary">
-                        Runner inactive for {'>'}30s. Requesting checkpoint resume...
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <div className="w-full rounded-[20px] border border-border-default/60 bg-bg-surface/50 p-6 text-left shadow-premium backdrop-blur-md">
-                    <div className="border-b border-border-subtle/40 pb-5">
-                      <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted/60">
-                        Live Transcript
-                      </div>
-                      <AnimatePresence mode="wait" initial={false}>
-                        {liveActivity ? (
-                          <motion.div
-                            key={liveActivity.key}
-                            initial={{ opacity: 0, y: 8 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -8 }}
-                            transition={{ duration: 0.24, ease: EASE_OUT_EXPO }}
-                            className="flex items-start gap-3"
-                          >
-                            <motion.span
-                              aria-hidden="true"
-                              className="glow-heartbeat mt-[10px] h-[3px] w-[3px] shrink-0 rounded-full bg-accent-primary"
-                            />
-                            <span
-                              title={formatFeedMessage(liveActivity, { prefixThinking: false })}
-                              className={cn(
-                                'block min-w-0 flex-1 whitespace-pre-wrap break-words text-[14px] leading-relaxed text-text-primary',
-                                liveActivity.kind === 'thinking'
-                                  ? 'max-h-[168px] overflow-y-auto rounded-[12px] border border-white/5 bg-[#0a0a0a]/60 px-4 py-4 font-mono text-[13px] text-text-primary/95 shadow-inner backdrop-blur-sm'
-                                  : 'font-sans font-medium tracking-[-0.01em]',
-                              )}
-                            >
-                              {formatFeedMessage(liveActivity, { prefixThinking: false })}
-                            </span>
-                          </motion.div>
-                        ) : (
-                          <div className="rounded-[12px] border border-border-subtle bg-bg-base/42 px-3 py-3 text-[13px] text-text-muted">
-                            {getPlaceholderMessage(status, currentBatch.id)}
-                          </div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-[10px] bg-bg-base/50 px-3 py-2">
-                      <span
-                        className={cn(
-                          'inline-flex items-center gap-1.5 rounded-[7px] border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.14em]',
-                          connectionMeta.chipClass,
-                        )}
-                      >
-                        <span
-                          aria-hidden="true"
-                          className={cn(
-                            'h-1.5 w-1.5 rounded-full',
-                            streamConnectionState === 'live' && !isAutoRecovering
-                              ? 'bg-status-secure'
-                              : streamConnectionState === 'reconnecting' || isAutoRecovering
-                                ? 'bg-status-warning'
-                                : 'bg-text-muted',
-                          )}
-                        />
-                        {connectionMeta.label}
-                      </span>
-                      <span className="text-[12px] text-text-muted/80">{connectionMeta.copy}</span>
-                      <span className="h-1 w-1 rounded-full bg-border-default/40" />
-                      <span className="text-[12px] font-medium text-text-secondary">{runnerStatusHeadline}</span>
-                      {latestProgressTimestamp ? (
-                        <>
-                          <span className="hidden h-1 w-1 rounded-full bg-border-default sm:inline-block" />
-                          <span className="text-[12px] text-text-muted">
-                            Last update {formatTimestamp(latestProgressTimestamp)}
-                          </span>
-                        </>
-                      ) : null}
-                      {showManualCheckIn ? (
-                        <button
-                          type="button"
-                          onClick={handleCheckIn}
-                          disabled={isNudging}
-                          className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary disabled:opacity-50"
-                        >
-                          {isNudging ? 'Checking runner...' : 'Check runner'}
-                        </button>
-                      ) : null}
-                      {showReconnectFeed ? (
-                        <button
-                          type="button"
-                          onClick={reconnectLiveFeed}
-                          className="ml-auto shrink-0 rounded-[6px] bg-bg-base/80 px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-base hover:text-text-primary"
-                        >
-                          Reconnect feed
-                        </button>
-                      ) : null}
-                      {canCancelGeneration ? (
-                        <button
-                          type="button"
-                          onClick={() => void handleCancel()}
-                          disabled={isCancelling}
-                          className="shrink-0 rounded-[6px] bg-red-500/10 px-2 py-1 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20 hover:text-red-300 disabled:opacity-50"
-                        >
-                          {isCancelling ? (
-                            <span className="flex items-center gap-1">
-                              <LoaderCircle className="h-3 w-3 animate-spin" />
-                              Stopping…
-                            </span>
-                          ) : (
-                            <span className="flex items-center gap-1">
-                              <XCircle className="h-3 w-3" />
-                              Stop generation
-                            </span>
-                          )}
-                        </button>
-                      ) : null}
-                    </div>
-
-                    <div ref={logContainerRef} className="mt-4 max-h-[280px] overflow-y-auto pr-2">
-                      {activityFeed.length === 0 ? (
-                        <div className="rounded-[12px] border border-border-subtle bg-bg-base/38 px-3 py-3 font-sans text-[13px] text-text-muted">
-                          Recent updates will collect here as the plan builder works.
-                        </div>
-                      ) : (
-                        <AnimatePresence initial={false}>
-                          {activityFeed.map((entry) => (
-                            <motion.div
-                              key={entry.key}
-                              initial={{ opacity: 0, y: -8 }}
-                              animate={{ opacity: 1, y: 0 }}
-                              exit={{ opacity: 0, y: -4 }}
-                              transition={{ duration: 0.2, ease: EASE_OUT_EXPO }}
-                              className="flex items-start gap-4 py-3"
-                            >
-                              <span className={cn('mt-[1px] text-base leading-none', getActivityToneClass(entry.icon))} aria-hidden="true">
-                                {entry.icon}
-                              </span>
-                              <span className="w-[68px] shrink-0 pt-[1px] font-mono text-[11px] text-text-muted">
-                                {formatTimestamp(entry.timestamp)}
-                              </span>
-                              <span
-                                className={cn(
-                                  'min-w-0 flex-1 text-[13px] leading-6',
-                                  entry.kind === 'thinking'
-                                    ? 'font-mono text-text-primary/75 bg-bg-base/32 px-2.5 py-2 rounded-[10px] leading-relaxed border border-white/5'
-                                    : 'font-sans text-text-secondary',
-                                )}
-                              >
-                                {formatFeedMessage(entry)}
-                              </span>
-                            </motion.div>
-                          ))}
-                        </AnimatePresence>
-                      )}
-                    </div>
-                  </div>
-
-                  {error && !showResumeBadge ? (
-                    <div className="mt-4 flex items-center gap-2 rounded-[12px] border border-status-warning/30 bg-status-warning/10 px-3 py-2 text-[12px] text-status-warning">
-                      <TriangleAlert className="h-4 w-4" />
-                      <span>{error}</span>
-                    </div>
-                  ) : null}
-
-                  {showResumeBadge && autoRecoveryFailed ? (
-                    <motion.div
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="mt-6 flex flex-col items-center gap-3 rounded-[16px] border border-border-default/80 bg-bg-surface/60 p-4"
-                    >
-                      <div className="flex items-center gap-2 font-sans text-[13px] text-text-secondary">
-                        <TriangleAlert className="h-4 w-4 text-accent-primary" />
-                        <span>{isFailed ? 'The runner stopped before finishing.' : 'The runner stayed quiet for too long.'}</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={handleResume}
-                        disabled={isResuming}
-                        className="btn-primary px-4 py-2 text-[13px]"
-                      >
-                        {isResuming ? 'Resuming...' : 'Resume build'}
-                      </button>
-                    </motion.div>
-                  ) : null}
-                </>
-              )}
-            </div>
             </motion.div>
           )}
         </AnimatePresence>

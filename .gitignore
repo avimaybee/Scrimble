@@ -42,3 +42,6 @@ wrangler.toml.bak
 debug
 # Scratch
 prompt.txt
+.github
+prompt.txt
+docs/ux
