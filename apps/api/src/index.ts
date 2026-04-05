@@ -156,7 +156,14 @@ v1.get('/projects/:id', async (c) => {
 
 v1.post('/artifacts', async (c) => {
   const body = await c.req.json();
-  const parsed = createArtifactSchema.parse(body);
+  const parsedResult = createArtifactSchema.safeParse(body);
+  if (!parsedResult.success) {
+    return c.json(
+      formatValidationErrorResponse('Invalid artifact payload.', parsedResult.error.issues),
+      400,
+    );
+  }
+  const parsed = parsedResult.data;
   const stored = await storeJsonArtifact(c.env.ARTIFACTS, {
     projectId: parsed.projectId,
     type: parsed.type,

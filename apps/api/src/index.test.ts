@@ -707,6 +707,77 @@ describe('API start route contracts', () => {
     });
   });
 
+  it('returns 400 validation contract for invalid artifact create payload', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request(
+      '/v1/artifacts',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          projectId: '',
+          payload: { revision: 2 },
+        }),
+      },
+      env,
+    );
+    const payload = (await response.json()) as {
+      error: string;
+      message: string;
+      issues: Array<{ path: Array<string | number> }>;
+    };
+
+    expect(response.status).toBe(400);
+    expect(payload).toMatchObject({
+      error: 'Invalid artifact payload.',
+      message: 'Request validation failed.',
+    });
+    expect(payload.issues.some((issue) => issue.path[0] === 'projectId' || issue.path[0] === 'type')).toBe(true);
+    expect(storageMocks.storeJsonArtifact).not.toHaveBeenCalled();
+  });
+
+  it('stores artifact and returns key/bytes payload on valid create request', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request(
+      '/v1/artifacts',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          projectId: 'project-8',
+          type: 'plan-snapshot',
+          payload: { revision: 3 },
+          metadata: { source: 'cli' },
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      key: 'artifact-key',
+      bytes: 1,
+    });
+    expect(storageMocks.storeJsonArtifact).toHaveBeenCalledWith(env.ARTIFACTS, {
+      projectId: 'project-8',
+      type: 'plan-snapshot',
+      payload: { revision: 3 },
+      metadata: { source: 'cli' },
+    });
+  });
+
   it('returns consistent error/message contract when artifacts key is missing', async () => {
     const { env } = createEnv(async () =>
       new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
