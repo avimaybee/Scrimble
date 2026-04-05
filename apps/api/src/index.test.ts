@@ -382,4 +382,98 @@ describe('API start route contracts', () => {
       error: 'Failed to start replan run (status 500).',
     });
   });
+
+  it('returns idle generation status when no initial run exists', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getLatestRunForProject.mockResolvedValueOnce(null);
+
+    const response = await app.request('/v1/generation/project-3', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      instanceId: 'project-3',
+      status: 'idle',
+      message: 'No generation run found.',
+    });
+    expect(persistenceMocks.getLatestRunForProject).toHaveBeenCalledWith(env.DB, {
+      projectId: 'project-3',
+      type: 'initial',
+    });
+  });
+
+  it('returns latest generation run payload from D1', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getLatestRunForProject.mockResolvedValueOnce({
+      runId: 'run-generation',
+      status: 'completed',
+      output: { revisionId: 'rev-2' },
+    });
+
+    const response = await app.request('/v1/generation/project-3', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      instanceId: 'project-3',
+      runId: 'run-generation',
+      status: 'completed',
+      output: { revisionId: 'rev-2' },
+    });
+  });
+
+  it('returns idle replan status when no replan run exists', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'replan' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getLatestRunForProject.mockResolvedValueOnce(null);
+
+    const response = await app.request('/v1/replan/project-4', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      instanceId: 'project-4',
+      status: 'idle',
+      message: 'No replan run found.',
+    });
+    expect(persistenceMocks.getLatestRunForProject).toHaveBeenCalledWith(env.DB, {
+      projectId: 'project-4',
+      type: 'replan',
+    });
+  });
+
+  it('returns latest replan run payload from D1', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'replan' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getLatestRunForProject.mockResolvedValueOnce({
+      runId: 'run-replan',
+      status: 'failed',
+      error: 'provider timeout',
+    });
+
+    const response = await app.request('/v1/replan/project-4', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      instanceId: 'project-4',
+      runId: 'run-replan',
+      status: 'failed',
+      error: 'provider timeout',
+    });
+  });
 });
