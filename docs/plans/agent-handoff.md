@@ -33,6 +33,16 @@
 - `groq`
 - `together`
 
+Cloud planning/replanning (`apps/api/src/lib/planning-ai.ts`) is intentionally narrowed to an **OpenAI-compatible MVP pipe**:
+- `openai`
+- `openrouter`
+- `github-copilot`
+- `groq`
+- `together`
+- `azure` (with explicit `baseUrl`)
+
+`/v1/generation/start` and `/v1/replan/start` now require `aiConfig` with a non-empty `apiKey`; missing/unsupported configs are rejected with `400`.
+
 ## GitHub Copilot Subscription Support
 
 Scrimble can now initialize and use GitHub Copilot as an AI provider with:

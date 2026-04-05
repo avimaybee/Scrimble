@@ -26,13 +26,13 @@ const replanSchema = z.object({
 interface InitialPlanInput {
   goal: string;
   repoSnapshot?: string;
-  aiConfig?: unknown;
+  aiConfig: unknown;
 }
 
 interface ReplanInput {
   updateRequest: string;
   currentPlanSummary?: string;
-  aiConfig?: unknown;
+  aiConfig: unknown;
 }
 
 interface OpenAICompatibleChoice {
@@ -43,26 +43,22 @@ interface OpenAICompatibleResponse {
   choices?: OpenAICompatibleChoice[];
 }
 
-interface AnthropicContentBlock {
-  type?: string;
-  text?: string;
+interface NormalizedOpenAICompatibleConfig {
+  provider: ParsedAIConfig['provider'];
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+  options?: ParsedAIConfig['options'];
 }
 
-interface AnthropicResponse {
-  content?: AnthropicContentBlock[];
-}
-
-interface GeminiPart {
-  text?: string;
-}
-
-interface GeminiCandidate {
-  content?: { parts?: GeminiPart[] };
-}
-
-interface GeminiResponse {
-  candidates?: GeminiCandidate[];
-}
+const OPENAI_COMPATIBLE_PROVIDERS = new Set<ParsedAIConfig['provider']>([
+  'openai',
+  'openrouter',
+  'github-copilot',
+  'groq',
+  'together',
+  'azure',
+]);
 
 function defaultBaseUrl(provider: ParsedAIConfig['provider']): string | undefined {
   switch (provider) {
@@ -76,10 +72,6 @@ function defaultBaseUrl(provider: ParsedAIConfig['provider']): string | undefine
       return 'https://api.groq.com/openai/v1';
     case 'together':
       return 'https://api.together.xyz/v1';
-    case 'anthropic':
-      return 'https://api.anthropic.com/v1';
-    case 'google':
-      return 'https://generativelanguage.googleapis.com/v1beta';
     case 'azure':
       return undefined;
     default:
@@ -91,23 +83,20 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
 }
 
-function extractJsonValue(text: string): unknown {
-  const fenced = text.match(/```json\s*([\s\S]*?)```/i) ?? text.match(/```([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1] : text;
-  if (!candidate) {
+function parseRawJsonObject(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) {
     throw new Error('Model response was empty.');
   }
-
-  const trimmed = candidate.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    throw new Error('Model response must be a raw JSON object with no markdown or prose.');
+  }
   try {
     return JSON.parse(trimmed) as unknown;
-  } catch {
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    if (start < 0 || end <= start) {
-      throw new Error('Model response did not contain parseable JSON.');
-    }
-    return JSON.parse(trimmed.slice(start, end + 1)) as unknown;
+  } catch (error) {
+    throw new Error(
+      `Model response JSON parse failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -135,7 +124,7 @@ function buildInitialPrompt(input: { goal: string; repoSnapshot?: string }): str
     '- CLI-first execution model with one active chunk at a time.',
     '- Generate 3 to 7 concrete chunks with sequence starting at 1.',
     '- Chunks must be implementation-ready and verifiable.',
-    '- Return JSON only, no prose outside JSON.',
+    '- Return only one raw JSON object (no markdown fences, no prose, no commentary).',
     '',
     `Project goal: ${input.goal}`,
     input.repoSnapshot ? `Repository snapshot:\n${input.repoSnapshot}` : 'Repository snapshot: not supplied.',
@@ -165,32 +154,14 @@ function buildReplanPrompt(input: { updateRequest: string; currentPlanSummary?: 
     '- Preserve completed work and revise only remaining direction.',
     '- Keep Cloudflare backend boundary and CLI-first execution.',
     '- Generate 2 to 6 revised chunks with sequence starting at 1.',
-    '- Return JSON only, no prose outside JSON.',
+    '- Return only one raw JSON object (no markdown fences, no prose, no commentary).',
     '',
     `Replan request: ${input.updateRequest}`,
     input.currentPlanSummary ? `Current plan summary:\n${input.currentPlanSummary}` : 'Current plan summary: not supplied.',
   ].join('\n');
 }
 
-function getProviderTextFromResponse(provider: ParsedAIConfig['provider'], response: unknown): string {
-  if (provider === 'anthropic') {
-    const typed = response as AnthropicResponse;
-    const first = typed.content?.find((block) => block.type === 'text' && typeof block.text === 'string');
-    if (!first?.text) {
-      throw new Error('Anthropic response did not include text content.');
-    }
-    return first.text;
-  }
-
-  if (provider === 'google') {
-    const typed = response as GeminiResponse;
-    const first = typed.candidates?.[0]?.content?.parts?.find((part) => typeof part.text === 'string');
-    if (!first?.text) {
-      throw new Error('Google response did not include text content.');
-    }
-    return first.text;
-  }
-
+function getOpenAICompatibleText(response: unknown): string {
   const typed = response as OpenAICompatibleResponse;
   const content = typed.choices?.[0]?.message?.content;
   if (!content) {
@@ -199,66 +170,37 @@ function getProviderTextFromResponse(provider: ParsedAIConfig['provider'], respo
   return content;
 }
 
-async function callProvider(config: ParsedAIConfig, prompt: string): Promise<string> {
+function normalizeOpenAICompatibleConfig(config: ParsedAIConfig): NormalizedOpenAICompatibleConfig {
+  if (!OPENAI_COMPATIBLE_PROVIDERS.has(config.provider)) {
+    throw new Error(
+      `Provider "${config.provider}" is not supported for cloud planning MVP. Use an OpenAI-compatible provider.`,
+    );
+  }
+
   const apiKey = config.apiKey?.trim();
   if (!apiKey) {
     throw new Error(`AI config for provider "${config.provider}" is missing apiKey.`);
   }
-
   const baseUrl = config.baseUrl ?? defaultBaseUrl(config.provider);
   if (!baseUrl) {
     throw new Error(`AI config for provider "${config.provider}" requires baseUrl.`);
   }
-  const safeBase = normalizeBaseUrl(baseUrl);
 
-  if (config.provider === 'anthropic') {
-    const response = await fetch(`${safeBase}/messages`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: config.model,
-        max_tokens: config.options?.maxTokens ?? 4096,
-        temperature: config.options?.temperature ?? 0.2,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(`Anthropic request failed (${response.status}): ${await response.text()}`);
-    }
-    return getProviderTextFromResponse(config.provider, (await response.json()) as unknown);
-  }
+  return {
+    provider: config.provider,
+    model: config.model,
+    apiKey,
+    baseUrl: normalizeBaseUrl(baseUrl),
+    ...(config.options ? { options: config.options } : {}),
+  };
+}
 
-  if (config.provider === 'google') {
-    const modelPath = config.model.startsWith('models/') ? config.model : `models/${config.model}`;
-    const response = await fetch(`${safeBase}/${modelPath}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: config.options?.temperature ?? 0.2,
-          maxOutputTokens: config.options?.maxTokens ?? 4096,
-          topP: config.options?.topP,
-        },
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(`Google request failed (${response.status}): ${await response.text()}`);
-    }
-    return getProviderTextFromResponse(config.provider, (await response.json()) as unknown);
-  }
-
-  const response = await fetch(`${safeBase}/chat/completions`, {
+async function callOpenAICompatible(config: NormalizedOpenAICompatibleConfig, prompt: string): Promise<string> {
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: `Bearer ${apiKey}`,
+      authorization: `Bearer ${config.apiKey}`,
     },
     body: JSON.stringify({
       model: config.model,
@@ -268,7 +210,7 @@ async function callProvider(config: ParsedAIConfig, prompt: string): Promise<str
       messages: [
         {
           role: 'system',
-          content: 'Return strictly valid JSON matching the requested schema.',
+          content: 'Return strictly one raw JSON object matching the requested schema.',
         },
         {
           role: 'user',
@@ -281,65 +223,7 @@ async function callProvider(config: ParsedAIConfig, prompt: string): Promise<str
   if (!response.ok) {
     throw new Error(`OpenAI-compatible request failed (${response.status}): ${await response.text()}`);
   }
-  return getProviderTextFromResponse(config.provider, (await response.json()) as unknown);
-}
-
-function deterministicInitialPlan(input: { goal: string; repoSnapshot?: string }): {
-  architectureSummary: string;
-  chunks: PersistedPlanChunk[];
-} {
-  return {
-    architectureSummary: [
-      `Goal: ${input.goal}`,
-      'CLI-first execution with one active chunk at a time.',
-      'Cloudflare Workers + D1 + R2 backend boundary.',
-      input.repoSnapshot ? `Repo snapshot: ${input.repoSnapshot}` : 'Repo snapshot: not supplied.',
-    ].join('\n'),
-    chunks: [
-      {
-        sequence: 1,
-        title: 'Foundation hardening',
-        prompt: 'Stabilize CLI and API foundations before adding higher-order orchestration complexity.',
-        doneCondition: 'CLI/API runtime validations pass and baseline project health is documented.',
-        verificationHints: ['pnpm run lint', 'pnpm run build', 'pnpm test'],
-      },
-    ],
-  };
-}
-
-function deterministicReplan(input: { updateRequest: string; currentPlanSummary?: string }): {
-  revisedPlanSummary: string;
-  chunks: PersistedPlanChunk[];
-} {
-  return {
-    revisedPlanSummary: [
-      `Replan request: ${input.updateRequest}`,
-      input.currentPlanSummary
-        ? `Current plan summary: ${input.currentPlanSummary}`
-        : 'Current plan summary: not supplied.',
-      'Preserve completed chunks and adjust only future pending chunks.',
-    ].join('\n'),
-    chunks: [
-      {
-        sequence: 1,
-        title: 'Apply replan changes',
-        prompt: `Apply requested plan update: ${input.updateRequest}`,
-        doneCondition: 'Requested update is reflected in implementation and validated.',
-        verificationHints: ['scrimble verify', 'scrimble status'],
-      },
-    ],
-  };
-}
-
-function toPersistedChunks(chunks: z.infer<typeof chunkSchema>[]): PersistedPlanChunk[] {
-  return chunks.map((chunk) => ({
-    sequence: chunk.sequence,
-    title: chunk.title,
-    prompt: chunk.prompt,
-    doneCondition: chunk.doneCondition,
-    ...(chunk.doNotTouch ? { doNotTouch: chunk.doNotTouch } : {}),
-    ...(chunk.verificationHints ? { verificationHints: chunk.verificationHints } : {}),
-  }));
+  return getOpenAICompatibleText((await response.json()) as unknown);
 }
 
 export async function generateInitialPlan(input: InitialPlanInput): Promise<{
@@ -347,19 +231,19 @@ export async function generateInitialPlan(input: InitialPlanInput): Promise<{
   chunks: PersistedPlanChunk[];
 }> {
   if (!input.aiConfig) {
-    return deterministicInitialPlan(input);
+    throw new Error('aiConfig is required for cloud planning.');
   }
-
   const validated = aiConfigSchema.parse(input.aiConfig);
+  const config = normalizeOpenAICompatibleConfig(validated);
   const prompt = buildInitialPrompt({
     goal: input.goal,
     ...(input.repoSnapshot ? { repoSnapshot: input.repoSnapshot } : {}),
   });
-  const responseText = await callProvider(validated, prompt);
-  const parsed = initialPlanSchema.parse(extractJsonValue(responseText));
+  const responseText = await callOpenAICompatible(config, prompt);
+  const parsed = initialPlanSchema.parse(parseRawJsonObject(responseText));
   return {
     architectureSummary: parsed.architectureSummary,
-    chunks: toPersistedChunks(parsed.chunks),
+    chunks: parsed.chunks,
   };
 }
 
@@ -368,18 +252,18 @@ export async function generateReplan(input: ReplanInput): Promise<{
   chunks: PersistedPlanChunk[];
 }> {
   if (!input.aiConfig) {
-    return deterministicReplan(input);
+    throw new Error('aiConfig is required for cloud replanning.');
   }
-
   const validated = aiConfigSchema.parse(input.aiConfig);
+  const config = normalizeOpenAICompatibleConfig(validated);
   const prompt = buildReplanPrompt({
     updateRequest: input.updateRequest,
     ...(input.currentPlanSummary ? { currentPlanSummary: input.currentPlanSummary } : {}),
   });
-  const responseText = await callProvider(validated, prompt);
-  const parsed = replanSchema.parse(extractJsonValue(responseText));
+  const responseText = await callOpenAICompatible(config, prompt);
+  const parsed = replanSchema.parse(parseRawJsonObject(responseText));
   return {
     revisedPlanSummary: parsed.revisedPlanSummary,
-    chunks: toPersistedChunks(parsed.chunks),
+    chunks: parsed.chunks,
   };
 }

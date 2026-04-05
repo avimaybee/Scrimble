@@ -28,8 +28,8 @@ export interface PersistedPlanChunk {
   title: string;
   prompt: string;
   doneCondition: string;
-  doNotTouch?: string;
-  verificationHints?: string[];
+  doNotTouch?: string | undefined;
+  verificationHints?: string[] | undefined;
 }
 
 export interface PersistPlanRevisionInput {

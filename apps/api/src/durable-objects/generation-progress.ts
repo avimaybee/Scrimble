@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { aiConfigSchema } from '@scrimble/shared';
 import {
   appendProjectEvent,
   markGenerationRunCompleted,
@@ -35,7 +36,7 @@ interface GenerationJobInput {
   projectId: string;
   goal: string;
   repoSnapshot?: string;
-  aiConfig?: unknown;
+  aiConfig: unknown;
 }
 
 interface ReplanJobInput {
@@ -43,7 +44,7 @@ interface ReplanJobInput {
   projectId: string;
   updateRequest: string;
   currentPlanSummary?: string;
-  aiConfig?: unknown;
+  aiConfig: unknown;
 }
 
 interface ProgressHubEnv {
@@ -67,6 +68,7 @@ const META_LAST_SEQUENCE = 'meta:last-sequence';
 const RETAIN_EVENT_COUNT = 200;
 const STEP_MAX_ATTEMPTS = 3;
 const STEP_BASE_BACKOFF_MS = 300;
+const CLOUD_PLANNING_PROVIDERS = new Set(['openai', 'openrouter', 'github-copilot', 'groq', 'together', 'azure']);
 
 function sequenceToKey(sequence: number): string {
   return `${EVENT_KEY_PREFIX}${sequence.toString().padStart(12, '0')}`;
@@ -74,6 +76,17 @@ function sequenceToKey(sequence: number): string {
 
 function createSseFrame(eventName: string, payload: unknown): Uint8Array {
   return encoder.encode(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function isValidCloudPlanningAiConfig(value: unknown): boolean {
+  const parsed = aiConfigSchema.safeParse(value);
+  if (!parsed.success) {
+    return false;
+  }
+  if (!parsed.data.apiKey?.trim()) {
+    return false;
+  }
+  return CLOUD_PLANNING_PROVIDERS.has(parsed.data.provider);
 }
 
 /**
@@ -127,8 +140,11 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
 
   private async handleStartGeneration(request: Request): Promise<Response> {
     const input = (await request.json()) as GenerationJobInput;
-    if (!input.runId?.trim() || !input.projectId?.trim() || !input.goal?.trim()) {
-      return Response.json({ error: 'runId, projectId and goal are required' }, { status: 400 });
+    if (!input.runId?.trim() || !input.projectId?.trim() || !input.goal?.trim() || !isValidCloudPlanningAiConfig(input.aiConfig)) {
+      return Response.json(
+        { error: 'runId, projectId, goal, and valid cloud-planning aiConfig are required' },
+        { status: 400 },
+      );
     }
     const activeJobResponse = await this.ensureNoActiveJob('generation');
     if (activeJobResponse) {
@@ -143,7 +159,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         projectId: input.projectId.trim(),
         goal: input.goal.trim(),
         ...(input.repoSnapshot?.trim() ? { repoSnapshot: input.repoSnapshot.trim() } : {}),
-        ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
+        aiConfig: input.aiConfig,
       },
     };
     this.activeJob = jobState;
@@ -157,8 +173,11 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
 
   private async handleStartReplan(request: Request): Promise<Response> {
     const input = (await request.json()) as ReplanJobInput;
-    if (!input.runId?.trim() || !input.projectId?.trim() || !input.updateRequest?.trim()) {
-      return Response.json({ error: 'runId, projectId and updateRequest are required' }, { status: 400 });
+    if (!input.runId?.trim() || !input.projectId?.trim() || !input.updateRequest?.trim() || !isValidCloudPlanningAiConfig(input.aiConfig)) {
+      return Response.json(
+        { error: 'runId, projectId, updateRequest, and valid cloud-planning aiConfig are required' },
+        { status: 400 },
+      );
     }
     const activeJobResponse = await this.ensureNoActiveJob('replan');
     if (activeJobResponse) {
@@ -173,7 +192,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         projectId: input.projectId.trim(),
         updateRequest: input.updateRequest.trim(),
         ...(input.currentPlanSummary?.trim() ? { currentPlanSummary: input.currentPlanSummary.trim() } : {}),
-        ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
+        aiConfig: input.aiConfig,
       },
     };
     this.activeJob = jobState;
@@ -223,7 +242,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
           const plan = await generateInitialPlan({
             goal: input.goal,
             ...(input.repoSnapshot ? { repoSnapshot: input.repoSnapshot } : {}),
-            ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
+            aiConfig: input.aiConfig,
           });
           await this.publishProgressInternal('architecture-generated', 'Architecture summary generated.');
           await this.publishProgressInternal('chunks-generated', 'Initial chunk plan generated.', {
@@ -359,7 +378,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
           const plan = await generateReplan({
             updateRequest: input.updateRequest,
             ...(input.currentPlanSummary ? { currentPlanSummary: input.currentPlanSummary } : {}),
-            ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
+            aiConfig: input.aiConfig,
           });
           await this.publishProgressInternal('plan-drafted', 'Revised plan summary drafted.');
           await this.publishProgressInternal('chunks-revised', 'Revised chunks generated.', {

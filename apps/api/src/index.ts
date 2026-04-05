@@ -51,21 +51,48 @@ const createArtifactSchema = z.object({
   payload: z.unknown(),
   metadata: z.record(z.string(), z.string()).optional(),
 });
+
+const CLOUD_PLANNING_PROVIDERS = new Set([
+  'openai',
+  'openrouter',
+  'github-copilot',
+  'groq',
+  'together',
+  'azure',
+]);
+
+const cloudPlanningAiConfigSchema = aiConfigSchema.superRefine((value, context) => {
+  if (!value.apiKey?.trim()) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'aiConfig.apiKey is required for cloud planning runs.',
+      path: ['apiKey'],
+    });
+  }
+
+  if (!CLOUD_PLANNING_PROVIDERS.has(value.provider)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Provider "${value.provider}" is not supported for cloud planning MVP. Use an OpenAI-compatible provider.`,
+      path: ['provider'],
+    });
+  }
+});
+
 const startGenerationSchema = z.object({
   projectId: z.string().min(1),
   goal: z.string().min(1),
   repoSnapshot: z.string().optional(),
-  aiConfig: aiConfigSchema.optional(),
+  aiConfig: cloudPlanningAiConfigSchema,
 });
 const startReplanSchema = z.object({
   projectId: z.string().min(1),
   updateRequest: z.string().min(1),
   currentPlanSummary: z.string().optional(),
-  aiConfig: aiConfigSchema.optional(),
+  aiConfig: cloudPlanningAiConfigSchema,
 });
 
-function redactAIConfig(aiConfig?: unknown): Record<string, unknown> | undefined {
-  if (!aiConfig) return undefined;
+function redactAIConfig(aiConfig: unknown): Record<string, unknown> {
   const parsed = aiConfigSchema.parse(aiConfig);
   return {
     provider: parsed.provider,
@@ -139,7 +166,17 @@ v1.get('/artifacts/list', async (c) => {
 
 v1.post('/generation/start', async (c) => {
   const body = await c.req.json();
-  const parsed = startGenerationSchema.parse(body);
+  const parsedResult = startGenerationSchema.safeParse(body);
+  if (!parsedResult.success) {
+    return c.json(
+      {
+        error: 'Invalid generation start payload.',
+        issues: parsedResult.error.issues,
+      },
+      400,
+    );
+  }
+  const parsed = parsedResult.data;
   const projectId = parsed.projectId.trim();
   const runId = crypto.randomUUID();
 
@@ -162,7 +199,7 @@ v1.post('/generation/start', async (c) => {
     input: {
       goal: parsed.goal,
       ...(parsed.repoSnapshot ? { repoSnapshot: parsed.repoSnapshot } : {}),
-      ...(parsed.aiConfig ? { aiConfig: redactAIConfig(parsed.aiConfig) } : {}),
+      aiConfig: redactAIConfig(parsed.aiConfig),
     },
   });
   await appendProjectEvent(c.env.DB, {
@@ -183,7 +220,7 @@ v1.post('/generation/start', async (c) => {
       projectId,
       goal: parsed.goal,
       ...(parsed.repoSnapshot ? { repoSnapshot: parsed.repoSnapshot } : {}),
-      ...(parsed.aiConfig ? { aiConfig: parsed.aiConfig } : {}),
+      aiConfig: parsed.aiConfig,
     }),
   });
   
@@ -249,7 +286,17 @@ v1.get('/generation/:id/stream', async (c) => {
 
 v1.post('/replan/start', async (c) => {
   const body = await c.req.json();
-  const parsed = startReplanSchema.parse(body);
+  const parsedResult = startReplanSchema.safeParse(body);
+  if (!parsedResult.success) {
+    return c.json(
+      {
+        error: 'Invalid replan start payload.',
+        issues: parsedResult.error.issues,
+      },
+      400,
+    );
+  }
+  const parsed = parsedResult.data;
   const projectId = parsed.projectId.trim();
   const runId = crypto.randomUUID();
 
@@ -271,7 +318,7 @@ v1.post('/replan/start', async (c) => {
     input: {
       updateRequest: parsed.updateRequest,
       ...(parsed.currentPlanSummary ? { currentPlanSummary: parsed.currentPlanSummary } : {}),
-      ...(parsed.aiConfig ? { aiConfig: redactAIConfig(parsed.aiConfig) } : {}),
+      aiConfig: redactAIConfig(parsed.aiConfig),
     },
   });
   
@@ -287,7 +334,7 @@ v1.post('/replan/start', async (c) => {
       projectId,
       updateRequest: parsed.updateRequest,
       ...(parsed.currentPlanSummary ? { currentPlanSummary: parsed.currentPlanSummary } : {}),
-      ...(parsed.aiConfig ? { aiConfig: parsed.aiConfig } : {}),
+      aiConfig: parsed.aiConfig,
     }),
   });
   

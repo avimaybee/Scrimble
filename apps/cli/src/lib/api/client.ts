@@ -120,7 +120,7 @@ export async function readArtifact<T>(client: CloudClientConfig, key: string): P
 
 export async function startReplan(
   client: CloudClientConfig,
-  payload: { updateRequest: string; currentPlanSummary?: string; aiConfig?: Record<string, unknown> },
+  payload: { updateRequest: string; currentPlanSummary?: string; aiConfig: Record<string, unknown> },
 ): Promise<{ instanceId: string; status: string }> {
   return requestJson(client, '/v1/replan/start', {
     method: 'POST',
@@ -128,7 +128,7 @@ export async function startReplan(
       projectId: client.projectId,
       updateRequest: payload.updateRequest,
       ...(payload.currentPlanSummary ? { currentPlanSummary: payload.currentPlanSummary } : {}),
-      ...(payload.aiConfig ? { aiConfig: payload.aiConfig } : {}),
+      aiConfig: payload.aiConfig,
     }),
   });
 }
