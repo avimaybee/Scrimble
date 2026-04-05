@@ -1,0 +1,19 @@
+{
+  "name": "@scrimble/db",
+  "version": "0.1.0",
+  "description": "Database schema and migrations for Scrimble",
+  "type": "module",
+  "scripts": {
+    "migrate:local": "wrangler d1 migrations apply scrimble --local",
+    "migrate:remote": "wrangler d1 migrations apply scrimble --remote",
+    "generate": "echo 'Migration generation - create files manually in migrations/'",
+    "clean": "rimraf .wrangler"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0",
+    "rimraf": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

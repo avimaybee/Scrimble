@@ -1,0 +1,21 @@
+name = "scrimble-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+ENVIRONMENT = "development"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "scrimble"
+database_id = "placeholder-will-be-set-on-deploy"
+
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "scrimble-artifacts"
+
+# Uncomment when ready to use Workflows
+# [[workflows]]
+# binding = "GENERATION_WORKFLOW"
+# name = "generation-workflow"
+# class_name = "GenerationWorkflow"

@@ -1,0 +1,61 @@
+{
+  "name": "@scrimble/cli",
+  "version": "0.1.0",
+  "description": "Scrimble CLI - execution companion for AI-native builders",
+  "type": "module",
+  "bin": {
+    "scrimble": "./bin/run.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "bin",
+    "oclif.manifest.json"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b --watch",
+    "lint": "eslint src --ext .ts,.tsx",
+    "test": "vitest run",
+    "clean": "rimraf dist oclif.manifest.json"
+  },
+  "dependencies": {
+    "@oclif/core": "^4.2.0",
+    "@oclif/plugin-help": "^6.2.0",
+    "@oclif/plugin-plugins": "^5.4.0",
+    "@scrimble/shared": "workspace:*",
+    "ink": "^5.1.0",
+    "react": "^18.3.0",
+    "chalk": "^5.4.0",
+    "conf": "^13.1.0",
+    "zod": "^3.24.0",
+    "ai": "^4.1.0",
+    "@ai-sdk/openai": "^1.2.0",
+    "@ai-sdk/anthropic": "^1.2.0",
+    "@ai-sdk/google": "^1.2.0",
+    "chokidar": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.0",
+    "typescript": "^5.7.0",
+    "eslint": "^9.17.0",
+    "vitest": "^2.1.0",
+    "rimraf": "^6.0.0",
+    "oclif": "^4.17.0"
+  },
+  "oclif": {
+    "bin": "scrimble",
+    "dirname": "scrimble",
+    "commands": "./dist/commands",
+    "plugins": [
+      "@oclif/plugin-help"
+    ],
+    "topicSeparator": " ",
+    "default": "."
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

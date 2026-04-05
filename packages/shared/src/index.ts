@@ -1,0 +1,45 @@
+// Re-export all types (these are the canonical type definitions)
+export * from './types/index.js';
+
+// Re-export schemas only (types are inferred from schemas, not re-exported)
+export {
+  // Schema exports (validators)
+  aiProviderSchema,
+  aiOptionsSchema,
+  aiConfigSchema,
+  scrimbleConfigSchema,
+  projectStatusSchema,
+  createProjectSchema,
+  chunkStatusSchema,
+  chunkDefinitionSchema,
+  planDataSchema,
+  verificationStatusSchema,
+  verificationCheckSchema,
+  verificationResultSchema,
+  generationRunTypeSchema,
+  generationRunStatusSchema,
+  stackInfoSchema,
+  directoryNodeSchema,
+  repoContextSchema,
+  generationInputSchema,
+  initProjectRequestSchema,
+  completeChunkRequestSchema,
+  skipChunkRequestSchema,
+  updatePlanRequestSchema,
+} from './schemas/index.js';
+
+// Constants
+export const SCRIMBLE_DIR = '.scrimble';
+export const CONFIG_FILE = 'config.json';
+export const PROJECT_FILE = 'project.json';
+export const PLAN_FILE = 'plan.json';
+export const CURRENT_CHUNK_FILE = 'current-chunk.md';
+export const ARCHITECTURE_FILE = 'architecture.md';
+export const RESEARCH_FILE = 'research-summary.md';
+export const ACTIVITY_LOG = 'activity.log';
+export const SESSION_FILE = 'session.json';
+export const VERIFICATION_DIR = 'verification';
+export const PROMPTS_DIR = 'prompts';
+export const RULES_DIR = 'rules';
+
+export const DEFAULT_CLOUD_ENDPOINT = 'https://api.scrimble.dev';

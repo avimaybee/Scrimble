@@ -1,0 +1,33 @@
+{
+  "name": "scrimble",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CLI-resident execution companion for solo AI-native builders",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avimaybee/Scrimble.git"
+  },
+  "keywords": ["cli", "ai", "productivity", "execution", "planning"],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/avimaybee/Scrimble/issues"
+  },
+  "homepage": "https://github.com/avimaybee/Scrimble#readme",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "test": "turbo test",
+    "clean": "turbo clean && rimraf node_modules"
+  },
+  "devDependencies": {
+    "turbo": "^2.4.0",
+    "rimraf": "^6.0.0",
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
