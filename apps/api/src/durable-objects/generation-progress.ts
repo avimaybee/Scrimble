@@ -1,4 +1,13 @@
 import { DurableObject } from 'cloudflare:workers';
+import {
+  appendProjectEvent,
+  markGenerationRunCompleted,
+  markGenerationRunFailed,
+  markGenerationRunRunning,
+  persistPlanRevision,
+  type PersistedPlanChunk,
+} from '../lib/persistence.js';
+import { storeJsonArtifact } from '../lib/storage.js';
 
 interface ProgressPublishPayload {
   stage: string;
@@ -21,15 +30,22 @@ interface Subscriber {
 }
 
 interface GenerationJobInput {
+  runId: string;
   projectId: string;
   goal: string;
   repoSnapshot?: string;
 }
 
 interface ReplanJobInput {
+  runId: string;
   projectId: string;
   updateRequest: string;
   currentPlanSummary?: string;
+}
+
+interface ProgressHubEnv {
+  DB: D1Database;
+  ARTIFACTS: R2Bucket;
 }
 
 interface JobState {
@@ -65,12 +81,14 @@ function createSseFrame(eventName: string, payload: unknown): Uint8Array {
  *
  * All orchestration and step-level retry behavior lives in this Durable Object.
  */
-export class GenerationProgressHub extends DurableObject<unknown> {
+export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
   private readonly subscribers = new Map<number, Subscriber>();
   private subscriberCounter = 0;
+  private readonly doState: DurableObjectState;
 
-  constructor(private readonly state: DurableObjectState, env: unknown) {
+  constructor(state: DurableObjectState, env: ProgressHubEnv) {
     super(state, env);
+    this.doState = state;
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -105,8 +123,8 @@ export class GenerationProgressHub extends DurableObject<unknown> {
 
   private async handleStartGeneration(request: Request): Promise<Response> {
     const input = (await request.json()) as GenerationJobInput;
-    if (!input.projectId?.trim() || !input.goal?.trim()) {
-      return Response.json({ error: 'projectId and goal are required' }, { status: 400 });
+    if (!input.runId?.trim() || !input.projectId?.trim() || !input.goal?.trim()) {
+      return Response.json({ error: 'runId, projectId and goal are required' }, { status: 400 });
     }
     const activeJobResponse = await this.ensureNoActiveJob('generation');
     if (activeJobResponse) {
@@ -117,23 +135,24 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       type: 'generation',
       status: 'pending',
       input: {
+        runId: input.runId.trim(),
         projectId: input.projectId.trim(),
         goal: input.goal.trim(),
         ...(input.repoSnapshot?.trim() ? { repoSnapshot: input.repoSnapshot.trim() } : {}),
       },
     };
-    await this.state.storage.put(JOB_STATE_KEY, jobState);
+    await this.doState.storage.put(JOB_STATE_KEY, jobState);
 
     // Execute the job asynchronously
-    this.state.waitUntil(this.runGenerationJob(jobState));
+    this.doState.waitUntil(this.runGenerationJob(jobState));
 
     return Response.json({ status: 'queued', type: 'generation' });
   }
 
   private async handleStartReplan(request: Request): Promise<Response> {
     const input = (await request.json()) as ReplanJobInput;
-    if (!input.projectId?.trim() || !input.updateRequest?.trim()) {
-      return Response.json({ error: 'projectId and updateRequest are required' }, { status: 400 });
+    if (!input.runId?.trim() || !input.projectId?.trim() || !input.updateRequest?.trim()) {
+      return Response.json({ error: 'runId, projectId and updateRequest are required' }, { status: 400 });
     }
     const activeJobResponse = await this.ensureNoActiveJob('replan');
     if (activeJobResponse) {
@@ -144,21 +163,22 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       type: 'replan',
       status: 'pending',
       input: {
+        runId: input.runId.trim(),
         projectId: input.projectId.trim(),
         updateRequest: input.updateRequest.trim(),
         ...(input.currentPlanSummary?.trim() ? { currentPlanSummary: input.currentPlanSummary.trim() } : {}),
       },
     };
-    await this.state.storage.put(JOB_STATE_KEY, jobState);
+    await this.doState.storage.put(JOB_STATE_KEY, jobState);
 
     // Execute the job asynchronously
-    this.state.waitUntil(this.runReplanJob(jobState));
+    this.doState.waitUntil(this.runReplanJob(jobState));
 
     return Response.json({ status: 'queued', type: 'replan' });
   }
 
   private async handleStatus(): Promise<Response> {
-    const jobState = await this.state.storage.get<JobState>(JOB_STATE_KEY);
+    const jobState = await this.doState.storage.get<JobState>(JOB_STATE_KEY);
     if (!jobState) {
       return Response.json({ status: 'idle', message: 'No job has been started' });
     }
@@ -173,10 +193,12 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       status: 'running',
       startedAt: new Date().toISOString(),
     };
-    await this.state.storage.put(JOB_STATE_KEY, runningState);
+    await this.doState.storage.put(JOB_STATE_KEY, runningState);
     await this.publishProgressInternal('started', 'Generation job started.');
 
     try {
+      await markGenerationRunRunning(this.env.DB, input.runId);
+
       await this.runStepWithRetry({
         jobType: 'generation',
         step: 'normalize-input',
@@ -204,11 +226,13 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         jobType: 'generation',
         step: 'generate-initial-chunks',
         run: async () => {
-          const generated = [
+          const generated: PersistedPlanChunk[] = [
             {
-              id: 'chunk-001',
+              sequence: 1,
               title: 'Foundation hardening',
-              objective: 'Ensure CLI and backend scaffolding are stable and validated.',
+              prompt: 'Stabilize CLI and API foundations before adding higher-order orchestration complexity.',
+              doneCondition: 'CLI/API runtime validations pass and baseline project health is documented.',
+              verificationHints: ['pnpm run lint', 'pnpm run build', 'pnpm test'],
             },
           ];
           await this.publishProgressInternal('chunks-generated', 'Initial chunk plan generated.', {
@@ -218,10 +242,57 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         },
       });
 
+      const revision = await this.runStepWithRetry({
+        jobType: 'generation',
+        step: 'persist-plan-revision',
+        run: async () => {
+          const persisted = await persistPlanRevision(this.env.DB, {
+            projectId: input.projectId,
+            architecture: architectureSummary,
+            chunks,
+          });
+          await this.publishProgressInternal('plan-revision-persisted', 'Plan revision persisted.', {
+            revisionId: persisted.revisionId,
+            version: persisted.version,
+          });
+          return persisted;
+        },
+      });
+
+      const artifact = await this.runStepWithRetry({
+        jobType: 'generation',
+        step: 'persist-output-artifact',
+        run: async () => {
+          const stored = await storeJsonArtifact(this.env.ARTIFACTS, {
+            projectId: input.projectId,
+            type: 'generation-output',
+            payload: {
+              runId: input.runId,
+              architectureSummary,
+              chunks,
+              revisionId: revision.revisionId,
+              revisionVersion: revision.version,
+            },
+            metadata: {
+              runId: input.runId,
+              revisionId: revision.revisionId,
+            },
+          });
+          await this.publishProgressInternal('artifact-persisted', 'Generation artifact persisted.', {
+            artifactKey: stored.key,
+          });
+          return stored;
+        },
+      });
+
       const output = {
+        runId: input.runId,
         projectId: input.projectId,
         architectureSummary,
         chunks,
+        revisionId: revision.revisionId,
+        revisionVersion: revision.version,
+        artifactKey: artifact.key,
         completedAt: new Date().toISOString(),
       };
 
@@ -231,7 +302,20 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         output,
         completedAt: output.completedAt,
       };
-      await this.state.storage.put(JOB_STATE_KEY, completedState);
+      await this.doState.storage.put(JOB_STATE_KEY, completedState);
+      await markGenerationRunCompleted(this.env.DB, {
+        runId: input.runId,
+        output,
+      });
+      await appendProjectEvent(this.env.DB, {
+        projectId: input.projectId,
+        type: 'generation_completed',
+        data: {
+          runId: input.runId,
+          revisionId: revision.revisionId,
+          artifactKey: artifact.key,
+        },
+      });
       await this.publishProgressInternal('completed', 'Generation job completed.', { completedAt: output.completedAt });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -241,7 +325,19 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         error: errorMessage,
         completedAt: new Date().toISOString(),
       };
-      await this.state.storage.put(JOB_STATE_KEY, failedState);
+      await this.doState.storage.put(JOB_STATE_KEY, failedState);
+      await markGenerationRunFailed(this.env.DB, {
+        runId: input.runId,
+        error: errorMessage,
+      });
+      await appendProjectEvent(this.env.DB, {
+        projectId: input.projectId,
+        type: 'generation_failed',
+        data: {
+          runId: input.runId,
+          error: errorMessage,
+        },
+      });
       await this.publishProgressInternal('failed', `Generation job failed: ${errorMessage}`);
     }
   }
@@ -254,10 +350,12 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       status: 'running',
       startedAt: new Date().toISOString(),
     };
-    await this.state.storage.put(JOB_STATE_KEY, runningState);
+    await this.doState.storage.put(JOB_STATE_KEY, runningState);
     await this.publishProgressInternal('started', 'Replan job started.');
 
     try {
+      await markGenerationRunRunning(this.env.DB, input.runId);
+
       const revisedPlanSummary = await this.runStepWithRetry({
         jobType: 'replan',
         step: 'draft-plan-summary',
@@ -278,11 +376,13 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         jobType: 'replan',
         step: 'generate-replanned-chunks',
         run: async () => {
-          const generated = [
+          const generated: PersistedPlanChunk[] = [
             {
-              id: 'chunk-next',
+              sequence: 1,
               title: 'Apply replan changes',
-              objective: 'Integrate update request while preserving completed work.',
+              prompt: `Apply requested plan update: ${input.updateRequest}`,
+              doneCondition: 'Requested update is reflected in implementation and validated.',
+              verificationHints: ['scrimble verify', 'scrimble status'],
             },
           ];
           await this.publishProgressInternal('chunks-revised', 'Revised chunks generated.', {
@@ -292,10 +392,57 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         },
       });
 
+      const revision = await this.runStepWithRetry({
+        jobType: 'replan',
+        step: 'persist-plan-revision',
+        run: async () => {
+          const persisted = await persistPlanRevision(this.env.DB, {
+            projectId: input.projectId,
+            architecture: revisedPlanSummary,
+            chunks: updatedChunks,
+          });
+          await this.publishProgressInternal('plan-revision-persisted', 'Replan revision persisted.', {
+            revisionId: persisted.revisionId,
+            version: persisted.version,
+          });
+          return persisted;
+        },
+      });
+
+      const artifact = await this.runStepWithRetry({
+        jobType: 'replan',
+        step: 'persist-output-artifact',
+        run: async () => {
+          const stored = await storeJsonArtifact(this.env.ARTIFACTS, {
+            projectId: input.projectId,
+            type: 'replan-output',
+            payload: {
+              runId: input.runId,
+              revisedPlanSummary,
+              chunks: updatedChunks,
+              revisionId: revision.revisionId,
+              revisionVersion: revision.version,
+            },
+            metadata: {
+              runId: input.runId,
+              revisionId: revision.revisionId,
+            },
+          });
+          await this.publishProgressInternal('artifact-persisted', 'Replan artifact persisted.', {
+            artifactKey: stored.key,
+          });
+          return stored;
+        },
+      });
+
       const output = {
+        runId: input.runId,
         projectId: input.projectId,
         revisedPlanSummary,
         chunks: updatedChunks,
+        revisionId: revision.revisionId,
+        revisionVersion: revision.version,
+        artifactKey: artifact.key,
         completedAt: new Date().toISOString(),
       };
 
@@ -305,7 +452,20 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         output,
         completedAt: output.completedAt,
       };
-      await this.state.storage.put(JOB_STATE_KEY, completedState);
+      await this.doState.storage.put(JOB_STATE_KEY, completedState);
+      await markGenerationRunCompleted(this.env.DB, {
+        runId: input.runId,
+        output,
+      });
+      await appendProjectEvent(this.env.DB, {
+        projectId: input.projectId,
+        type: 'plan_replanned',
+        data: {
+          runId: input.runId,
+          revisionId: revision.revisionId,
+          artifactKey: artifact.key,
+        },
+      });
       await this.publishProgressInternal('completed', 'Replan job completed.', { completedAt: output.completedAt });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -315,7 +475,11 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         error: errorMessage,
         completedAt: new Date().toISOString(),
       };
-      await this.state.storage.put(JOB_STATE_KEY, failedState);
+      await this.doState.storage.put(JOB_STATE_KEY, failedState);
+      await markGenerationRunFailed(this.env.DB, {
+        runId: input.runId,
+        error: errorMessage,
+      });
       await this.publishProgressInternal('failed', `Replan job failed: ${errorMessage}`);
     }
   }
@@ -330,7 +494,7 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       timestamp: new Date().toISOString(),
     };
 
-    await this.state.storage.put(sequenceToKey(sequence), event);
+    await this.doState.storage.put(sequenceToKey(sequence), event);
     await this.trimOldEvents(sequence);
     this.broadcast(event);
   }
@@ -350,7 +514,7 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       timestamp: new Date().toISOString(),
     };
 
-    await this.state.storage.put(sequenceToKey(sequence), event);
+    await this.doState.storage.put(sequenceToKey(sequence), event);
     await this.trimOldEvents(sequence);
     this.broadcast(event);
 
@@ -407,7 +571,7 @@ export class GenerationProgressHub extends DurableObject<unknown> {
 
   private async listEventsSince(since: number): Promise<GenerationProgressEvent[]> {
     const startKey = sequenceToKey(since + 1);
-    const entries = await this.state.storage.list<GenerationProgressEvent>({
+    const entries = await this.doState.storage.list<GenerationProgressEvent>({
       start: startKey,
       end: `${EVENT_KEY_PREFIX}\uffff`,
       limit: RETAIN_EVENT_COUNT,
@@ -425,9 +589,9 @@ export class GenerationProgressHub extends DurableObject<unknown> {
   }
 
   private async nextSequence(): Promise<number> {
-    const previous = (await this.state.storage.get<number>(META_LAST_SEQUENCE)) ?? 0;
+    const previous = (await this.doState.storage.get<number>(META_LAST_SEQUENCE)) ?? 0;
     const next = previous + 1;
-    await this.state.storage.put(META_LAST_SEQUENCE, next);
+    await this.doState.storage.put(META_LAST_SEQUENCE, next);
     return next;
   }
 
@@ -442,7 +606,7 @@ export class GenerationProgressHub extends DurableObject<unknown> {
       keysToDelete.push(sequenceToKey(sequence));
     }
     if (keysToDelete.length > 0) {
-      await this.state.storage.delete(keysToDelete);
+      await this.doState.storage.delete(keysToDelete);
     }
   }
 
@@ -472,7 +636,7 @@ export class GenerationProgressHub extends DurableObject<unknown> {
   }
 
   private async ensureNoActiveJob(type: JobState['type']): Promise<Response | null> {
-    const existing = await this.state.storage.get<JobState>(JOB_STATE_KEY);
+    const existing = await this.doState.storage.get<JobState>(JOB_STATE_KEY);
     if (!existing) {
       return null;
     }

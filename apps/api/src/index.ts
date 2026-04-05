@@ -3,6 +3,12 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { z } from 'zod';
 import type { GenerationProgressHub } from './durable-objects/generation-progress.js';
+import {
+  appendProjectEvent,
+  createGenerationRunRecord,
+  ensureLocalProjectRecord,
+  markGenerationRunFailed,
+} from './lib/persistence.js';
 import { listArtifacts, readArtifact, storeJsonArtifact } from './lib/storage.js';
 export { GenerationProgressHub } from './durable-objects/generation-progress.js';
 
@@ -118,26 +124,61 @@ v1.get('/artifacts/list', async (c) => {
 v1.post('/generation/start', async (c) => {
   const body = await c.req.json();
   const parsed = startGenerationSchema.parse(body);
+  const projectId = parsed.projectId.trim();
+  const runId = crypto.randomUUID();
+
+  await ensureLocalProjectRecord(c.env.DB, {
+    projectId,
+    goal: parsed.goal.trim(),
+  });
+  await createGenerationRunRecord(c.env.DB, {
+    runId,
+    projectId,
+    type: 'initial',
+    input: {
+      goal: parsed.goal,
+      ...(parsed.repoSnapshot ? { repoSnapshot: parsed.repoSnapshot } : {}),
+    },
+  });
+  await appendProjectEvent(c.env.DB, {
+    projectId,
+    type: 'generation_started',
+    data: { runId },
+  });
   
   // Use project ID as the DO instance name for consistent addressing
-  const doId = c.env.PROGRESS_HUB.idFromName(parsed.projectId);
+  const doId = c.env.PROGRESS_HUB.idFromName(projectId);
   const stub = c.env.PROGRESS_HUB.get(doId);
   
   const response = await stub.fetch('https://progress-hub.internal/start-generation', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      projectId: parsed.projectId,
+      runId,
+      projectId,
       goal: parsed.goal,
       ...(parsed.repoSnapshot ? { repoSnapshot: parsed.repoSnapshot } : {}),
     }),
   });
   
   const result = (await response.json()) as Record<string, unknown>;
-  return c.json({
-    instanceId: parsed.projectId,
-    ...result,
-  });
+  if (!response.ok) {
+    const errorMessage = typeof result['error'] === 'string'
+      ? result['error']
+      : `Failed to start generation run (status ${response.status}).`;
+    await markGenerationRunFailed(c.env.DB, { runId, error: errorMessage });
+  }
+  return new Response(
+    JSON.stringify({
+      instanceId: projectId,
+      runId,
+      ...result,
+    }),
+    {
+      status: response.status,
+      headers: { 'content-type': 'application/json' },
+    },
+  );
 });
 
 v1.get('/generation/:id', async (c) => {
@@ -180,26 +221,55 @@ v1.get('/generation/:id/stream', async (c) => {
 v1.post('/replan/start', async (c) => {
   const body = await c.req.json();
   const parsed = startReplanSchema.parse(body);
+  const projectId = parsed.projectId.trim();
+  const runId = crypto.randomUUID();
+
+  await ensureLocalProjectRecord(c.env.DB, {
+    projectId,
+  });
+  await createGenerationRunRecord(c.env.DB, {
+    runId,
+    projectId,
+    type: 'replan',
+    input: {
+      updateRequest: parsed.updateRequest,
+      ...(parsed.currentPlanSummary ? { currentPlanSummary: parsed.currentPlanSummary } : {}),
+    },
+  });
   
   // Use project ID as the DO instance name for consistent addressing
-  const doId = c.env.PROGRESS_HUB.idFromName(parsed.projectId);
+  const doId = c.env.PROGRESS_HUB.idFromName(projectId);
   const stub = c.env.PROGRESS_HUB.get(doId);
   
   const response = await stub.fetch('https://progress-hub.internal/start-replan', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      projectId: parsed.projectId,
+      runId,
+      projectId,
       updateRequest: parsed.updateRequest,
       ...(parsed.currentPlanSummary ? { currentPlanSummary: parsed.currentPlanSummary } : {}),
     }),
   });
   
   const result = (await response.json()) as Record<string, unknown>;
-  return c.json({
-    instanceId: parsed.projectId,
-    ...result,
-  });
+  if (!response.ok) {
+    const errorMessage = typeof result['error'] === 'string'
+      ? result['error']
+      : `Failed to start replan run (status ${response.status}).`;
+    await markGenerationRunFailed(c.env.DB, { runId, error: errorMessage });
+  }
+  return new Response(
+    JSON.stringify({
+      instanceId: projectId,
+      runId,
+      ...result,
+    }),
+    {
+      status: response.status,
+      headers: { 'content-type': 'application/json' },
+    },
+  );
 });
 
 v1.get('/replan/:id', async (c) => {
