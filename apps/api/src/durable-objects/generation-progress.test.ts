@@ -253,6 +253,84 @@ describe('GenerationProgressHub orchestration', () => {
     expect(status.error).toContain('persistent provider outage');
   });
 
+  it('retries failed replan step and emits replan retry observability events', async () => {
+    planningMocks.generateReplan
+      .mockRejectedValueOnce(new Error('transient replan provider error'))
+      .mockResolvedValueOnce({
+        revisedPlanSummary: 'Recovered replan summary',
+        chunks: [planChunk],
+      });
+
+    const { hub, waitUntilPromises } = createHub();
+    await hub.fetch(
+      new Request('https://progress-hub.internal/start-replan', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          runId: 'run-r1',
+          projectId: 'project-r1',
+          updateRequest: 'Adjust scope',
+          aiConfig: validAiConfig,
+        }),
+      }),
+    );
+
+    await flushBackground(waitUntilPromises);
+
+    expect(planningMocks.generateReplan).toHaveBeenCalledTimes(2);
+    expect(persistenceMocks.appendProjectEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        projectId: 'project-r1',
+        type: 'replan_step_retrying',
+        data: expect.objectContaining({
+          runId: 'run-r1',
+          step: 'generate-replan',
+          attempt: 1,
+          maxAttempts: 3,
+          error: 'transient replan provider error',
+        }),
+      }),
+    );
+  });
+
+  it('emits replan step_failed observability event after retry exhaustion', async () => {
+    planningMocks.generateReplan.mockRejectedValue(new Error('persistent replan provider outage'));
+
+    const { hub, waitUntilPromises } = createHub();
+    await hub.fetch(
+      new Request('https://progress-hub.internal/start-replan', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          runId: 'run-r2',
+          projectId: 'project-r2',
+          updateRequest: 'Adjust scope',
+          aiConfig: validAiConfig,
+        }),
+      }),
+    );
+
+    await flushBackground(waitUntilPromises);
+
+    expect(planningMocks.generateReplan).toHaveBeenCalledTimes(3);
+    expect(persistenceMocks.markGenerationRunFailed).toHaveBeenCalledTimes(1);
+    expect(persistenceMocks.appendProjectEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        projectId: 'project-r2',
+        type: 'replan_step_failed',
+        data: expect.objectContaining({
+          runId: 'run-r2',
+          step: 'generate-replan',
+          attempt: 3,
+          maxAttempts: 3,
+          error: 'persistent replan provider outage',
+        }),
+      }),
+    );
+  });
+
   it('applies since filtering for /events progress reads', async () => {
     const { hub } = createHub();
 

@@ -492,4 +492,50 @@ describe('API start route contracts', () => {
       error: 'provider timeout',
     });
   });
+
+  it('forwards /generation/:id/progress requests to DO events endpoint with since query', async () => {
+    const { env, stub, namespace } = createEnv(async () =>
+      new Response(JSON.stringify({ events: [{ sequence: 2, stage: 'chunks-generated' }], count: 1 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/generation/project-5/progress?since=7', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      events: [{ sequence: 2, stage: 'chunks-generated' }],
+      count: 1,
+    });
+    expect(namespace.idFromName).toHaveBeenCalledWith('project-5');
+    expect(stub.fetch).toHaveBeenCalledWith('https://progress-hub.internal/events?since=7');
+  });
+
+  it('forwards /generation/:id/stream requests to DO stream endpoint preserving accept header', async () => {
+    const { env, stub, namespace } = createEnv(async (_url, init) =>
+      new Response(': connected\n\nevent: progress\ndata: {"sequence":2}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    );
+
+    const response = await app.request(
+      '/v1/generation/project-6/stream?since=11',
+      {
+        method: 'GET',
+        headers: { accept: 'text/event-stream' },
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/event-stream');
+    expect(await response.text()).toContain('event: progress');
+    expect(namespace.idFromName).toHaveBeenCalledWith('project-6');
+
+    const [url, init] = stub.fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://progress-hub.internal/stream?since=11');
+    expect((init.headers as Record<string, string>)['accept']).toBe('text/event-stream');
+  });
 });
