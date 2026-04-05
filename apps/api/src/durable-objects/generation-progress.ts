@@ -61,7 +61,6 @@ interface JobState {
 const encoder = new TextEncoder();
 const EVENT_KEY_PREFIX = 'event/';
 const META_LAST_SEQUENCE = 'meta:last-sequence';
-const JOB_STATE_KEY = 'job:state';
 const RETAIN_EVENT_COUNT = 200;
 const STEP_MAX_ATTEMPTS = 3;
 const STEP_BASE_BACKOFF_MS = 300;
@@ -85,6 +84,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
   private readonly subscribers = new Map<number, Subscriber>();
   private subscriberCounter = 0;
   private readonly doState: DurableObjectState;
+  private activeJob: JobState | null = null;
+  private lastJob: JobState | null = null;
 
   constructor(state: DurableObjectState, env: ProgressHubEnv) {
     super(state, env);
@@ -141,7 +142,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         ...(input.repoSnapshot?.trim() ? { repoSnapshot: input.repoSnapshot.trim() } : {}),
       },
     };
-    await this.doState.storage.put(JOB_STATE_KEY, jobState);
+    this.activeJob = jobState;
+    this.lastJob = jobState;
 
     // Execute the job asynchronously
     this.doState.waitUntil(this.runGenerationJob(jobState));
@@ -169,7 +171,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         ...(input.currentPlanSummary?.trim() ? { currentPlanSummary: input.currentPlanSummary.trim() } : {}),
       },
     };
-    await this.doState.storage.put(JOB_STATE_KEY, jobState);
+    this.activeJob = jobState;
+    this.lastJob = jobState;
 
     // Execute the job asynchronously
     this.doState.waitUntil(this.runReplanJob(jobState));
@@ -178,7 +181,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
   }
 
   private async handleStatus(): Promise<Response> {
-    const jobState = await this.doState.storage.get<JobState>(JOB_STATE_KEY);
+    const jobState = this.activeJob ?? this.lastJob;
     if (!jobState) {
       return Response.json({ status: 'idle', message: 'No job has been started' });
     }
@@ -193,7 +196,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       status: 'running',
       startedAt: new Date().toISOString(),
     };
-    await this.doState.storage.put(JOB_STATE_KEY, runningState);
+    this.activeJob = runningState;
+    this.lastJob = runningState;
     await this.publishProgressInternal('started', 'Generation job started.');
 
     try {
@@ -302,7 +306,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         output,
         completedAt: output.completedAt,
       };
-      await this.doState.storage.put(JOB_STATE_KEY, completedState);
+      this.lastJob = completedState;
+      this.activeJob = null;
       await markGenerationRunCompleted(this.env.DB, {
         runId: input.runId,
         output,
@@ -325,7 +330,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         error: errorMessage,
         completedAt: new Date().toISOString(),
       };
-      await this.doState.storage.put(JOB_STATE_KEY, failedState);
+      this.lastJob = failedState;
+      this.activeJob = null;
       await markGenerationRunFailed(this.env.DB, {
         runId: input.runId,
         error: errorMessage,
@@ -350,7 +356,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       status: 'running',
       startedAt: new Date().toISOString(),
     };
-    await this.doState.storage.put(JOB_STATE_KEY, runningState);
+    this.activeJob = runningState;
+    this.lastJob = runningState;
     await this.publishProgressInternal('started', 'Replan job started.');
 
     try {
@@ -452,7 +459,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         output,
         completedAt: output.completedAt,
       };
-      await this.doState.storage.put(JOB_STATE_KEY, completedState);
+      this.lastJob = completedState;
+      this.activeJob = null;
       await markGenerationRunCompleted(this.env.DB, {
         runId: input.runId,
         output,
@@ -475,7 +483,8 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         error: errorMessage,
         completedAt: new Date().toISOString(),
       };
-      await this.doState.storage.put(JOB_STATE_KEY, failedState);
+      this.lastJob = failedState;
+      this.activeJob = null;
       await markGenerationRunFailed(this.env.DB, {
         runId: input.runId,
         error: errorMessage,
@@ -636,7 +645,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
   }
 
   private async ensureNoActiveJob(type: JobState['type']): Promise<Response | null> {
-    const existing = await this.doState.storage.get<JobState>(JOB_STATE_KEY);
+    const existing = this.activeJob;
     if (!existing) {
       return null;
     }

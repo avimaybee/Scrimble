@@ -7,6 +7,8 @@ import {
   appendProjectEvent,
   createGenerationRunRecord,
   ensureLocalProjectRecord,
+  getActiveRunForProject,
+  getLatestRunForProject,
   markGenerationRunFailed,
 } from './lib/persistence.js';
 import { listArtifacts, readArtifact, storeJsonArtifact } from './lib/storage.js';
@@ -127,6 +129,14 @@ v1.post('/generation/start', async (c) => {
   const projectId = parsed.projectId.trim();
   const runId = crypto.randomUUID();
 
+  const activeRun = await getActiveRunForProject(c.env.DB, projectId);
+  if (activeRun) {
+    return c.json({
+      error: `Cannot start generation while run ${activeRun.runId} is ${activeRun.status}.`,
+      activeRun,
+    }, 409);
+  }
+
   await ensureLocalProjectRecord(c.env.DB, {
     projectId,
     goal: parsed.goal.trim(),
@@ -183,11 +193,14 @@ v1.post('/generation/start', async (c) => {
 
 v1.get('/generation/:id', async (c) => {
   const id = c.req.param('id');
-  const doId = c.env.PROGRESS_HUB.idFromName(id);
-  const stub = c.env.PROGRESS_HUB.get(doId);
-  const response = await stub.fetch('https://progress-hub.internal/status');
-  const status = (await response.json()) as Record<string, unknown>;
-  return c.json({ instanceId: id, ...status });
+  const run = await getLatestRunForProject(c.env.DB, { projectId: id, type: 'initial' });
+  if (!run) {
+    return c.json({ instanceId: id, status: 'idle', message: 'No generation run found.' });
+  }
+  return c.json({
+    instanceId: id,
+    ...run,
+  });
 });
 
 v1.get('/generation/:id/progress', async (c) => {
@@ -223,6 +236,14 @@ v1.post('/replan/start', async (c) => {
   const parsed = startReplanSchema.parse(body);
   const projectId = parsed.projectId.trim();
   const runId = crypto.randomUUID();
+
+  const activeRun = await getActiveRunForProject(c.env.DB, projectId);
+  if (activeRun) {
+    return c.json({
+      error: `Cannot start replan while run ${activeRun.runId} is ${activeRun.status}.`,
+      activeRun,
+    }, 409);
+  }
 
   await ensureLocalProjectRecord(c.env.DB, {
     projectId,
@@ -274,11 +295,14 @@ v1.post('/replan/start', async (c) => {
 
 v1.get('/replan/:id', async (c) => {
   const id = c.req.param('id');
-  const doId = c.env.PROGRESS_HUB.idFromName(id);
-  const stub = c.env.PROGRESS_HUB.get(doId);
-  const response = await stub.fetch('https://progress-hub.internal/status');
-  const status = (await response.json()) as Record<string, unknown>;
-  return c.json({ instanceId: id, ...status });
+  const run = await getLatestRunForProject(c.env.DB, { projectId: id, type: 'replan' });
+  if (!run) {
+    return c.json({ instanceId: id, status: 'idle', message: 'No replan run found.' });
+  }
+  return c.json({
+    instanceId: id,
+    ...run,
+  });
 });
 
 app.route('/v1', v1);

@@ -1,3 +1,6 @@
+const LOCAL_USER_ID = 'local-user';
+const LOCAL_USER_EMAIL = 'local@scrimble.dev';
+
 export interface EnsureLocalProjectInput {
   projectId: string;
   goal?: string;
@@ -47,65 +50,63 @@ export interface AppendProjectEventInput {
   data?: Record<string, unknown>;
 }
 
-function slug(value: string): string {
-  return value
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9\-_.]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
+export interface GenerationRunRecord {
+  runId: string;
+  projectId: string;
+  type: 'initial' | 'replan' | 'update';
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt: string;
 }
 
-function ensureNonEmpty(value: string, field: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    throw new Error(`${field} is required.`);
-  }
-  return trimmed;
+interface GenerationRunRow {
+  id: string;
+  project_id: string;
+  type: 'initial' | 'replan' | 'update';
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  input_data: string | null;
+  output_data: string | null;
+  error: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
 }
 
-function localUserIdFromProject(projectId: string): string {
-  const safe = slug(projectId);
-  return safe ? `local-${safe}` : `local-${crypto.randomUUID()}`;
+function parseJsonColumn(value: string | null): unknown | undefined {
+  if (value === null) return undefined;
+  return JSON.parse(value) as unknown;
 }
 
-function localEmailFromProject(projectId: string): string {
-  const safe = slug(projectId);
-  const localPart = safe || `project-${crypto.randomUUID().slice(0, 8)}`;
-  return `${localPart}@local.scrimble.dev`;
-}
-
-function normalizePlanChunks(chunks: PersistedPlanChunk[]): PersistedPlanChunk[] {
-  return chunks
-    .map((chunk, index) => ({
-      sequence: chunk.sequence > 0 ? chunk.sequence : index + 1,
-      title: ensureNonEmpty(chunk.title, 'chunk.title'),
-      prompt: ensureNonEmpty(chunk.prompt, 'chunk.prompt'),
-      doneCondition: ensureNonEmpty(chunk.doneCondition, 'chunk.doneCondition'),
-      ...(chunk.doNotTouch?.trim() ? { doNotTouch: chunk.doNotTouch.trim() } : {}),
-      ...(chunk.verificationHints && chunk.verificationHints.length > 0
-        ? { verificationHints: chunk.verificationHints }
-        : {}),
-    }))
-    .sort((a, b) => a.sequence - b.sequence);
+function mapGenerationRunRow(row: GenerationRunRow): GenerationRunRecord {
+  return {
+    runId: row.id,
+    projectId: row.project_id,
+    type: row.type,
+    status: row.status,
+    ...(row.input_data !== null ? { input: parseJsonColumn(row.input_data) } : {}),
+    ...(row.output_data !== null ? { output: parseJsonColumn(row.output_data) } : {}),
+    ...(row.error !== null ? { error: row.error } : {}),
+    ...(row.started_at !== null ? { startedAt: row.started_at } : {}),
+    ...(row.completed_at !== null ? { completedAt: row.completed_at } : {}),
+    createdAt: row.created_at,
+  };
 }
 
 export async function ensureLocalProjectRecord(
   db: D1Database,
   input: EnsureLocalProjectInput,
 ): Promise<void> {
-  const projectId = ensureNonEmpty(input.projectId, 'projectId');
-  const userId = localUserIdFromProject(projectId);
-  const email = localEmailFromProject(projectId);
-  const goal = input.goal?.trim() || null;
-
   await db.prepare(
     `
       INSERT INTO users (id, email)
       VALUES (?1, ?2)
       ON CONFLICT(id) DO NOTHING
     `,
-  ).bind(userId, email).run();
+  ).bind(LOCAL_USER_ID, LOCAL_USER_EMAIL).run();
 
   await db.prepare(
     `
@@ -115,27 +116,22 @@ export async function ensureLocalProjectRecord(
         goal = COALESCE(excluded.goal, projects.goal),
         updated_at = datetime('now')
     `,
-  ).bind(projectId, userId, projectId, goal).run();
+  ).bind(input.projectId, LOCAL_USER_ID, input.projectId, input.goal ?? null).run();
 }
 
 export async function createGenerationRunRecord(
   db: D1Database,
   input: CreateGenerationRunInput,
 ): Promise<void> {
-  const runId = ensureNonEmpty(input.runId, 'runId');
-  const projectId = ensureNonEmpty(input.projectId, 'projectId');
-  const inputJson = JSON.stringify(input.input);
-
   await db.prepare(
     `
       INSERT INTO generation_runs (id, project_id, type, status, input_data, created_at)
       VALUES (?1, ?2, ?3, 'pending', ?4, datetime('now'))
     `,
-  ).bind(runId, projectId, input.type, inputJson).run();
+  ).bind(input.runId, input.projectId, input.type, JSON.stringify(input.input)).run();
 }
 
 export async function markGenerationRunRunning(db: D1Database, runId: string): Promise<void> {
-  const safeRunId = ensureNonEmpty(runId, 'runId');
   await db.prepare(
     `
       UPDATE generation_runs
@@ -144,15 +140,13 @@ export async function markGenerationRunRunning(db: D1Database, runId: string): P
           error = NULL
       WHERE id = ?1
     `,
-  ).bind(safeRunId).run();
+  ).bind(runId).run();
 }
 
 export async function markGenerationRunCompleted(
   db: D1Database,
   input: MarkGenerationRunCompletedInput,
 ): Promise<void> {
-  const runId = ensureNonEmpty(input.runId, 'runId');
-  const outputJson = JSON.stringify(input.output);
   await db.prepare(
     `
       UPDATE generation_runs
@@ -162,15 +156,13 @@ export async function markGenerationRunCompleted(
           completed_at = datetime('now')
       WHERE id = ?1
     `,
-  ).bind(runId, outputJson).run();
+  ).bind(input.runId, JSON.stringify(input.output)).run();
 }
 
 export async function markGenerationRunFailed(
   db: D1Database,
   input: MarkGenerationRunFailedInput,
 ): Promise<void> {
-  const runId = ensureNonEmpty(input.runId, 'runId');
-  const error = ensureNonEmpty(input.error, 'error');
   await db.prepare(
     `
       UPDATE generation_runs
@@ -179,16 +171,58 @@ export async function markGenerationRunFailed(
           completed_at = datetime('now')
       WHERE id = ?1
     `,
-  ).bind(runId, error).run();
+  ).bind(input.runId, input.error).run();
+}
+
+export async function getActiveRunForProject(
+  db: D1Database,
+  projectId: string,
+): Promise<GenerationRunRecord | null> {
+  const row = await db.prepare(
+    `
+      SELECT id, project_id, type, status, input_data, output_data, error, started_at, completed_at, created_at
+      FROM generation_runs
+      WHERE project_id = ?1
+        AND status IN ('pending', 'running')
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+  ).bind(projectId).first<GenerationRunRow>();
+  return row ? mapGenerationRunRow(row) : null;
+}
+
+export async function getLatestRunForProject(
+  db: D1Database,
+  options: { projectId: string; type?: 'initial' | 'replan' | 'update' },
+): Promise<GenerationRunRecord | null> {
+  const row = options.type
+    ? await db.prepare(
+      `
+        SELECT id, project_id, type, status, input_data, output_data, error, started_at, completed_at, created_at
+        FROM generation_runs
+        WHERE project_id = ?1
+          AND type = ?2
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+    ).bind(options.projectId, options.type).first<GenerationRunRow>()
+    : await db.prepare(
+      `
+        SELECT id, project_id, type, status, input_data, output_data, error, started_at, completed_at, created_at
+        FROM generation_runs
+        WHERE project_id = ?1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+    ).bind(options.projectId).first<GenerationRunRow>();
+  return row ? mapGenerationRunRow(row) : null;
 }
 
 export async function persistPlanRevision(
   db: D1Database,
   input: PersistPlanRevisionInput,
 ): Promise<PersistPlanRevisionResult> {
-  const projectId = ensureNonEmpty(input.projectId, 'projectId');
-  const architecture = ensureNonEmpty(input.architecture, 'architecture');
-  const chunks = normalizePlanChunks(input.chunks);
+  const chunks = [...input.chunks].sort((a, b) => a.sequence - b.sequence);
 
   const versionRow = await db.prepare(
     `
@@ -196,22 +230,16 @@ export async function persistPlanRevision(
       FROM plan_revisions
       WHERE project_id = ?1
     `,
-  ).bind(projectId).first<{ maxVersion: number | null }>();
+  ).bind(input.projectId).first<{ maxVersion: number | null }>();
   const version = (versionRow?.maxVersion ?? 0) + 1;
   const revisionId = crypto.randomUUID();
   const now = new Date().toISOString();
 
+  // Keep plan_revisions as lightweight metadata; chunks table is the execution source of truth.
   const planData = {
-    architecture,
-    chunks: chunks.map((chunk, index) => ({
-      id: `chunk-${String(index + 1).padStart(3, '0')}`,
-      sequence: chunk.sequence,
-      title: chunk.title,
-      prompt: chunk.prompt,
-      doneCondition: chunk.doneCondition,
-      ...(chunk.doNotTouch ? { doNotTouch: chunk.doNotTouch } : {}),
-      ...(chunk.verificationHints ? { verificationHints: chunk.verificationHints } : {}),
-    })),
+    architecture: input.architecture,
+    chunkCount: chunks.length,
+    source: 'chunks-table',
   };
 
   await db.prepare(
@@ -219,7 +247,7 @@ export async function persistPlanRevision(
       INSERT INTO plan_revisions (id, project_id, version, plan_data, created_at)
       VALUES (?1, ?2, ?3, ?4, ?5)
     `,
-  ).bind(revisionId, projectId, version, JSON.stringify(planData), now).run();
+  ).bind(revisionId, input.projectId, version, JSON.stringify(planData), now).run();
 
   let activeChunkId: string | undefined;
   for (const [index, chunk] of chunks.entries()) {
@@ -246,7 +274,7 @@ export async function persistPlanRevision(
       `,
     ).bind(
       chunkId,
-      projectId,
+      input.projectId,
       revisionId,
       chunk.sequence,
       chunk.title,
@@ -266,7 +294,7 @@ export async function persistPlanRevision(
           updated_at = datetime('now')
       WHERE id = ?2
     `,
-  ).bind(activeChunkId ?? null, projectId).run();
+  ).bind(activeChunkId ?? null, input.projectId).run();
 
   return {
     revisionId,
@@ -279,8 +307,6 @@ export async function appendProjectEvent(
   db: D1Database,
   input: AppendProjectEventInput,
 ): Promise<void> {
-  const projectId = ensureNonEmpty(input.projectId, 'projectId');
-  const type = ensureNonEmpty(input.type, 'type');
   await db.prepare(
     `
       INSERT INTO events (id, project_id, type, data, created_at)
@@ -288,8 +314,8 @@ export async function appendProjectEvent(
     `,
   ).bind(
     crypto.randomUUID(),
-    projectId,
-    type,
+    input.projectId,
+    input.type,
     input.data ? JSON.stringify(input.data) : null,
   ).run();
 }
