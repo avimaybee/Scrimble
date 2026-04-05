@@ -45,6 +45,35 @@ function buildReplannedPendingChunks(request: string, startSequence: number): Lo
   ];
 }
 
+function formatCloudError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const prefix = raw.match(/^Cloud API request failed \(\d+\):\s*/)?.[0];
+  const payload = prefix ? raw.slice(prefix.length) : raw;
+  try {
+    const parsed = JSON.parse(payload) as {
+      error?: unknown;
+      message?: unknown;
+      issues?: Array<{ message?: unknown }>;
+    };
+    const errorMessage = typeof parsed.error === 'string' ? parsed.error : undefined;
+    const details = Array.isArray(parsed.issues)
+      ? parsed.issues
+          .map((issue) => (typeof issue.message === 'string' ? issue.message : undefined))
+          .filter((message): message is string => Boolean(message))
+      : [];
+    if (errorMessage && details.length > 0) {
+      return `${errorMessage} ${details.join(' ')}`;
+    }
+    if (errorMessage) {
+      return errorMessage;
+    }
+    if (typeof parsed.message === 'string') {
+      return parsed.message;
+    }
+  } catch {}
+  return raw;
+}
+
 export default class Replan extends Command {
   static override description = 'Regenerate remaining plan while preserving completed work';
 
@@ -94,6 +123,8 @@ export default class Replan extends Command {
     await writeCurrentChunkFromPlan(nextPlan);
 
     let cloudRunId: string | undefined;
+    let cloudStartError: string | undefined;
+    let cloudWaitError: string | undefined;
     if (flags.cloud) {
       try {
         const cloud = await resolveCloudClientConfig();
@@ -112,10 +143,11 @@ export default class Replan extends Command {
         });
         cloudRunId = started.instanceId;
       } catch (error) {
+        cloudStartError = formatCloudError(error);
         await recordTelemetry({
           event: 'replan_cloud_start_failed',
           level: 'warn',
-          payload: { message: error instanceof Error ? error.message : String(error) },
+          payload: { message: cloudStartError },
         });
       }
     }
@@ -132,10 +164,11 @@ export default class Replan extends Command {
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       } catch (error) {
+        cloudWaitError = formatCloudError(error);
         await recordTelemetry({
           event: 'replan_cloud_wait_failed',
           level: 'warn',
-          payload: { message: error instanceof Error ? error.message : String(error) },
+          payload: { message: cloudWaitError },
         });
       }
     }
@@ -157,6 +190,11 @@ export default class Replan extends Command {
     this.log(chalk.green('✓ Plan replanned while preserving completed work.'));
     if (cloudRunId) {
       this.log(chalk.dim(`Cloud replan run: ${cloudRunId}`));
+    } else if (flags.cloud && cloudStartError) {
+      this.log(chalk.yellow(`⚠ Cloud replan start failed: ${cloudStartError}`));
+    }
+    if (cloudWaitError) {
+      this.log(chalk.yellow(`⚠ Cloud replan wait failed: ${cloudWaitError}`));
     }
     this.log('');
   }
