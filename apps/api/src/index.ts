@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { z } from 'zod';
+import { aiConfigSchema } from '@scrimble/shared';
 import type { GenerationProgressHub } from './durable-objects/generation-progress.js';
 import {
   appendProjectEvent,
@@ -54,12 +55,25 @@ const startGenerationSchema = z.object({
   projectId: z.string().min(1),
   goal: z.string().min(1),
   repoSnapshot: z.string().optional(),
+  aiConfig: aiConfigSchema.optional(),
 });
 const startReplanSchema = z.object({
   projectId: z.string().min(1),
   updateRequest: z.string().min(1),
   currentPlanSummary: z.string().optional(),
+  aiConfig: aiConfigSchema.optional(),
 });
+
+function redactAIConfig(aiConfig?: unknown): Record<string, unknown> | undefined {
+  if (!aiConfig) return undefined;
+  const parsed = aiConfigSchema.parse(aiConfig);
+  return {
+    provider: parsed.provider,
+    model: parsed.model,
+    ...(parsed.baseUrl ? { baseUrl: parsed.baseUrl } : {}),
+    ...(parsed.options ? { options: parsed.options } : {}),
+  };
+}
 
 v1.get('/projects', async (c) => {
   // TODO: Implement project listing
@@ -148,6 +162,7 @@ v1.post('/generation/start', async (c) => {
     input: {
       goal: parsed.goal,
       ...(parsed.repoSnapshot ? { repoSnapshot: parsed.repoSnapshot } : {}),
+      ...(parsed.aiConfig ? { aiConfig: redactAIConfig(parsed.aiConfig) } : {}),
     },
   });
   await appendProjectEvent(c.env.DB, {
@@ -168,6 +183,7 @@ v1.post('/generation/start', async (c) => {
       projectId,
       goal: parsed.goal,
       ...(parsed.repoSnapshot ? { repoSnapshot: parsed.repoSnapshot } : {}),
+      ...(parsed.aiConfig ? { aiConfig: parsed.aiConfig } : {}),
     }),
   });
   
@@ -255,6 +271,7 @@ v1.post('/replan/start', async (c) => {
     input: {
       updateRequest: parsed.updateRequest,
       ...(parsed.currentPlanSummary ? { currentPlanSummary: parsed.currentPlanSummary } : {}),
+      ...(parsed.aiConfig ? { aiConfig: redactAIConfig(parsed.aiConfig) } : {}),
     },
   });
   
@@ -270,6 +287,7 @@ v1.post('/replan/start', async (c) => {
       projectId,
       updateRequest: parsed.updateRequest,
       ...(parsed.currentPlanSummary ? { currentPlanSummary: parsed.currentPlanSummary } : {}),
+      ...(parsed.aiConfig ? { aiConfig: parsed.aiConfig } : {}),
     }),
   });
   

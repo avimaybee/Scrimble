@@ -9,6 +9,7 @@ import {
   type LocalChunk,
 } from '../lib/local/index.js';
 import { getReplanStatus, resolveCloudClientConfig, startReplan } from '../lib/api/index.js';
+import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
 function summarizePlan(plan: Awaited<ReturnType<typeof loadPlanState>>): string {
@@ -96,9 +97,18 @@ export default class Replan extends Command {
     if (flags.cloud) {
       try {
         const cloud = await resolveCloudClientConfig();
+        const config = await loadScrimbleConfig();
+        const aiConfigPayload: Record<string, unknown> = {
+          provider: config.ai.provider,
+          model: config.ai.model,
+          ...(config.ai.apiKey ? { apiKey: config.ai.apiKey } : {}),
+          ...(config.ai.baseUrl ? { baseUrl: config.ai.baseUrl } : {}),
+          ...(config.ai.options ? { options: config.ai.options } : {}),
+        };
         const started = await startReplan(cloud, {
           updateRequest: flags.request,
           currentPlanSummary: summarizePlan(plan),
+          aiConfig: aiConfigPayload,
         });
         cloudRunId = started.instanceId;
       } catch (error) {

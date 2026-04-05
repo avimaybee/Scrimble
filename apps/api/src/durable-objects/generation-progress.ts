@@ -7,6 +7,7 @@ import {
   persistPlanRevision,
   type PersistedPlanChunk,
 } from '../lib/persistence.js';
+import { generateInitialPlan, generateReplan } from '../lib/planning-ai.js';
 import { storeJsonArtifact } from '../lib/storage.js';
 
 interface ProgressPublishPayload {
@@ -34,6 +35,7 @@ interface GenerationJobInput {
   projectId: string;
   goal: string;
   repoSnapshot?: string;
+  aiConfig?: unknown;
 }
 
 interface ReplanJobInput {
@@ -41,6 +43,7 @@ interface ReplanJobInput {
   projectId: string;
   updateRequest: string;
   currentPlanSummary?: string;
+  aiConfig?: unknown;
 }
 
 interface ProgressHubEnv {
@@ -140,6 +143,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         projectId: input.projectId.trim(),
         goal: input.goal.trim(),
         ...(input.repoSnapshot?.trim() ? { repoSnapshot: input.repoSnapshot.trim() } : {}),
+        ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
       },
     };
     this.activeJob = jobState;
@@ -169,6 +173,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         projectId: input.projectId.trim(),
         updateRequest: input.updateRequest.trim(),
         ...(input.currentPlanSummary?.trim() ? { currentPlanSummary: input.currentPlanSummary.trim() } : {}),
+        ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
       },
     };
     this.activeJob = jobState;
@@ -211,40 +216,24 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
         },
       });
 
-      const architectureSummary = await this.runStepWithRetry({
+      const generatedPlan = await this.runStepWithRetry({
         jobType: 'generation',
-        step: 'generate-architecture-summary',
+        step: 'generate-initial-plan',
         run: async () => {
-          const summary = [
-            `Goal: ${input.goal}`,
-            'CLI-first execution with one active chunk at a time.',
-            'Cloudflare Workers + D1 + R2 backend boundary.',
-            input.repoSnapshot ? `Repo snapshot: ${input.repoSnapshot}` : 'Repo snapshot: not supplied.',
-          ].join('\n');
-          await this.publishProgressInternal('architecture-generated', 'Architecture summary generated.');
-          return summary;
-        },
-      });
-
-      const chunks = await this.runStepWithRetry({
-        jobType: 'generation',
-        step: 'generate-initial-chunks',
-        run: async () => {
-          const generated: PersistedPlanChunk[] = [
-            {
-              sequence: 1,
-              title: 'Foundation hardening',
-              prompt: 'Stabilize CLI and API foundations before adding higher-order orchestration complexity.',
-              doneCondition: 'CLI/API runtime validations pass and baseline project health is documented.',
-              verificationHints: ['pnpm run lint', 'pnpm run build', 'pnpm test'],
-            },
-          ];
-          await this.publishProgressInternal('chunks-generated', 'Initial chunk plan generated.', {
-            chunkCount: generated.length,
+          const plan = await generateInitialPlan({
+            goal: input.goal,
+            ...(input.repoSnapshot ? { repoSnapshot: input.repoSnapshot } : {}),
+            ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
           });
-          return generated;
+          await this.publishProgressInternal('architecture-generated', 'Architecture summary generated.');
+          await this.publishProgressInternal('chunks-generated', 'Initial chunk plan generated.', {
+            chunkCount: plan.chunks.length,
+          });
+          return plan;
         },
       });
+      const architectureSummary = generatedPlan.architectureSummary;
+      const chunks: PersistedPlanChunk[] = generatedPlan.chunks;
 
       const revision = await this.runStepWithRetry({
         jobType: 'generation',
@@ -363,41 +352,24 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
     try {
       await markGenerationRunRunning(this.env.DB, input.runId);
 
-      const revisedPlanSummary = await this.runStepWithRetry({
+      const replanned = await this.runStepWithRetry({
         jobType: 'replan',
-        step: 'draft-plan-summary',
+        step: 'generate-replan',
         run: async () => {
-          const summary = [
-            `Replan request: ${input.updateRequest}`,
-            input.currentPlanSummary
-              ? `Current plan summary: ${input.currentPlanSummary}`
-              : 'Current plan summary: not supplied.',
-            'Preserve completed chunks and adjust only future pending chunks.',
-          ].join('\n');
-          await this.publishProgressInternal('plan-drafted', 'Revised plan summary drafted.');
-          return summary;
-        },
-      });
-
-      const updatedChunks = await this.runStepWithRetry({
-        jobType: 'replan',
-        step: 'generate-replanned-chunks',
-        run: async () => {
-          const generated: PersistedPlanChunk[] = [
-            {
-              sequence: 1,
-              title: 'Apply replan changes',
-              prompt: `Apply requested plan update: ${input.updateRequest}`,
-              doneCondition: 'Requested update is reflected in implementation and validated.',
-              verificationHints: ['scrimble verify', 'scrimble status'],
-            },
-          ];
-          await this.publishProgressInternal('chunks-revised', 'Revised chunks generated.', {
-            chunkCount: generated.length,
+          const plan = await generateReplan({
+            updateRequest: input.updateRequest,
+            ...(input.currentPlanSummary ? { currentPlanSummary: input.currentPlanSummary } : {}),
+            ...(input.aiConfig ? { aiConfig: input.aiConfig } : {}),
           });
-          return generated;
+          await this.publishProgressInternal('plan-drafted', 'Revised plan summary drafted.');
+          await this.publishProgressInternal('chunks-revised', 'Revised chunks generated.', {
+            chunkCount: plan.chunks.length,
+          });
+          return plan;
         },
       });
+      const revisedPlanSummary = replanned.revisedPlanSummary;
+      const updatedChunks: PersistedPlanChunk[] = replanned.chunks;
 
       const revision = await this.runStepWithRetry({
         jobType: 'replan',

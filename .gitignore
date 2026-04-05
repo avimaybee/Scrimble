@@ -33,3 +33,7 @@ coverage/
 
 # Local Scrimble state (for development)
 .scrimble/session.json
+
+.agents
+.github/*
+!.github/copilot-instructions.md
