@@ -194,6 +194,20 @@ describe('GenerationProgressHub orchestration', () => {
       events: Array<{ stage: string; message: string }>;
     };
     expect(eventsPayload.events.some((event) => event.stage === 'step-retrying')).toBe(true);
+    expect(persistenceMocks.appendProjectEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        projectId: 'project-2',
+        type: 'generation_step_retrying',
+        data: expect.objectContaining({
+          runId: 'run-2',
+          step: 'generate-initial-plan',
+          attempt: 1,
+          maxAttempts: 3,
+          error: 'transient provider error',
+        }),
+      }),
+    );
   });
 
   it('marks run as failed after max retry exhaustion', async () => {
@@ -218,10 +232,84 @@ describe('GenerationProgressHub orchestration', () => {
     expect(planningMocks.generateInitialPlan).toHaveBeenCalledTimes(3);
     expect(persistenceMocks.markGenerationRunFailed).toHaveBeenCalledTimes(1);
     expect(persistenceMocks.markGenerationRunCompleted).not.toHaveBeenCalled();
+    expect(persistenceMocks.appendProjectEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        projectId: 'project-3',
+        type: 'generation_step_failed',
+        data: expect.objectContaining({
+          runId: 'run-3',
+          step: 'generate-initial-plan',
+          attempt: 3,
+          maxAttempts: 3,
+          error: 'persistent provider outage',
+        }),
+      }),
+    );
 
     const statusResponse = await hub.fetch(new Request('https://progress-hub.internal/status'));
     const status = (await statusResponse.json()) as { status: string; error?: string };
     expect(status.status).toBe('failed');
     expect(status.error).toContain('persistent provider outage');
+  });
+
+  it('applies since filtering for /events progress reads', async () => {
+    const { hub } = createHub();
+
+    await hub.fetch(
+      new Request('https://progress-hub.internal/publish', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stage: 'first', message: 'first event' }),
+      }),
+    );
+    await hub.fetch(
+      new Request('https://progress-hub.internal/publish', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stage: 'second', message: 'second event' }),
+      }),
+    );
+
+    const response = await hub.fetch(new Request('https://progress-hub.internal/events?since=1'));
+    const payload = (await response.json()) as {
+      events: Array<{ sequence: number; stage: string }>;
+      count: number;
+    };
+
+    expect(payload.count).toBe(1);
+    expect(payload.events[0]).toMatchObject({ sequence: 2, stage: 'second' });
+  });
+
+  it('streams backlog progress with SSE framing on /stream', async () => {
+    const { hub } = createHub();
+
+    await hub.fetch(
+      new Request('https://progress-hub.internal/publish', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stage: 'first', message: 'first event' }),
+      }),
+    );
+    await hub.fetch(
+      new Request('https://progress-hub.internal/publish', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stage: 'second', message: 'second event' }),
+      }),
+    );
+
+    const response = await hub.fetch(new Request('https://progress-hub.internal/stream?since=1'));
+    expect(response.headers.get('Content-Type')).toContain('text/event-stream');
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const first = await reader?.read();
+    const chunk = new TextDecoder().decode(first?.value);
+    expect(chunk).toContain('event: progress');
+    expect(chunk).toContain('"stage":"second"');
+    expect(chunk).toContain('"sequence":2');
+
+    await reader?.cancel();
   });
 });

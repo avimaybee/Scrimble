@@ -62,6 +62,11 @@ interface JobState {
   completedAt?: string;
 }
 
+interface RetryContext {
+  projectId: string;
+  runId: string;
+}
+
 const encoder = new TextEncoder();
 const EVENT_KEY_PREFIX = 'event/';
 const META_LAST_SEQUENCE = 'meta:last-sequence';
@@ -214,6 +219,10 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
 
   private async runGenerationJob(initialState: JobState): Promise<void> {
     const input = initialState.input as GenerationJobInput;
+    const retryContext: RetryContext = {
+      projectId: input.projectId,
+      runId: input.runId,
+    };
 
     const runningState: JobState = {
       ...initialState,
@@ -230,6 +239,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       await this.runStepWithRetry({
         jobType: 'generation',
         step: 'normalize-input',
+        context: retryContext,
         run: async () => {
           await this.publishProgressInternal('normalized', 'Input normalized.', { projectId: input.projectId });
         },
@@ -238,6 +248,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       const generatedPlan = await this.runStepWithRetry({
         jobType: 'generation',
         step: 'generate-initial-plan',
+        context: retryContext,
         run: async () => {
           const plan = await generateInitialPlan({
             goal: input.goal,
@@ -257,6 +268,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       const revision = await this.runStepWithRetry({
         jobType: 'generation',
         step: 'persist-plan-revision',
+        context: retryContext,
         run: async () => {
           const persisted = await persistPlanRevision(this.env.DB, {
             projectId: input.projectId,
@@ -274,6 +286,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       const artifact = await this.runStepWithRetry({
         jobType: 'generation',
         step: 'persist-output-artifact',
+        context: retryContext,
         run: async () => {
           const stored = await storeJsonArtifact(this.env.ARTIFACTS, {
             projectId: input.projectId,
@@ -358,6 +371,10 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
 
   private async runReplanJob(initialState: JobState): Promise<void> {
     const input = initialState.input as ReplanJobInput;
+    const retryContext: RetryContext = {
+      projectId: input.projectId,
+      runId: input.runId,
+    };
 
     const runningState: JobState = {
       ...initialState,
@@ -374,6 +391,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       const replanned = await this.runStepWithRetry({
         jobType: 'replan',
         step: 'generate-replan',
+        context: retryContext,
         run: async () => {
           const plan = await generateReplan({
             updateRequest: input.updateRequest,
@@ -393,6 +411,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       const revision = await this.runStepWithRetry({
         jobType: 'replan',
         step: 'persist-plan-revision',
+        context: retryContext,
         run: async () => {
           const persisted = await persistPlanRevision(this.env.DB, {
             projectId: input.projectId,
@@ -410,6 +429,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
       const artifact = await this.runStepWithRetry({
         jobType: 'replan',
         step: 'persist-output-artifact',
+        context: retryContext,
         run: async () => {
           const stored = await storeJsonArtifact(this.env.ARTIFACTS, {
             projectId: input.projectId,
@@ -655,6 +675,7 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
   private async runStepWithRetry<T>(options: {
     jobType: JobState['type'];
     step: string;
+    context?: RetryContext;
     run: () => Promise<T>;
     maxAttempts?: number;
   }): Promise<T> {
@@ -677,6 +698,19 @@ export class GenerationProgressHub extends DurableObject<ProgressHubEnv> {
           maxAttempts,
           error: message,
         });
+        if (options.context) {
+          await appendProjectEvent(this.env.DB, {
+            projectId: options.context.projectId,
+            type: canRetry ? `${options.jobType}_step_retrying` : `${options.jobType}_step_failed`,
+            data: {
+              runId: options.context.runId,
+              step: options.step,
+              attempt,
+              maxAttempts,
+              error: message,
+            },
+          });
+        }
         if (canRetry) {
           const backoffMs = STEP_BASE_BACKOFF_MS * (2 ** (attempt - 1));
           await this.delay(backoffMs);

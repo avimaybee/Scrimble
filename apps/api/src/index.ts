@@ -92,6 +92,18 @@ const startReplanSchema = z.object({
   aiConfig: cloudPlanningAiConfigSchema,
 });
 
+function formatValidationErrorResponse(error: string, issues: z.ZodIssue[]): {
+  error: string;
+  message: string;
+  issues: z.ZodIssue[];
+} {
+  return {
+    error,
+    message: 'Request validation failed.',
+    issues,
+  };
+}
+
 function redactAIConfig(aiConfig: unknown): Record<string, unknown> {
   const parsed = aiConfigSchema.parse(aiConfig);
   return {
@@ -168,13 +180,7 @@ v1.post('/generation/start', async (c) => {
   const body = await c.req.json();
   const parsedResult = startGenerationSchema.safeParse(body);
   if (!parsedResult.success) {
-    return c.json(
-      {
-        error: 'Invalid generation start payload.',
-        issues: parsedResult.error.issues,
-      },
-      400,
-    );
+    return c.json(formatValidationErrorResponse('Invalid generation start payload.', parsedResult.error.issues), 400);
   }
   const parsed = parsedResult.data;
   const projectId = parsed.projectId.trim();
@@ -288,13 +294,7 @@ v1.post('/replan/start', async (c) => {
   const body = await c.req.json();
   const parsedResult = startReplanSchema.safeParse(body);
   if (!parsedResult.success) {
-    return c.json(
-      {
-        error: 'Invalid replan start payload.',
-        issues: parsedResult.error.issues,
-      },
-      400,
-    );
+    return c.json(formatValidationErrorResponse('Invalid replan start payload.', parsedResult.error.issues), 400);
   }
   const parsed = parsedResult.data;
   const projectId = parsed.projectId.trim();

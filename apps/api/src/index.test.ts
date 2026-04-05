@@ -92,9 +92,17 @@ describe('API start route contracts', () => {
     );
 
     expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({
+    const payload = (await response.json()) as {
+      error: string;
+      message: string;
+      issues: Array<{ message: string }>;
+    };
+    expect(payload).toMatchObject({
       error: 'Invalid generation start payload.',
+      message: 'Request validation failed.',
     });
+    expect(payload.issues.length).toBeGreaterThan(0);
+    expect(payload.issues.some((issue) => issue.message.includes('aiConfig.apiKey'))).toBe(true);
     expect(stub.fetch).not.toHaveBeenCalled();
     expect(persistenceMocks.createGenerationRunRecord).not.toHaveBeenCalled();
   });
@@ -255,9 +263,17 @@ describe('API start route contracts', () => {
     );
 
     expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({
+    const payload = (await response.json()) as {
+      error: string;
+      message: string;
+      issues: Array<{ message: string }>;
+    };
+    expect(payload).toMatchObject({
       error: 'Invalid replan start payload.',
+      message: 'Request validation failed.',
     });
+    expect(payload.issues.length).toBeGreaterThan(0);
+    expect(payload.issues.some((issue) => issue.message.includes('not supported for cloud planning MVP'))).toBe(true);
     expect(stub.fetch).not.toHaveBeenCalled();
     expect(persistenceMocks.createGenerationRunRecord).not.toHaveBeenCalled();
   });
