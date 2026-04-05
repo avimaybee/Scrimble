@@ -26,9 +26,31 @@ export const aiConfigSchema = z.object({
   options: aiOptionsSchema.optional(),
 }).strict();
 
+export const authProviderSchema = z.enum(['custom', 'github']);
+
+export const authConfigSchema = z.object({
+  provider: authProviderSchema,
+  clientId: z.string().min(1),
+  deviceCodeEndpoint: z.string().url(),
+  tokenEndpoint: z.string().url(),
+  scope: z.string().optional(),
+  audience: z.string().optional(),
+}).strict();
+
+export const authSessionSchema = z.object({
+  provider: authProviderSchema,
+  accessToken: z.string().min(1),
+  tokenType: z.string().min(1),
+  scope: z.string().optional(),
+  refreshToken: z.string().optional(),
+  expiresAt: z.string().datetime().optional(),
+  createdAt: z.string().datetime(),
+}).strict();
+
 // Local config schema
 export const scrimbleConfigSchema = z.object({
   ai: aiConfigSchema,
+  auth: authConfigSchema.optional(),
   projectId: z.string().optional(),
   cloudEndpoint: z.string().url().optional(),
 }).strict();
@@ -148,6 +170,9 @@ export const updatePlanRequestSchema = z.object({
 // Only export schema-derived types for use with zod inference
 export type AIProviderFromSchema = z.infer<typeof aiProviderSchema>;
 export type AIConfigFromSchema = z.infer<typeof aiConfigSchema>;
+export type AuthProviderFromSchema = z.infer<typeof authProviderSchema>;
+export type AuthConfigFromSchema = z.infer<typeof authConfigSchema>;
+export type AuthSessionFromSchema = z.infer<typeof authSessionSchema>;
 export type ScrimbleConfigFromSchema = z.infer<typeof scrimbleConfigSchema>;
 export type ProjectStatusFromSchema = z.infer<typeof projectStatusSchema>;
 export type ChunkStatusFromSchema = z.infer<typeof chunkStatusSchema>;

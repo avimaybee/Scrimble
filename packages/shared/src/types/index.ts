@@ -195,9 +195,31 @@ export interface AIOptions {
   topP?: number;
 }
 
+export type AuthProvider = 'custom' | 'github';
+
+export interface AuthConfig {
+  provider: AuthProvider;
+  clientId: string;
+  deviceCodeEndpoint: string;
+  tokenEndpoint: string;
+  scope?: string | undefined;
+  audience?: string | undefined;
+}
+
+export interface AuthSession {
+  provider: AuthProvider;
+  accessToken: string;
+  tokenType: string;
+  scope?: string | undefined;
+  refreshToken?: string | undefined;
+  expiresAt?: string | undefined;
+  createdAt: string;
+}
+
 // Local config
 export interface ScrimbleConfig {
   ai: AIConfig;
+  auth?: AuthConfig;
   projectId?: ProjectID;
   cloudEndpoint?: string;
 }

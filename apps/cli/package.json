@@ -16,9 +16,9 @@
   "scripts": {
     "build": "tsc -b",
     "dev": "tsc -b --watch",
-    "lint": "tsc --noEmit",
+    "lint": "tsc -p tsconfig.lint.json",
     "test": "vitest run --passWithNoTests",
-    "clean": "rimraf dist oclif.manifest.json"
+    "clean": "rimraf dist oclif.manifest.json tsconfig.tsbuildinfo"
   },
   "dependencies": {
     "@oclif/core": "^4.2.0",
@@ -53,7 +53,7 @@
       "@oclif/plugin-help"
     ],
     "topicSeparator": " ",
-    "default": "."
+    "default": "root"
   },
   "engines": {
     "node": ">=20.0.0"

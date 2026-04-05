@@ -1,5 +1,8 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
+import { authSessionSchema } from '@scrimble/shared';
+import { loadPlanState } from '../lib/local/index.js';
+import { detectStaleness } from '../lib/staleness.js';
 
 export default class Doctor extends Command {
   static override description = 'Check Scrimble configuration and health';
@@ -50,6 +53,20 @@ export default class Doctor extends Command {
       } catch {
         checks.push({ name: 'config.json', status: 'warn', message: 'Not found (run `scrimble init`)' });
       }
+
+      // Check 2c: auth session
+      try {
+        const sessionPath = path.join(scrimbleDir, 'session.json');
+        const sessionContent = await fs.readFile(sessionPath, 'utf8');
+        const parsedSession = authSessionSchema.parse(JSON.parse(sessionContent));
+        if (parsedSession.expiresAt && new Date(parsedSession.expiresAt).getTime() <= Date.now()) {
+          checks.push({ name: 'auth session', status: 'warn', message: 'Session expired (run `scrimble login`)' });
+        } else {
+          checks.push({ name: 'auth session', status: 'pass', message: `Active (${parsedSession.provider}) ✓` });
+        }
+      } catch {
+        checks.push({ name: 'auth session', status: 'warn', message: 'No active session (run `scrimble login`)' });
+      }
     } catch {
       checks.push({ name: '.scrimble directory', status: 'warn', message: 'Not found (run `scrimble init`)' });
     }
@@ -61,6 +78,24 @@ export default class Doctor extends Command {
       checks.push({ name: 'Git repository', status: 'pass', message: 'Found ✓' });
     } catch {
       checks.push({ name: 'Git repository', status: 'warn', message: 'Not a git repository' });
+    }
+
+    // Check 4: stale-state detection
+    try {
+      const plan = await loadPlanState();
+      const staleIssues = await detectStaleness(plan);
+      if (staleIssues.length === 0) {
+        checks.push({ name: 'State freshness', status: 'pass', message: 'No stale-state issues ✓' });
+      } else {
+        const hasError = staleIssues.some((issue) => issue.severity === 'error');
+        checks.push({
+          name: 'State freshness',
+          status: hasError ? 'fail' : 'warn',
+          message: staleIssues.map((issue) => issue.message).join(' | '),
+        });
+      }
+    } catch {
+      checks.push({ name: 'State freshness', status: 'warn', message: 'Could not evaluate local staleness.' });
     }
 
     // Display results

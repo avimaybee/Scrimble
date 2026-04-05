@@ -1,8 +1,12 @@
 import { Command } from '@oclif/core';
 import chalk from 'chalk';
-import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
-import { SCRIMBLE_DIR, PLAN_FILE } from '@scrimble/shared';
+import {
+  getActiveChunk,
+  getCompletionStats,
+  loadPlanState,
+  loadProjectState,
+} from '../lib/local/index.js';
+import { detectStaleness } from '../lib/staleness.js';
 
 export default class Status extends Command {
   static override description = 'Show project status and progress';
@@ -12,92 +16,71 @@ export default class Status extends Command {
   ];
 
   async run(): Promise<void> {
-    const cwd = process.cwd();
-    const scrimbleDir = path.join(cwd, SCRIMBLE_DIR);
-
-    // Check if initialized
-    try {
-      await fs.access(scrimbleDir);
-    } catch {
-      this.log(chalk.yellow('\n⚠ Scrimble not initialized in this directory.'));
-      this.log(chalk.dim('  Run `scrimble init` to get started.\n'));
-      return;
-    }
-
-    // Load project and plan
-    let project: { name?: string; goal?: string; initialized?: string } = {};
-    let plan: { chunks?: Array<{ title: string; status: string }> } | null = null;
-
-    try {
-      const projectContent = await fs.readFile(path.join(scrimbleDir, 'project.json'), 'utf-8');
-      project = JSON.parse(projectContent);
-    } catch {
-      // Ignore
-    }
-
-    try {
-      const planContent = await fs.readFile(path.join(scrimbleDir, PLAN_FILE), 'utf-8');
-      plan = JSON.parse(planContent);
-    } catch {
-      // No plan
-    }
+    const project = await loadProjectState();
+    const plan = await loadPlanState();
+    const stats = getCompletionStats(plan);
+    const activeChunk = getActiveChunk(plan);
+    const staleIssues = await detectStaleness(plan);
+    const projectName = typeof project['name'] === 'string' ? project['name'] : 'Unknown';
+    const projectGoal = typeof project['goal'] === 'string' ? project['goal'] : null;
+    const initialized = typeof project['initialized'] === 'string' ? project['initialized'] : null;
 
     this.log('');
-    this.log(chalk.bold(`📊 Project Status: ${project.name ?? 'Unknown'}`));
+    this.log(chalk.bold(`📊 Project Status: ${projectName}`));
     this.log('');
 
-    if (project.goal) {
-      this.log(chalk.dim(`Goal: ${project.goal}`));
+    if (projectGoal) {
+      this.log(chalk.dim(`Goal: ${projectGoal}`));
       this.log('');
     }
 
-    if (project.initialized) {
-      this.log(chalk.dim(`Initialized: ${new Date(project.initialized).toLocaleDateString()}`));
+    if (initialized) {
+      this.log(chalk.dim(`Initialized: ${new Date(initialized).toLocaleDateString()}`));
+      this.log('');
     }
 
-    if (!plan?.chunks) {
+    if (plan.chunks.length === 0) {
       this.log(chalk.yellow('\n  No execution plan generated yet.'));
-      this.log(chalk.dim('  Run your AI provider to generate a plan.\n'));
+      this.log(chalk.dim('  Run `scrimble import --goal "<goal>"` or generation workflow.\n'));
       return;
     }
 
-    // Show chunk progress
-    const total = plan.chunks.length;
-    const completed = plan.chunks.filter(c => c.status === 'completed').length;
-    const skipped = plan.chunks.filter(c => c.status === 'skipped').length;
-    const active = plan.chunks.find(c => c.status === 'active');
-
     this.log('');
     this.log(chalk.bold('Progress:'));
-    
-    // Progress bar
     const barWidth = 30;
-    const progress = Math.round((completed / total) * barWidth);
+    const progress = stats.total === 0 ? 0 : Math.round((stats.completed / stats.total) * barWidth);
     const bar = chalk.green('█'.repeat(progress)) + chalk.dim('░'.repeat(barWidth - progress));
-    this.log(`  [${bar}] ${completed}/${total} chunks`);
-    
-    if (skipped > 0) {
-      this.log(chalk.yellow(`  ${skipped} chunk(s) skipped`));
+    this.log(`  [${bar}] ${stats.completed}/${stats.total} chunks complete`);
+    if (stats.skipped > 0) {
+      this.log(chalk.yellow(`  ${stats.skipped} chunk(s) skipped`));
     }
 
     this.log('');
 
-    if (active) {
+    if (activeChunk) {
       this.log(chalk.bold('Current:'));
-      this.log(chalk.cyan(`  → ${active.title}`));
-    } else if (completed === total) {
+      this.log(chalk.cyan(`  → ${activeChunk.title}`));
+    } else if (stats.completed + stats.skipped === stats.total) {
       this.log(chalk.green('  ✓ All chunks completed!'));
     }
 
     this.log('');
 
-    // List all chunks
+    if (staleIssues.length > 0) {
+      this.log(chalk.bold('Integrity alerts:'));
+      for (const issue of staleIssues) {
+        const color = issue.severity === 'error' ? chalk.red : chalk.yellow;
+        this.log(color(`  - ${issue.message}`));
+      }
+      this.log('');
+    }
+
     this.log(chalk.bold('Chunks:'));
     for (const chunk of plan.chunks) {
       const icon = chunk.status === 'completed' ? chalk.green('✓') :
                    chunk.status === 'skipped' ? chalk.yellow('○') :
                    chunk.status === 'active' ? chalk.cyan('→') :
-                   chalk.dim('·');
+                    chalk.dim('·');
       const title = chunk.status === 'active' ? chalk.bold(chunk.title) : chunk.title;
       this.log(`  ${icon} ${title}`);
     }

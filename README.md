@@ -44,8 +44,21 @@ scrimble/
 | Command | Description |
 |---------|-------------|
 | `scrimble init` | Initialize Scrimble in current repository |
+| `scrimble import` | Adopt an existing repo and generate a reality-based chunk plan |
+| `scrimble login` | Authenticate using OAuth device flow |
+| `scrimble approve` | Approve/reject architecture before execution |
+| `scrimble` | Show active chunk context and quick actions |
+| `scrimble prompt` | Print the raw active-chunk prompt |
+| `scrimble verify` | Run local verification checks |
+| `scrimble done` | Complete current chunk and sync completion event |
 | `scrimble doctor` | Check configuration and health |
 | `scrimble status` | Show project status and progress |
+| `scrimble next` | Preview or activate next pending chunk |
+| `scrimble skip` | Skip active chunk with risk acknowledgement |
+| `scrimble update` | Apply targeted plan updates |
+| `scrimble replan` | Rebuild remaining plan while preserving completed chunks |
+| `scrimble sync` | Reconcile local/cloud state and resolve conflicts |
+| `scrimble watch` | Run proactive resident mode with alerts |
 | `scrimble logout` | Clear local session |
 
 ## Development
@@ -104,6 +117,18 @@ Supported providers:
 - GitHub Copilot subscriptions (via Copilot token)
 - Azure OpenAI
 - Groq, Together AI, etc.
+
+## Authentication
+
+Use device login for a local CLI session:
+
+```bash
+# default custom provider (from .scrimble/config.json auth block)
+node apps/cli/bin/run.js login
+
+# GitHub OAuth device flow
+node apps/cli/bin/run.js login --provider github --client-id <oauth-client-id>
+```
 
 ## License
 

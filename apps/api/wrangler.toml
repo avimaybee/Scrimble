@@ -14,8 +14,10 @@ database_id = "placeholder-will-be-set-on-deploy"
 binding = "ARTIFACTS"
 bucket_name = "scrimble-artifacts"
 
-# Uncomment when ready to use Workflows
-# [[workflows]]
-# binding = "GENERATION_WORKFLOW"
-# name = "generation-workflow"
-# class_name = "GenerationWorkflow"
+[[durable_objects.bindings]]
+name = "PROGRESS_HUB"
+class_name = "GenerationProgressHub"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["GenerationProgressHub"]

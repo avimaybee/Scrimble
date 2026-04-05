@@ -452,6 +452,7 @@ Users configure their AI provider in `.scrimble/config.json`:
 ### Completed foundation work
 - Monorepo setup (pnpm workspace + turbo).
 - CLI scaffold with working `init`, `doctor`, `status`, `logout`.
+- OAuth device flow login command (`scrimble login`) with session persistence.
 - Shared types/schemas package and D1 initial migration.
 - API scaffold on Cloudflare Workers + Hono.
 - Ink component foundation files created in `apps/cli/src/components/`.
@@ -465,6 +466,54 @@ Users configure their AI provider in `.scrimble/config.json`:
   - `apiKey: "${GITHUB_COPILOT_TOKEN}"`
   - `baseUrl: "https://api.githubcopilot.com"`
 
+### Prompt templates delivered
+- Added architecture synthesis prompt template in `apps/cli/src/lib/ai/prompts/architecture.ts`.
+- Added chunk planning prompt template in `apps/cli/src/lib/ai/prompts/chunk-planning.ts`.
+- Prompt templates enforce the PRD mandatory prompt contract sections.
+
+### R2 artifact storage delivered
+- Added storage helper in `apps/api/src/lib/storage.ts`.
+- Added API routes for artifact create/read/list under `/v1/artifacts*`.
+
+### Workflow surfaces expanded
+- Added generation workflow start/status routes under `/v1/generation/*`.
+- Added replan workflow scaffold in `apps/api/src/workflows/replan-workflow.ts`.
+- Added replan workflow start/status routes under `/v1/replan/*`.
+- Added `REPLAN_WORKFLOW` binding in `apps/api/wrangler.toml`.
+
+### Generation progress streaming delivered
+- Added `GenerationProgressHub` Durable Object for progress event fanout and retention.
+- Generation workflow now publishes stage updates to progress hub during execution.
+- Added progress APIs:
+  - `GET /v1/generation/:id/progress` (poll/backfill events)
+  - `GET /v1/generation/:id/stream` (SSE stream)
+
 ### Plan artifacts saved in repo for agent handoff
 - `docs/plans/master-plan.md` (full architecture/implementation plan copy)
 - `docs/plans/agent-handoff.md` (current state, decisions, and next steps)
+
+### Execution loop and recovery delivered
+- Added architecture approval flow via `scrimble approve`.
+- Added import/re-entry/navigation commands:
+  - `scrimble import`, `scrimble prompt`, `scrimble next`, `scrimble skip`
+  - enhanced default `scrimble` and `scrimble status`
+- Added completion sync semantics:
+  - `scrimble done` now records completion sync events and performs optional immediate cloud sync.
+- Added plan evolution + integrity commands:
+  - `scrimble update`, `scrimble replan`, `scrimble sync`
+  - stale-state checks in `status`/`doctor`
+  - conflict resolution strategy in `sync` (`manual|local|cloud`)
+
+### Proactive mode + hardening delivered
+- `scrimble watch` now evaluates proactive triggers and emits suggested next actions with confidence.
+- Added proactive notifications + alert throttling + pause/resume controls.
+- Added observability telemetry stream in `.scrimble/telemetry.ndjson`.
+- Added security helper for sensitive local JSON writes (session/config paths).
+- Added verification performance tuning by parallelizing local checks.
+
+### Roadmap completion status
+- All SQL-tracked roadmap todos (`p1-*` through `p5-*`) are marked **done**.
+
+### Post-completion runtime hardening
+- Removed oclif startup warning path by moving default command implementation from `index` to hidden `root` command.
+- Updated CLI build script to `tsc -b --force` to ensure dist artifacts are emitted even after no-emit lint passes.

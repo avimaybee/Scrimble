@@ -10,6 +10,8 @@ import {
   scrimbleConfigSchema,
 } from '@scrimble/shared';
 import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
+import { writeSecureJson } from '../lib/security.js';
+import { recordTelemetry } from '../lib/telemetry.js';
 
 export default class Init extends Command {
   static override description = 'Initialize Scrimble in the current repository';
@@ -85,16 +87,22 @@ export default class Init extends Command {
     await fs.mkdir(path.join(scrimbleDir, 'rules'), { recursive: true });
 
     // Create default config
-    const defaultConfig = { ai: defaultAIConfig };
+    const defaultCloudEndpoint = 'https://api.scrimble.dev';
+    const defaultConfig = {
+      ai: defaultAIConfig,
+      auth: {
+        provider: 'custom',
+        clientId: 'scrimble-cli',
+        deviceCodeEndpoint: `${defaultCloudEndpoint}/oauth/device/code`,
+        tokenEndpoint: `${defaultCloudEndpoint}/oauth/token`,
+        scope: 'scrimble:cli',
+      },
+      cloudEndpoint: defaultCloudEndpoint,
+    };
 
     // Validate config structure
     const validatedConfig = scrimbleConfigSchema.parse(defaultConfig);
     
-    await fs.writeFile(
-      path.join(scrimbleDir, CONFIG_FILE),
-      JSON.stringify(validatedConfig, null, 2)
-    );
-
     // Create project.json placeholder
     const projectData = {
       name: repoName,
@@ -104,10 +112,8 @@ export default class Init extends Command {
       goal: flags.goal ?? null,
     };
 
-    await fs.writeFile(
-      path.join(scrimbleDir, PROJECT_FILE),
-      JSON.stringify(projectData, null, 2)
-    );
+    await writeSecureJson(path.join(scrimbleDir, CONFIG_FILE), validatedConfig);
+    await writeSecureJson(path.join(scrimbleDir, PROJECT_FILE), projectData);
 
     // Create .gitignore for sensitive files
     const gitignoreContent = `# Scrimble sensitive files
@@ -153,12 +159,21 @@ Run \`scrimble\` to see the current execution chunk and what to work on next.
     if (selectedProvider === 'github-copilot') {
       this.log(chalk.dim('     GitHub Copilot users: set GITHUB_COPILOT_TOKEN from your Copilot auth/session token.'));
     }
+    this.log(chalk.dim('  3. Authenticate: `scrimble login`'));
     if (!flags.goal) {
-      this.log(chalk.dim('  3. Run `scrimble` to start planning your project'));
+      this.log(chalk.dim('  4. Run `scrimble` to start planning your project'));
     } else {
-      this.log(chalk.dim('  3. Run `scrimble` to generate your execution plan'));
+      this.log(chalk.dim('  4. Run `scrimble` to generate your execution plan'));
     }
     this.log('');
+
+    await recordTelemetry({
+      event: 'project_initialized',
+      payload: {
+        provider: selectedProvider,
+        model: defaultAIConfig.model,
+      },
+    });
   }
 
   private async detectStack(cwd: string): Promise<{ languages: string[]; frameworks: string[]; packageManager?: string }> {

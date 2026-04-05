@@ -1,0 +1,248 @@
+import { Command, Flags } from '@oclif/core';
+import chalk from 'chalk';
+import * as fs from 'node:fs/promises';
+import { createRepoWatcher, evaluateProactiveSignals, type RepoWatchEvent } from '../lib/watch/index.js';
+import { runVerification } from '../lib/verify/index.js';
+import { loadPlanState, readLatestVerification, type LocalPlanState } from '../lib/local/index.js';
+import { recordTelemetry } from '../lib/telemetry.js';
+import { getScrimblePaths } from '../lib/local/index.js';
+
+interface WatchState {
+  paused: boolean;
+  quietMode: boolean;
+  updatedAt: string;
+}
+
+function summarizeBatch(events: RepoWatchEvent[]): string {
+  const created = events.filter((event) => event.type === 'created').length;
+  const changed = events.filter((event) => event.type === 'changed').length;
+  const deleted = events.filter((event) => event.type === 'deleted').length;
+  return `created ${created} • changed ${changed} • deleted ${deleted}`;
+}
+
+async function readWatchState(): Promise<WatchState> {
+  const filePath = getScrimblePaths().watchState;
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<WatchState>;
+    return {
+      paused: parsed.paused ?? false,
+      quietMode: parsed.quietMode ?? false,
+      updatedAt: parsed.updatedAt ?? new Date().toISOString(),
+    };
+  } catch {
+    return {
+      paused: false,
+      quietMode: false,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+}
+
+async function writeWatchState(state: WatchState): Promise<void> {
+  const filePath = getScrimblePaths().watchState;
+  await fs.writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+}
+
+export default class Watch extends Command {
+  static override description = 'Run resident mode and proactively surface next actions while files change';
+
+  static override examples = [
+    '<%= config.bin %> watch',
+    '<%= config.bin %> watch --verify --notify',
+    '<%= config.bin %> watch --pause',
+    '<%= config.bin %> watch --resume',
+  ];
+
+  static override flags = {
+    json: Flags.boolean({
+      description: 'Emit change batches as JSON',
+      default: false,
+    }),
+    quiet: Flags.boolean({
+      description: 'Suppress per-file events and print only summaries',
+      default: false,
+    }),
+    verify: Flags.boolean({
+      description: 'Run verification after each file-change batch',
+      default: false,
+    }),
+    'verify-command': Flags.string({
+      description: 'Verification command (repeatable)',
+      multiple: true,
+    }),
+    notify: Flags.boolean({
+      description: 'Emit proactive notifications with terminal bell for warnings',
+      default: true,
+      allowNo: true,
+    }),
+    pause: Flags.boolean({
+      description: 'Pause proactive notifications and exit',
+      default: false,
+    }),
+    resume: Flags.boolean({
+      description: 'Resume proactive notifications and exit',
+      default: false,
+    }),
+    'debounce-ms': Flags.integer({
+      description: 'Batch debounce duration in milliseconds',
+      default: 300,
+      min: 50,
+    }),
+    'max-alerts-per-minute': Flags.integer({
+      description: 'Alert throttle to avoid notification spam',
+      default: 6,
+      min: 1,
+    }),
+  };
+
+  async run(): Promise<void> {
+    const { flags } = await this.parse(Watch);
+    const persistedState = await readWatchState();
+
+    if (flags.pause && flags.resume) {
+      this.log(chalk.red('\nUse either --pause or --resume, not both.\n'));
+      this.exit(1);
+    }
+
+    if (flags.pause) {
+      await writeWatchState({
+        ...persistedState,
+        paused: true,
+        quietMode: flags.quiet || persistedState.quietMode,
+        updatedAt: new Date().toISOString(),
+      });
+      this.log(chalk.yellow('\nProactive watch notifications paused.\n'));
+      return;
+    }
+
+    if (flags.resume) {
+      await writeWatchState({
+        ...persistedState,
+        paused: false,
+        quietMode: flags.quiet ? true : false,
+        updatedAt: new Date().toISOString(),
+      });
+      this.log(chalk.green('\nProactive watch notifications resumed.\n'));
+      return;
+    }
+
+    if (persistedState.paused) {
+      this.log(chalk.yellow('\nWatch mode is currently paused. Run `scrimble watch --resume` first.\n'));
+      return;
+    }
+
+    let verificationInFlight = false;
+    let planCache: LocalPlanState = await loadPlanState();
+    let alertsInWindow = 0;
+    let alertWindowStartedAt = Date.now();
+
+    const watcher = createRepoWatcher({
+      debounceMs: flags['debounce-ms'],
+      onEvent: (event) => {
+        if (flags.quiet || flags.json || persistedState.quietMode) return;
+        const icon =
+          event.type === 'created'
+            ? chalk.green('+')
+            : event.type === 'deleted'
+              ? chalk.red('-')
+              : chalk.cyan('~');
+        this.log(`${icon} ${event.relativePath}`);
+      },
+      onBatch: async (events) => {
+        if (flags.json) {
+          this.log(JSON.stringify({ type: 'batch', events }, null, 2));
+        } else {
+          this.log(chalk.dim(`[watch] ${summarizeBatch(events)}`));
+        }
+
+        let verificationResult = await readLatestVerification();
+        if (flags.verify && !verificationInFlight) {
+          verificationInFlight = true;
+          try {
+            const result = await runVerification({
+              ...(flags['verify-command'] ? { commands: flags['verify-command'] } : {}),
+            });
+            verificationResult = result;
+            const color =
+              result.status === 'pass'
+                ? chalk.green
+                : result.status === 'fail'
+                  ? chalk.red
+                  : chalk.yellow;
+            this.log(color(`[verify] ${result.status.toUpperCase()} (${Math.round(result.confidence * 100)}%)`));
+          } finally {
+            verificationInFlight = false;
+          }
+        }
+
+        planCache = await loadPlanState();
+        const proactiveSignals = evaluateProactiveSignals({
+          events,
+          plan: planCache,
+          verificationResult,
+        });
+
+        const now = Date.now();
+        if (now - alertWindowStartedAt > 60_000) {
+          alertWindowStartedAt = now;
+          alertsInWindow = 0;
+        }
+
+        for (const signal of proactiveSignals) {
+          if (alertsInWindow >= flags['max-alerts-per-minute']) {
+            break;
+          }
+
+          const color = signal.severity === 'warn' ? chalk.yellow : chalk.cyan;
+          this.log(
+            color(
+              `[proactive] ${signal.message} (suggested: ${signal.suggestedCommand}, confidence ${Math.round(signal.confidence * 100)}%)`,
+            ),
+          );
+          alertsInWindow += 1;
+
+          if (flags.notify && signal.severity === 'warn') {
+            this.log('\u0007');
+          }
+
+          await recordTelemetry({
+            event: 'proactive_signal',
+            payload: {
+              type: signal.type,
+              severity: signal.severity,
+              suggestedCommand: signal.suggestedCommand,
+              confidence: signal.confidence,
+            },
+          });
+        }
+      },
+    });
+
+    this.log('');
+    this.log(chalk.bold('👀 Scrimble proactive watch mode started'));
+    this.log(chalk.dim(`Debounce: ${flags['debounce-ms']}ms`));
+    this.log(chalk.dim(`Alert throttle: ${flags['max-alerts-per-minute']} alerts/minute`));
+    if (flags.verify) {
+      this.log(chalk.dim('Verification mode: enabled'));
+    }
+    this.log(chalk.dim('Press Ctrl+C to stop.'));
+    this.log('');
+
+    await new Promise<void>((resolve) => {
+      const shutdown = async (): Promise<void> => {
+        await watcher.close();
+        resolve();
+      };
+
+      process.on('SIGINT', () => {
+        void shutdown();
+      });
+      process.on('SIGTERM', () => {
+        void shutdown();
+      });
+    });
+
+    this.log(chalk.dim('Watch mode stopped.'));
+  }
+}
