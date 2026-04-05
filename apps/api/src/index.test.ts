@@ -6,6 +6,7 @@ const persistenceMocks = vi.hoisted(() => ({
   ensureLocalProjectRecord: vi.fn(),
   getActiveRunForProject: vi.fn(),
   getLatestRunForProject: vi.fn(),
+  getRunStepDiagnostics: vi.fn(),
   markGenerationRunFailed: vi.fn(),
 }));
 
@@ -59,6 +60,10 @@ describe('API start route contracts', () => {
     persistenceMocks.appendProjectEvent.mockResolvedValue(undefined);
     persistenceMocks.markGenerationRunFailed.mockResolvedValue(undefined);
     persistenceMocks.getLatestRunForProject.mockResolvedValue(null);
+    persistenceMocks.getRunStepDiagnostics.mockResolvedValue({
+      retryCount: 0,
+      failedStepCount: 0,
+    });
   });
 
   afterEach(() => {
@@ -443,6 +448,15 @@ describe('API start route contracts', () => {
       runId: 'run-generation',
       status: 'completed',
       output: { revisionId: 'rev-2' },
+      diagnostics: {
+        retryCount: 0,
+        failedStepCount: 0,
+      },
+    });
+    expect(persistenceMocks.getRunStepDiagnostics).toHaveBeenCalledWith(env.DB, {
+      projectId: 'project-3',
+      runId: 'run-generation',
+      type: 'generation',
     });
   });
 
@@ -490,6 +504,15 @@ describe('API start route contracts', () => {
       runId: 'run-replan',
       status: 'failed',
       error: 'provider timeout',
+      diagnostics: {
+        retryCount: 0,
+        failedStepCount: 0,
+      },
+    });
+    expect(persistenceMocks.getRunStepDiagnostics).toHaveBeenCalledWith(env.DB, {
+      projectId: 'project-4',
+      runId: 'run-replan',
+      type: 'replan',
     });
   });
 

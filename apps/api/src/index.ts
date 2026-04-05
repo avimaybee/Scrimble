@@ -10,6 +10,7 @@ import {
   ensureLocalProjectRecord,
   getActiveRunForProject,
   getLatestRunForProject,
+  getRunStepDiagnostics,
   markGenerationRunFailed,
 } from './lib/persistence.js';
 import { listArtifacts, readArtifact, storeJsonArtifact } from './lib/storage.js';
@@ -256,9 +257,15 @@ v1.get('/generation/:id', async (c) => {
   if (!run) {
     return c.json({ instanceId: id, status: 'idle', message: 'No generation run found.' });
   }
+  const diagnostics = await getRunStepDiagnostics(c.env.DB, {
+    projectId: id,
+    runId: run.runId,
+    type: 'generation',
+  });
   return c.json({
     instanceId: id,
     ...run,
+    diagnostics,
   });
 });
 
@@ -364,9 +371,15 @@ v1.get('/replan/:id', async (c) => {
   if (!run) {
     return c.json({ instanceId: id, status: 'idle', message: 'No replan run found.' });
   }
+  const diagnostics = await getRunStepDiagnostics(c.env.DB, {
+    projectId: id,
+    runId: run.runId,
+    type: 'replan',
+  });
   return c.json({
     instanceId: id,
     ...run,
+    diagnostics,
   });
 });
 

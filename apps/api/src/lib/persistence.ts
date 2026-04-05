@@ -50,6 +50,18 @@ export interface AppendProjectEventInput {
   data?: Record<string, unknown>;
 }
 
+export interface RunStepDiagnostics {
+  retryCount: number;
+  failedStepCount: number;
+  latestFailure?: {
+    step?: string;
+    attempt?: number;
+    maxAttempts?: number;
+    error?: string;
+    occurredAt: string;
+  };
+}
+
 export interface GenerationRunRecord {
   runId: string;
   projectId: string;
@@ -73,6 +85,12 @@ interface GenerationRunRow {
   error: string | null;
   started_at: string | null;
   completed_at: string | null;
+  created_at: string;
+}
+
+interface EventDiagnosticsRow {
+  type: string;
+  data: string | null;
   created_at: string;
 }
 
@@ -318,4 +336,59 @@ export async function appendProjectEvent(
     input.type,
     input.data ? JSON.stringify(input.data) : null,
   ).run();
+}
+
+export async function getRunStepDiagnostics(
+  db: D1Database,
+  options: { projectId: string; runId: string; type: 'generation' | 'replan' },
+): Promise<RunStepDiagnostics> {
+  const rows = await db.prepare(
+    `
+      SELECT type, data, created_at
+      FROM events
+      WHERE project_id = ?1
+        AND (type = ?2 OR type = ?3)
+        AND json_extract(data, '$.runId') = ?4
+      ORDER BY created_at DESC
+    `,
+  ).bind(
+    options.projectId,
+    `${options.type}_step_retrying`,
+    `${options.type}_step_failed`,
+    options.runId,
+  ).all<EventDiagnosticsRow>();
+
+  const events = rows.results ?? [];
+  let latestFailure: RunStepDiagnostics['latestFailure'];
+  let retryCount = 0;
+  let failedStepCount = 0;
+
+  for (const event of events) {
+    if (event.type === `${options.type}_step_retrying`) {
+      retryCount += 1;
+      continue;
+    }
+
+    if (event.type === `${options.type}_step_failed`) {
+      failedStepCount += 1;
+      if (!latestFailure) {
+        const parsed = parseJsonColumn(event.data) as
+          | { step?: string; attempt?: number; maxAttempts?: number; error?: string }
+          | undefined;
+        latestFailure = {
+          ...(parsed?.step ? { step: parsed.step } : {}),
+          ...(typeof parsed?.attempt === 'number' ? { attempt: parsed.attempt } : {}),
+          ...(typeof parsed?.maxAttempts === 'number' ? { maxAttempts: parsed.maxAttempts } : {}),
+          ...(parsed?.error ? { error: parsed.error } : {}),
+          occurredAt: event.created_at,
+        };
+      }
+    }
+  }
+
+  return {
+    retryCount,
+    failedStepCount,
+    ...(latestFailure ? { latestFailure } : {}),
+  };
 }
