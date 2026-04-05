@@ -58,11 +58,11 @@ export default class Replan extends Command {
       required: true,
     }),
     wait: Flags.boolean({
-      description: 'Wait for cloud replan workflow completion',
+      description: 'Wait for cloud replan run completion',
       default: false,
     }),
     cloud: Flags.boolean({
-      description: 'Trigger cloud replan workflow in addition to local replan',
+      description: 'Trigger cloud replan run in addition to local replan',
       default: true,
       allowNo: true,
     }),
@@ -92,7 +92,7 @@ export default class Replan extends Command {
     await savePlanState(nextPlan);
     await writeCurrentChunkFromPlan(nextPlan);
 
-    let workflowInstanceId: string | undefined;
+    let cloudRunId: string | undefined;
     if (flags.cloud) {
       try {
         const cloud = await resolveCloudClientConfig();
@@ -100,7 +100,7 @@ export default class Replan extends Command {
           updateRequest: flags.request,
           currentPlanSummary: summarizePlan(plan),
         });
-        workflowInstanceId = started.instanceId;
+        cloudRunId = started.instanceId;
       } catch (error) {
         await recordTelemetry({
           event: 'replan_cloud_start_failed',
@@ -110,13 +110,13 @@ export default class Replan extends Command {
       }
     }
 
-    if (flags.wait && workflowInstanceId) {
+    if (flags.wait && cloudRunId) {
       try {
         const cloud = await resolveCloudClientConfig();
         for (let attempt = 0; attempt < 15; attempt += 1) {
-          const status = await getReplanStatus(cloud, workflowInstanceId);
+          const status = await getReplanStatus(cloud, cloudRunId);
           const statusValue = String(status['status'] ?? '');
-          if (statusValue === 'complete' || statusValue === 'completed' || statusValue === 'errored') {
+          if (statusValue === 'complete' || statusValue === 'completed' || statusValue === 'errored' || statusValue === 'failed') {
             break;
           }
           await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -132,12 +132,12 @@ export default class Replan extends Command {
 
     await appendActivity('plan_replanned', {
       request: flags.request,
-      workflowInstanceId: workflowInstanceId ?? null,
+      cloudRunId: cloudRunId ?? null,
     });
     await recordTelemetry({
       event: 'plan_replanned',
       payload: {
-        workflowInstanceId: workflowInstanceId ?? null,
+        cloudRunId: cloudRunId ?? null,
         preservedCount: preserved.length,
         generatedPendingCount: replannedPending.length,
       },
@@ -145,8 +145,8 @@ export default class Replan extends Command {
 
     this.log('');
     this.log(chalk.green('✓ Plan replanned while preserving completed work.'));
-    if (workflowInstanceId) {
-      this.log(chalk.dim(`Cloud workflow instance: ${workflowInstanceId}`));
+    if (cloudRunId) {
+      this.log(chalk.dim(`Cloud replan run: ${cloudRunId}`));
     }
     this.log('');
   }

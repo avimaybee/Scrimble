@@ -9,7 +9,7 @@
 - Architecture/chunk prompt templates implemented.
 - R2 artifact persistence surface implemented in API (`/v1/artifacts*`).
 - Cloudflare API scaffold and D1 migration are in place.
-- Generation and replan workflow start/status API surfaces are implemented.
+- Generation and replan Durable Object start/status API surfaces are implemented.
 - Generation progress streaming is implemented via Durable Object + SSE/poll routes.
 - Full CLI execution/recovery/proactive command surface is now implemented.
 
@@ -92,11 +92,18 @@ Implementation files:
 
 ## Progress Streaming Support
 
-Progress transport now exists for generation workflow:
+Progress transport now exists for generation/replan orchestration:
 - Durable Object: `apps/api/src/durable-objects/generation-progress.ts`
 - Poll endpoint: `GET /v1/generation/:id/progress?since=<sequence>`
 - Stream endpoint: `GET /v1/generation/:id/stream?since=<sequence>` (SSE)
-- Workflow publishes progress stages from `apps/api/src/workflows/generation-workflow.ts`
+- Progress stages are published directly by `GenerationProgressHub` during orchestration
+
+## SOTA Refactor Status
+
+- Cloudflare Workflows were removed; orchestration now runs inside `GenerationProgressHub`.
+- Local sync now uses Last-Write-Wins with hash latch (`lastRemotePlanHash`), with no local event queue.
+- Proactive engine no longer uses filename relevance heuristics; resident mode reacts to passive execution signals.
+- TypeScript build/lint cache separation is in place (`tsconfig.lint.json` + `tsc -b`), so cached builds are instant.
 
 ## Execution Loop + Recovery Surface (Implemented)
 
@@ -112,7 +119,7 @@ Supporting runtime additions:
 - Stale-state detection: `apps/cli/src/lib/staleness.ts`
 - Telemetry pipeline: `apps/cli/src/lib/telemetry.ts`
 - Security utility for sensitive writes: `apps/cli/src/lib/security.ts`
-- CLI runtime startup warning removed by moving default command to `root` and forcing clean emit path.
+- CLI runtime startup warning removed by moving default command to hidden `root`.
 
 ## High-Signal Files
 
@@ -135,8 +142,6 @@ Supporting runtime additions:
 - `apps/api/src/lib/storage.ts`
 - `apps/api/src/index.ts`
 - `apps/api/src/durable-objects/generation-progress.ts`
-- `apps/api/src/workflows/generation-workflow.ts`
-- `apps/api/src/workflows/replan-workflow.ts`
 - `apps/api/wrangler.toml`
 - `packages/shared/src/types/index.ts`
 - `packages/shared/src/schemas/index.ts`
@@ -144,8 +149,9 @@ Supporting runtime additions:
 
 ## TODO Tracking Snapshot
 
-- Done: **43**
-- Pending: **0**
+- Roadmap phases (`p1-*` to `p5-*`): **done**
+- SOTA refactor baseline (`r1-*`): **done**
+- Current continuation focus: keep plans/docs/runtime aligned to pure Durable Object orchestration.
 
 Ready pending tasks:
 - none (roadmap todos complete)

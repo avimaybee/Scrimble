@@ -41,7 +41,7 @@ export default class Status extends Command {
 
     if (plan.chunks.length === 0) {
       this.log(chalk.yellow('\n  No execution plan generated yet.'));
-      this.log(chalk.dim('  Run `scrimble import --goal "<goal>"` or generation workflow.\n'));
+      this.log(chalk.dim('  Run `scrimble import --goal "<goal>"` or start a cloud generation run.\n'));
       return;
     }
 

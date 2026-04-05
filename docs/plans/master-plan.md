@@ -57,7 +57,7 @@ const result = await generateText({ model, prompt: '...' });
 | **API** | **Cloudflare Workers** | Serverless API endpoints, fast cold starts |
 | **Database** | **Cloudflare D1** | SQLite-compatible, serverless SQL for project/plan state |
 | **File Storage** | **Cloudflare R2** | Large artifact storage (architecture docs, research) |
-| **Long-running Jobs** | **Cloudflare Workflows** | Generation, replanning (durable execution with retries) |
+| **Long-running Jobs + Progress** | **Durable Objects (`GenerationProgressHub`)** | In-DO generation/replan orchestration, step retries, retained events, SSE/poll progress |
 | **AI Gateway** | **Cloudflare AI Gateway** | Optional proxy for caching, rate limiting, observability |
 | **Auth Sessions** | **Workers KV** | Session token storage with TTL |
 | **Real-time Events** | **Durable Objects** | WebSocket connections for live progress updates |
@@ -128,9 +128,8 @@ scrimble/
 │       │   │   ├── generations.ts
 │       │   │   ├── chunks.ts
 │       │   │   └── events.ts
-│       │   ├── workflows/
-│       │   │   ├── generation.ts    # Architecture + chunk generation
-│       │   │   └── replan.ts        # Replan workflow
+│       │   ├── durable-objects/
+│       │   │   └── generation-progress.ts # Generation/replan orchestration + progress stream
 │       │   ├── lib/
 │       │   │   ├── db.ts            # D1 helpers
 │       │   │   ├── storage.ts       # R2 helpers
@@ -324,7 +323,7 @@ Users configure their AI provider in `.scrimble/config.json`:
 - [ ] `p2-1` AI provider abstraction (Vercel AI SDK integration)
 - [ ] `p2-2` Prompt templates for architecture synthesis
 - [ ] `p2-3` Prompt templates for chunk planning
-- [ ] `p2-4` Cloudflare Workflow for generation
+- [ ] `p2-4` Durable Object orchestration for generation
 - [ ] `p2-5` R2 storage for large artifacts
 - [ ] `p2-6` Generation progress streaming (Durable Objects)
 - [ ] `p2-7` Architecture approval flow (CLI)
@@ -348,7 +347,7 @@ Users configure their AI provider in `.scrimble/config.json`:
 
 - [ ] `p4-1` `scrimble update` command
 - [ ] `p4-2` `scrimble replan` command
-- [ ] `p4-3` Replan workflow (preserves completed work)
+- [ ] `p4-3` Replan orchestration in `GenerationProgressHub` (preserves completed work)
 - [ ] `p4-4` `scrimble sync` command
 - [ ] `p4-5` Stale state detection
 - [ ] `p4-6` Conflict resolution flows
@@ -390,11 +389,11 @@ Users configure their AI provider in `.scrimble/config.json`:
 - Type-safe with TypeScript
 - Easy to add new providers
 
-### 4. Why Cloudflare Workflows over Durable Objects for generation?
-- Automatic retries and error handling
-- Built for long-running operations (minutes to hours)
-- Step-based execution with persistence
-- Better fit for generation/replan jobs
+### 4. Why a single Durable Object for generation + replan orchestration?
+- One boundary for orchestration and progress streaming
+- Deterministic per-project sequencing using DO instance IDs
+- Step-level retries/backoff can run in-process with explicit progress events
+- Lower infrastructure complexity (fewer bindings, fewer moving parts)
 
 ### 5. Why D1 over KV for project state?
 - Relational data (projects → chunks → events)
@@ -415,7 +414,7 @@ Users configure their AI provider in `.scrimble/config.json`:
 | Risk | Mitigation |
 |------|------------|
 | AI provider rate limits | Cloudflare AI Gateway caching + rate limiting |
-| Long generation times | Workflows with progress streaming |
+| Long generation times | Step retries in `GenerationProgressHub` + retained progress events via SSE/poll |
 | Network failures | Local-first design, offline-capable for reads |
 | Token expiration | Auto-refresh with device code flow |
 | Large context windows | Chunked prompts, R2 for large artifacts |
@@ -475,15 +474,14 @@ Users configure their AI provider in `.scrimble/config.json`:
 - Added storage helper in `apps/api/src/lib/storage.ts`.
 - Added API routes for artifact create/read/list under `/v1/artifacts*`.
 
-### Workflow surfaces expanded
-- Added generation workflow start/status routes under `/v1/generation/*`.
-- Added replan workflow scaffold in `apps/api/src/workflows/replan-workflow.ts`.
-- Added replan workflow start/status routes under `/v1/replan/*`.
-- Added `REPLAN_WORKFLOW` binding in `apps/api/wrangler.toml`.
+### DO orchestration surfaces expanded
+- Added generation and replan start/status routes under `/v1/generation/*` and `/v1/replan/*`.
+- API routes now dispatch directly into `GenerationProgressHub` Durable Object instances.
+- `apps/api/wrangler.toml` now binds only `PROGRESS_HUB` for orchestration + progress transport.
 
 ### Generation progress streaming delivered
 - Added `GenerationProgressHub` Durable Object for progress event fanout and retention.
-- Generation workflow now publishes stage updates to progress hub during execution.
+- Generation/replan orchestration now publishes stage updates from inside the Durable Object.
 - Added progress APIs:
   - `GET /v1/generation/:id/progress` (poll/backfill events)
   - `GET /v1/generation/:id/stream` (SSE stream)
@@ -498,7 +496,8 @@ Users configure their AI provider in `.scrimble/config.json`:
   - `scrimble import`, `scrimble prompt`, `scrimble next`, `scrimble skip`
   - enhanced default `scrimble` and `scrimble status`
 - Added completion sync semantics:
-  - `scrimble done` now records completion sync events and performs optional immediate cloud sync.
+  - `scrimble done` now marks completion directly in local plan state.
+  - `scrimble sync` uses hash-latch conflict detection (no local event queue).
 - Added plan evolution + integrity commands:
   - `scrimble update`, `scrimble replan`, `scrimble sync`
   - stale-state checks in `status`/`doctor`
@@ -516,4 +515,4 @@ Users configure their AI provider in `.scrimble/config.json`:
 
 ### Post-completion runtime hardening
 - Removed oclif startup warning path by moving default command implementation from `index` to hidden `root` command.
-- Updated CLI build script to `tsc -b --force` to ensure dist artifacts are emitted even after no-emit lint passes.
+- Isolated lint/build TypeScript caches (`tsconfig.lint.json` + `tsc -b`), enabling instant cached builds without `--force`.

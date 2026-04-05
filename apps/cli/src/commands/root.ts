@@ -52,7 +52,7 @@ export default class Root extends Command {
       this.log(chalk.bold('  To get started:'));
       this.log(chalk.dim('  1. Configure your AI provider in .scrimble/config.json'));
       this.log(chalk.dim('  2. Set your API key environment variable'));
-      this.log(chalk.dim('  3. Run `scrimble import --goal "<goal>"` or your generation workflow'));
+      this.log(chalk.dim('  3. Run `scrimble import --goal "<goal>"` or start a cloud generation run'));
       this.log('');
       return;
     }

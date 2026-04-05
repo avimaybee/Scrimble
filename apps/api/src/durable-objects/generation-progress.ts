@@ -47,6 +47,8 @@ const EVENT_KEY_PREFIX = 'event/';
 const META_LAST_SEQUENCE = 'meta:last-sequence';
 const JOB_STATE_KEY = 'job:state';
 const RETAIN_EVENT_COUNT = 200;
+const STEP_MAX_ATTEMPTS = 3;
+const STEP_BASE_BACKOFF_MS = 300;
 
 function sequenceToKey(sequence: number): string {
   return `${EVENT_KEY_PREFIX}${sequence.toString().padStart(12, '0')}`;
@@ -61,8 +63,7 @@ function createSseFrame(eventName: string, payload: unknown): Uint8Array {
  * 1. The orchestrator for generation and replan jobs
  * 2. The SSE broadcaster for progress events
  *
- * All LLM orchestration and step-by-step retry logic lives here instead of
- * in separate Cloudflare Workflows.
+ * All orchestration and step-level retry behavior lives in this Durable Object.
  */
 export class GenerationProgressHub extends DurableObject<unknown> {
   private readonly subscribers = new Map<number, Subscriber>();
@@ -107,6 +108,10 @@ export class GenerationProgressHub extends DurableObject<unknown> {
     if (!input.projectId?.trim() || !input.goal?.trim()) {
       return Response.json({ error: 'projectId and goal are required' }, { status: 400 });
     }
+    const activeJobResponse = await this.ensureNoActiveJob('generation');
+    if (activeJobResponse) {
+      return activeJobResponse;
+    }
 
     const jobState: JobState = {
       type: 'generation',
@@ -129,6 +134,10 @@ export class GenerationProgressHub extends DurableObject<unknown> {
     const input = (await request.json()) as ReplanJobInput;
     if (!input.projectId?.trim() || !input.updateRequest?.trim()) {
       return Response.json({ error: 'projectId and updateRequest are required' }, { status: 400 });
+    }
+    const activeJobResponse = await this.ensureNoActiveJob('replan');
+    if (activeJobResponse) {
+      return activeJobResponse;
     }
 
     const jobState: JobState = {
@@ -158,39 +167,55 @@ export class GenerationProgressHub extends DurableObject<unknown> {
 
   private async runGenerationJob(initialState: JobState): Promise<void> {
     const input = initialState.input as GenerationJobInput;
-    
+
+    const runningState: JobState = {
+      ...initialState,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    };
+    await this.state.storage.put(JOB_STATE_KEY, runningState);
+    await this.publishProgressInternal('started', 'Generation job started.');
+
     try {
-      // Update status to running
-      const runningState: JobState = {
-        ...initialState,
-        status: 'running',
-        startedAt: new Date().toISOString(),
-      };
-      await this.state.storage.put(JOB_STATE_KEY, runningState);
-      await this.publishProgressInternal('started', 'Generation job started.');
-
-      // Step 1: Normalize input
-      await this.publishProgressInternal('normalized', 'Input normalized.', { projectId: input.projectId });
-
-      // Step 2: Generate architecture summary (stub for now - will integrate with AI provider)
-      const architectureSummary = [
-        `Goal: ${input.goal}`,
-        'CLI-first execution with one active chunk at a time.',
-        'Cloudflare Workers + D1 + R2 backend boundary.',
-        input.repoSnapshot ? `Repo snapshot: ${input.repoSnapshot}` : 'Repo snapshot: not supplied.',
-      ].join('\n');
-      await this.publishProgressInternal('architecture-generated', 'Architecture summary generated.');
-
-      // Step 3: Generate initial chunk plan (stub for now - will integrate with AI provider)
-      const chunks = [
-        {
-          id: 'chunk-001',
-          title: 'Foundation hardening',
-          objective: 'Ensure CLI and backend scaffolding are stable and validated.',
+      await this.runStepWithRetry({
+        jobType: 'generation',
+        step: 'normalize-input',
+        run: async () => {
+          await this.publishProgressInternal('normalized', 'Input normalized.', { projectId: input.projectId });
         },
-      ];
-      await this.publishProgressInternal('chunks-generated', 'Initial chunk plan generated.', {
-        chunkCount: chunks.length,
+      });
+
+      const architectureSummary = await this.runStepWithRetry({
+        jobType: 'generation',
+        step: 'generate-architecture-summary',
+        run: async () => {
+          const summary = [
+            `Goal: ${input.goal}`,
+            'CLI-first execution with one active chunk at a time.',
+            'Cloudflare Workers + D1 + R2 backend boundary.',
+            input.repoSnapshot ? `Repo snapshot: ${input.repoSnapshot}` : 'Repo snapshot: not supplied.',
+          ].join('\n');
+          await this.publishProgressInternal('architecture-generated', 'Architecture summary generated.');
+          return summary;
+        },
+      });
+
+      const chunks = await this.runStepWithRetry({
+        jobType: 'generation',
+        step: 'generate-initial-chunks',
+        run: async () => {
+          const generated = [
+            {
+              id: 'chunk-001',
+              title: 'Foundation hardening',
+              objective: 'Ensure CLI and backend scaffolding are stable and validated.',
+            },
+          ];
+          await this.publishProgressInternal('chunks-generated', 'Initial chunk plan generated.', {
+            chunkCount: generated.length,
+          });
+          return generated;
+        },
       });
 
       const output = {
@@ -200,19 +225,18 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         completedAt: new Date().toISOString(),
       };
 
-      // Update status to completed
       const completedState: JobState = {
         ...runningState,
         status: 'completed',
         output,
-        completedAt: new Date().toISOString(),
+        completedAt: output.completedAt,
       };
       await this.state.storage.put(JOB_STATE_KEY, completedState);
       await this.publishProgressInternal('completed', 'Generation job completed.', { completedAt: output.completedAt });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const failedState: JobState = {
-        ...initialState,
+        ...runningState,
         status: 'failed',
         error: errorMessage,
         completedAt: new Date().toISOString(),
@@ -225,36 +249,47 @@ export class GenerationProgressHub extends DurableObject<unknown> {
   private async runReplanJob(initialState: JobState): Promise<void> {
     const input = initialState.input as ReplanJobInput;
 
+    const runningState: JobState = {
+      ...initialState,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    };
+    await this.state.storage.put(JOB_STATE_KEY, runningState);
+    await this.publishProgressInternal('started', 'Replan job started.');
+
     try {
-      // Update status to running
-      const runningState: JobState = {
-        ...initialState,
-        status: 'running',
-        startedAt: new Date().toISOString(),
-      };
-      await this.state.storage.put(JOB_STATE_KEY, runningState);
-      await this.publishProgressInternal('started', 'Replan job started.');
-
-      // Step 1: Draft revised plan summary (stub for now - will integrate with AI provider)
-      const revisedPlanSummary = [
-        `Replan request: ${input.updateRequest}`,
-        input.currentPlanSummary
-          ? `Current plan summary: ${input.currentPlanSummary}`
-          : 'Current plan summary: not supplied.',
-        'Preserve completed chunks and adjust only future pending chunks.',
-      ].join('\n');
-      await this.publishProgressInternal('plan-drafted', 'Revised plan summary drafted.');
-
-      // Step 2: Produce revised chunks (stub for now - will integrate with AI provider)
-      const updatedChunks = [
-        {
-          id: 'chunk-next',
-          title: 'Apply replan changes',
-          objective: 'Integrate update request while preserving completed work.',
+      const revisedPlanSummary = await this.runStepWithRetry({
+        jobType: 'replan',
+        step: 'draft-plan-summary',
+        run: async () => {
+          const summary = [
+            `Replan request: ${input.updateRequest}`,
+            input.currentPlanSummary
+              ? `Current plan summary: ${input.currentPlanSummary}`
+              : 'Current plan summary: not supplied.',
+            'Preserve completed chunks and adjust only future pending chunks.',
+          ].join('\n');
+          await this.publishProgressInternal('plan-drafted', 'Revised plan summary drafted.');
+          return summary;
         },
-      ];
-      await this.publishProgressInternal('chunks-revised', 'Revised chunks generated.', {
-        chunkCount: updatedChunks.length,
+      });
+
+      const updatedChunks = await this.runStepWithRetry({
+        jobType: 'replan',
+        step: 'generate-replanned-chunks',
+        run: async () => {
+          const generated = [
+            {
+              id: 'chunk-next',
+              title: 'Apply replan changes',
+              objective: 'Integrate update request while preserving completed work.',
+            },
+          ];
+          await this.publishProgressInternal('chunks-revised', 'Revised chunks generated.', {
+            chunkCount: generated.length,
+          });
+          return generated;
+        },
       });
 
       const output = {
@@ -264,19 +299,18 @@ export class GenerationProgressHub extends DurableObject<unknown> {
         completedAt: new Date().toISOString(),
       };
 
-      // Update status to completed
       const completedState: JobState = {
         ...runningState,
         status: 'completed',
         output,
-        completedAt: new Date().toISOString(),
+        completedAt: output.completedAt,
       };
       await this.state.storage.put(JOB_STATE_KEY, completedState);
       await this.publishProgressInternal('completed', 'Replan job completed.', { completedAt: output.completedAt });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const failedState: JobState = {
-        ...initialState,
+        ...runningState,
         status: 'failed',
         error: errorMessage,
         completedAt: new Date().toISOString(),
@@ -435,5 +469,63 @@ export class GenerationProgressHub extends DurableObject<unknown> {
   private nextSubscriberId(): number {
     this.subscriberCounter += 1;
     return this.subscriberCounter;
+  }
+
+  private async ensureNoActiveJob(type: JobState['type']): Promise<Response | null> {
+    const existing = await this.state.storage.get<JobState>(JOB_STATE_KEY);
+    if (!existing) {
+      return null;
+    }
+    if (existing.status !== 'pending' && existing.status !== 'running') {
+      return null;
+    }
+    return Response.json(
+      {
+        error: `Cannot start ${type} while ${existing.type} is ${existing.status}.`,
+        activeJob: existing,
+      },
+      { status: 409 },
+    );
+  }
+
+  private async runStepWithRetry<T>(options: {
+    jobType: JobState['type'];
+    step: string;
+    run: () => Promise<T>;
+    maxAttempts?: number;
+  }): Promise<T> {
+    const maxAttempts = options.maxAttempts ?? STEP_MAX_ATTEMPTS;
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await options.run();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        lastError = error instanceof Error ? error : new Error(message);
+        const canRetry = attempt < maxAttempts;
+        await this.publishProgressInternal(canRetry ? 'step-retrying' : 'step-failed', canRetry
+          ? `Step "${options.step}" failed on attempt ${attempt}/${maxAttempts}; retrying.`
+          : `Step "${options.step}" failed on attempt ${attempt}/${maxAttempts}.`, {
+          jobType: options.jobType,
+          step: options.step,
+          attempt,
+          maxAttempts,
+          error: message,
+        });
+        if (canRetry) {
+          const backoffMs = STEP_BASE_BACKOFF_MS * (2 ** (attempt - 1));
+          await this.delay(backoffMs);
+        }
+      }
+    }
+
+    throw lastError ?? new Error(`Step "${options.step}" failed.`);
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 }
