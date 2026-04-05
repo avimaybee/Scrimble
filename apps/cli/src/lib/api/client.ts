@@ -51,6 +51,24 @@ export async function resolveCloudClientConfig(cwd = process.cwd()): Promise<Clo
   };
 }
 
+export class CloudApiError extends Error {
+  constructor(
+    public status: number,
+    public body: string,
+  ) {
+    super(`Cloud API request failed (${status})`);
+    this.name = 'CloudApiError';
+  }
+
+  parseBody<T>(): T | undefined {
+    try {
+      return JSON.parse(this.body) as T;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 async function requestJson<T>(
   client: CloudClientConfig,
   endpoint: string,
@@ -69,7 +87,7 @@ async function requestJson<T>(
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Cloud API request failed (${response.status}): ${body}`);
+    throw new CloudApiError(response.status, body);
   }
 
   return response.json() as Promise<T>;

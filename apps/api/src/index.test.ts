@@ -158,6 +158,76 @@ describe('API start route contracts', () => {
     });
   });
 
+  it('returns 409 for generation start when project already has an active run', async () => {
+    const { env, stub } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getActiveRunForProject.mockResolvedValue({
+      runId: 'run-active',
+      status: 'running',
+    });
+
+    const response = await app.request(
+      '/v1/generation/start',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          projectId: 'project-1',
+          goal: 'Ship runtime',
+          aiConfig: validAiConfig,
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: 'Cannot start generation while run run-active is running.',
+      activeRun: { runId: 'run-active', status: 'running' },
+    });
+    expect(persistenceMocks.createGenerationRunRecord).not.toHaveBeenCalled();
+    expect(stub.fetch).not.toHaveBeenCalled();
+  });
+
+  it('marks generation run as failed when Durable Object start returns an error status', async () => {
+    const { env, stub } = createEnv(async () =>
+      new Response(JSON.stringify({ error: 'Generation orchestrator unavailable' }), {
+        status: 503,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request(
+      '/v1/generation/start',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          projectId: 'project-1',
+          goal: 'Ship runtime',
+          aiConfig: validAiConfig,
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      instanceId: 'project-1',
+      runId: 'run-fixed',
+      error: 'Generation orchestrator unavailable',
+    });
+    expect(stub.fetch).toHaveBeenCalledTimes(1);
+    expect(persistenceMocks.markGenerationRunFailed).toHaveBeenCalledWith(env.DB, {
+      runId: 'run-fixed',
+      error: 'Generation orchestrator unavailable',
+    });
+  });
+
   it('returns 400 for replan start when provider is unsupported', async () => {
     const { env, stub } = createEnv(async () =>
       new Response(JSON.stringify({ status: 'queued', type: 'replan' }), {
@@ -242,5 +312,74 @@ describe('API start route contracts', () => {
     );
     expect(namespace.idFromName).toHaveBeenCalledWith('project-2');
     expect(stub.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 409 for replan start when project already has an active run', async () => {
+    const { env, stub } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'replan' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getActiveRunForProject.mockResolvedValue({
+      runId: 'run-active',
+      status: 'pending',
+    });
+
+    const response = await app.request(
+      '/v1/replan/start',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          projectId: 'project-2',
+          updateRequest: 'Change scope',
+          aiConfig: validAiConfig,
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: 'Cannot start replan while run run-active is pending.',
+      activeRun: { runId: 'run-active', status: 'pending' },
+    });
+    expect(persistenceMocks.createGenerationRunRecord).not.toHaveBeenCalled();
+    expect(stub.fetch).not.toHaveBeenCalled();
+  });
+
+  it('uses fallback failure message when replan Durable Object error payload lacks error field', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ reason: 'backend overloaded' }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request(
+      '/v1/replan/start',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          projectId: 'project-2',
+          updateRequest: 'Change scope',
+          aiConfig: validAiConfig,
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      instanceId: 'project-2',
+      runId: 'run-fixed',
+      reason: 'backend overloaded',
+    });
+    expect(persistenceMocks.markGenerationRunFailed).toHaveBeenCalledWith(env.DB, {
+      runId: 'run-fixed',
+      error: 'Failed to start replan run (status 500).',
+    });
   });
 });

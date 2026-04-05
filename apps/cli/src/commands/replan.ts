@@ -8,7 +8,7 @@ import {
   writeCurrentChunkFromPlan,
   type LocalChunk,
 } from '../lib/local/index.js';
-import { getReplanStatus, resolveCloudClientConfig, startReplan } from '../lib/api/index.js';
+import { getReplanStatus, resolveCloudClientConfig, startReplan, CloudApiError } from '../lib/api/index.js';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
@@ -46,32 +46,32 @@ function buildReplannedPendingChunks(request: string, startSequence: number): Lo
 }
 
 function formatCloudError(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  const prefix = raw.match(/^Cloud API request failed \(\d+\):\s*/)?.[0];
-  const payload = prefix ? raw.slice(prefix.length) : raw;
-  try {
-    const parsed = JSON.parse(payload) as {
+  if (error instanceof CloudApiError) {
+    const parsed = error.parseBody<{
       error?: unknown;
       message?: unknown;
       issues?: Array<{ message?: unknown }>;
-    };
-    const errorMessage = typeof parsed.error === 'string' ? parsed.error : undefined;
-    const details = Array.isArray(parsed.issues)
-      ? parsed.issues
-          .map((issue) => (typeof issue.message === 'string' ? issue.message : undefined))
-          .filter((message): message is string => Boolean(message))
-      : [];
-    if (errorMessage && details.length > 0) {
-      return `${errorMessage} ${details.join(' ')}`;
+    }>();
+    if (parsed) {
+      const errorMessage = typeof parsed.error === 'string' ? parsed.error : undefined;
+      const details = Array.isArray(parsed.issues)
+        ? parsed.issues
+            .map((issue) => (typeof issue.message === 'string' ? issue.message : undefined))
+            .filter((message): message is string => Boolean(message))
+        : [];
+      if (errorMessage && details.length > 0) {
+        return `${errorMessage} ${details.join(' ')}`;
+      }
+      if (errorMessage) {
+        return errorMessage;
+      }
+      if (typeof parsed.message === 'string') {
+        return parsed.message;
+      }
     }
-    if (errorMessage) {
-      return errorMessage;
-    }
-    if (typeof parsed.message === 'string') {
-      return parsed.message;
-    }
-  } catch {}
-  return raw;
+    return error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 export default class Replan extends Command {
