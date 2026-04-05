@@ -92,6 +92,11 @@ const startReplanSchema = z.object({
   currentPlanSummary: z.string().optional(),
   aiConfig: cloudPlanningAiConfigSchema,
 });
+const artifactListQuerySchema = z.object({
+  projectId: z.string().trim().min(1).optional(),
+  type: z.string().trim().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
 
 function formatValidationErrorResponse(error: string, issues: z.ZodIssue[]): {
   error: string;
@@ -128,19 +133,25 @@ function redactAIConfig(aiConfig: unknown): Record<string, unknown> {
 }
 
 v1.get('/projects', async (c) => {
-  // TODO: Implement project listing
-  return c.json({ projects: [], message: 'Not yet implemented' });
+  return c.json(
+    formatErrorResponse('Not Implemented', 'Project listing is not implemented yet.'),
+    501,
+  );
 });
 
 v1.post('/projects', async (c) => {
-  // TODO: Implement project creation
-  return c.json({ message: 'Not yet implemented' }, 501);
+  return c.json(
+    formatErrorResponse('Not Implemented', 'Project creation is not implemented yet.'),
+    501,
+  );
 });
 
 v1.get('/projects/:id', async (c) => {
-  // TODO: Implement project fetch
   const id = c.req.param('id');
-  return c.json({ message: 'Not yet implemented', id }, 501);
+  return c.json(
+    formatErrorResponse('Not Implemented', 'Project fetch is not implemented yet.', { id }),
+    501,
+  );
 });
 
 v1.post('/artifacts', async (c) => {
@@ -179,17 +190,24 @@ v1.get('/artifacts', async (c) => {
 });
 
 v1.get('/artifacts/list', async (c) => {
-  const projectId = c.req.query('projectId');
-  const type = c.req.query('type');
-  const limitParam = c.req.query('limit');
-  const limit = limitParam ? Number.parseInt(limitParam, 10) : 20;
-  const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20;
+  const parsedResult = artifactListQuerySchema.safeParse({
+    projectId: c.req.query('projectId'),
+    type: c.req.query('type'),
+    limit: c.req.query('limit'),
+  });
+  if (!parsedResult.success) {
+    return c.json(
+      formatValidationErrorResponse('Invalid artifacts list query.', parsedResult.error.issues),
+      400,
+    );
+  }
+  const parsed = parsedResult.data;
 
-  const prefixParts = [projectId, type].filter((value): value is string => Boolean(value));
+  const prefixParts = [parsed.projectId, parsed.type].filter((value): value is string => Boolean(value));
   const prefix = prefixParts.length > 0 ? `${prefixParts.join('/')}/` : undefined;
   const artifacts = await listArtifacts(c.env.ARTIFACTS, {
     ...(prefix ? { prefix } : {}),
-    limit: safeLimit,
+    limit: parsed.limit,
   });
 
   return c.json({ artifacts, count: artifacts.length });

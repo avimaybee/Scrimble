@@ -463,6 +463,51 @@ describe('API start route contracts', () => {
     });
   });
 
+  it('returns failed generation diagnostics including latestFailure details', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getLatestRunForProject.mockResolvedValueOnce({
+      runId: 'run-generation-failed',
+      status: 'failed',
+      error: 'provider timeout',
+    });
+    persistenceMocks.getRunStepDiagnostics.mockResolvedValueOnce({
+      retryCount: 2,
+      failedStepCount: 1,
+      latestFailure: {
+        step: 'generate_chunks',
+        attempt: 3,
+        maxAttempts: 3,
+        error: 'provider timeout',
+        occurredAt: '2026-04-05T10:00:00.000Z',
+      },
+    });
+
+    const response = await app.request('/v1/generation/project-3', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      instanceId: 'project-3',
+      runId: 'run-generation-failed',
+      status: 'failed',
+      diagnostics: {
+        retryCount: 2,
+        failedStepCount: 1,
+        latestFailure: {
+          step: 'generate_chunks',
+          attempt: 3,
+          maxAttempts: 3,
+          error: 'provider timeout',
+          occurredAt: '2026-04-05T10:00:00.000Z',
+        },
+      },
+    });
+  });
+
   it('returns idle replan status when no replan run exists', async () => {
     const { env } = createEnv(async () =>
       new Response(JSON.stringify({ status: 'queued', type: 'replan' }), {
@@ -519,6 +564,51 @@ describe('API start route contracts', () => {
     });
   });
 
+  it('returns failed replan diagnostics including latestFailure details', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'replan' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    persistenceMocks.getLatestRunForProject.mockResolvedValueOnce({
+      runId: 'run-replan-failed',
+      status: 'failed',
+      error: 'provider timeout',
+    });
+    persistenceMocks.getRunStepDiagnostics.mockResolvedValueOnce({
+      retryCount: 3,
+      failedStepCount: 1,
+      latestFailure: {
+        step: 'replan_chunks',
+        attempt: 4,
+        maxAttempts: 4,
+        error: 'provider timeout',
+        occurredAt: '2026-04-05T11:00:00.000Z',
+      },
+    });
+
+    const response = await app.request('/v1/replan/project-4', { method: 'GET' }, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      instanceId: 'project-4',
+      runId: 'run-replan-failed',
+      status: 'failed',
+      diagnostics: {
+        retryCount: 3,
+        failedStepCount: 1,
+        latestFailure: {
+          step: 'replan_chunks',
+          attempt: 4,
+          maxAttempts: 4,
+          error: 'provider timeout',
+          occurredAt: '2026-04-05T11:00:00.000Z',
+        },
+      },
+    });
+  });
+
   it('forwards /generation/:id/progress requests to DO events endpoint with since query', async () => {
     const { env, stub, namespace } = createEnv(async () =>
       new Response(JSON.stringify({ events: [{ sequence: 2, stage: 'chunks-generated' }], count: 1 }), {
@@ -565,6 +655,58 @@ describe('API start route contracts', () => {
     expect((init.headers as Record<string, string>)['accept']).toBe('text/event-stream');
   });
 
+  it('returns explicit 501 error contract for project listing placeholder route', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/projects', { method: 'GET' }, env);
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toEqual({
+      error: 'Not Implemented',
+      message: 'Project listing is not implemented yet.',
+    });
+  });
+
+  it('returns explicit 501 error contract for project creation placeholder route', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/projects', { method: 'POST' }, env);
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toEqual({
+      error: 'Not Implemented',
+      message: 'Project creation is not implemented yet.',
+    });
+  });
+
+  it('returns explicit 501 error contract for project fetch placeholder route', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/projects/project-999', { method: 'GET' }, env);
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toEqual({
+      error: 'Not Implemented',
+      message: 'Project fetch is not implemented yet.',
+      id: 'project-999',
+    });
+  });
+
   it('returns consistent error/message contract when artifacts key is missing', async () => {
     const { env } = createEnv(async () =>
       new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
@@ -579,6 +721,82 @@ describe('API start route contracts', () => {
     expect(await response.json()).toEqual({
       error: 'Missing query parameter: key',
       message: 'Request validation failed.',
+    });
+  });
+
+  it('returns 400 validation contract when artifacts list limit is non-numeric', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/artifacts/list?limit=abc', { method: 'GET' }, env);
+    const payload = (await response.json()) as {
+      error: string;
+      message: string;
+      issues: Array<{ path: Array<string | number> }>;
+    };
+
+    expect(response.status).toBe(400);
+    expect(payload).toMatchObject({
+      error: 'Invalid artifacts list query.',
+      message: 'Request validation failed.',
+    });
+    expect(payload.issues.some((issue) => issue.path[0] === 'limit')).toBe(true);
+    expect(storageMocks.listArtifacts).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 validation contract when artifacts list limit exceeds max', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/artifacts/list?limit=101', { method: 'GET' }, env);
+    const payload = (await response.json()) as {
+      error: string;
+      message: string;
+      issues: Array<{ path: Array<string | number> }>;
+    };
+
+    expect(response.status).toBe(400);
+    expect(payload).toMatchObject({
+      error: 'Invalid artifacts list query.',
+      message: 'Request validation failed.',
+    });
+    expect(payload.issues.some((issue) => issue.path[0] === 'limit')).toBe(true);
+    expect(storageMocks.listArtifacts).not.toHaveBeenCalled();
+  });
+
+  it('lists artifacts with validated prefix and limit', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    storageMocks.listArtifacts.mockResolvedValueOnce([
+      { key: 'project-7/plan/revision-2.json', uploaded: '2026-04-05T11:20:00.000Z' },
+    ]);
+
+    const response = await app.request(
+      '/v1/artifacts/list?projectId=project-7&type=plan&limit=2',
+      { method: 'GET' },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      artifacts: [{ key: 'project-7/plan/revision-2.json', uploaded: '2026-04-05T11:20:00.000Z' }],
+      count: 1,
+    });
+    expect(storageMocks.listArtifacts).toHaveBeenCalledWith(env.ARTIFACTS, {
+      prefix: 'project-7/plan/',
+      limit: 2,
     });
   });
 
