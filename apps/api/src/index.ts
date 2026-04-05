@@ -105,6 +105,18 @@ function formatValidationErrorResponse(error: string, issues: z.ZodIssue[]): {
   };
 }
 
+function formatErrorResponse(
+  error: string,
+  message: string,
+  extra?: Record<string, unknown>,
+): { error: string; message: string } & Record<string, unknown> {
+  return {
+    error,
+    message,
+    ...(extra ?? {}),
+  };
+}
+
 function redactAIConfig(aiConfig: unknown): Record<string, unknown> {
   const parsed = aiConfigSchema.parse(aiConfig);
   return {
@@ -149,12 +161,18 @@ v1.post('/artifacts', async (c) => {
 v1.get('/artifacts', async (c) => {
   const key = c.req.query('key');
   if (!key) {
-    return c.json({ error: 'Missing query parameter: key' }, 400);
+    return c.json(
+      formatErrorResponse('Missing query parameter: key', 'Request validation failed.'),
+      400,
+    );
   }
 
   const artifact = await readArtifact(c.env.ARTIFACTS, key);
   if (!artifact) {
-    return c.json({ error: 'Artifact not found', key }, 404);
+    return c.json(
+      formatErrorResponse('Artifact not found', 'Requested artifact does not exist.', { key }),
+      404,
+    );
   }
 
   return c.json({ key, artifact });
@@ -387,7 +405,7 @@ app.route('/v1', v1);
 
 // 404 handler
 app.notFound((c) => {
-  return c.json({ error: 'Not Found', path: c.req.path }, 404);
+  return c.json(formatErrorResponse('Not Found', 'Route does not exist.', { path: c.req.path }), 404);
 });
 
 // Error handler

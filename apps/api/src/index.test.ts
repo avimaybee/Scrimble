@@ -64,6 +64,9 @@ describe('API start route contracts', () => {
       retryCount: 0,
       failedStepCount: 0,
     });
+    storageMocks.readArtifact.mockResolvedValue({ ok: true });
+    storageMocks.listArtifacts.mockResolvedValue([]);
+    storageMocks.storeJsonArtifact.mockResolvedValue({ key: 'artifact-key', contentLength: 1 });
   });
 
   afterEach(() => {
@@ -560,5 +563,60 @@ describe('API start route contracts', () => {
     const [url, init] = stub.fetch.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('https://progress-hub.internal/stream?since=11');
     expect((init.headers as Record<string, string>)['accept']).toBe('text/event-stream');
+  });
+
+  it('returns consistent error/message contract when artifacts key is missing', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/artifacts', { method: 'GET' }, env);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'Missing query parameter: key',
+      message: 'Request validation failed.',
+    });
+  });
+
+  it('returns consistent not-found artifact error payload', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    storageMocks.readArtifact.mockResolvedValueOnce(null);
+
+    const response = await app.request('/v1/artifacts?key=missing-artifact', { method: 'GET' }, env);
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: 'Artifact not found',
+      message: 'Requested artifact does not exist.',
+      key: 'missing-artifact',
+    });
+    expect(storageMocks.readArtifact).toHaveBeenCalledWith(env.ARTIFACTS, 'missing-artifact');
+  });
+
+  it('returns consistent notFound route error contract', async () => {
+    const { env } = createEnv(async () =>
+      new Response(JSON.stringify({ status: 'queued', type: 'generation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const response = await app.request('/v1/does-not-exist', { method: 'GET' }, env);
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: 'Not Found',
+      message: 'Route does not exist.',
+      path: '/v1/does-not-exist',
+    });
   });
 });
