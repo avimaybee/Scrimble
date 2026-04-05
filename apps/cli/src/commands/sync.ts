@@ -10,7 +10,13 @@ import {
   savePlanState,
   type LocalPlanState,
 } from '../lib/local/index.js';
-import { listArtifacts, readArtifact, resolveCloudClientConfig, uploadArtifact } from '../lib/api/index.js';
+import {
+  formatCloudError,
+  listArtifacts,
+  readArtifact,
+  resolveCloudClientConfig,
+  uploadArtifact,
+} from '../lib/api/index.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
 type ConflictStrategy = 'manual' | 'local' | 'cloud';
@@ -60,6 +66,25 @@ export default class Sync extends Command {
     }),
   };
 
+  private async exitCloudSyncFailure(plan: LocalPlanState, error: unknown): Promise<never> {
+    const message = formatCloudError(error);
+    const nextPlan: LocalPlanState = {
+      ...plan,
+      sync: {
+        ...(plan.sync ?? {}),
+        lastSyncError: message,
+      },
+    };
+    await savePlanState(nextPlan);
+    await recordTelemetry({
+      event: 'state_sync_failed',
+      level: 'warn',
+      payload: { message },
+    });
+    this.log(chalk.red(`\nCloud sync failed: ${message}\n`));
+    this.exit(1);
+  }
+
   async run(): Promise<void> {
     const { flags } = await this.parse(Sync);
     const conflictStrategy = flags['on-conflict'] as ConflictStrategy;
@@ -76,12 +101,21 @@ export default class Sync extends Command {
     }
 
     // Fetch remote snapshot to check for conflicts
-    const snapshots = await listArtifacts(cloudConfig, 'plan-snapshot', 1);
+    let snapshots: Array<{ key: string; size: number; uploaded: string }> = [];
+    try {
+      snapshots = await listArtifacts(cloudConfig, 'plan-snapshot', 1);
+    } catch (error) {
+      await this.exitCloudSyncFailure(plan, error);
+    }
     let remoteSnapshot: PlanSnapshotPayload | undefined;
     if (snapshots.length > 0) {
       const latestSnapshot = snapshots[0];
       if (latestSnapshot) {
-        remoteSnapshot = await readArtifact<PlanSnapshotPayload>(cloudConfig, latestSnapshot.key);
+        try {
+          remoteSnapshot = await readArtifact<PlanSnapshotPayload>(cloudConfig, latestSnapshot.key);
+        } catch (error) {
+          await this.exitCloudSyncFailure(plan, error);
+        }
       }
     }
 
@@ -146,11 +180,15 @@ export default class Sync extends Command {
     const nextPlanHash = computePlanHash(planToSync);
 
     // Upload plan snapshot with new hash
-    await uploadArtifact(cloudConfig, 'plan-snapshot', {
-      planHash: nextPlanHash,
-      syncedAt,
-      plan: planToSync,
-    });
+    try {
+      await uploadArtifact(cloudConfig, 'plan-snapshot', {
+        planHash: nextPlanHash,
+        syncedAt,
+        plan: planToSync,
+      });
+    } catch (error) {
+      await this.exitCloudSyncFailure(plan, error);
+    }
 
     // Update local sync state with new hashes (remove lastSyncError on success)
     const syncState = {

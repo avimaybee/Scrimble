@@ -8,7 +8,7 @@ import {
   writeCurrentChunkFromPlan,
   type LocalChunk,
 } from '../lib/local/index.js';
-import { getReplanStatus, resolveCloudClientConfig, startReplan, CloudApiError } from '../lib/api/index.js';
+import { formatCloudError, getReplanStatus, resolveCloudClientConfig, startReplan } from '../lib/api/index.js';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
@@ -43,35 +43,6 @@ function buildReplannedPendingChunks(request: string, startSequence: number): Lo
       createdAt,
     },
   ];
-}
-
-function formatCloudError(error: unknown): string {
-  if (error instanceof CloudApiError) {
-    const parsed = error.parseBody<{
-      error?: unknown;
-      message?: unknown;
-      issues?: Array<{ message?: unknown }>;
-    }>();
-    if (parsed) {
-      const errorMessage = typeof parsed.error === 'string' ? parsed.error : undefined;
-      const details = Array.isArray(parsed.issues)
-        ? parsed.issues
-            .map((issue) => (typeof issue.message === 'string' ? issue.message : undefined))
-            .filter((message): message is string => Boolean(message))
-        : [];
-      if (errorMessage && details.length > 0) {
-        return `${errorMessage} ${details.join(' ')}`;
-      }
-      if (errorMessage) {
-        return errorMessage;
-      }
-      if (typeof parsed.message === 'string') {
-        return parsed.message;
-      }
-    }
-    return error.message;
-  }
-  return error instanceof Error ? error.message : String(error);
 }
 
 export default class Replan extends Command {
