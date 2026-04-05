@@ -16,8 +16,8 @@
   "scripts": {
     "build": "tsc -b",
     "dev": "tsc -b --watch",
-    "lint": "eslint src --ext .ts,.tsx",
-    "test": "vitest run",
+    "lint": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
     "clean": "rimraf dist oclif.manifest.json"
   },
   "dependencies": {

@@ -176,6 +176,7 @@ export type AIProvider =
   | 'anthropic' 
   | 'google' 
   | 'openrouter' 
+  | 'github-copilot'
   | 'azure' 
   | 'groq' 
   | 'together';

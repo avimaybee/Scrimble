@@ -2,7 +2,14 @@ import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { SCRIMBLE_DIR, CONFIG_FILE, PROJECT_FILE, scrimbleConfigSchema } from '@scrimble/shared';
+import {
+  SCRIMBLE_DIR,
+  CONFIG_FILE,
+  PROJECT_FILE,
+  aiProviderSchema,
+  scrimbleConfigSchema,
+} from '@scrimble/shared';
+import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
 
 export default class Init extends Command {
   static override description = 'Initialize Scrimble in the current repository';
@@ -21,6 +28,14 @@ export default class Init extends Command {
       char: 'f',
       description: 'Overwrite existing .scrimble directory',
       default: false,
+    }),
+    'ai-provider': Flags.string({
+      description: 'AI provider to configure',
+      options: [...aiProviderSchema.options],
+      default: 'openai',
+    }),
+    'ai-model': Flags.string({
+      description: 'AI model (defaults to provider-specific recommended model)',
     }),
   };
 
@@ -58,6 +73,11 @@ export default class Init extends Command {
       this.log(chalk.dim(`  Frameworks: ${stack.frameworks.join(', ')}`));
     }
 
+    const selectedProvider = aiProviderSchema.parse(flags['ai-provider']);
+    const defaultAIConfig = buildDefaultAIConfig(selectedProvider, flags['ai-model']);
+    this.log(chalk.dim(`  AI provider: ${selectedProvider}`));
+    this.log(chalk.dim(`  AI model: ${defaultAIConfig.model}`));
+
     // Create .scrimble directory structure
     await fs.mkdir(scrimbleDir, { recursive: true });
     await fs.mkdir(path.join(scrimbleDir, 'verification'), { recursive: true });
@@ -65,13 +85,7 @@ export default class Init extends Command {
     await fs.mkdir(path.join(scrimbleDir, 'rules'), { recursive: true });
 
     // Create default config
-    const defaultConfig = {
-      ai: {
-        provider: 'openai',
-        model: 'gpt-4o',
-        apiKey: '${OPENAI_API_KEY}',
-      },
-    };
+    const defaultConfig = { ai: defaultAIConfig };
 
     // Validate config structure
     const validatedConfig = scrimbleConfigSchema.parse(defaultConfig);
@@ -132,9 +146,13 @@ Run \`scrimble\` to see the current execution chunk and what to work on next.
     this.log('');
 
     // Next steps
+    const keyPlaceholder = getDefaultApiKeyPlaceholder(selectedProvider);
     this.log(chalk.bold('Next steps:'));
     this.log(chalk.dim('  1. Edit .scrimble/config.json to configure your AI provider'));
-    this.log(chalk.dim('  2. Set your API key: export OPENAI_API_KEY="your-key"'));
+    this.log(chalk.dim(`  2. Set your API key: export ${keyPlaceholder.slice(2, -1)}="your-key"`));
+    if (selectedProvider === 'github-copilot') {
+      this.log(chalk.dim('     GitHub Copilot users: set GITHUB_COPILOT_TOKEN from your Copilot auth/session token.'));
+    }
     if (!flags.goal) {
       this.log(chalk.dim('  3. Run `scrimble` to start planning your project'));
     } else {

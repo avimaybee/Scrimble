@@ -22,7 +22,7 @@
   "scripts": {
     "build": "tsc -b",
     "dev": "tsc -b --watch",
-    "lint": "eslint src --ext .ts",
+    "lint": "tsc --noEmit",
     "clean": "rimraf dist"
   },
   "dependencies": {

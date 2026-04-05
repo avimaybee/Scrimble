@@ -83,11 +83,25 @@ Configure your AI provider in `.scrimble/config.json`:
 }
 ```
 
+GitHub Copilot subscription example:
+
+```json
+{
+  "ai": {
+    "provider": "github-copilot",
+    "model": "gpt-4.1",
+    "apiKey": "${GITHUB_COPILOT_TOKEN}",
+    "baseUrl": "https://api.githubcopilot.com"
+  }
+}
+```
+
 Supported providers:
 - OpenAI (GPT-4, GPT-4o, etc.)
 - Anthropic (Claude 3.5, Claude 4)
 - Google (Gemini Pro, Flash)
 - OpenRouter (any model)
+- GitHub Copilot subscriptions (via Copilot token)
 - Azure OpenAI
 - Groq, Together AI, etc.
 

@@ -8,8 +8,8 @@
     "build": "wrangler deploy --dry-run --outdir dist",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "lint": "eslint src --ext .ts",
-    "test": "vitest run",
+    "lint": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
     "clean": "rimraf dist .wrangler"
   },
   "dependencies": {

@@ -6,6 +6,7 @@ export const aiProviderSchema = z.enum([
   'anthropic',
   'google',
   'openrouter',
+  'github-copilot',
   'azure',
   'groq',
   'together',
