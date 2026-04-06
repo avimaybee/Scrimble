@@ -6,7 +6,12 @@ const apiMocks = vi.hoisted(() => ({
   resolveCloudClientConfig: vi.fn(),
 }));
 
+const runtimeMocks = vi.hoisted(() => ({
+  readRuntimeEvents: vi.fn(),
+}));
+
 vi.mock('../lib/api/index.js', () => apiMocks);
+vi.mock('../lib/conductor/runtime.js', () => runtimeMocks);
 
 import Logs from './logs.js';
 
@@ -15,6 +20,7 @@ function stripAnsi(value: string): string {
 }
 
 function makeCommand(flags: {
+  source: 'all' | 'local' | 'cloud';
   type?: string;
   since?: string;
   limit: number;
@@ -39,6 +45,7 @@ function makeCommand(flags: {
 
 describe('logs command', () => {
   beforeEach(() => {
+    runtimeMocks.readRuntimeEvents.mockResolvedValue([]);
     apiMocks.resolveCloudClientConfig.mockResolvedValue({
       baseUrl: 'https://api.scrimble.dev',
       projectId: 'project-1',
@@ -67,6 +74,7 @@ describe('logs command', () => {
     const command = makeCommand(
       {
         limit: 40,
+        source: 'all',
         follow: false,
         'poll-interval-ms': 2000,
         json: false,
@@ -87,6 +95,7 @@ describe('logs command', () => {
     const command = makeCommand(
       {
         limit: 10,
+        source: 'all',
         follow: false,
         'poll-interval-ms': 2000,
         json: true,
@@ -96,8 +105,13 @@ describe('logs command', () => {
 
     await command.run();
 
-    const payload = JSON.parse(output.join('\n')) as { projectId: string; events: unknown[] };
+    const payload = JSON.parse(output.join('\n')) as {
+      projectId: string;
+      localEvents: unknown[];
+      cloudEvents: unknown[];
+    };
     expect(payload.projectId).toBe('project-1');
-    expect(payload.events.length).toBe(2);
+    expect(payload.localEvents.length).toBe(0);
+    expect(payload.cloudEvents.length).toBe(2);
   });
 });

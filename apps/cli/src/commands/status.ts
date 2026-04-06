@@ -14,6 +14,14 @@ import {
   resolveCloudClientConfig,
 } from '../lib/api/index.js';
 import { detectStaleness } from '../lib/staleness.js';
+import {
+  loadConductorWorkspace,
+  getActiveTrack,
+  parsePlan,
+  getNextTask,
+  getPlanStats,
+} from '../lib/conductor/index.js';
+import { loadRuntimeState, readRuntimeEvents } from '../lib/conductor/runtime.js';
 
 export default class Status extends Command {
   static override description = 'Show project status and progress';
@@ -48,6 +56,10 @@ export default class Status extends Command {
     const projectGoal = typeof project['goal'] === 'string' ? project['goal'] : null;
     const initialized = typeof project['initialized'] === 'string' ? project['initialized'] : null;
 
+    // Load Conductor workspace and runtime state
+    const conductorWorkspace = await loadConductorWorkspace();
+    const runtimeState = await loadRuntimeState();
+
     this.log('');
     this.log(chalk.bold(`📊 Project Status: ${projectName}`));
     this.log('');
@@ -62,9 +74,55 @@ export default class Status extends Command {
       this.log('');
     }
 
-    if (plan.chunks.length === 0) {
+    // Show Conductor status if workspace exists
+    if (conductorWorkspace.exists) {
+      this.log(chalk.bold('Conductor:'));
+      this.log(chalk.dim(`  Status: ${runtimeState.status}`));
+      
+      const activeTrack = getActiveTrack(conductorWorkspace);
+      if (activeTrack) {
+        this.log(chalk.cyan(`  Active Track: ${activeTrack.title}`));
+        
+        // Parse plan if available
+        if (activeTrack.planPath) {
+          const trackPlan = await parsePlan(activeTrack.planPath, activeTrack.id);
+          const planStats = getPlanStats(trackPlan);
+          const nextTask = getNextTask(trackPlan);
+          
+          this.log(chalk.dim(`  Tasks: ${planStats.completed}/${planStats.total} complete`));
+          if (nextTask) {
+            this.log(chalk.cyan(`  Next Task: ${nextTask.title}`));
+            if (nextTask.isManualVerification) {
+              this.log(chalk.yellow('    ⚠ Manual verification required'));
+            }
+          }
+        }
+      }
+      
+      this.log(chalk.dim(`  Tracks: ${conductorWorkspace.tracks.length} total`));
+      for (const track of conductorWorkspace.tracks) {
+        const icon = track.status === 'completed' ? chalk.green('✓') :
+                     track.status === 'active' ? chalk.cyan('→') :
+                     track.status === 'blocked' ? chalk.red('!') :
+                       chalk.dim('·');
+        this.log(`    ${icon} ${track.title}`);
+      }
+      this.log('');
+      
+      // Show recent runtime events
+      const recentEvents = await readRuntimeEvents({ limit: 3 });
+      if (recentEvents.length > 0) {
+        this.log(chalk.bold('Recent Activity:'));
+        for (const event of recentEvents) {
+          this.log(chalk.dim(`  ${new Date(event.timestamp).toLocaleTimeString()} ${event.type}`));
+        }
+        this.log('');
+      }
+    }
+
+    if (plan.chunks.length === 0 && !conductorWorkspace.exists) {
       this.log(chalk.yellow('\n  No execution plan generated yet.'));
-      this.log(chalk.dim('  Run `scrimble import --goal "<goal>"` or start a cloud generation run.\n'));
+      this.log(chalk.dim('  Run `scrimble generate` to create a Conductor track.\n'));
       return;
     }
 

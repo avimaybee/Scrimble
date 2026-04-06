@@ -19,9 +19,24 @@ const stalenessMocks = vi.hoisted(() => ({
   detectStaleness: vi.fn(),
 }));
 
+const conductorMocks = vi.hoisted(() => ({
+  getActiveTrack: vi.fn(),
+  getNextTask: vi.fn(),
+  getPlanStats: vi.fn(),
+  loadConductorWorkspace: vi.fn(),
+  parsePlan: vi.fn(),
+}));
+
+const runtimeMocks = vi.hoisted(() => ({
+  isTrackApproved: vi.fn(),
+  loadRuntimeState: vi.fn(),
+}));
+
 vi.mock('../lib/local/index.js', () => localMocks);
 vi.mock('../lib/onboarding.js', () => onboardingMocks);
 vi.mock('../lib/staleness.js', () => stalenessMocks);
+vi.mock('../lib/conductor/index.js', () => conductorMocks);
+vi.mock('../lib/conductor/runtime.js', () => runtimeMocks);
 
 import Root from './root.js';
 
@@ -40,6 +55,21 @@ function runRootWith(runCommand: ReturnType<typeof vi.fn>): Promise<void> {
 
 describe('root onboarding routing', () => {
   beforeEach(() => {
+    conductorMocks.loadConductorWorkspace.mockResolvedValue({ exists: false, tracks: [] });
+    conductorMocks.getActiveTrack.mockReturnValue(undefined);
+    conductorMocks.getNextTask.mockReturnValue(undefined);
+    conductorMocks.getPlanStats.mockReturnValue({
+      total: 0,
+      completed: 0,
+      inProgress: 0,
+      pending: 0,
+      skipped: 0,
+      manualCheckpoints: 0,
+    });
+    conductorMocks.parsePlan.mockResolvedValue({ trackId: 'track-1', phases: [], tasks: [] });
+    runtimeMocks.loadRuntimeState.mockResolvedValue({ status: 'idle', attemptCount: 0, lastActivityAt: '2026-04-06T00:00:00.000Z' });
+    runtimeMocks.isTrackApproved.mockResolvedValue(false);
+
     onboardingMocks.getAuthStatus.mockResolvedValue({ isAuthenticated: true, reason: 'ok' });
     onboardingMocks.getAIConfigurationStatus.mockResolvedValue({ isValid: true, reason: 'ok' });
     localMocks.isProjectInitialized.mockResolvedValue(true);

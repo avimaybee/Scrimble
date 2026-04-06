@@ -1,71 +1,32 @@
-import { Command, Flags } from '@oclif/core';
+import { Command } from '@oclif/core';
 import chalk from 'chalk';
-import {
-  appendActivity,
-  getNextPendingChunk,
-  loadPlanState,
-  savePlanState,
-  writeCurrentChunkFromPlan,
-} from '../lib/local/index.js';
-import { recordTelemetry } from '../lib/telemetry.js';
+import { getTaskProvider } from '../lib/tasks/index.js';
 
 export default class Next extends Command {
-  static override description = 'Preview the next pending chunk without activation (or activate it)';
+  static override description = 'Advance to the next pending task/chunk';
 
-  static override examples = [
-    '<%= config.bin %> next',
-    '<%= config.bin %> next --activate',
-  ];
-
-  static override flags = {
-    activate: Flags.boolean({
-      description: 'Activate the next pending chunk immediately',
-      default: false,
-    }),
-  };
+  static override examples = ['<%= config.bin %> next'];
 
   async run(): Promise<void> {
-    const { flags } = await this.parse(Next);
-    const plan = await loadPlanState();
-    const nextChunk = getNextPendingChunk(plan);
+    const provider = await getTaskProvider();
+    const result = await provider.activateNextTask();
 
-    if (!nextChunk) {
-      this.log(chalk.green('\nNo pending chunks remain.\n'));
-      return;
-    }
-
-    if (!flags.activate) {
+    if (result.alreadyActiveTask) {
       this.log('');
-      this.log(chalk.bold('Next pending chunk:'));
-      this.log(chalk.cyan(`- ${nextChunk.title} (${nextChunk.id})`));
-      this.log(chalk.dim(`Run \`scrimble next --activate\` to make it active.`));
+      this.log(chalk.yellow(`Task already active: ${result.alreadyActiveTask.title}`));
+      this.log(chalk.dim(`Task ID: ${result.alreadyActiveTask.id}`));
       this.log('');
       return;
     }
 
-    const nextChunks = plan.chunks.map((chunk) =>
-      chunk.id === nextChunk.id
-        ? {
-            ...chunk,
-            status: 'active' as const,
-            updatedAt: new Date().toISOString(),
-          }
-        : chunk.status === 'active'
-          ? { ...chunk, status: 'pending' as const, updatedAt: new Date().toISOString() }
-          : chunk,
-    );
-
-    const activated = { ...plan, chunks: nextChunks };
-    await savePlanState(activated);
-    await writeCurrentChunkFromPlan(activated);
-    await appendActivity('chunk_activated', { chunkId: nextChunk.id });
-    await recordTelemetry({
-      event: 'chunk_activated',
-      payload: { chunkId: nextChunk.id },
-    });
+    if (!result.activatedTask) {
+      this.log(chalk.yellow('\nNo pending task available to activate.\n'));
+      return;
+    }
 
     this.log('');
-    this.log(chalk.green(`✓ Activated chunk: ${nextChunk.title}`));
+    this.log(chalk.green(`✓ Activated: ${result.activatedTask.title}`));
+    this.log(chalk.dim(`Task ID: ${result.activatedTask.id}`));
     this.log('');
   }
 }

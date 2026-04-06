@@ -23,10 +23,25 @@ const telemetryMocks = vi.hoisted(() => ({
   recordTelemetry: vi.fn(),
 }));
 
+const conductorMocks = vi.hoisted(() => ({
+  getActiveTrack: vi.fn(),
+  loadConductorWorkspace: vi.fn(),
+  parsePlan: vi.fn(),
+  updateTaskStatus: vi.fn(),
+}));
+
+const runtimeMocks = vi.hoisted(() => ({
+  appendRuntimeEvent: vi.fn(),
+  loadRuntimeState: vi.fn(),
+  setRunStatus: vi.fn(),
+}));
+
 vi.mock('../lib/local/index.js', () => localMocks);
 vi.mock('../lib/verify/index.js', () => verifyMocks);
 vi.mock('../lib/api/index.js', () => apiMocks);
 vi.mock('../lib/telemetry.js', () => telemetryMocks);
+vi.mock('../lib/conductor/index.js', () => conductorMocks);
+vi.mock('../lib/conductor/runtime.js', () => runtimeMocks);
 
 import Done from './done.js';
 
@@ -83,6 +98,14 @@ function makeCommand(logs: string[]): Done {
 
 describe('done command cloud completion emission', () => {
   beforeEach(() => {
+    conductorMocks.loadConductorWorkspace.mockResolvedValue({ exists: false, tracks: [] });
+    conductorMocks.getActiveTrack.mockReturnValue(undefined);
+    conductorMocks.parsePlan.mockResolvedValue({ trackId: 't-1', phases: [], tasks: [] });
+    conductorMocks.updateTaskStatus.mockResolvedValue(undefined);
+    runtimeMocks.loadRuntimeState.mockResolvedValue({ status: 'idle', attemptCount: 0, lastActivityAt: '2026-04-06T00:00:00.000Z' });
+    runtimeMocks.appendRuntimeEvent.mockResolvedValue(undefined);
+    runtimeMocks.setRunStatus.mockResolvedValue(undefined);
+
     localMocks.loadPlanState.mockResolvedValue(makePlanState());
     localMocks.getActiveChunk.mockReturnValue(makePlanState().chunks[0]);
     localMocks.getNextPendingChunk.mockReturnValue(makePlanState().chunks[1]);
@@ -140,5 +163,38 @@ describe('done command cloud completion emission', () => {
       payload: { message: 'Unauthorized' },
     });
     expect(stripAnsi(logs.join('\n'))).toContain('Cloud history update failed: Unauthorized');
+  });
+
+  it('marks conductor in-progress task complete when conductor workspace exists', async () => {
+    conductorMocks.loadConductorWorkspace.mockResolvedValue({
+      exists: true,
+      tracks: [{ id: 'track-1', title: 'Track One', status: 'active', planPath: 'C:\\tmp\\plan.md' }],
+    });
+    runtimeMocks.loadRuntimeState.mockResolvedValue({
+      status: 'idle',
+      activeTrackId: 'track-1',
+      activeTaskId: 'task-1',
+      attemptCount: 0,
+      lastActivityAt: '2026-04-06T00:00:00.000Z',
+    });
+    conductorMocks.parsePlan
+      .mockResolvedValueOnce({
+        trackId: 'track-1',
+        phases: [],
+        tasks: [{ id: 'task-1', title: 'Do work', status: 'in_progress', substeps: [], isManualVerification: false, rawMarkdown: '' }],
+      })
+      .mockResolvedValueOnce({
+        trackId: 'track-1',
+        phases: [],
+        tasks: [{ id: 'task-2', title: 'Next work', status: 'pending', substeps: [], isManualVerification: false, rawMarkdown: '' }],
+      });
+
+    const logs: string[] = [];
+    const command = makeCommand(logs);
+    await command.run();
+
+    expect(conductorMocks.updateTaskStatus).toHaveBeenCalledWith('C:\\tmp\\plan.md', 'task-1', 'completed');
+    expect(conductorMocks.updateTaskStatus).toHaveBeenCalledWith('C:\\tmp\\plan.md', 'task-2', 'in_progress');
+    expect(stripAnsi(logs.join('\n'))).toContain('Task completion recorded');
   });
 });

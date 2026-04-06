@@ -1,23 +1,9 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
-import {
-  appendActivity,
-  getActiveChunk,
-  getNextPendingChunk,
-  loadPlanState,
-  savePlanState,
-  writeCurrentChunkFromPlan,
-} from '../lib/local/index.js';
-import {
-  formatCloudError,
-  recordChunkCompletion,
-  resolveCloudClientConfig,
-} from '../lib/api/index.js';
-import { runVerification } from '../lib/verify/index.js';
-import { recordTelemetry } from '../lib/telemetry.js';
+import { getTaskProvider } from '../lib/tasks/index.js';
 
 export default class Done extends Command {
-  static override description = 'Complete current chunk: verify, sync completion, and activate next chunk';
+  static override description = 'Complete the active task/chunk through the active task provider';
 
   static override examples = [
     '<%= config.bin %> done',
@@ -42,7 +28,7 @@ export default class Done extends Command {
       multiple: true,
     }),
     cloud: Flags.boolean({
-      description: 'Emit chunk completion to cloud history',
+      description: 'Emit completion to cloud history when supported by provider',
       default: true,
       allowNo: true,
     }),
@@ -50,115 +36,44 @@ export default class Done extends Command {
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Done);
-    const plan = await loadPlanState();
-    const activeChunk = getActiveChunk(plan);
-    if (!activeChunk) {
-      this.log(chalk.yellow('\nNo active chunk available to complete.\n'));
-      return;
-    }
+    const provider = await getTaskProvider();
 
-    let verificationResult: Awaited<ReturnType<typeof runVerification>> | undefined;
-    if (!flags['no-verify']) {
-      verificationResult = await runVerification({
-        ...(flags['verify-command'] ? { commands: flags['verify-command'] } : {}),
-      });
+    try {
+      const completeOptions = {
+        force: flags.force,
+        skipVerification: flags['no-verify'],
+        cloud: flags.cloud,
+        ...(flags.reason ? { reason: flags.reason } : {}),
+        ...(flags['verify-command'] && flags['verify-command'].length > 0
+          ? { verifyCommands: flags['verify-command'] }
+          : {}),
+      };
 
-      if (verificationResult.status === 'fail' && !flags.force) {
-        this.log(chalk.red('\nVerification failed. Use --force with --reason to override.\n'));
-        this.exit(1);
+      const result = await provider.completeTask(completeOptions);
+
+      if (!result) {
+        this.log(chalk.yellow('\nNo active task available to complete.\n'));
+        return;
       }
-      if (verificationResult.status === 'fail' && flags.force && !flags.reason) {
-        this.log(chalk.red('\nOverride requires --reason when verification fails.\n'));
-        this.exit(1);
+
+      this.log('');
+      this.log(chalk.green('✓ Task completion recorded.'));
+      this.log(chalk.dim(`Completed: ${result.completedTask.title}`));
+      if (flags.cloud && result.cloudRecorded) {
+        this.log(chalk.dim('Cloud history updated.'));
+      } else if (flags.cloud && result.cloudError) {
+        this.log(chalk.yellow(`⚠ Cloud history update failed: ${result.cloudError}`));
       }
-    }
-
-    const now = new Date().toISOString();
-    const completedChunks = plan.chunks.map((chunk) =>
-      chunk.id === activeChunk.id
-        ? { ...chunk, status: 'completed' as const, completedAt: now, updatedAt: now }
-        : chunk,
-    );
-    const nextPending = getNextPendingChunk({ ...plan, chunks: completedChunks });
-    const finalChunks = completedChunks.map((chunk) =>
-      nextPending && chunk.id === nextPending.id
-        ? { ...chunk, status: 'active' as const, updatedAt: now }
-        : chunk,
-    );
-
-    const completionPayload = {
-      chunkId: activeChunk.id,
-      chunkTitle: activeChunk.title,
-      completedAt: now,
-      verificationStatus: verificationResult?.status ?? null,
-      forced: flags.force,
-      reason: flags.reason ?? null,
-      nextChunkId: nextPending?.id ?? null,
-    };
-
-    // Remove lastSyncError on successful state update
-    const syncState = { ...(plan.sync ?? {}) };
-    delete syncState.lastSyncError;
-
-    const nextPlan = {
-      ...plan,
-      chunks: finalChunks,
-      sync: syncState,
-    };
-
-    let cloudRecorded = false;
-    let cloudError: string | undefined;
-    if (flags.cloud) {
-      try {
-        const cloudConfig = await resolveCloudClientConfig();
-        await recordChunkCompletion(cloudConfig, {
-          chunkId: activeChunk.id,
-          chunkTitle: activeChunk.title,
-          ...(verificationResult?.status ? { verificationStatus: verificationResult.status } : {}),
-          forced: flags.force,
-          reason: flags.reason ?? null,
-          nextChunkId: nextPending?.id ?? null,
-          completedAt: now,
-        });
-        cloudRecorded = true;
-      } catch (error) {
-        cloudError = formatCloudError(error);
-        await recordTelemetry({
-          event: 'chunk_done_cloud_emit_failed',
-          level: 'warn',
-          payload: { message: cloudError },
-        });
+      if (result.nextTask) {
+        this.log(chalk.cyan(`Next active: ${result.nextTask.title}`));
+      } else {
+        this.log(chalk.green('No pending tasks remain.'));
       }
+      this.log('');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log(chalk.red(`\n${message}\n`));
+      this.exit(1);
     }
-
-    await savePlanState(nextPlan);
-    await writeCurrentChunkFromPlan(nextPlan);
-    await appendActivity('chunk_done', {
-      ...completionPayload,
-      cloudRecorded,
-      cloudError: cloudError ?? null,
-    });
-    await recordTelemetry({
-      event: 'chunk_done',
-      payload: {
-        ...completionPayload,
-        cloudRecorded,
-      },
-    });
-
-    this.log('');
-    this.log(chalk.green('✓ Chunk completion recorded.'));
-    this.log(chalk.dim(`Completed: ${activeChunk.title}`));
-    if (flags.cloud && cloudRecorded) {
-      this.log(chalk.dim('Cloud history updated.'));
-    } else if (flags.cloud && cloudError) {
-      this.log(chalk.yellow(`⚠ Cloud history update failed: ${cloudError}`));
-    }
-    if (nextPending) {
-      this.log(chalk.cyan(`Next active chunk: ${nextPending.title}`));
-    } else {
-      this.log(chalk.green('No pending chunks remain.'));
-    }
-    this.log('');
   }
 }

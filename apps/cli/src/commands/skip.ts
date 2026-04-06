@@ -1,16 +1,9 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
-import {
-  appendActivity,
-  getActiveChunk,
-  loadPlanState,
-  savePlanState,
-  writeCurrentChunkFromPlan,
-} from '../lib/local/index.js';
-import { recordTelemetry } from '../lib/telemetry.js';
+import { getTaskProvider } from '../lib/tasks/index.js';
 
 export default class Skip extends Command {
-  static override description = 'Skip current chunk with explicit reason and risk acknowledgement';
+  static override description = 'Skip active task/chunk with explicit reason and risk acknowledgement';
 
   static override examples = [
     '<%= config.bin %> skip --reason "Blocked by external API outage" --ack-risk',
@@ -18,7 +11,7 @@ export default class Skip extends Command {
 
   static override flags = {
     reason: Flags.string({
-      description: 'Reason for skipping this chunk',
+      description: 'Reason for skipping this task/chunk',
       required: true,
     }),
     'ack-risk': Flags.boolean({
@@ -32,69 +25,22 @@ export default class Skip extends Command {
     if (!flags['ack-risk']) {
       this.log(chalk.red('\nSkipping requires explicit risk acknowledgement: add --ack-risk.\n'));
       this.exit(1);
-    }
-
-    const plan = await loadPlanState();
-    const activeChunk = getActiveChunk(plan);
-    if (!activeChunk) {
-      this.log(chalk.yellow('\nNo active chunk found to skip.\n'));
       return;
     }
 
-    const timestamp = new Date().toISOString();
-    let activatedNextId: string | undefined;
-    const updatedChunks = plan.chunks.map((chunk) => {
-      if (chunk.id === activeChunk.id) {
-        return {
-          ...chunk,
-          status: 'skipped' as const,
-          skipReason: flags.reason,
-          skippedAt: timestamp,
-          updatedAt: timestamp,
-        };
-      }
-      return chunk;
-    });
-
-    const firstPendingIndex = updatedChunks.findIndex((chunk) => chunk.status === 'pending');
-    if (firstPendingIndex !== -1) {
-      const pendingChunk = updatedChunks[firstPendingIndex];
-      if (!pendingChunk) {
-        throw new Error('Pending chunk lookup failed during skip flow.');
-      }
-      activatedNextId = pendingChunk.id;
-      updatedChunks[firstPendingIndex] = {
-        ...pendingChunk,
-        status: 'active',
-        updatedAt: timestamp,
-      };
+    const provider = await getTaskProvider();
+    const result = await provider.skipTask(flags.reason);
+    if (!result) {
+      this.log(chalk.yellow('\nNo active task found to skip.\n'));
+      return;
     }
 
-    const nextPlan = { ...plan, chunks: updatedChunks };
-
-    await savePlanState(nextPlan);
-    await writeCurrentChunkFromPlan(nextPlan);
-    await appendActivity('chunk_skipped', {
-      chunkId: activeChunk.id,
-      reason: flags.reason,
-      activatedNextId: activatedNextId ?? null,
-    });
-    await recordTelemetry({
-      event: 'chunk_skipped',
-      level: 'warn',
-      payload: {
-        chunkId: activeChunk.id,
-        reason: flags.reason,
-      },
-    });
-
     this.log('');
-    this.log(chalk.yellow(`⚠ Skipped chunk: ${activeChunk.title}`));
-    if (activatedNextId) {
-      const activated = nextPlan.chunks.find((chunk) => chunk.id === activatedNextId);
-      this.log(chalk.cyan(`Activated next chunk: ${activated?.title ?? activatedNextId}`));
+    this.log(chalk.yellow(`⚠ Skipped: ${result.skippedTask.title}`));
+    if (result.nextTask) {
+      this.log(chalk.cyan(`Activated next: ${result.nextTask.title}`));
     } else {
-      this.log(chalk.dim('No further pending chunks were available to activate.'));
+      this.log(chalk.dim('No further pending tasks were available to activate.'));
     }
     this.log('');
   }

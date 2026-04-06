@@ -10,13 +10,13 @@ import {
   isProjectInitialized,
   loadPlanState,
   loadProjectState,
-  renderChunkMarkdown,
 } from '../lib/local/index.js';
 import { getAIConfigurationStatus, getAuthStatus } from '../lib/onboarding.js';
 import { detectStaleness } from '../lib/staleness.js';
+import { getTaskProvider } from '../lib/tasks/index.js';
 
 export default class Root extends Command {
-  static override description = 'Run smart onboarding checks, then show current chunk and project status';
+  static override description = 'Run smart onboarding checks, then show current task and project status';
   static override hidden = true;
 
   static override examples = [
@@ -39,155 +39,154 @@ export default class Root extends Command {
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Root);
-
     const cwd = process.cwd();
 
-    let authStatus = await getAuthStatus(cwd);
-    if (!authStatus.isAuthenticated) {
-      this.log(chalk.yellow('\n🔐 Authentication required. Starting `scrimble login`...\n'));
-      await this.config.runCommand('login');
-      authStatus = await getAuthStatus(cwd);
-      if (!authStatus.isAuthenticated) {
-        this.log(chalk.red('\nLogin did not produce a valid session.\n'));
-        return;
-      }
+    const onboardingComplete = await ensureOnboarding(cwd, this.log.bind(this), this.config.runCommand.bind(this.config));
+    if (!onboardingComplete) {
+      return;
     }
 
-    let projectInitialized = await isProjectInitialized(cwd);
-    if (!projectInitialized) {
-      this.log(chalk.yellow('\n🚀 Project initialization required. Starting `scrimble init`...\n'));
-      await this.config.runCommand('init');
-      projectInitialized = await isProjectInitialized(cwd);
-      if (!projectInitialized) {
-        this.log(chalk.red('\nProject is still not initialized after `scrimble init`.\n'));
-        return;
-      }
-    }
-
-    let aiStatus = await getAIConfigurationStatus(cwd);
-    if (!aiStatus.isValid) {
-      this.log(chalk.yellow('\n🤖 AI configuration is incomplete. Starting `scrimble config set-ai`...\n'));
-      await this.config.runCommand('config:set-ai');
-      aiStatus = await getAIConfigurationStatus(cwd);
-      if (!aiStatus.isValid) {
-        this.log(chalk.red('\nAI configuration is still incomplete after setup.\n'));
-        return;
-      }
-    }
-
-    let plan = await loadPlanState(cwd);
-    if (plan.chunks.length === 0) {
-      this.log(chalk.yellow('\n🧭 No execution plan found. Starting `scrimble generate`...\n'));
-      await this.config.runCommand('generate');
-      plan = await loadPlanState(cwd);
+    let provider = await getTaskProvider(cwd);
+    if (provider.kind === 'legacy') {
+      const plan = await loadPlanState(cwd);
       if (plan.chunks.length === 0) {
-        this.log(chalk.yellow('\nNo execution plan is available yet. Complete generation and run `scrimble` again.\n'));
-        return;
+        this.log(chalk.yellow('\n🧭 No execution plan found. Starting `scrimble generate`...\n'));
+        await this.config.runCommand('generate');
+        provider = await getTaskProvider(cwd);
       }
+    }
+
+    if (flags.ink && provider.kind === 'legacy') {
+      await renderLegacyInk(cwd);
+      return;
     }
 
     const project = await loadProjectState(cwd);
-    const activeChunk = getActiveChunk(plan);
-    const nextChunk = getNextPendingChunk(plan);
-    const stats = getCompletionStats(plan);
     const projectName = typeof project['name'] === 'string' ? project['name'] : 'Unknown Project';
     const projectGoal = typeof project['goal'] === 'string' ? project['goal'] : null;
-    const staleIssues = await detectStaleness(plan);
-
-    if (flags.ink) {
-      await render(
-        React.createElement(RootDashboard, {
-          projectName,
-          projectGoal,
-          progress: {
-            completed: stats.completed,
-            total: stats.total,
-            skipped: stats.skipped,
-          },
-          ...(activeChunk
-            ? {
-              activeChunk: {
-                title: activeChunk.title,
-                prompt: activeChunk.prompt,
-                ...(activeChunk.doneWhen ? { doneWhen: activeChunk.doneWhen } : {}),
-                ...(activeChunk.doNotTouch ? { doNotTouch: activeChunk.doNotTouch } : {}),
-              },
-            }
-            : {}),
-          ...(nextChunk ? { nextChunkTitle: nextChunk.title } : {}),
-          staleMessages: staleIssues.map((issue) => issue.message),
-        }),
-      ).waitUntilExit();
-      return;
-    }
+    const summary = await provider.getSummary();
 
     this.log('');
     this.log(chalk.bold(`📦 ${projectName}`));
     if (projectGoal) {
       this.log(chalk.dim(`   ${projectGoal}`));
     }
-    this.log(chalk.dim(`   Progress: ${stats.completed}/${stats.total} complete (${stats.skipped} skipped)`));
+    this.log(chalk.dim(`   ${summary.statusLabel}`));
+    if (summary.progressLabel) {
+      this.log(chalk.dim(`   ${summary.progressLabel}`));
+    }
     this.log('');
 
-    if (plan.architecture?.approved === false) {
-      this.log(chalk.yellow('  Architecture is not approved.'));
-      this.log(chalk.dim('  Run `scrimble approve` or `scrimble replan --request "<change>"`.'));
-      this.log('');
-      return;
-    }
-
-    if (!activeChunk) {
-      this.log(chalk.green('  ✓ No active chunk right now.'));
-      if (nextChunk) {
-        this.log(chalk.cyan(`  Next available: ${nextChunk.title}`));
-        this.log(chalk.dim('  Run `scrimble next --activate` to continue.'));
-      } else {
-        this.log(chalk.green('  All chunks are complete or intentionally skipped.'));
+    if (summary.activeTask) {
+      this.log(chalk.bold('📋 Current Task'));
+      this.log(chalk.cyan(`  ${summary.activeTask.title} (${summary.activeTask.id})`));
+      if (flags.verbose) {
+        this.log(chalk.dim(summary.activeTask.prompt));
+      } else if (summary.activeTask.doneWhen) {
+        this.log(chalk.dim(`  Done when: ${summary.activeTask.doneWhen}`));
       }
       this.log('');
-      return;
-    }
-
-    this.log(chalk.bold('📋 Current Chunk'));
-    this.log('');
-    if (flags.verbose) {
-      this.log(renderChunkMarkdown(activeChunk));
+    } else if (summary.nextTask) {
+      this.log(chalk.green('  ✓ No active task right now.'));
+      this.log(chalk.cyan(`  Next available: ${summary.nextTask.title}`));
+      this.log('');
     } else {
-      this.log(chalk.cyan(`  ${activeChunk.title} (${activeChunk.id})`));
-      this.log(chalk.dim(`  Done when: ${activeChunk.doneWhen ?? 'See prompt details'}`));
+      this.log(chalk.yellow('  No active or pending tasks are currently available.'));
       this.log('');
-      this.log(chalk.bold('Prompt:'));
-      this.log(activeChunk.prompt);
-      if (activeChunk.doNotTouch) {
-        this.log('');
-        this.log(chalk.bold('Do not touch:'));
-        this.log(chalk.dim(activeChunk.doNotTouch));
-      }
-      if (activeChunk.verificationSignals && activeChunk.verificationSignals.length > 0) {
-        this.log('');
-        this.log(chalk.bold('Verification signals:'));
-        for (const signal of activeChunk.verificationSignals) {
-          this.log(chalk.dim(`  - ${signal}`));
-        }
-      }
     }
-    this.log('');
 
-    if (staleIssues.length > 0) {
-      this.log(chalk.yellow('⚠ Integrity notes:'));
-      for (const issue of staleIssues) {
-        this.log(chalk.yellow(`  - ${issue.message}`));
+    if (summary.warnings.length > 0) {
+      this.log(chalk.yellow('⚠ Notes:'));
+      for (const warning of summary.warnings) {
+        this.log(chalk.yellow(`  - ${warning}`));
       }
       this.log('');
     }
 
     this.log(chalk.bold('Quick Actions:'));
-    this.log(chalk.dim('  scrimble prompt    - Copy prompt for your AI coding agent'));
-    this.log(chalk.dim('  scrimble verify    - Check if chunk is complete'));
-    this.log(chalk.dim('  scrimble done      - Mark chunk as complete'));
-    this.log(chalk.dim('  scrimble skip      - Skip this chunk (with reason)'));
-    this.log(chalk.dim('  scrimble next      - Preview next chunk'));
-    this.log(chalk.dim('  scrimble sync      - Reconcile local and cloud state'));
+    for (const action of summary.quickActions) {
+      this.log(chalk.dim(`  ${action}`));
+    }
+    this.log('');
+
+    this.log(chalk.bold('Next Action:'));
+    this.log(chalk.cyan(`  ${summary.nextAction}`));
     this.log('');
   }
+}
+
+async function ensureOnboarding(
+  cwd: string,
+  log: (message?: string) => void,
+  runCommand: (id: string) => Promise<unknown>,
+): Promise<boolean> {
+  let authStatus = await getAuthStatus(cwd);
+  if (!authStatus.isAuthenticated) {
+    log(chalk.yellow('\n🔐 Authentication required. Starting `scrimble login`...\n'));
+    await runCommand('login');
+    authStatus = await getAuthStatus(cwd);
+    if (!authStatus.isAuthenticated) {
+      log(chalk.red('\nLogin did not produce a valid session.\n'));
+      return false;
+    }
+  }
+
+  let projectInitialized = await isProjectInitialized(cwd);
+  if (!projectInitialized) {
+    log(chalk.yellow('\n🚀 Project initialization required. Starting `scrimble init`...\n'));
+    await runCommand('init');
+    projectInitialized = await isProjectInitialized(cwd);
+    if (!projectInitialized) {
+      log(chalk.red('\nProject is still not initialized after `scrimble init`.\n'));
+      return false;
+    }
+  }
+
+  let aiStatus = await getAIConfigurationStatus(cwd);
+  if (!aiStatus.isValid) {
+    log(chalk.yellow('\n🤖 AI configuration is incomplete. Starting `scrimble config set-ai`...\n'));
+    await runCommand('config:set-ai');
+    aiStatus = await getAIConfigurationStatus(cwd);
+    if (!aiStatus.isValid) {
+      log(chalk.red('\nAI configuration is still incomplete after setup.\n'));
+      return false;
+    }
+  }
+
+  return true;
+}
+
+async function renderLegacyInk(cwd: string): Promise<void> {
+  const plan = await loadPlanState(cwd);
+  const project = await loadProjectState(cwd);
+  const activeChunk = getActiveChunk(plan);
+  const nextChunk = getNextPendingChunk(plan);
+  const stats = getCompletionStats(plan);
+  const staleIssues = await detectStaleness(plan);
+  const projectName = typeof project['name'] === 'string' ? project['name'] : 'Unknown Project';
+  const projectGoal = typeof project['goal'] === 'string' ? project['goal'] : null;
+
+  await render(
+    React.createElement(RootDashboard, {
+      projectName,
+      projectGoal,
+      progress: {
+        completed: stats.completed,
+        total: stats.total,
+        skipped: stats.skipped,
+      },
+      ...(activeChunk
+        ? {
+          activeChunk: {
+            title: activeChunk.title,
+            prompt: activeChunk.prompt,
+            ...(activeChunk.doneWhen ? { doneWhen: activeChunk.doneWhen } : {}),
+            ...(activeChunk.doNotTouch ? { doNotTouch: activeChunk.doNotTouch } : {}),
+          },
+        }
+        : {}),
+      ...(nextChunk ? { nextChunkTitle: nextChunk.title } : {}),
+      staleMessages: staleIssues.map((issue) => issue.message),
+    }),
+  ).waitUntilExit();
 }

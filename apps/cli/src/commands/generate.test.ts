@@ -5,6 +5,9 @@ const localMocks = vi.hoisted(() => ({
   loadPlanState: vi.fn(),
   savePlanState: vi.fn(),
   writeCurrentChunkFromPlan: vi.fn(),
+  getScrimblePaths: vi.fn().mockReturnValue({
+    research: '/tmp/.scrimble/research-summary.md',
+  }),
 }));
 
 const apiMocks = vi.hoisted(() => {
@@ -73,10 +76,26 @@ const telemetryMocks = vi.hoisted(() => ({
   recordTelemetry: vi.fn(),
 }));
 
+const conductorMocks = vi.hoisted(() => ({
+  loadConductorWorkspace: vi.fn(),
+}));
+
+const runtimeMocks = vi.hoisted(() => ({
+  appendRuntimeEvent: vi.fn(),
+}));
+
+const geminiMocks = vi.hoisted(() => ({
+  runPreflight: vi.fn(),
+  formatPreflightResult: vi.fn(),
+}));
+
 vi.mock('../lib/local/index.js', () => localMocks);
 vi.mock('../lib/api/index.js', () => apiMocks);
 vi.mock('../lib/config/load-config.js', () => configMocks);
 vi.mock('../lib/telemetry.js', () => telemetryMocks);
+vi.mock('../lib/conductor/index.js', () => conductorMocks);
+vi.mock('../lib/conductor/runtime.js', () => runtimeMocks);
+vi.mock('../lib/gemini/index.js', () => geminiMocks);
 
 import Generate from './generate.js';
 
@@ -98,6 +117,12 @@ describe('generate command cloud flow', () => {
     localMocks.savePlanState.mockResolvedValue(undefined);
     localMocks.writeCurrentChunkFromPlan.mockResolvedValue(undefined);
     localMocks.appendActivity.mockResolvedValue(undefined);
+
+    // Mock no Conductor workspace to trigger cloud flow
+    conductorMocks.loadConductorWorkspace.mockResolvedValue({
+      exists: false,
+      tracks: [],
+    });
 
     apiMocks.resolveCloudClientConfig.mockResolvedValue({
       baseUrl: 'https://api.scrimble.dev',
@@ -150,7 +175,7 @@ describe('generate command cloud flow', () => {
     const logs: string[] = [];
     await expect(Generate.prototype.run.call({
       parse: vi.fn().mockResolvedValue({
-        flags: { goal: 'Ship runtime', wait: false, apply: true },
+        flags: { goal: 'Ship runtime', cloud: false, manual: false, wait: false, apply: true },
       }),
       log: (message = '') => {
         logs.push(String(message));
@@ -158,6 +183,8 @@ describe('generate command cloud flow', () => {
       exit: (code?: number) => {
         throw new Error(`EXIT_${String(code ?? 0)}`);
       },
+      runCloudGeneration: Generate.prototype['runCloudGeneration'],
+      runConductorTrackCreation: Generate.prototype['runConductorTrackCreation'],
     } as unknown as Generate)).rejects.toThrow('EXIT_1');
 
     const normalizedLogs = logs.map(stripAnsi).join('\n');
@@ -168,7 +195,7 @@ describe('generate command cloud flow', () => {
     const logs: string[] = [];
     await Generate.prototype.run.call({
       parse: vi.fn().mockResolvedValue({
-        flags: { goal: 'Ship runtime', wait: true, apply: true },
+        flags: { goal: 'Ship runtime', cloud: false, manual: false, wait: true, apply: true },
       }),
       log: (message = '') => {
         logs.push(String(message));
@@ -176,6 +203,8 @@ describe('generate command cloud flow', () => {
       exit: (code?: number) => {
         throw new Error(`EXIT_${String(code ?? 0)}`);
       },
+      runCloudGeneration: Generate.prototype['runCloudGeneration'],
+      runConductorTrackCreation: Generate.prototype['runConductorTrackCreation'],
     } as unknown as Generate);
 
     expect(localMocks.savePlanState).toHaveBeenCalledWith(

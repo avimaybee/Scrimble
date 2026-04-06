@@ -44,20 +44,20 @@ scrimble/
 | Command | Description |
 |---------|-------------|
 | `scrimble init` | Initialize Scrimble in current repository |
-| `scrimble import` | Adopt an existing repo and generate a reality-based chunk plan |
-| `scrimble generate` | Start cloud plan generation from a goal (optionally wait/apply locally) |
+| `scrimble import` | Compatibility alias for `scrimble init` (brownfield adoption path) |
+| `scrimble generate` | Create a Conductor track from a goal (or use `--cloud` for legacy cloud generation) |
 | `scrimble config set-ai` | Run the AI provider/model/key setup wizard |
 | `scrimble login` | Authenticate using OAuth device flow |
-| `scrimble approve` | Approve/reject architecture before execution |
-| `scrimble` | Auto-run onboarding (login/init/config/generate) when needed, then show active chunk context (`--ink` for Ink dashboard) |
-| `scrimble prompt` | Print the raw active-chunk prompt |
+| `scrimble approve` | Approve a Conductor track for autonomous execution |
+| `scrimble` | Auto-run onboarding, then show Conductor runtime overview and next action |
+| `scrimble prompt` | Print the current Conductor task prompt (legacy chunk prompt fallback) |
 | `scrimble verify` | Run local verification checks |
-| `scrimble done` | Complete current chunk and persist completion to local + cloud history |
+| `scrimble done` | Complete current Conductor task (legacy chunk completion fallback) |
 | `scrimble doctor` | Check configuration and health |
 | `scrimble status` | Show project status and progress |
-| `scrimble logs` | Stream cloud execution and project events |
-| `scrimble next` | Preview or activate next pending chunk |
-| `scrimble skip` | Skip active chunk with risk acknowledgement |
+| `scrimble logs` | Show local runtime events first, then cloud execution/project events |
+| `scrimble next` | Preview or activate next pending Conductor task |
+| `scrimble skip` | Skip active Conductor task with risk acknowledgement |
 | `scrimble update` | Apply targeted plan updates |
 | `scrimble replan` | Rebuild remaining plan while preserving completed chunks |
 | `scrimble sync` | Reconcile local/cloud plan state using canonical D1 registry |

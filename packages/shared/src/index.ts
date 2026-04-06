@@ -46,4 +46,20 @@ export const VERIFICATION_DIR = 'verification';
 export const PROMPTS_DIR = 'prompts';
 export const RULES_DIR = 'rules';
 
+// Conductor artifact paths (planning truth)
+export const CONDUCTOR_DIR = 'conductor';
+export const CONDUCTOR_PRODUCT_FILE = 'product.md';
+export const CONDUCTOR_GUIDELINES_FILE = 'product-guidelines.md';
+export const CONDUCTOR_TECH_STACK_FILE = 'tech-stack.md';
+export const CONDUCTOR_WORKFLOW_FILE = 'workflow.md';
+export const CONDUCTOR_TRACKS_FILE = 'tracks.md';
+export const CONDUCTOR_TRACKS_DIR = 'tracks';
+
+// Scrimble runtime paths (runtime truth)
+export const RUNTIME_DIR = 'runtime';
+export const RUNTIME_STATE_FILE = 'run-state.json';
+export const RUNTIME_APPROVALS_FILE = 'approvals.json';
+export const RUNTIME_EVENTS_FILE = 'events.ndjson';
+export const RUNTIME_ATTEMPTS_DIR = 'attempts';
+
 export const DEFAULT_CLOUD_ENDPOINT = 'https://api.scrimble.dev';

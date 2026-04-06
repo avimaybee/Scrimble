@@ -1,5 +1,8 @@
 // Core entity types for Scrimble
 
+// Conductor and runtime types for the Gemini-Conductor pivot
+export * from './conductor.js';
+
 export type UserID = string;
 export type ProjectID = string;
 export type ChunkID = string;

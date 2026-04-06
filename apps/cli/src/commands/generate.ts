@@ -15,6 +15,9 @@ import {
 import { formatCloudError, getGenerationStatus, resolveCloudClientConfig, startGeneration } from '../lib/api/index.js';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { recordTelemetry } from '../lib/telemetry.js';
+import { runPreflight, formatPreflightResult } from '../lib/gemini/index.js';
+import { loadConductorWorkspace } from '../lib/conductor/index.js';
+import { appendRuntimeEvent } from '../lib/conductor/runtime.js';
 
 async function promptForGoal(): Promise<string> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -126,24 +129,33 @@ function buildGeneratedPlan(
 }
 
 export default class Generate extends Command {
-  static override description = 'Start a cloud generation run and optionally wait/apply output locally';
+  static override description = 'Create a Conductor track or start a cloud generation run';
 
   static override examples = [
-    '<%= config.bin %> generate --goal "Ship stable runtime"',
-    '<%= config.bin %> generate --goal "Ship stable runtime" --wait',
-    '<%= config.bin %> generate --goal "Ship stable runtime" --wait --no-apply',
+    '<%= config.bin %> generate "Add user authentication"',
+    '<%= config.bin %> generate --goal "Ship stable runtime" --cloud',
+    '<%= config.bin %> generate --goal "Ship stable runtime" --cloud --wait',
+    '<%= config.bin %> generate --manual',
   ];
 
   static override flags = {
     goal: Flags.string({
-      description: 'Generation goal describing the plan to produce',
+      description: 'Generation goal describing the plan or track to produce',
+    }),
+    cloud: Flags.boolean({
+      description: 'Use cloud generation instead of Conductor',
+      default: false,
+    }),
+    manual: Flags.boolean({
+      description: 'Print manual Conductor instructions instead of guided flow',
+      default: false,
     }),
     wait: Flags.boolean({
-      description: 'Wait for cloud generation run completion',
+      description: 'Wait for cloud generation run completion (--cloud only)',
       default: false,
     }),
     apply: Flags.boolean({
-      description: 'Apply completed generation output to local plan.json',
+      description: 'Apply completed generation output to local plan.json (--cloud only)',
       default: true,
       allowNo: true,
     }),
@@ -151,6 +163,91 @@ export default class Generate extends Command {
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Generate);
+
+    // Check for Conductor workspace
+    const conductorWorkspace = await loadConductorWorkspace();
+
+    // If --cloud flag or no Conductor workspace, use legacy cloud generation
+    if (flags.cloud || !conductorWorkspace.exists) {
+      await this.runCloudGeneration(flags);
+      return;
+    }
+
+    // Conductor track creation flow
+    await this.runConductorTrackCreation(flags);
+  }
+
+  private async runConductorTrackCreation(
+    flags: { goal: string | undefined; manual: boolean },
+  ): Promise<void> {
+    // Get goal
+    let goal = flags.goal?.trim() ?? '';
+    if (!goal) {
+      goal = await promptForGoal();
+    }
+
+    // Run Gemini preflight
+    const preflight = await runPreflight();
+
+    if (!preflight.canProceed) {
+      this.log('');
+      this.log(chalk.red('Gemini preflight failed:'));
+      this.log(formatPreflightResult(preflight));
+      this.log('');
+      this.exit(1);
+    }
+
+    // Show preflight warnings if any
+    if (preflight.warnings.length > 0) {
+      this.log('');
+      this.log(chalk.yellow('⚠ Preflight warnings:'));
+      for (const warning of preflight.warnings) {
+        this.log(chalk.yellow(`  - ${warning}`));
+      }
+    }
+
+    // Record event
+    await appendRuntimeEvent('track_creation_started', { goal, manual: flags.manual });
+
+    this.log('');
+    this.log(chalk.bold('Creating Conductor Track'));
+    this.log(chalk.dim(`Goal: ${goal}`));
+    this.log('');
+
+    // For now, always show manual instructions
+    // Phase 3 will add mediated Gemini session for guided mode
+    if (flags.manual || true) {
+      this.log(chalk.cyan('Manual Track Creation:'));
+      this.log('');
+      this.log('  1. Start Gemini CLI in your project directory:');
+      this.log(chalk.dim('     gemini'));
+      this.log('');
+      this.log('  2. Run the Conductor newTrack command:');
+      this.log(chalk.dim(`     /conductor:newTrack "${goal}"`));
+      this.log('');
+      this.log('  3. Answer Conductor\'s questions to define the track');
+      this.log('');
+      this.log('  4. Once complete, run:');
+      this.log(chalk.dim('     scrimble status'));
+      this.log('');
+      this.log(chalk.dim('Scrimble will detect the new track in conductor/tracks/'));
+      this.log('');
+    }
+
+    await recordTelemetry({
+      event: 'conductor_track_creation_requested',
+      payload: { goal, manual: flags.manual },
+    });
+
+    await appendActivity('conductor_track_creation', {
+      goal,
+      manual: flags.manual,
+    });
+  }
+
+  private async runCloudGeneration(
+    flags: { goal: string | undefined; wait: boolean; apply: boolean },
+  ): Promise<void> {
     const plan = await loadPlanState();
     let goal = flags.goal?.trim() ?? '';
     if (!goal) {
