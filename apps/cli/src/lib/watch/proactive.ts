@@ -9,7 +9,7 @@ export interface ProactiveSignal {
     | 'dependency-drift'
     | 'plan-divergence'
     | 'no-active-chunk'
-    | 'test-exit';
+    | 'execution-signal';
   severity: 'info' | 'warn';
   message: string;
   suggestedCommand: string;
@@ -34,17 +34,21 @@ function containsDependencySignal(events: RepoWatchEvent[]): boolean {
  * Passive system event detection: test runner exits, build completions, etc.
  * Instead of heuristic filename matching, we watch for actual execution artifacts.
  */
-function containsTestExecutionSignal(events: RepoWatchEvent[]): boolean {
-  const testOutputPatterns = [
+function containsExecutionSignal(events: RepoWatchEvent[]): boolean {
+  const executionOutputPatterns = [
     'test-results',
     'coverage',
     'junit.xml',
     '.nyc_output',
     '__snapshots__',
+    'dist/',
+    '.tsbuildinfo',
+    '.next/',
+    'build/',
   ];
   return events.some((event) => {
     const pathLower = event.relativePath.toLowerCase();
-    return testOutputPatterns.some((pattern) => pathLower.includes(pattern));
+    return executionOutputPatterns.some((pattern) => pathLower.includes(pattern));
   });
 }
 
@@ -68,18 +72,18 @@ export function evaluateProactiveSignals(input: {
     return signals;
   }
 
-  // Detect test execution via output artifacts (passive observation)
-  if (containsTestExecutionSignal(events)) {
+  const executionSignalDetected = containsExecutionSignal(events);
+  if (executionSignalDetected) {
     signals.push({
-      type: 'test-exit',
+      type: 'execution-signal',
       severity: 'info',
-      message: 'Test execution artifacts detected. Consider verifying chunk completion.',
+      message: 'Execution artifacts detected (tests/build). Consider re-verifying this active chunk.',
       suggestedCommand: 'scrimble verify',
       confidence: 0.82,
     });
   }
 
-  if (verificationResult?.status === 'pass' && events.length > 0) {
+  if (verificationResult?.status === 'pass' && (executionSignalDetected || events.length >= 3)) {
     signals.push({
       type: 'completion-ready',
       severity: 'info',

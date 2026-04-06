@@ -9,10 +9,9 @@ const localMocks = vi.hoisted(() => ({
 }));
 
 const apiMocks = vi.hoisted(() => ({
-  listArtifacts: vi.fn(),
-  readArtifact: vi.fn(),
+  getPlanRegistryState: vi.fn(),
   resolveCloudClientConfig: vi.fn(),
-  uploadArtifact: vi.fn(),
+  syncPlanRegistry: vi.fn(),
 }));
 
 const telemetryMocks = vi.hoisted(() => ({
@@ -102,21 +101,33 @@ describe('sync command cloud failure handling', () => {
       baseUrl: 'https://api.scrimble.dev',
       projectId: 'project-1',
     });
-    apiMocks.listArtifacts.mockResolvedValue([]);
-    apiMocks.readArtifact.mockResolvedValue(undefined);
-    apiMocks.uploadArtifact.mockResolvedValue({ key: 'artifact-key', bytes: 42 });
+    apiMocks.getPlanRegistryState.mockResolvedValue({
+      projectId: 'project-1',
+      latest: null,
+    });
+    apiMocks.syncPlanRegistry.mockResolvedValue({
+      status: 'synced',
+      projectId: 'project-1',
+      latest: {
+        version: 1,
+        planHash: 'local-hash',
+        plan: makePlanState(),
+        syncedAt: '2026-04-06T00:00:00.000Z',
+        createdAt: '2026-04-06T00:00:00.000Z',
+      },
+    });
 
     telemetryMocks.recordTelemetry.mockResolvedValue(undefined);
   });
 
   it('parses validation issues from cloud sync errors and stores lastSyncError', async () => {
-    apiMocks.listArtifacts.mockRejectedValue(
+    apiMocks.getPlanRegistryState.mockRejectedValue(
       new MockCloudApiError(
         400,
         JSON.stringify({
-          error: 'Invalid artifacts list query.',
+          error: 'Invalid sync payload.',
           message: 'Request validation failed.',
-          issues: [{ message: 'Number must be less than or equal to 100' }],
+          issues: [{ message: 'planHash is required' }],
         }),
       ),
     );
@@ -128,7 +139,7 @@ describe('sync command cloud failure handling', () => {
     ).rejects.toThrow('EXIT_1');
 
     const normalizedLogs = stripAnsi(logs.join('\n'));
-    const expectedMessage = 'Invalid artifacts list query. Number must be less than or equal to 100';
+    const expectedMessage = 'Invalid sync payload. planHash is required';
     expect(normalizedLogs).toContain(`Cloud sync failed: ${expectedMessage}`);
     expect(localMocks.savePlanState).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -143,17 +154,17 @@ describe('sync command cloud failure handling', () => {
       level: 'warn',
       payload: { message: expectedMessage },
     });
-    expect(apiMocks.uploadArtifact).not.toHaveBeenCalled();
+    expect(apiMocks.syncPlanRegistry).not.toHaveBeenCalled();
     expect(localMocks.appendActivity).not.toHaveBeenCalled();
   });
 
   it('formats non-validation cloud errors with error and message fields', async () => {
-    apiMocks.uploadArtifact.mockRejectedValue(
+    apiMocks.syncPlanRegistry.mockRejectedValue(
       new MockCloudApiError(
         501,
         JSON.stringify({
           error: 'Not Implemented',
-          message: 'Project listing is not implemented yet.',
+          message: 'Plan registry endpoint is not implemented yet.',
         }),
       ),
     );
@@ -165,7 +176,7 @@ describe('sync command cloud failure handling', () => {
     ).rejects.toThrow('EXIT_1');
 
     const normalizedLogs = stripAnsi(logs.join('\n'));
-    const expectedMessage = 'Not Implemented: Project listing is not implemented yet.';
+    const expectedMessage = 'Not Implemented: Plan registry endpoint is not implemented yet.';
     expect(normalizedLogs).toContain(`Cloud sync failed: ${expectedMessage}`);
     expect(localMocks.savePlanState).toHaveBeenCalledWith(
       expect.objectContaining({

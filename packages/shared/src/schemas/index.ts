@@ -26,7 +26,7 @@ export const aiConfigSchema = z.object({
   options: aiOptionsSchema.optional(),
 }).strict();
 
-export const authProviderSchema = z.enum(['custom', 'github']);
+export const authProviderSchema = z.enum(['custom', 'firebase']);
 
 export const authConfigSchema = z.object({
   provider: authProviderSchema,
@@ -164,6 +164,12 @@ export const skipChunkRequestSchema = z.object({
 
 export const updatePlanRequestSchema = z.object({
   updateDescription: z.string().min(1).max(2000),
+});
+
+// Firebase bridge schemas
+export const firebaseApproveRequestSchema = z.object({
+  userCode: z.string().min(1),
+  idToken: z.string().min(1),
 });
 
 // Type exports from schemas (these should match the types in types/index.ts)

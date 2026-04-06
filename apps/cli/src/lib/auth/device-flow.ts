@@ -1,7 +1,16 @@
 import {
+  type AuthProvider,
   authSessionSchema,
-  type AuthConfig,
 } from '@scrimble/shared';
+
+interface DeviceFlowAuthConfig {
+  provider: AuthProvider;
+  clientId: string;
+  deviceCodeEndpoint: string;
+  tokenEndpoint: string;
+  scope?: string | undefined;
+  audience?: string | undefined;
+}
 
 interface DeviceCodeStartResult {
   deviceCode: string;
@@ -61,7 +70,7 @@ function parseDeviceCodeResult(payload: Record<string, unknown>): DeviceCodeStar
   };
 }
 
-function buildTokenPollingForm(authConfig: AuthConfig, deviceCode: string): URLSearchParams {
+function buildTokenPollingForm(authConfig: DeviceFlowAuthConfig, deviceCode: string): URLSearchParams {
   const params = new URLSearchParams({
     grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
     client_id: authConfig.clientId,
@@ -79,7 +88,7 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-export async function startDeviceCode(authConfig: AuthConfig): Promise<DeviceCodeStartResult> {
+export async function startDeviceCode(authConfig: DeviceFlowAuthConfig): Promise<DeviceCodeStartResult> {
   const params = new URLSearchParams({
     client_id: authConfig.clientId,
   });
@@ -95,7 +104,7 @@ export async function startDeviceCode(authConfig: AuthConfig): Promise<DeviceCod
 }
 
 export async function pollDeviceCodeToken(
-  authConfig: AuthConfig,
+  authConfig: DeviceFlowAuthConfig,
   startResult: DeviceCodeStartResult,
 ) {
   const deadline = Date.now() + (startResult.expiresIn * 1000);

@@ -8,6 +8,11 @@ import {
   savePlanState,
   writeCurrentChunkFromPlan,
 } from '../lib/local/index.js';
+import {
+  formatCloudError,
+  recordChunkCompletion,
+  resolveCloudClientConfig,
+} from '../lib/api/index.js';
 import { runVerification } from '../lib/verify/index.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
@@ -35,6 +40,11 @@ export default class Done extends Command {
     'verify-command': Flags.string({
       description: 'Additional verification command (repeatable)',
       multiple: true,
+    }),
+    cloud: Flags.boolean({
+      description: 'Emit chunk completion to cloud history',
+      default: true,
+      allowNo: true,
     }),
   };
 
@@ -79,6 +89,7 @@ export default class Done extends Command {
     const completionPayload = {
       chunkId: activeChunk.id,
       chunkTitle: activeChunk.title,
+      completedAt: now,
       verificationStatus: verificationResult?.status ?? null,
       forced: flags.force,
       reason: flags.reason ?? null,
@@ -95,17 +106,54 @@ export default class Done extends Command {
       sync: syncState,
     };
 
+    let cloudRecorded = false;
+    let cloudError: string | undefined;
+    if (flags.cloud) {
+      try {
+        const cloudConfig = await resolveCloudClientConfig();
+        await recordChunkCompletion(cloudConfig, {
+          chunkId: activeChunk.id,
+          chunkTitle: activeChunk.title,
+          ...(verificationResult?.status ? { verificationStatus: verificationResult.status } : {}),
+          forced: flags.force,
+          reason: flags.reason ?? null,
+          nextChunkId: nextPending?.id ?? null,
+          completedAt: now,
+        });
+        cloudRecorded = true;
+      } catch (error) {
+        cloudError = formatCloudError(error);
+        await recordTelemetry({
+          event: 'chunk_done_cloud_emit_failed',
+          level: 'warn',
+          payload: { message: cloudError },
+        });
+      }
+    }
+
     await savePlanState(nextPlan);
     await writeCurrentChunkFromPlan(nextPlan);
-    await appendActivity('chunk_done', completionPayload);
+    await appendActivity('chunk_done', {
+      ...completionPayload,
+      cloudRecorded,
+      cloudError: cloudError ?? null,
+    });
     await recordTelemetry({
       event: 'chunk_done',
-      payload: completionPayload,
+      payload: {
+        ...completionPayload,
+        cloudRecorded,
+      },
     });
 
     this.log('');
     this.log(chalk.green('✓ Chunk completion recorded.'));
     this.log(chalk.dim(`Completed: ${activeChunk.title}`));
+    if (flags.cloud && cloudRecorded) {
+      this.log(chalk.dim('Cloud history updated.'));
+    } else if (flags.cloud && cloudError) {
+      this.log(chalk.yellow(`⚠ Cloud history update failed: ${cloudError}`));
+    }
     if (nextPending) {
       this.log(chalk.cyan(`Next active chunk: ${nextPending.title}`));
     } else {

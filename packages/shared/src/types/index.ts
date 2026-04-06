@@ -195,7 +195,7 @@ export interface AIOptions {
   topP?: number;
 }
 
-export type AuthProvider = 'custom' | 'github';
+export type AuthProvider = 'custom' | 'firebase';
 
 export interface AuthConfig {
   provider: AuthProvider;

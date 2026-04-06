@@ -65,7 +65,7 @@ export default class Watch extends Command {
     }),
     verify: Flags.boolean({
       description: 'Run verification after each file-change batch',
-      default: false,
+      default: true,
     }),
     'verify-command': Flags.string({
       description: 'Verification command (repeatable)',
@@ -93,6 +93,11 @@ export default class Watch extends Command {
       description: 'Alert throttle to avoid notification spam',
       default: 6,
       min: 1,
+    }),
+    'signal-cooldown-ms': Flags.integer({
+      description: 'Minimum time between repeating the same proactive signal',
+      default: 15000,
+      min: 1000,
     }),
   };
 
@@ -136,6 +141,7 @@ export default class Watch extends Command {
     let planCache: LocalPlanState = await loadPlanState();
     let alertsInWindow = 0;
     let alertWindowStartedAt = Date.now();
+    const lastSignalAt = new Map<string, number>();
 
     const watcher = createRepoWatcher({
       debounceMs: flags['debounce-ms'],
@@ -150,71 +156,84 @@ export default class Watch extends Command {
         this.log(`${icon} ${event.relativePath}`);
       },
       onBatch: async (events) => {
-        if (flags.json) {
-          this.log(JSON.stringify({ type: 'batch', events }, null, 2));
-        } else {
-          this.log(chalk.dim(`[watch] ${summarizeBatch(events)}`));
-        }
-
-        let verificationResult = await readLatestVerification();
-        if (flags.verify && !verificationInFlight) {
-          verificationInFlight = true;
-          try {
-            const result = await runVerification({
-              ...(flags['verify-command'] ? { commands: flags['verify-command'] } : {}),
-            });
-            verificationResult = result;
-            const color =
-              result.status === 'pass'
-                ? chalk.green
-                : result.status === 'fail'
-                  ? chalk.red
-                  : chalk.yellow;
-            this.log(color(`[verify] ${result.status.toUpperCase()} (${Math.round(result.confidence * 100)}%)`));
-          } finally {
-            verificationInFlight = false;
-          }
-        }
-
-        planCache = await loadPlanState();
-        const proactiveSignals = evaluateProactiveSignals({
-          events,
-          plan: planCache,
-          verificationResult,
-        });
-
-        const now = Date.now();
-        if (now - alertWindowStartedAt > 60_000) {
-          alertWindowStartedAt = now;
-          alertsInWindow = 0;
-        }
-
-        for (const signal of proactiveSignals) {
-          if (alertsInWindow >= flags['max-alerts-per-minute']) {
-            break;
+        try {
+          if (flags.json) {
+            this.log(JSON.stringify({ type: 'batch', events }, null, 2));
+          } else {
+            this.log(chalk.dim(`[watch] ${summarizeBatch(events)}`));
           }
 
-          const color = signal.severity === 'warn' ? chalk.yellow : chalk.cyan;
-          this.log(
-            color(
-              `[proactive] ${signal.message} (suggested: ${signal.suggestedCommand}, confidence ${Math.round(signal.confidence * 100)}%)`,
-            ),
-          );
-          alertsInWindow += 1;
-
-          if (flags.notify && signal.severity === 'warn') {
-            this.log('\u0007');
+          let verificationResult = await readLatestVerification();
+          if (flags.verify && !verificationInFlight) {
+            verificationInFlight = true;
+            try {
+              const result = await runVerification({
+                ...(flags['verify-command'] ? { commands: flags['verify-command'] } : {}),
+              });
+              verificationResult = result;
+              const color =
+                result.status === 'pass'
+                  ? chalk.green
+                  : result.status === 'fail'
+                    ? chalk.red
+                    : chalk.yellow;
+              this.log(color(`[verify] ${result.status.toUpperCase()} (${Math.round(result.confidence * 100)}%)`));
+            } catch (error) {
+              this.log(chalk.yellow(`[verify] failed: ${error instanceof Error ? error.message : String(error)}`));
+            } finally {
+              verificationInFlight = false;
+            }
           }
 
-          await recordTelemetry({
-            event: 'proactive_signal',
-            payload: {
-              type: signal.type,
-              severity: signal.severity,
-              suggestedCommand: signal.suggestedCommand,
-              confidence: signal.confidence,
-            },
+          planCache = await loadPlanState();
+          const proactiveSignals = evaluateProactiveSignals({
+            events,
+            plan: planCache,
+            verificationResult,
           });
+
+          const now = Date.now();
+          if (now - alertWindowStartedAt > 60_000) {
+            alertWindowStartedAt = now;
+            alertsInWindow = 0;
+          }
+
+          for (const signal of proactiveSignals) {
+            if (alertsInWindow >= flags['max-alerts-per-minute']) {
+              break;
+            }
+
+            const signalKey = `${signal.type}:${signal.suggestedCommand}`;
+            const lastSeen = lastSignalAt.get(signalKey);
+            if (lastSeen && now - lastSeen < flags['signal-cooldown-ms']) {
+              continue;
+            }
+            lastSignalAt.set(signalKey, now);
+
+            const color = signal.severity === 'warn' ? chalk.yellow : chalk.cyan;
+            this.log(
+              color(
+                `[proactive] ${signal.message} (suggested: ${signal.suggestedCommand}, confidence ${Math.round(signal.confidence * 100)}%)`,
+              ),
+            );
+            alertsInWindow += 1;
+
+            if (flags.notify && signal.severity === 'warn') {
+              this.log('\u0007');
+            }
+
+            await recordTelemetry({
+              event: 'proactive_signal',
+              payload: {
+                type: signal.type,
+                severity: signal.severity,
+                suggestedCommand: signal.suggestedCommand,
+                confidence: signal.confidence,
+              },
+            });
+          }
+        } catch (error) {
+          this.log(chalk.yellow(`[watch] batch processing failed: ${error instanceof Error ? error.message : String(error)}`));
         }
       },
     });
@@ -222,10 +241,9 @@ export default class Watch extends Command {
     this.log('');
     this.log(chalk.bold('👀 Scrimble proactive watch mode started'));
     this.log(chalk.dim(`Debounce: ${flags['debounce-ms']}ms`));
+    this.log(chalk.dim(`Verification on change: ${flags.verify ? 'enabled' : 'disabled'}`));
     this.log(chalk.dim(`Alert throttle: ${flags['max-alerts-per-minute']} alerts/minute`));
-    if (flags.verify) {
-      this.log(chalk.dim('Verification mode: enabled'));
-    }
+    this.log(chalk.dim(`Signal cooldown: ${flags['signal-cooldown-ms']}ms`));
     this.log(chalk.dim('Press Ctrl+C to stop.'));
     this.log('');
 

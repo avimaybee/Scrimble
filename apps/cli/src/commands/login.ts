@@ -8,17 +8,16 @@ import {
   SESSION_FILE,
   authConfigSchema,
   authProviderSchema,
-  type AuthConfig,
 } from '@scrimble/shared';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { pollDeviceCodeToken, startDeviceCode } from '../lib/auth/device-flow.js';
+import { getAuthStatus } from '../lib/onboarding.js';
 import { writeSecureJson } from '../lib/security.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
-const GITHUB_DEVICE_CODE_ENDPOINT = 'https://github.com/login/device/code';
-const GITHUB_TOKEN_ENDPOINT = 'https://github.com/login/oauth/access_token';
+type ParsedAuthConfig = ReturnType<typeof authConfigSchema.parse>;
 
-function defaultCustomAuth(cloudEndpoint?: string): Omit<AuthConfig, 'provider'> {
+function defaultCustomAuth(cloudEndpoint?: string): Omit<ParsedAuthConfig, 'provider'> {
   const endpoint = cloudEndpoint ?? 'https://api.scrimble.dev';
   return {
     clientId: 'scrimble-cli',
@@ -38,28 +37,14 @@ function resolveAuthConfig(
     audience?: string | undefined;
   },
   configFromFile?: Awaited<ReturnType<typeof loadScrimbleConfig>>,
-): AuthConfig {
+): ParsedAuthConfig {
   const provider = authProviderSchema.parse(providerInput);
   const configAuth = configFromFile?.auth;
-
-  if (provider === 'github') {
-    const clientId = flags['client-id'] ?? configAuth?.clientId;
-    if (!clientId) {
-      throw new Error('GitHub login requires --client-id (or .scrimble/config.json auth.clientId).');
-    }
-
-    return authConfigSchema.parse({
-      provider,
-      clientId,
-      deviceCodeEndpoint: flags['device-endpoint'] ?? configAuth?.deviceCodeEndpoint ?? GITHUB_DEVICE_CODE_ENDPOINT,
-      tokenEndpoint: flags['token-endpoint'] ?? configAuth?.tokenEndpoint ?? GITHUB_TOKEN_ENDPOINT,
-      scope: flags.scope ?? configAuth?.scope ?? 'read:user user:email',
-    });
-  }
 
   const fallback = defaultCustomAuth(configFromFile?.cloudEndpoint);
   const audience = flags.audience ?? configAuth?.audience;
   const scope = flags.scope ?? configAuth?.scope ?? fallback.scope;
+  
   return authConfigSchema.parse({
     provider,
     clientId: flags['client-id'] ?? configAuth?.clientId ?? fallback.clientId,
@@ -76,7 +61,7 @@ export default class Login extends Command {
 
   static override examples = [
     '<%= config.bin %> login',
-    '<%= config.bin %> login --provider github --client-id YOUR_GITHUB_APP_CLIENT_ID',
+    '<%= config.bin %> login --provider firebase',
   ];
 
   static override flags = {
@@ -86,7 +71,7 @@ export default class Login extends Command {
       default: 'custom',
     }),
     'client-id': Flags.string({
-      description: 'OAuth client_id (required for github unless present in config)',
+      description: 'OAuth client_id override (defaults to config or scrimble-cli)',
     }),
     'device-endpoint': Flags.string({
       description: 'OAuth device authorization endpoint override',
@@ -106,6 +91,10 @@ export default class Login extends Command {
     const { flags } = await this.parse(Login);
     const cwd = process.cwd();
     const configPath = path.join(cwd, SCRIMBLE_DIR, CONFIG_FILE);
+    const authStatus = await getAuthStatus(cwd);
+    if (authStatus.isAuthenticated) {
+      this.log(chalk.dim('\nExisting authenticated session detected; this login will replace it.\n'));
+    }
 
     let configFromFile: Awaited<ReturnType<typeof loadScrimbleConfig>> | undefined;
     try {

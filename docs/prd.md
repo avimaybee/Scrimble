@@ -22,17 +22,21 @@ The north-star behavior is simple:
 
 ## 1. Product Thesis
 
-Scrimble exists for solo AI-native builders who can start quickly but struggle to finish.
+Scrimble exists because **long-horizon autonomous coding fails without a Conductor.**
 
-The core problem is not lack of tools; it is:
+While tools like Aider, OpenClaw, and Cline are incredible at writing code, they suffer from:
+- context window degradation over time,
+- scope drift (refactoring the world instead of fixing the bug),
+- and inability to plan 50 steps ahead.
 
-- context loss,
-- scope drift,
-- weak execution discipline,
-- and poor re-entry after breaks.
+Scrimble solves this by becoming the **Agent Orchestrator**. It generates a highly in-depth, long-horizon series of chunked tasks, and then *automatically feeds them* to CLI agents. 
 
-Scrimble solves this by becoming a repo-native execution companion that:
-
+The human shouldn't have to sit and copy-paste prompts all day. Scrimble:
+1. understands current project reality and generates a sequence of chunks,
+2. automatically dispatches the active chunk to a worker agent (e.g., Aider, OpenClaw),
+3. monitors the agent's progress and detects when it stops,
+4. automatically verifies the outcome, and
+5. hands off the next chunk, keeping the loop running with zero-touch automation.
 1. understands current project reality,
 2. plans in sequenced chunks,
 3. constrains focus to one active chunk,
@@ -189,19 +193,18 @@ Required local artifacts (structure can evolve, purpose cannot):
 ## 7.2 Import Existing Project
 `scrimble import` must adopt partially built repos and plan from current reality, not greenfield assumptions.
 
-## 7.3 Current Chunk Delivery
-`scrimble` (no subcommand) must show:
+## 7.3 Conductor Mode (Agent Dispatch)
+`scrimble run` (or default `scrimble`) must act as the orchestrator:
+- Loads the active chunk.
+- Spawns a configured external agent (e.g., `openclaw --prompt "..."`).
+- Monitors the agent's stdout and exit codes.
+- Detects idleness or completion.
 
-- project status,
-- current chunk,
-- exact prompt,
-- do-not-touch boundary,
-- done condition,
-- verification hint,
-- quick action options.
-
-## 7.4 Prompt Output
-`scrimble prompt` prints raw prompt output for copy/paste automation.
+## 7.4 Auto-Progression
+When an agent finishes its task, Scrimble must automatically:
+- trigger `verify`,
+- if clean, trigger `done`,
+- and immediately dispatch the next chunk to the agent, creating a zero-touch continuous execution loop.
 
 ## 7.5 Verification
 `scrimble verify` runs local checks and returns pass/warn/fail/manual-review with confidence.
@@ -342,9 +345,9 @@ Capture enough telemetry to improve finish rates:
 - project management suite features,
 - browser-first dashboards,
 - native mobile app,
-- replacing coding agents (Cursor/Claude/etc).
+- replacing the actual code generation models.
 
-Scrimble orchestrates execution discipline; it does not replace IDE agents.
+Scrimble orchestrates and commands execution discipline; it does not generate the code itself—it delegates that to tools like OpenClaw or Aider.
 
 ---
 

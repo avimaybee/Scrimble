@@ -12,19 +12,20 @@ import {
 } from '../lib/local/index.js';
 import {
   formatCloudError,
-  listArtifacts,
-  readArtifact,
+  getPlanRegistryState,
   resolveCloudClientConfig,
-  uploadArtifact,
+  syncPlanRegistry,
 } from '../lib/api/index.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
 type ConflictStrategy = 'manual' | 'local' | 'cloud';
 
-interface PlanSnapshotPayload {
-  planHash: string;
-  syncedAt: string;
-  plan: LocalPlanState;
+function isLocalPlanState(value: unknown): value is LocalPlanState {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as { version?: unknown; chunks?: unknown };
+  return typeof candidate.version === 'number' && Array.isArray(candidate.chunks);
 }
 
 /**
@@ -46,7 +47,7 @@ function hasConflict(
 }
 
 export default class Sync extends Command {
-  static override description = 'Sync local plan state to cloud using hash-based Last-Write-Wins';
+  static override description = 'Sync local plan state with canonical cloud registry using hash-based Last-Write-Wins';
 
   static override examples = [
     '<%= config.bin %> sync',
@@ -100,26 +101,16 @@ export default class Sync extends Command {
       return;
     }
 
-    // Fetch remote snapshot to check for conflicts
-    let snapshots: Array<{ key: string; size: number; uploaded: string }> = [];
+    // Fetch canonical remote registry state to check for conflicts
+    let remoteRegistry: { projectId: string; latest: { planHash: string; syncedAt: string; plan: unknown } | null };
     try {
-      snapshots = await listArtifacts(cloudConfig, 'plan-snapshot', 1);
+      remoteRegistry = await getPlanRegistryState(cloudConfig);
     } catch (error) {
       await this.exitCloudSyncFailure(plan, error);
+      return;
     }
-    let remoteSnapshot: PlanSnapshotPayload | undefined;
-    if (snapshots.length > 0) {
-      const latestSnapshot = snapshots[0];
-      if (latestSnapshot) {
-        try {
-          remoteSnapshot = await readArtifact<PlanSnapshotPayload>(cloudConfig, latestSnapshot.key);
-        } catch (error) {
-          await this.exitCloudSyncFailure(plan, error);
-        }
-      }
-    }
-
-    const remotePlanHash = remoteSnapshot?.planHash;
+    const remoteLatest = remoteRegistry.latest;
+    const remotePlanHash = remoteLatest?.planHash;
     const localLastRemote = plan.sync?.lastRemotePlanHash;
     const conflictDetected = hasConflict(localPlanHash, remotePlanHash, localLastRemote);
 
@@ -155,11 +146,16 @@ export default class Sync extends Command {
         return;
       }
 
-      if (conflictStrategy === 'cloud' && remoteSnapshot?.plan) {
+      if (conflictStrategy === 'cloud') {
+        const remotePlan = remoteLatest?.plan;
+        if (!isLocalPlanState(remotePlan)) {
+          await this.exitCloudSyncFailure(plan, new Error('Remote registry response did not include a valid plan payload.'));
+          return;
+        }
         // Take remote plan as source of truth
         planToSync = {
-          ...remoteSnapshot.plan,
-          sync: remoteSnapshot.plan.sync ?? {},
+          ...remotePlan,
+          sync: remotePlan.sync ?? {},
         };
       }
       // conflictStrategy === 'local' means we keep our local plan (planToSync stays as plan)
@@ -176,31 +172,42 @@ export default class Sync extends Command {
       return;
     }
 
-    const syncedAt = new Date().toISOString();
-    const nextPlanHash = computePlanHash(planToSync);
+    let canonicalPlan = planToSync;
+    let canonicalPlanHash = computePlanHash(planToSync);
+    let syncedAt = new Date().toISOString();
 
-    // Upload plan snapshot with new hash
-    try {
-      await uploadArtifact(cloudConfig, 'plan-snapshot', {
-        planHash: nextPlanHash,
-        syncedAt,
-        plan: planToSync,
-      });
-    } catch (error) {
-      await this.exitCloudSyncFailure(plan, error);
+    const cloudWasSource = conflictDetected && conflictStrategy === 'cloud';
+    if (cloudWasSource && remoteLatest) {
+      canonicalPlanHash = remoteLatest.planHash;
+      syncedAt = remoteLatest.syncedAt;
+    } else {
+      try {
+        const syncResult = await syncPlanRegistry(cloudConfig, {
+          planHash: canonicalPlanHash,
+          plan: canonicalPlan,
+          ...(remotePlanHash ? { expectedRemoteHash: remotePlanHash } : {}),
+        });
+        if (isLocalPlanState(syncResult.latest.plan)) {
+          canonicalPlan = syncResult.latest.plan;
+        }
+        canonicalPlanHash = syncResult.latest.planHash;
+        syncedAt = syncResult.latest.syncedAt;
+      } catch (error) {
+        await this.exitCloudSyncFailure(plan, error);
+      }
     }
 
     // Update local sync state with new hashes (remove lastSyncError on success)
     const syncState = {
-      ...(planToSync.sync ?? {}),
+      ...(canonicalPlan.sync ?? {}),
       lastSyncedAt: syncedAt,
-      lastSyncedHash: nextPlanHash,
-      lastRemotePlanHash: nextPlanHash,
+      lastSyncedHash: canonicalPlanHash,
+      lastRemotePlanHash: canonicalPlanHash,
     };
     delete syncState.lastSyncError;
 
     const savedPlan: LocalPlanState = {
-      ...planToSync,
+      ...canonicalPlan,
       sync: syncState,
     };
 
@@ -208,19 +215,21 @@ export default class Sync extends Command {
     await appendActivity('state_synced', {
       conflictStrategy,
       conflictDetected,
-      planHash: nextPlanHash,
+      planHash: canonicalPlanHash,
+      source: cloudWasSource ? 'cloud' : 'local',
     });
     await recordTelemetry({
       event: 'state_synced',
       payload: {
         conflictDetected,
         conflictStrategy,
+        source: cloudWasSource ? 'cloud' : 'local',
       },
     });
 
     this.log('');
     this.log(chalk.green('✓ Sync complete.'));
-    this.log(chalk.dim(`Plan hash: ${nextPlanHash.slice(0, 12)}...`));
+    this.log(chalk.dim(`Plan hash: ${canonicalPlanHash.slice(0, 12)}...`));
     this.log('');
   }
 }

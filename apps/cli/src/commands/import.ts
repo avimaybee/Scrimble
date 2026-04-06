@@ -2,6 +2,7 @@ import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import type { RepoContext } from '@scrimble/shared';
 import {
   appendActivity,
   ensureScrimbleDirectories,
@@ -10,6 +11,7 @@ import {
   type LocalChunk,
   type LocalPlanState,
 } from '../lib/local/index.js';
+import { buildArchitecturePrompt, buildChunkPlanningPrompt } from '../lib/ai/prompts/index.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 
 interface StackSnapshot {
@@ -127,12 +129,47 @@ export default class Import extends Command {
     }
 
     const stack = detectStackFromFiles(fileList, deps);
+    const repoContext: RepoContext = {
+      name: path.basename(cwd),
+      path: cwd,
+      stack: {
+        languages: stack.languages,
+        frameworks: stack.frameworks,
+      },
+      structure: [],
+      existingFiles: Array.from(fileList).sort().slice(0, 50),
+    };
     const architectureSummary = [
       `Imported repo objective: ${flags.goal}.`,
       stack.languages.length > 0 ? `Detected languages: ${stack.languages.join(', ')}.` : 'No language signal detected.',
       stack.frameworks.length > 0 ? `Detected frameworks: ${stack.frameworks.join(', ')}.` : 'No framework signal detected.',
       'Approach: preserve existing working behavior, then close high-impact gaps in bounded chunks.',
     ].join('\n');
+    const researchSummary = [
+      '# Research Summary',
+      '',
+      `Goal analyzed: ${flags.goal}`,
+      stack.languages.length > 0
+        ? `Detected languages: ${stack.languages.join(', ')}`
+        : 'Detected languages: none',
+      stack.frameworks.length > 0
+        ? `Detected frameworks: ${stack.frameworks.join(', ')}`
+        : 'Detected frameworks: none',
+      `Existing top-level files scanned: ${repoContext.existingFiles?.length ?? 0}`,
+      '',
+      'Initial planning posture: preserve known-good behavior, then close high-risk gaps in bounded chunks.',
+    ].join('\n');
+    const architecturePrompt = buildArchitecturePrompt({
+      projectGoal: flags.goal,
+      repoContext,
+    });
+    const chunkPlanningPrompt = buildChunkPlanningPrompt({
+      projectGoal: flags.goal,
+      architectureSummary,
+      repoContext,
+      completedWorkSummary: 'No completed work yet (import baseline).',
+      chunkCountTarget: 3,
+    });
 
     const plan: LocalPlanState = {
       version: 1,
@@ -151,6 +188,9 @@ export default class Import extends Command {
     };
 
     await fs.writeFile(paths.architecture, `${architectureSummary}\n`, 'utf8');
+    await fs.writeFile(paths.research, `${researchSummary}\n`, 'utf8');
+    await fs.writeFile(path.join(paths.promptsDir, 'architecture-planning.md'), `${architecturePrompt}\n`, 'utf8');
+    await fs.writeFile(path.join(paths.promptsDir, 'chunk-planning.md'), `${chunkPlanningPrompt}\n`, 'utf8');
     await savePlanState(plan);
     await writeCurrentChunkFromPlan(plan);
     await appendActivity('project_imported', {
@@ -169,6 +209,8 @@ export default class Import extends Command {
     this.log('');
     this.log(chalk.green('✓ Existing repository imported into Scrimble.'));
     this.log(chalk.dim(`Architecture summary written to ${paths.architecture}`));
+    this.log(chalk.dim(`Research summary written to ${paths.research}`));
+    this.log(chalk.dim(`Planning prompts written to ${paths.promptsDir}`));
     this.log(chalk.dim('Run `scrimble` to view the active chunk and execution prompt.'));
     this.log('');
   }

@@ -6,12 +6,49 @@ import {
   SCRIMBLE_DIR,
   CONFIG_FILE,
   PROJECT_FILE,
+  RESEARCH_FILE,
   aiProviderSchema,
   scrimbleConfigSchema,
 } from '@scrimble/shared';
+import {
+  CloudApiError,
+  formatCloudError,
+  getPlanRegistryState,
+  getProject,
+  listProjects,
+  resolveCloudClientConfig,
+} from '../lib/api/index.js';
 import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
+import { savePlanState, type LocalPlanState, writeCurrentChunkFromPlan } from '../lib/local/index.js';
 import { writeSecureJson } from '../lib/security.js';
 import { recordTelemetry } from '../lib/telemetry.js';
+
+function normalizeProjectId(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\-_]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return normalized.length > 0 ? normalized : 'project';
+}
+
+function isLocalPlanState(value: unknown): value is LocalPlanState {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as { version?: unknown; chunks?: unknown };
+  return typeof candidate.version === 'number' && Array.isArray(candidate.chunks);
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export default class Init extends Command {
   static override description = 'Initialize Scrimble in the current repository';
@@ -19,6 +56,7 @@ export default class Init extends Command {
   static override examples = [
     '<%= config.bin %> init',
     '<%= config.bin %> init --goal "Build a REST API for user management"',
+    '<%= config.bin %> init --project-id my-project --from-cloud',
   ];
 
   static override flags = {
@@ -39,6 +77,14 @@ export default class Init extends Command {
     'ai-model': Flags.string({
       description: 'AI model (defaults to provider-specific recommended model)',
     }),
+    'from-cloud': Flags.boolean({
+      description: 'Bootstrap from authenticated cloud project and canonical plan registry',
+      default: true,
+      allowNo: true,
+    }),
+    'project-id': Flags.string({
+      description: 'Cloud project id to bootstrap (defaults to repo slug)',
+    }),
   };
 
   async run(): Promise<void> {
@@ -49,17 +95,23 @@ export default class Init extends Command {
     const cwd = process.cwd();
     const scrimbleDir = path.join(cwd, SCRIMBLE_DIR);
 
-    // Check if already initialized
-    try {
-      await fs.access(scrimbleDir);
-      if (!flags.force) {
+    const scrimbleDirExists = await pathExists(scrimbleDir);
+    if (scrimbleDirExists) {
+      const hasProjectFile = await pathExists(path.join(scrimbleDir, PROJECT_FILE));
+      const hasConfigFile = await pathExists(path.join(scrimbleDir, CONFIG_FILE));
+      const fullyInitialized = hasProjectFile && hasConfigFile;
+
+      if (fullyInitialized && !flags.force) {
         this.log(chalk.yellow('  ⚠ .scrimble directory already exists.'));
         this.log(chalk.dim('    Use --force to reinitialize.\n'));
         return;
       }
-      this.log(chalk.dim('  Reinitializing existing .scrimble directory...'));
-    } catch {
-      // Directory doesn't exist, which is expected
+
+      if (fullyInitialized) {
+        this.log(chalk.dim('  Reinitializing existing .scrimble directory...'));
+      } else {
+        this.log(chalk.dim('  Detected incomplete .scrimble state. Repairing initialization...'));
+      }
     }
 
     // Detect repository info
@@ -77,6 +129,7 @@ export default class Init extends Command {
 
     const selectedProvider = aiProviderSchema.parse(flags['ai-provider']);
     const defaultAIConfig = buildDefaultAIConfig(selectedProvider, flags['ai-model']);
+    const explicitProjectId = flags['project-id'] ? normalizeProjectId(flags['project-id']) : undefined;
     this.log(chalk.dim(`  AI provider: ${selectedProvider}`));
     this.log(chalk.dim(`  AI model: ${defaultAIConfig.model}`));
 
@@ -98,13 +151,14 @@ export default class Init extends Command {
         scope: 'scrimble:cli',
       },
       cloudEndpoint: defaultCloudEndpoint,
+      ...(explicitProjectId ? { projectId: explicitProjectId } : {}),
     };
 
     // Validate config structure
-    const validatedConfig = scrimbleConfigSchema.parse(defaultConfig);
+    let validatedConfig = scrimbleConfigSchema.parse(defaultConfig);
     
     // Create project.json placeholder
-    const projectData = {
+    let projectData: Record<string, unknown> = {
       name: repoName,
       path: cwd,
       stack,
@@ -144,11 +198,112 @@ Run \`scrimble\` to see the current execution chunk and what to work on next.
 - Complete the "Done When" conditions before marking complete
 `;
     await fs.writeFile(path.join(scrimbleDir, 'rules', 'agent-context.md'), agentContext);
+    const researchSummary = `# Research Summary
+
+No dedicated research findings captured yet.
+
+## Initial Context
+- Goal: ${flags.goal ?? 'Not specified yet'}
+- Repository: ${repoName}
+- Captured At: ${new Date().toISOString()}
+`;
+    await fs.writeFile(path.join(scrimbleDir, RESEARCH_FILE), researchSummary);
+
+    let bootstrapWarning: string | undefined;
+    let bootstrapSummary:
+      | {
+        projectId: string;
+        importedPlan: boolean;
+      }
+      | undefined;
+    if (flags['from-cloud']) {
+      try {
+        const cloud = await resolveCloudClientConfig(cwd);
+        if (!cloud.accessToken) {
+          bootstrapWarning = 'Cloud bootstrap skipped (no active session). Run `scrimble login` first.';
+        } else {
+          let targetProjectId = explicitProjectId ?? cloud.projectId;
+          let cloudProject: Awaited<ReturnType<typeof getProject>> | undefined;
+
+          try {
+            cloudProject = await getProject(cloud, targetProjectId);
+          } catch (error) {
+            const notFound = error instanceof CloudApiError && error.status === 404;
+            if (!notFound || explicitProjectId) {
+              throw error;
+            }
+
+            const cloudProjects = await listProjects(cloud);
+            if (cloudProjects.length === 1) {
+              const onlyProject = cloudProjects[0];
+              if (!onlyProject) {
+                throw new Error('Cloud project lookup returned an empty result.');
+              }
+              targetProjectId = onlyProject.id;
+              cloudProject = onlyProject;
+            } else if (cloudProjects.length > 1) {
+              const projectIds = cloudProjects.map((project) => project.id).join(', ');
+              bootstrapWarning = `Cloud bootstrap skipped (multiple projects found: ${projectIds}). Re-run with --project-id <id>.`;
+            } else {
+              bootstrapWarning = 'Cloud bootstrap skipped (no cloud projects found for this account).';
+            }
+          }
+
+          if (cloudProject) {
+            validatedConfig = scrimbleConfigSchema.parse({
+              ...validatedConfig,
+              projectId: targetProjectId,
+            });
+            await writeSecureJson(path.join(scrimbleDir, CONFIG_FILE), validatedConfig);
+
+            projectData = {
+              ...projectData,
+              id: cloudProject.id,
+              name: cloudProject.name,
+              goal: cloudProject.goal ?? projectData['goal'] ?? null,
+              status: cloudProject.status,
+              bootstrappedFromCloudAt: new Date().toISOString(),
+            };
+            await writeSecureJson(path.join(scrimbleDir, PROJECT_FILE), projectData);
+
+            const registry = await getPlanRegistryState({
+              ...cloud,
+              projectId: targetProjectId,
+            });
+
+            let importedPlan = false;
+            if (registry.latest && isLocalPlanState(registry.latest.plan)) {
+              await savePlanState(registry.latest.plan, cwd);
+              await writeCurrentChunkFromPlan(registry.latest.plan, cwd);
+              importedPlan = true;
+            }
+
+            bootstrapSummary = {
+              projectId: targetProjectId,
+              importedPlan,
+            };
+          }
+        }
+      } catch (error) {
+        bootstrapWarning = `Cloud bootstrap skipped: ${formatCloudError(error)}`;
+      }
+    }
 
     this.log('');
     this.log(chalk.green('  ✓ .scrimble directory created'));
     this.log(chalk.green('  ✓ config.json created'));
     this.log(chalk.green('  ✓ project.json created'));
+    this.log(chalk.green('  ✓ research-summary.md created'));
+    if (bootstrapSummary) {
+      this.log(chalk.green(`  ✓ Cloud project linked: ${bootstrapSummary.projectId}`));
+      if (bootstrapSummary.importedPlan) {
+        this.log(chalk.green('  ✓ Pulled canonical plan from cloud'));
+      } else {
+        this.log(chalk.dim('  Cloud project found but no canonical plan revision exists yet.'));
+      }
+    } else if (bootstrapWarning) {
+      this.log(chalk.yellow(`  ⚠ ${bootstrapWarning}`));
+    }
     this.log('');
 
     // Next steps

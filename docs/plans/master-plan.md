@@ -58,9 +58,9 @@ const result = await generateText({ model, prompt: '...' });
 | **Database** | **Cloudflare D1** | SQLite-compatible, serverless SQL for project/plan state |
 | **File Storage** | **Cloudflare R2** | Large artifact storage (architecture docs, research) |
 | **Long-running Jobs + Progress** | **Durable Objects (`GenerationProgressHub`)** | In-DO generation/replan orchestration, step retries, retained events, SSE/poll progress |
-| **AI Gateway** | **Cloudflare AI Gateway** | Optional proxy for caching, rate limiting, observability |
-| **Auth Sessions** | **Workers KV** | Session token storage with TTL |
-| **Real-time Events** | **Durable Objects** | WebSocket connections for live progress updates |
+| **Model Access** | **OpenAI-compatible provider APIs** | Cloud planning/replan via configured provider credentials |
+| **Auth Sessions** | **D1 (`device_codes`)** | Device-flow challenge + token exchange state |
+| **Real-time Events** | **Durable Objects + SSE** | Event streaming over `/stream` and pollable `/events` |
 
 ### Authentication Strategy
 
@@ -77,12 +77,12 @@ const result = await generateText({ model, prompt: '...' });
 ```
 scrimble/
 ├── apps/
-│   └── cli/                    # CLI application (oclif + Ink)
+│   └── cli/                    # CLI application (oclif, chalk-first output, optional Ink views)
 │       ├── src/
 │       │   ├── commands/       # oclif commands
 │       │   │   ├── init.ts
 │       │   │   ├── import.ts
-│       │   │   ├── index.ts    # Default command (show current chunk)
+│       │   │   ├── root.ts     # Default command (onboarding router + current chunk)
 │       │   │   ├── prompt.ts
 │       │   │   ├── verify.ts
 │       │   │   ├── done.ts
@@ -413,7 +413,7 @@ Users configure their AI provider in `.scrimble/config.json`:
 
 | Risk | Mitigation |
 |------|------------|
-| AI provider rate limits | Cloudflare AI Gateway caching + rate limiting |
+| AI provider rate limits | Provider retries/backoff + configurable model/provider in CLI config |
 | Long generation times | Step retries in `GenerationProgressHub` + retained progress events via SSE/poll |
 | Network failures | Local-first design, offline-capable for reads |
 | Token expiration | Auto-refresh with device code flow |

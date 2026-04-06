@@ -9,6 +9,7 @@ import {
   CURRENT_CHUNK_FILE,
   PLAN_FILE,
   PROJECT_FILE,
+  RESEARCH_FILE,
   PROMPTS_DIR,
   RULES_DIR,
   SCRIMBLE_DIR,
@@ -62,6 +63,7 @@ export interface ScrimblePaths {
   project: string;
   plan: string;
   architecture: string;
+  research: string;
   currentChunk: string;
   activityLog: string;
   verificationDir: string;
@@ -86,6 +88,7 @@ export function getScrimblePaths(cwd = process.cwd()): ScrimblePaths {
     project: path.join(root, PROJECT_FILE),
     plan: path.join(root, PLAN_FILE),
     architecture: path.join(root, ARCHITECTURE_FILE),
+    research: path.join(root, RESEARCH_FILE),
     currentChunk: path.join(root, CURRENT_CHUNK_FILE),
     activityLog: path.join(root, ACTIVITY_LOG),
     verificationDir,
@@ -118,6 +121,17 @@ export async function ensureScrimbleDirectories(cwd = process.cwd()): Promise<Sc
   await fs.mkdir(paths.rulesDir, { recursive: true });
   await fs.mkdir(paths.conflictsDir, { recursive: true });
   return paths;
+}
+
+export async function isProjectInitialized(cwd = process.cwd()): Promise<boolean> {
+  const paths = getScrimblePaths(cwd);
+  try {
+    await fs.access(paths.root);
+    await fs.access(paths.project);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeChunk(chunk: Partial<LocalChunk>, index: number): LocalChunk {

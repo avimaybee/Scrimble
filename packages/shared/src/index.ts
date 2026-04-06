@@ -29,6 +29,7 @@ export {
   completeChunkRequestSchema,
   skipChunkRequestSchema,
   updatePlanRequestSchema,
+  firebaseApproveRequestSchema,
 } from './schemas/index.js';
 
 // Constants

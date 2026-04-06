@@ -1,5 +1,5 @@
 {
-  "name": "@scrimble/cli",
+  "name": "scrimble",
   "version": "0.1.0",
   "description": "Scrimble CLI - execution companion for AI-native builders",
   "type": "module",

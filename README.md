@@ -45,19 +45,22 @@ scrimble/
 |---------|-------------|
 | `scrimble init` | Initialize Scrimble in current repository |
 | `scrimble import` | Adopt an existing repo and generate a reality-based chunk plan |
+| `scrimble generate` | Start cloud plan generation from a goal (optionally wait/apply locally) |
+| `scrimble config set-ai` | Run the AI provider/model/key setup wizard |
 | `scrimble login` | Authenticate using OAuth device flow |
 | `scrimble approve` | Approve/reject architecture before execution |
-| `scrimble` | Show active chunk context and quick actions |
+| `scrimble` | Auto-run onboarding (login/init/config/generate) when needed, then show active chunk context (`--ink` for Ink dashboard) |
 | `scrimble prompt` | Print the raw active-chunk prompt |
 | `scrimble verify` | Run local verification checks |
-| `scrimble done` | Complete current chunk and sync completion event |
+| `scrimble done` | Complete current chunk and persist completion to local + cloud history |
 | `scrimble doctor` | Check configuration and health |
 | `scrimble status` | Show project status and progress |
+| `scrimble logs` | Stream cloud execution and project events |
 | `scrimble next` | Preview or activate next pending chunk |
 | `scrimble skip` | Skip active chunk with risk acknowledgement |
 | `scrimble update` | Apply targeted plan updates |
 | `scrimble replan` | Rebuild remaining plan while preserving completed chunks |
-| `scrimble sync` | Reconcile local/cloud state and resolve conflicts |
+| `scrimble sync` | Reconcile local/cloud plan state using canonical D1 registry |
 | `scrimble watch` | Run proactive resident mode with alerts |
 | `scrimble logout` | Clear local session |
 
@@ -120,15 +123,16 @@ Supported providers:
 
 ## Authentication
 
-Use device login for a local CLI session:
+Cloud API routes under `/v1/*` require a bearer token managed by the CLI.
+
+Run the login flow to authenticate your session:
 
 ```bash
-# default custom provider (from .scrimble/config.json auth block)
-node apps/cli/bin/run.js login
-
-# GitHub OAuth device flow
-node apps/cli/bin/run.js login --provider github --client-id <oauth-client-id>
+# Start the standard OAuth device flow (Firebase-linked)
+scrimble login
 ```
+
+After login, `scrimble init --from-cloud` can bootstrap local project/plan state from the cloud registry.
 
 ## License
 

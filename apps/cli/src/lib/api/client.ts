@@ -129,11 +129,157 @@ export async function listArtifacts(
 }
 
 export async function readArtifact<T>(client: CloudClientConfig, key: string): Promise<T> {
-  const params = new URLSearchParams({ key });
+  const params = new URLSearchParams({
+    key,
+    projectId: client.projectId,
+  });
   const result = await requestJson<{ artifact: T }>(client, `/v1/artifacts?${params.toString()}`, {
     method: 'GET',
   });
   return result.artifact;
+}
+
+export interface CloudProject {
+  id: string;
+  name: string;
+  goal?: string;
+  repoUrl?: string;
+  status: 'active' | 'paused' | 'completed' | 'abandoned';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listProjects(client: CloudClientConfig): Promise<CloudProject[]> {
+  const result = await requestJson<{ projects: CloudProject[] }>(client, '/v1/projects', { method: 'GET' });
+  return result.projects;
+}
+
+export async function getProject(client: CloudClientConfig, projectId = client.projectId): Promise<CloudProject> {
+  const result = await requestJson<{ project: CloudProject }>(
+    client,
+    `/v1/projects/${encodeURIComponent(projectId)}`,
+    { method: 'GET' },
+  );
+  return result.project;
+}
+
+export interface PlanRegistryLatest {
+  version: number;
+  planHash: string;
+  plan: unknown;
+  syncedAt: string;
+  createdAt: string;
+}
+
+export async function getPlanRegistryState(
+  client: CloudClientConfig,
+): Promise<{ projectId: string; latest: PlanRegistryLatest | null }> {
+  return requestJson(
+    client,
+    `/v1/projects/${encodeURIComponent(client.projectId)}/sync`,
+    { method: 'GET' },
+  );
+}
+
+export async function syncPlanRegistry(
+  client: CloudClientConfig,
+  payload: {
+    planHash: string;
+    plan: unknown;
+    expectedRemoteHash?: string;
+  },
+): Promise<{ status: 'synced' | 'noop'; projectId: string; latest: PlanRegistryLatest }> {
+  return requestJson(
+    client,
+    `/v1/projects/${encodeURIComponent(client.projectId)}/sync`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        planHash: payload.planHash,
+        plan: payload.plan,
+        ...(payload.expectedRemoteHash ? { expectedRemoteHash: payload.expectedRemoteHash } : {}),
+      }),
+    },
+  );
+}
+
+export async function recordChunkCompletion(
+  client: CloudClientConfig,
+  payload: {
+    chunkId: string;
+    chunkTitle: string;
+    verificationStatus?: string;
+    forced?: boolean;
+    reason?: string | null;
+    nextChunkId?: string | null;
+    completedAt: string;
+  },
+): Promise<{ status: 'recorded'; projectId: string; chunkId: string; completedAt: string }> {
+  return requestJson(
+    client,
+    `/v1/projects/${encodeURIComponent(client.projectId)}/chunks/complete`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        chunkId: payload.chunkId,
+        chunkTitle: payload.chunkTitle,
+        ...(payload.verificationStatus ? { verificationStatus: payload.verificationStatus } : {}),
+        ...(typeof payload.forced === 'boolean' ? { forced: payload.forced } : {}),
+        ...(payload.reason !== undefined ? { reason: payload.reason } : {}),
+        ...(payload.nextChunkId !== undefined ? { nextChunkId: payload.nextChunkId } : {}),
+        completedAt: payload.completedAt,
+      }),
+    },
+  );
+}
+
+export interface CloudProjectEvent {
+  id: string;
+  projectId: string;
+  type: string;
+  data?: unknown;
+  createdAt: string;
+}
+
+export async function listProjectEvents(
+  client: CloudClientConfig,
+  options: {
+    type?: string;
+    since?: string;
+    limit?: number;
+  } = {},
+): Promise<CloudProjectEvent[]> {
+  const params = new URLSearchParams({
+    limit: String(options.limit ?? 100),
+  });
+  if (options.type) {
+    params.set('type', options.type);
+  }
+  if (options.since) {
+    params.set('since', options.since);
+  }
+
+  const result = await requestJson<{ events: CloudProjectEvent[] }>(
+    client,
+    `/v1/projects/${encodeURIComponent(client.projectId)}/events?${params.toString()}`,
+    { method: 'GET' },
+  );
+  return result.events;
+}
+
+export async function startGeneration(
+  client: CloudClientConfig,
+  payload: { goal: string; repoSnapshot?: string; aiConfig: Record<string, unknown> },
+): Promise<{ instanceId: string; runId: string; status: string }> {
+  return requestJson(client, '/v1/generation/start', {
+    method: 'POST',
+    body: JSON.stringify({
+      projectId: client.projectId,
+      goal: payload.goal,
+      ...(payload.repoSnapshot ? { repoSnapshot: payload.repoSnapshot } : {}),
+      aiConfig: payload.aiConfig,
+    }),
+  });
 }
 
 export async function startReplan(
