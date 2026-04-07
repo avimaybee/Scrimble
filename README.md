@@ -4,8 +4,9 @@
 
 Scrimble helps you finish what you start by becoming a repo-native execution companion that:
 - Understands current project reality
-- Plans in sequenced chunks
-- Constrains focus to one active chunk
+- Captures intent and builds a native task graph
+- Routes work to Gemini/Copilot workers
+- Constrains execution by explicit file leases
 - Verifies progress honestly
 - Adapts as the project changes
 
@@ -45,24 +46,49 @@ scrimble/
 |---------|-------------|
 | `scrimble init` | Initialize Scrimble in current repository |
 | `scrimble import` | Compatibility alias for `scrimble init` (brownfield adoption path) |
-| `scrimble generate` | Create a Conductor track from a goal (or use `--cloud` for legacy cloud generation) |
+| `scrimble generate` | Generate a native task graph from captured intent and repo context |
 | `scrimble config set-ai` | Run the AI provider/model/key setup wizard |
 | `scrimble login` | Authenticate using OAuth device flow |
-| `scrimble approve` | Approve a Conductor track for autonomous execution |
-| `scrimble` | Auto-run onboarding, then show Conductor runtime overview and next action |
-| `scrimble prompt` | Print the current Conductor task prompt (legacy chunk prompt fallback) |
+| `scrimble approve` | Approve a track/task scope for autonomous execution |
+| `scrimble` | Auto-run onboarding, then show runtime overview and next action |
+| `scrimble run` | Execute native ledger tasks with worker routing (`--worker auto|gemini|copilot`) |
+| `scrimble workers` | Show Gemini/Copilot worker preflight health and capabilities |
+| `scrimble assign` | Manually assign a pending ledger task to a worker |
+| `scrimble retry` | Reset a failed/blocked ledger task back to pending |
+| `scrimble conflicts` | Show blocked/conflicted tasks and lease conflicts |
+| `scrimble prompt` | Print the current active task prompt |
 | `scrimble verify` | Run local verification checks |
-| `scrimble done` | Complete current Conductor task (legacy chunk completion fallback) |
+| `scrimble done` | Complete current task/chunk |
 | `scrimble doctor` | Check configuration and health |
 | `scrimble status` | Show project status and progress |
 | `scrimble logs` | Show local runtime events first, then cloud execution/project events |
-| `scrimble next` | Preview or activate next pending Conductor task |
-| `scrimble skip` | Skip active Conductor task with risk acknowledgement |
+| `scrimble next` | Preview or activate next pending task |
+| `scrimble skip` | Skip active task with risk acknowledgement |
 | `scrimble update` | Apply targeted plan updates |
 | `scrimble replan` | Rebuild remaining plan while preserving completed chunks |
 | `scrimble sync` | Reconcile local/cloud plan state using canonical D1 registry |
 | `scrimble watch` | Run proactive resident mode with alerts |
 | `scrimble logout` | Clear local session |
+
+## Native Ledger Runtime
+
+Scrimble stores canonical orchestration state in `.scrimble/`:
+
+```text
+.scrimble/
+  intent.json
+  ledger.json
+  runtime/
+    workers.json
+    attempts/
+    events.ndjson
+```
+
+Provider artifacts (`GEMINI.md`, `AGENTS.md`, `.github/copilot/settings.json`, `conductor/`) are treated as supplemental context, not scheduler truth.
+
+## Parallel Execution Safety (Experimental)
+
+Parallel mode currently uses **single workspace + file lease ownership** and is considered experimental. Scrimble rejects parallel dispatch when ownership is missing or overlapping, and flags edits outside leased paths as conflicts requiring intervention.
 
 ## Development
 

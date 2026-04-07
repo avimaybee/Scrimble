@@ -3,6 +3,11 @@
 // Conductor and runtime types for the Gemini-Conductor pivot
 export * from './conductor.js';
 
+// Native ledger types for multi-worker orchestration
+export * from './ledger.js';
+export * from './worker.js';
+export * from './intent.js';
+
 export type UserID = string;
 export type ProjectID = string;
 export type ChunkID = string;

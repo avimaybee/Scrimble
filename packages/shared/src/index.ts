@@ -61,5 +61,14 @@ export const RUNTIME_STATE_FILE = 'run-state.json';
 export const RUNTIME_APPROVALS_FILE = 'approvals.json';
 export const RUNTIME_EVENTS_FILE = 'events.ndjson';
 export const RUNTIME_ATTEMPTS_DIR = 'attempts';
+export const RUNTIME_WORKERS_FILE = 'workers.json';
+
+// Scrimble ledger paths (task/assignment truth)
+export const LEDGER_DIR = 'ledger';
+export const LEDGER_TASKS_FILE = 'tasks.json';
+export const LEDGER_ASSIGNMENTS_FILE = 'assignments.json';
+export const LEDGER_FILE_LEASES_FILE = 'file-leases.json';
+export const INTENT_FILE = 'intent.json';
+export const LEDGER_FILE = 'ledger.json';
 
 export const DEFAULT_CLOUD_ENDPOINT = 'https://api.scrimble.dev';
