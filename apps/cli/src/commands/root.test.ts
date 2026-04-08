@@ -12,7 +12,6 @@ const localMocks = vi.hoisted(() => ({
 
 const onboardingMocks = vi.hoisted(() => ({
   getAIConfigurationStatus: vi.fn(),
-  getAuthStatus: vi.fn(),
 }));
 
 const stalenessMocks = vi.hoisted(() => ({
@@ -70,7 +69,6 @@ describe('root onboarding routing', () => {
     runtimeMocks.loadRuntimeState.mockResolvedValue({ status: 'idle', attemptCount: 0, lastActivityAt: '2026-04-06T00:00:00.000Z' });
     runtimeMocks.isTrackApproved.mockResolvedValue(false);
 
-    onboardingMocks.getAuthStatus.mockResolvedValue({ isAuthenticated: true, reason: 'ok' });
     onboardingMocks.getAIConfigurationStatus.mockResolvedValue({ isValid: true, reason: 'ok' });
     localMocks.isProjectInitialized.mockResolvedValue(true);
     localMocks.loadPlanState.mockResolvedValue({
@@ -97,18 +95,6 @@ describe('root onboarding routing', () => {
     });
     localMocks.renderChunkMarkdown.mockReturnValue('chunk markdown');
     stalenessMocks.detectStaleness.mockResolvedValue([]);
-  });
-
-  it('triggers login flow when user is logged out', async () => {
-    onboardingMocks.getAuthStatus
-      .mockResolvedValueOnce({ isAuthenticated: false, reason: 'missing_session' })
-      .mockResolvedValueOnce({ isAuthenticated: true, reason: 'ok' });
-
-    const runCommand = vi.fn().mockResolvedValue(undefined);
-    await runRootWith(runCommand);
-
-    expect(runCommand).toHaveBeenCalledTimes(1);
-    expect(runCommand).toHaveBeenCalledWith('login');
   });
 
   it('triggers init flow when project is not initialized', async () => {

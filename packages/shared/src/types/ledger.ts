@@ -211,6 +211,20 @@ export interface WorkersState {
   updatedAt: string;
 }
 
+/** Root approval state for autonomous ledger execution. */
+export interface LedgerApprovalState {
+  /** Schema version for migrations. */
+  version: number;
+  /** Whether autonomous execution is approved. */
+  approved: boolean;
+  /** When approval was last granted. */
+  approvedAt?: string;
+  /** Optional approval notes. */
+  notes?: string;
+  /** Timestamp of last modification. */
+  updatedAt: string;
+}
+
 // --- Ledger Events ---
 
 /** Event types for the append-only event log. */

@@ -28,8 +28,9 @@ export async function setupLocalScaffold(input: LocalScaffoldInput): Promise<voi
   await writeSecureJson(path.join(input.scrimbleDir, CONFIG_FILE), input.config);
   await writeSecureJson(path.join(input.scrimbleDir, PROJECT_FILE), input.projectData);
 
-  const gitignoreContent = `# Scrimble sensitive files
-session.json
+  const gitignoreContent = `# Scrimble runtime artifacts
+runtime/
+telemetry.ndjson
 *.log
 `;
   await fs.writeFile(path.join(input.scrimbleDir, '.gitignore'), gitignoreContent);

@@ -1,7 +1,7 @@
 import type { VerificationStatus } from '@scrimble/shared';
 
-export type TaskProviderKind = 'conductor' | 'legacy';
-export type UnifiedTaskStatus = 'pending' | 'in_progress' | 'completed' | 'skipped';
+export type TaskProviderKind = 'ledger' | 'conductor' | 'legacy';
+export type UnifiedTaskStatus = 'pending' | 'in_progress' | 'completed' | 'skipped' | 'blocked' | 'failed';
 
 export interface UnifiedTask {
   id: string;
@@ -22,15 +22,12 @@ export interface CompleteTaskOptions {
   reason?: string;
   skipVerification: boolean;
   verifyCommands?: string[];
-  cloud: boolean;
 }
 
 export interface CompleteTaskResult {
   completedTask: UnifiedTask;
   nextTask?: UnifiedTask;
   verificationStatus?: VerificationStatus | null;
-  cloudRecorded?: boolean;
-  cloudError?: string;
 }
 
 export interface SkipTaskResult {

@@ -1,17 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const apiMocks = vi.hoisted(() => ({
-  formatCloudError: (error: unknown) => (error instanceof Error ? error.message : String(error)),
-  listProjectEvents: vi.fn(),
-  resolveCloudClientConfig: vi.fn(),
+const ledgerRecordMocks = vi.hoisted(() => ({
+  readLedgerEvents: vi.fn(),
 }));
 
-const runtimeMocks = vi.hoisted(() => ({
-  readRuntimeEvents: vi.fn(),
-}));
-
-vi.mock('../lib/api/index.js', () => apiMocks);
-vi.mock('../lib/conductor/runtime.js', () => runtimeMocks);
+vi.mock('../lib/ledger/records.js', () => ledgerRecordMocks);
 
 import Logs from './logs.js';
 
@@ -20,7 +13,6 @@ function stripAnsi(value: string): string {
 }
 
 function makeCommand(flags: {
-  source: 'all' | 'local' | 'cloud';
   type?: string;
   since?: string;
   limit: number;
@@ -45,36 +37,27 @@ function makeCommand(flags: {
 
 describe('logs command', () => {
   beforeEach(() => {
-    runtimeMocks.readRuntimeEvents.mockResolvedValue([]);
-    apiMocks.resolveCloudClientConfig.mockResolvedValue({
-      baseUrl: 'https://api.scrimble.dev',
-      projectId: 'project-1',
-      accessToken: 'token',
-    });
-    apiMocks.listProjectEvents.mockResolvedValue([
+    ledgerRecordMocks.readLedgerEvents.mockResolvedValue([
       {
         id: 'evt-2',
-        projectId: 'project-1',
-        type: 'generation_step_retrying',
-        data: { runId: 'run-1', step: 'generate_chunks', attempt: 2 },
-        createdAt: '2026-04-06T08:00:00.000Z',
+        type: 'task_completed',
+        data: { taskId: 'task-1', worker: 'gemini' },
+        timestamp: '2026-04-06T08:00:00.000Z',
       },
       {
         id: 'evt-1',
-        projectId: 'project-1',
-        type: 'chunk_completed',
-        data: { chunkId: 'chunk-002' },
-        createdAt: '2026-04-06T07:59:00.000Z',
+        type: 'run_started',
+        data: { worker: 'auto' },
+        timestamp: '2026-04-06T07:59:00.000Z',
       },
     ]);
   });
 
-  it('prints human-readable cloud event lines', async () => {
+  it('prints human-readable local event lines', async () => {
     const output: string[] = [];
     const command = makeCommand(
       {
         limit: 40,
-        source: 'all',
         follow: false,
         'poll-interval-ms': 2000,
         json: false,
@@ -85,9 +68,9 @@ describe('logs command', () => {
     await command.run();
 
     const text = stripAnsi(output.join('\n'));
-    expect(text).toContain('chunk_completed');
-    expect(text).toContain('generation_step_retrying');
-    expect(text).toContain('runId=run-1');
+    expect(text).toContain('task_completed');
+    expect(text).toContain('run_started');
+    expect(text).toContain('taskId=task-1');
   });
 
   it('prints JSON payload when --json is enabled', async () => {
@@ -95,7 +78,6 @@ describe('logs command', () => {
     const command = makeCommand(
       {
         limit: 10,
-        source: 'all',
         follow: false,
         'poll-interval-ms': 2000,
         json: true,
@@ -106,12 +88,9 @@ describe('logs command', () => {
     await command.run();
 
     const payload = JSON.parse(output.join('\n')) as {
-      projectId: string;
       localEvents: unknown[];
-      cloudEvents: unknown[];
     };
-    expect(payload.projectId).toBe('project-1');
-    expect(payload.localEvents.length).toBe(0);
-    expect(payload.cloudEvents.length).toBe(2);
+    expect(payload.localEvents.length).toBe(2);
   });
 });
+

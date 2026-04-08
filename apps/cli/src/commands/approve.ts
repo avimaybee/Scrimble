@@ -13,9 +13,10 @@ import {
 import { recordTelemetry } from '../lib/telemetry.js';
 import { loadConductorWorkspace } from '../lib/conductor/index.js';
 import { approveTrack, isTrackApproved, revokeTrackApproval, loadApprovals } from '../lib/conductor/runtime.js';
+import { loadLedgerApprovalState, loadTasksState, saveLedgerApprovalState } from '../lib/ledger/storage.js';
 
 export default class Approve extends Command {
-  static override description = 'Approve a Conductor track for autonomous execution, or approve architecture';
+  static override description = 'Approve autonomous execution for ledger tasks, a Conductor track, or legacy architecture';
 
   static override examples = [
     '<%= config.bin %> approve',
@@ -63,12 +64,21 @@ export default class Approve extends Command {
 
   async run(): Promise<void> {
     const { flags, args } = await this.parse(Approve);
+    const cwd = process.cwd();
 
     // Check for Conductor workspace
-    const conductorWorkspace = await loadConductorWorkspace();
+    const [conductorWorkspace, tasksState] = await Promise.all([
+      loadConductorWorkspace(cwd),
+      loadTasksState(cwd),
+    ]);
+    const hasLedgerTasks = tasksState.tasks.length > 0;
 
     // Handle --list flag
     if (flags.list) {
+      if (hasLedgerTasks) {
+        await this.handleLedgerApprovalList(cwd);
+        return;
+      }
       const approvals = await loadApprovals();
       this.log('');
       this.log(chalk.bold('Track Approvals:'));
@@ -83,14 +93,88 @@ export default class Approve extends Command {
       return;
     }
 
-    // If track argument provided, handle Conductor track approval
-    if (args.track || conductorWorkspace.exists) {
+    // Explicit track approval path (Conductor only)
+    if (args.track) {
       await this.handleTrackApproval(args.track, flags, conductorWorkspace);
+      return;
+    }
+
+    // Local-first ledger approval path
+    if (hasLedgerTasks) {
+      await this.handleLedgerApproval(flags, cwd);
+      return;
+    }
+
+    // If track argument provided, handle Conductor track approval
+    if (conductorWorkspace.exists) {
+      await this.handleTrackApproval(undefined, flags, conductorWorkspace);
       return;
     }
 
     // Legacy: architecture approval
     await this.handleArchitectureApproval(flags);
+  }
+
+  private async handleLedgerApprovalList(cwd: string): Promise<void> {
+    const approval = await loadLedgerApprovalState(cwd);
+    this.log('');
+    this.log(chalk.bold('Ledger Approval:'));
+    if (approval.approved) {
+      this.log(chalk.green(`  ✓ approved at ${new Date(approval.approvedAt ?? approval.updatedAt).toLocaleString()}`));
+      if (approval.notes) {
+        this.log(chalk.dim(`  notes: ${approval.notes}`));
+      }
+    } else {
+      this.log(chalk.yellow('  ⚠ not approved'));
+      this.log(chalk.dim('  run `scrimble approve` before `scrimble run`'));
+    }
+    this.log('');
+  }
+
+  private async handleLedgerApproval(
+    flags: { revoke: boolean; reject: boolean; notes: string | undefined },
+    cwd: string,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const current = await loadLedgerApprovalState(cwd);
+
+    if (flags.revoke || flags.reject) {
+      await saveLedgerApprovalState(
+        {
+          ...current,
+          approved: false,
+          ...(flags.notes ? { notes: flags.notes } : {}),
+          updatedAt: now,
+        },
+        cwd,
+      );
+      this.log('');
+      this.log(chalk.yellow('✗ Ledger autonomous execution approval revoked.'));
+      this.log(chalk.dim('Run `scrimble approve` to re-enable autonomous execution.'));
+      this.log('');
+      await recordTelemetry({ event: 'ledger_approval_revoked', payload: {} });
+      return;
+    }
+
+    await saveLedgerApprovalState(
+      {
+        ...current,
+        approved: true,
+        approvedAt: now,
+        ...(flags.notes ? { notes: flags.notes } : {}),
+        updatedAt: now,
+      },
+      cwd,
+    );
+
+    this.log('');
+    this.log(chalk.green('✓ Ledger autonomous execution approved.'));
+    if (flags.notes) {
+      this.log(chalk.dim(`  Notes: ${flags.notes}`));
+    }
+    this.log(chalk.dim('Run `scrimble run` to start autonomous execution.'));
+    this.log('');
+    await recordTelemetry({ event: 'ledger_approved', payload: {} });
   }
 
   private async handleTrackApproval(

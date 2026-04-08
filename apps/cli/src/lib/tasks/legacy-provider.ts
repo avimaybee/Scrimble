@@ -12,11 +12,6 @@ import {
 } from '../local/index.js';
 import { detectStaleness } from '../staleness.js';
 import { runVerification } from '../verify/index.js';
-import {
-  formatCloudError,
-  recordChunkCompletion,
-  resolveCloudClientConfig,
-} from '../api/index.js';
 import { recordTelemetry } from '../telemetry.js';
 import type {
   ActivateNextTaskResult,
@@ -128,56 +123,24 @@ export class LegacyTaskProvider implements TaskProvider {
       sync: syncState,
     };
 
-    let cloudRecorded = false;
-    let cloudError: string | undefined;
-    if (options.cloud) {
-      try {
-        const cloudConfig = await resolveCloudClientConfig(this.cwd);
-        await recordChunkCompletion(cloudConfig, {
-          chunkId: activeChunk.id,
-          chunkTitle: activeChunk.title,
-          ...(verificationStatus ? { verificationStatus } : {}),
-          forced: options.force,
-          reason: options.reason ?? null,
-          nextChunkId: nextPending?.id ?? null,
-          completedAt: now,
-        });
-        cloudRecorded = true;
-      } catch (error) {
-        cloudError = formatCloudError(error);
-        await recordTelemetry({
-          event: 'chunk_done_cloud_emit_failed',
-          level: 'warn',
-          payload: { message: cloudError },
-        });
-      }
-    }
-
     await savePlanState(nextPlan, this.cwd);
     await writeCurrentChunkFromPlan(nextPlan, this.cwd);
     await appendActivity(
       'chunk_done',
       {
         ...completionPayload,
-        cloudRecorded,
-        cloudError: cloudError ?? null,
       },
       this.cwd,
     );
     await recordTelemetry({
       event: 'chunk_done',
-      payload: {
-        ...completionPayload,
-        cloudRecorded,
-      },
+      payload: completionPayload,
     });
 
     return {
       completedTask: toUnifiedTask({ ...activeChunk, status: 'completed' }),
       ...(nextPending ? { nextTask: toUnifiedTask(nextPending) } : {}),
       verificationStatus,
-      cloudRecorded,
-      ...(cloudError ? { cloudError } : {}),
     };
   }
 
@@ -319,7 +282,7 @@ export class LegacyTaskProvider implements TaskProvider {
         'scrimble done',
         'scrimble skip',
         'scrimble next',
-        'scrimble sync',
+        'scrimble run',
       ],
     };
   }

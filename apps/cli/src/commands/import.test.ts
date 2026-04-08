@@ -7,8 +7,6 @@ function makeCommand(
     force: boolean;
     'ai-provider'?: string;
     'ai-model'?: string;
-    'from-cloud': boolean;
-    'project-id'?: string;
     'skip-preflight': boolean;
   },
   runCommand: ReturnType<typeof vi.fn>,
@@ -41,8 +39,6 @@ describe('import command alias behavior', () => {
         force: true,
         'ai-provider': 'openai',
         'ai-model': 'gpt-5',
-        'from-cloud': true,
-        'project-id': 'repo-name',
         'skip-preflight': true,
       },
       runCommand,
@@ -59,29 +55,8 @@ describe('import command alias behavior', () => {
       'openai',
       '--ai-model',
       'gpt-5',
-      '--project-id',
-      'repo-name',
       '--skip-preflight',
-      '--from-cloud',
     ]);
     expect(logs.join('\n')).toContain('alias for `scrimble init`');
-  });
-
-  it('forwards no-cloud flag explicitly when disabled', async () => {
-    const runCommand = vi.fn().mockResolvedValue(undefined);
-    const logs: string[] = [];
-    const command = makeCommand(
-      {
-        force: false,
-        'from-cloud': false,
-        'skip-preflight': false,
-      },
-      runCommand,
-      logs,
-    );
-
-    await command.run();
-
-    expect(runCommand).toHaveBeenCalledWith('init', ['--no-from-cloud']);
   });
 });

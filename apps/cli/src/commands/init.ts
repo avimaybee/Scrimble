@@ -1,13 +1,14 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
   SCRIMBLE_DIR,
   CONFIG_FILE,
   PROJECT_FILE,
+  SESSION_FILE,
   aiProviderSchema,
   scrimbleConfigSchema,
-  DEFAULT_CLOUD_ENDPOINT,
 } from '@scrimble/shared';
 import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
 import { recordTelemetry } from '../lib/telemetry.js';
@@ -16,17 +17,6 @@ import { loadConductorWorkspace, getActiveTrack } from '../lib/conductor/index.j
 import { pathExists } from '../lib/fs/index.js';
 import { detectStack } from '../lib/init/stack-detection.js';
 import { setupLocalScaffold } from '../lib/init/local-scaffold.js';
-import { maybeBootstrapFromCloud } from '../lib/init/cloud-bootstrap.js';
-
-function normalizeProjectId(value: string): string {
-  const normalized = value
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9\-_]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-  return normalized.length > 0 ? normalized : 'project';
-}
 
 interface ExistingStateAssessment {
   hasExistingDir: boolean;
@@ -100,7 +90,6 @@ export default class Init extends Command {
   static override examples = [
     '<%= config.bin %> init',
     '<%= config.bin %> init --goal "Build a REST API for user management"',
-    '<%= config.bin %> init --project-id my-project --from-cloud',
     '<%= config.bin %> init --skip-preflight',
   ];
 
@@ -121,14 +110,6 @@ export default class Init extends Command {
     }),
     'ai-model': Flags.string({
       description: 'AI model (defaults to provider-specific recommended model)',
-    }),
-    'from-cloud': Flags.boolean({
-      description: 'Bootstrap from authenticated cloud project and canonical plan registry',
-      default: true,
-      allowNo: true,
-    }),
-    'project-id': Flags.string({
-      description: 'Cloud project id to bootstrap (defaults to repo slug)',
     }),
     'skip-preflight': Flags.boolean({
       description: 'Skip Gemini/Conductor preflight checks',
@@ -171,7 +152,6 @@ export default class Init extends Command {
 
     const selectedProvider = aiProviderSchema.parse(flags['ai-provider']);
     const defaultAIConfig = buildDefaultAIConfig(selectedProvider, flags['ai-model']);
-    const explicitProjectId = flags['project-id'] ? normalizeProjectId(flags['project-id']) : undefined;
     this.log(chalk.dim(`  AI provider: ${selectedProvider}`));
     this.log(chalk.dim(`  AI model: ${defaultAIConfig.model}`));
 
@@ -197,16 +177,23 @@ export default class Init extends Command {
     }
 
     let config = scrimbleConfigSchema.parse({
+      schemaVersion: 1,
       ai: defaultAIConfig,
-      auth: {
-        provider: 'custom',
-        clientId: 'scrimble-cli',
-        deviceCodeEndpoint: `${DEFAULT_CLOUD_ENDPOINT}/oauth/device/code`,
-        tokenEndpoint: `${DEFAULT_CLOUD_ENDPOINT}/oauth/token`,
-        scope: 'scrimble:cli',
+      plannerWorker: 'auto',
+      workerPreferences: {
+        defaultWorker: 'auto',
+        allowParallel: false,
+        maxParallelWorkers: 1,
       },
-      cloudEndpoint: DEFAULT_CLOUD_ENDPOINT,
-      ...(explicitProjectId ? { projectId: explicitProjectId } : {}),
+      executionDefaults: {
+        worker: 'auto',
+        timeoutSeconds: 300,
+        maxParallelTasks: 1,
+        maxRetriesPerTask: 1,
+      },
+      verificationDefaults: {
+        enabled: true,
+      },
     });
 
     let projectData: Record<string, unknown> = {
@@ -232,16 +219,13 @@ export default class Init extends Command {
       ...(flags.goal ? { goal: flags.goal } : {}),
     });
 
-    const bootstrap = await maybeBootstrapFromCloud({
-      cwd,
-      scrimbleDir,
-      enabled: flags['from-cloud'],
-      config,
-      projectData,
-      ...(explicitProjectId ? { explicitProjectId } : {}),
-    });
-    config = bootstrap.config;
-    projectData = bootstrap.projectData;
+    const sessionPath = path.join(scrimbleDir, SESSION_FILE);
+    try {
+      await fs.unlink(sessionPath);
+      this.log(chalk.dim('  Removed legacy session.json'));
+    } catch {
+      // no-op when legacy session does not exist
+    }
 
     this.log('');
     this.log(chalk.green('  ✓ .scrimble directory created'));
@@ -251,16 +235,6 @@ export default class Init extends Command {
     this.log(chalk.green('  ✓ runtime/ directory created'));
     if (conductorWorkspace.exists) {
       this.log(chalk.green(`  ✓ Conductor workspace adopted (${conductorWorkspace.tracks.length} tracks)`));
-    }
-    if (bootstrap.summary) {
-      this.log(chalk.green(`  ✓ Cloud project linked: ${bootstrap.summary.projectId}`));
-      if (bootstrap.summary.importedPlan) {
-        this.log(chalk.green('  ✓ Pulled canonical plan from cloud'));
-      } else {
-        this.log(chalk.dim('  Cloud project found but no canonical plan revision exists yet.'));
-      }
-    } else if (bootstrap.warning) {
-      this.log(chalk.yellow(`  ⚠ ${bootstrap.warning}`));
     }
     this.log('');
 
@@ -276,8 +250,8 @@ export default class Init extends Command {
       if (selectedProvider === 'github-copilot') {
         this.log(chalk.dim('     GitHub Copilot users: set GITHUB_COPILOT_TOKEN from your Copilot auth/session token.'));
       }
-      this.log(chalk.dim('  3. Authenticate: `scrimble login`'));
-      this.log(chalk.dim('  4. Run `scrimble generate` to create a Conductor track'));
+      this.log(chalk.dim('  3. Run `scrimble workers` to check local worker health'));
+      this.log(chalk.dim('  4. Run `scrimble generate` to build a local task graph'));
     }
     this.log('');
 
@@ -288,8 +262,7 @@ export default class Init extends Command {
         model: defaultAIConfig.model,
         conductorExists: conductorWorkspace.exists,
         conductorTracks: conductorWorkspace.tracks.length,
-        projectId:
-          (typeof projectData['id'] === 'string' ? projectData['id'] : config.projectId) ?? null,
+        localFirst: true,
       },
     });
   }

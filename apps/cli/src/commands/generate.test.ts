@@ -2,237 +2,228 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const localMocks = vi.hoisted(() => ({
   appendActivity: vi.fn(),
-  loadPlanState: vi.fn(),
-  savePlanState: vi.fn(),
-  writeCurrentChunkFromPlan: vi.fn(),
-  getScrimblePaths: vi.fn().mockReturnValue({
-    research: '/tmp/.scrimble/research-summary.md',
-  }),
 }));
-
-const apiMocks = vi.hoisted(() => {
-  class MockCloudApiError extends Error {
-    constructor(
-      public status: number,
-      public body: string,
-    ) {
-      super(`Cloud API request failed (${status})`);
-      this.name = 'CloudApiError';
-    }
-
-    parseBody<T>(): T | undefined {
-      try {
-        return JSON.parse(this.body) as T;
-      } catch {
-        return undefined;
-      }
-    }
-  }
-
-  return {
-    CloudApiError: MockCloudApiError,
-    formatCloudError: (error: unknown) => {
-      if (error instanceof MockCloudApiError) {
-        const parsed = error.parseBody<{
-          error?: unknown;
-          message?: unknown;
-          issues?: Array<{ message?: unknown }>;
-        }>();
-        if (parsed) {
-          const errorMessage = typeof parsed.error === 'string' ? parsed.error : undefined;
-          const message = typeof parsed.message === 'string' ? parsed.message : undefined;
-          const details = Array.isArray(parsed.issues)
-            ? parsed.issues
-                .map((issue) => (typeof issue.message === 'string' ? issue.message : undefined))
-                .filter((value): value is string => Boolean(value))
-            : [];
-          if (errorMessage && details.length > 0) {
-            return `${errorMessage} ${details.join(' ')}`;
-          }
-          if (errorMessage && message && !message.includes(errorMessage)) {
-            return `${errorMessage}: ${message}`;
-          }
-          if (errorMessage) {
-            return errorMessage;
-          }
-          if (message) {
-            return message;
-          }
-        }
-      }
-      return error instanceof Error ? error.message : String(error);
-    },
-    getGenerationStatus: vi.fn(),
-    resolveCloudClientConfig: vi.fn(),
-    startGeneration: vi.fn(),
-  };
-});
 
 const configMocks = vi.hoisted(() => ({
   loadScrimbleConfig: vi.fn(),
+}));
+
+const planningIntentMocks = vi.hoisted(() => ({
+  captureIntent: vi.fn(),
+}));
+
+const planningGeneratorMocks = vi.hoisted(() => ({
+  generateTaskGraph: vi.fn(),
+}));
+
+const stackMocks = vi.hoisted(() => ({
+  detectStack: vi.fn(),
+}));
+
+const workerFactoryMocks = vi.hoisted(() => ({
+  getWorkerDriver: vi.fn(),
+}));
+
+const storageMocks = vi.hoisted(() => ({
+  loadLedgerApprovalState: vi.fn(),
+  loadTasksState: vi.fn(),
+  loadAssignmentsState: vi.fn(),
+  loadFileLeasesState: vi.fn(),
+  saveLedgerApprovalState: vi.fn(),
+  saveTasksState: vi.fn(),
+  saveAssignmentsState: vi.fn(),
+  saveFileLeasesState: vi.fn(),
+}));
+
+const recordMocks = vi.hoisted(() => ({
+  appendLedgerEvent: vi.fn(),
 }));
 
 const telemetryMocks = vi.hoisted(() => ({
   recordTelemetry: vi.fn(),
 }));
 
-const conductorMocks = vi.hoisted(() => ({
-  loadConductorWorkspace: vi.fn(),
-}));
-
-const runtimeMocks = vi.hoisted(() => ({
-  appendRuntimeEvent: vi.fn(),
-}));
-
-const geminiMocks = vi.hoisted(() => ({
-  runPreflight: vi.fn(),
-  formatPreflightResult: vi.fn(),
-}));
-
 vi.mock('../lib/local/index.js', () => localMocks);
-vi.mock('../lib/api/index.js', () => apiMocks);
 vi.mock('../lib/config/load-config.js', () => configMocks);
+vi.mock('../lib/planning/intent.js', () => planningIntentMocks);
+vi.mock('../lib/planning/generator.js', () => planningGeneratorMocks);
+vi.mock('../lib/init/stack-detection.js', () => stackMocks);
+vi.mock('../lib/workers/factory.js', () => workerFactoryMocks);
+vi.mock('../lib/ledger/storage.js', () => storageMocks);
+vi.mock('../lib/ledger/records.js', () => recordMocks);
 vi.mock('../lib/telemetry.js', () => telemetryMocks);
-vi.mock('../lib/conductor/index.js', () => conductorMocks);
-vi.mock('../lib/conductor/runtime.js', () => runtimeMocks);
-vi.mock('../lib/gemini/index.js', () => geminiMocks);
 
 import Generate from './generate.js';
 
-function stripAnsi(value: string): string {
-  return value.replace(/\u001b\[[0-9;]*m/g, '');
-}
-
-function makePlanState() {
+function makeGeneratedTask(id: string, status: 'pending' | 'completed' = 'pending') {
   return {
-    version: 1,
-    chunks: [],
-    metadata: {},
+    id,
+    title: id,
+    objective: id,
+    doneCriteria: id,
+    ownedFiles: [],
+    allowedFiles: [],
+    verificationCommands: [],
+    dependencies: [],
+    riskScore: 4,
+    status,
+    createdAt: '2024-01-01T00:00:00.000Z',
+    updatedAt: '2024-01-01T00:00:00.000Z',
+    attemptCount: 0,
+    maxRetries: 1,
   };
 }
 
-describe('generate command cloud flow', () => {
+describe('generate command local-first flow', () => {
   beforeEach(() => {
-    localMocks.loadPlanState.mockResolvedValue(makePlanState());
-    localMocks.savePlanState.mockResolvedValue(undefined);
-    localMocks.writeCurrentChunkFromPlan.mockResolvedValue(undefined);
     localMocks.appendActivity.mockResolvedValue(undefined);
-
-    // Mock no Conductor workspace to trigger cloud flow
-    conductorMocks.loadConductorWorkspace.mockResolvedValue({
-      exists: false,
-      tracks: [],
-    });
-
-    apiMocks.resolveCloudClientConfig.mockResolvedValue({
-      baseUrl: 'https://api.scrimble.dev',
-      projectId: 'project-1',
-    });
-    apiMocks.startGeneration.mockResolvedValue({
-      instanceId: 'project-1',
-      runId: 'run-1',
-      status: 'queued',
-    });
-    apiMocks.getGenerationStatus.mockResolvedValue({
-      status: 'completed',
-      output: {
-        architectureSummary: 'Cloud architecture',
-        chunks: [
-          {
-            sequence: 1,
-            title: 'Build API',
-            prompt: 'Implement API',
-            doneCondition: 'API is implemented',
-            verificationHints: ['pnpm run test'],
-          },
-        ],
-      },
-    });
-
     configMocks.loadScrimbleConfig.mockResolvedValue({
+      schemaVersion: 1,
       ai: {
         provider: 'openai',
         model: 'gpt-4o',
-        apiKey: 'secret-key',
-        baseUrl: 'https://api.openai.com/v1',
+        apiKey: '${OPENAI_API_KEY}',
+      },
+      workerPreferences: {
+        defaultWorker: 'gemini',
+        allowParallel: false,
+        maxParallelWorkers: 1,
       },
     });
-
+    planningIntentMocks.captureIntent.mockResolvedValue({
+      id: 'intent-1',
+      goal: 'Ship runtime',
+      productAssumptions: [],
+      constraints: [],
+      successCriteria: [],
+      outOfScope: [],
+      createdAt: '2024-01-01T00:00:00.000Z',
+      updatedAt: '2024-01-01T00:00:00.000Z',
+    });
+    planningGeneratorMocks.generateTaskGraph.mockReturnValue({
+      graph: {
+        intentId: 'intent-1',
+        tasks: [makeGeneratedTask('task-1'), makeGeneratedTask('task-2')],
+        edges: [],
+        phases: [],
+        generatedAt: '2024-01-01T00:00:00.000Z',
+        metadata: {
+          totalComplexity: 8,
+          parallelGroups: 1,
+          criticalPathLength: 2,
+          contextSourcesUsed: [],
+        },
+      },
+      warnings: [],
+      suggestions: [],
+    });
+    stackMocks.detectStack.mockResolvedValue({
+      languages: ['typescript'],
+      frameworks: ['hono'],
+      packageManagers: [],
+      buildTools: [],
+      testFrameworks: [],
+      hasDocker: false,
+    });
+    workerFactoryMocks.getWorkerDriver.mockImplementation(() => ({
+      preflight: vi.fn().mockResolvedValue({ available: true, warnings: [], errors: [] }),
+      discoverContextArtifacts: vi.fn().mockResolvedValue([]),
+    }));
+    storageMocks.loadTasksState.mockResolvedValue({ version: 1, tasks: [], updatedAt: '2024-01-01T00:00:00.000Z' });
+    storageMocks.loadLedgerApprovalState.mockResolvedValue({
+      version: 1,
+      approved: false,
+      updatedAt: '2024-01-01T00:00:00.000Z',
+    });
+    storageMocks.loadAssignmentsState.mockResolvedValue({
+      version: 1,
+      assignments: [],
+      updatedAt: '2024-01-01T00:00:00.000Z',
+    });
+    storageMocks.loadFileLeasesState.mockResolvedValue({
+      version: 1,
+      leases: [],
+      updatedAt: '2024-01-01T00:00:00.000Z',
+    });
+    storageMocks.saveTasksState.mockResolvedValue(undefined);
+    storageMocks.saveLedgerApprovalState.mockResolvedValue(undefined);
+    storageMocks.saveAssignmentsState.mockResolvedValue(undefined);
+    storageMocks.saveFileLeasesState.mockResolvedValue(undefined);
+    recordMocks.appendLedgerEvent.mockResolvedValue(undefined);
     telemetryMocks.recordTelemetry.mockResolvedValue(undefined);
   });
 
-  it('prints parsed cloud generation start validation errors', async () => {
-    apiMocks.startGeneration.mockRejectedValue(
-      new apiMocks.CloudApiError(
-        400,
-        JSON.stringify({
-          error: 'Invalid generation start payload.',
-          issues: [{ message: 'aiConfig.apiKey is required for cloud planning runs.' }],
-        }),
-      ),
-    );
-
-    const logs: string[] = [];
-    await expect(Generate.prototype.run.call({
-      parse: vi.fn().mockResolvedValue({
-        flags: { goal: 'Ship runtime', cloud: false, manual: false, wait: false, apply: true },
-      }),
-      log: (message = '') => {
-        logs.push(String(message));
-      },
-      exit: (code?: number) => {
-        throw new Error(`EXIT_${String(code ?? 0)}`);
-      },
-      runCloudGeneration: Generate.prototype['runCloudGeneration'],
-      runConductorTrackCreation: Generate.prototype['runConductorTrackCreation'],
-    } as unknown as Generate)).rejects.toThrow('EXIT_1');
-
-    const normalizedLogs = logs.map(stripAnsi).join('\n');
-    expect(normalizedLogs).toContain('Cloud generation start failed: Invalid generation start payload. aiConfig.apiKey is required for cloud planning runs.');
-  });
-
-  it('applies completed cloud generation output to local plan when waiting', async () => {
-    const logs: string[] = [];
+  it('generates local ledger tasks and resets assignments + leases', async () => {
     await Generate.prototype.run.call({
       parse: vi.fn().mockResolvedValue({
-        flags: { goal: 'Ship runtime', cloud: false, manual: false, wait: true, apply: true },
+        flags: { goal: 'Ship runtime', replan: false },
+        argv: [],
       }),
-      log: (message = '') => {
-        logs.push(String(message));
-      },
-      exit: (code?: number) => {
-        throw new Error(`EXIT_${String(code ?? 0)}`);
-      },
-      runCloudGeneration: Generate.prototype['runCloudGeneration'],
-      runConductorTrackCreation: Generate.prototype['runConductorTrackCreation'],
+      log: vi.fn(),
     } as unknown as Generate);
 
-    expect(localMocks.savePlanState).toHaveBeenCalledWith(
+    expect(storageMocks.saveTasksState).toHaveBeenCalledWith(
       expect.objectContaining({
-        architecture: expect.objectContaining({
-          summary: 'Cloud architecture',
-        }),
-        chunks: [
-          expect.objectContaining({
-            title: 'Build API',
-            status: 'active',
-            doneWhen: 'API is implemented',
-          }),
+        tasks: [expect.objectContaining({ id: 'task-1' }), expect.objectContaining({ id: 'task-2' })],
+      }),
+      expect.any(String),
+    );
+    expect(storageMocks.saveAssignmentsState).toHaveBeenCalledWith(
+      expect.objectContaining({ assignments: [] }),
+      expect.any(String),
+    );
+    expect(storageMocks.saveFileLeasesState).toHaveBeenCalledWith(
+      expect.objectContaining({ leases: [] }),
+      expect.any(String),
+    );
+    expect(storageMocks.saveLedgerApprovalState).toHaveBeenCalledWith(
+      expect.objectContaining({ approved: false }),
+      expect.any(String),
+    );
+  });
+
+  it('preserves completed tasks during replan', async () => {
+    storageMocks.loadTasksState.mockResolvedValue({
+      version: 1,
+      tasks: [makeGeneratedTask('done-1', 'completed'), makeGeneratedTask('old-2', 'pending')],
+      updatedAt: '2024-01-01T00:00:00.000Z',
+    });
+    planningGeneratorMocks.generateTaskGraph.mockReturnValue({
+      graph: {
+        intentId: 'intent-1',
+        tasks: [makeGeneratedTask('new-1'), makeGeneratedTask('new-2')],
+        edges: [],
+        phases: [],
+        generatedAt: '2024-01-01T00:00:00.000Z',
+        metadata: {
+          totalComplexity: 8,
+          parallelGroups: 1,
+          criticalPathLength: 2,
+          contextSourcesUsed: [],
+        },
+      },
+      warnings: [],
+      suggestions: [],
+    });
+
+    await Generate.prototype.run.call({
+      parse: vi.fn().mockResolvedValue({
+        flags: { goal: 'Ship runtime', replan: true },
+        argv: [],
+      }),
+      log: vi.fn(),
+    } as unknown as Generate);
+
+    expect(storageMocks.saveTasksState).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tasks: [
+          expect.objectContaining({ id: 'done-1', status: 'completed' }),
+          expect.objectContaining({ id: 'new-1' }),
+          expect.objectContaining({ id: 'new-2' }),
         ],
       }),
+      expect.any(String),
     );
-    expect(localMocks.writeCurrentChunkFromPlan).toHaveBeenCalledTimes(1);
-    expect(localMocks.appendActivity).toHaveBeenCalledWith(
-      'plan_generated',
-      expect.objectContaining({
-        cloudRunId: 'run-1',
-        waited: true,
-        finalStatus: 'completed',
-        applied: true,
-      }),
-    );
-
-    const normalizedLogs = logs.map(stripAnsi).join('\n');
-    expect(normalizedLogs).toContain('Plan generated from cloud output and applied locally.');
   });
 });
+

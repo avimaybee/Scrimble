@@ -30,14 +30,20 @@ function asNumber(value: unknown): number | undefined {
 }
 
 async function postForm(url: string, formData: URLSearchParams): Promise<Record<string, unknown>> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: formData,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: formData,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Authentication server unreachable (${url}): ${message}`);
+  }
 
   const json = (await response.json()) as Record<string, unknown>;
   if (!response.ok) {

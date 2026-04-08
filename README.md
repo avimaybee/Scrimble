@@ -31,11 +31,11 @@ scrimble/
 │   ├── cli/                    # CLI application (oclif + TypeScript)
 │   │   ├── src/commands/       # CLI commands
 │   │   └── bin/                # Entry points
-│   └── api/                    # Cloudflare Workers backend
+│   └── api/                    # Legacy backend package (not required for local-first CLI flows)
 │       └── src/                # API routes and handlers
 ├── packages/
 │   ├── shared/                 # Shared types and schemas
-│   └── db/                     # Database migrations
+│   └── db/                     # Legacy DB package
 ├── docs/                       # Documentation
 └── turbo.json                  # Turborepo configuration
 ```
@@ -48,9 +48,9 @@ scrimble/
 | `scrimble import` | Compatibility alias for `scrimble init` (brownfield adoption path) |
 | `scrimble generate` | Generate a native task graph from captured intent and repo context |
 | `scrimble config set-ai` | Run the AI provider/model/key setup wizard |
-| `scrimble login` | Authenticate using OAuth device flow |
+| `scrimble login` | Compatibility shim: Scrimble is local-first and has no product login |
 | `scrimble approve` | Approve a track/task scope for autonomous execution |
-| `scrimble` | Auto-run onboarding, then show runtime overview and next action |
+| `scrimble` | Run local onboarding checks, then show runtime overview and next action |
 | `scrimble run` | Execute native ledger tasks with worker routing (`--worker auto|gemini|copilot`) |
 | `scrimble workers` | Show Gemini/Copilot worker preflight health and capabilities |
 | `scrimble assign` | Manually assign a pending ledger task to a worker |
@@ -59,16 +59,16 @@ scrimble/
 | `scrimble prompt` | Print the current active task prompt |
 | `scrimble verify` | Run local verification checks |
 | `scrimble done` | Complete current task/chunk |
-| `scrimble doctor` | Check configuration and health |
-| `scrimble status` | Show project status and progress |
-| `scrimble logs` | Show local runtime events first, then cloud execution/project events |
+| `scrimble doctor` | Check local configuration and worker readiness |
+| `scrimble status` | Show local intent, task graph progress, assignments, workers, and leases |
+| `scrimble logs` | Show local runtime ledger events |
 | `scrimble next` | Preview or activate next pending task |
 | `scrimble skip` | Skip active task with risk acknowledgement |
 | `scrimble update` | Apply targeted plan updates |
-| `scrimble replan` | Rebuild remaining plan while preserving completed chunks |
-| `scrimble sync` | Reconcile local/cloud plan state using canonical D1 registry |
+| `scrimble replan` | Local alias for `scrimble generate --replan` |
+| `scrimble sync` | Compatibility shim: local-first mode has no Scrimble sync workflow |
 | `scrimble watch` | Run proactive resident mode with alerts |
-| `scrimble logout` | Clear local session |
+| `scrimble logout` | Compatibility shim: local-first mode has no Scrimble logout |
 
 ## Native Ledger Runtime
 
@@ -99,16 +99,13 @@ pnpm --filter @scrimble/shared run build
 # Build CLI
 pnpm --filter @scrimble/cli run build
 
-# Run API locally (requires Cloudflare account)
-pnpm --filter @scrimble/api run dev
+# Run CLI tests
+pnpm --filter @scrimble/cli test
 ```
 
 ## Technology Stack
 
 - **CLI**: oclif + TypeScript
-- **Backend**: Cloudflare Workers + Hono
-- **Database**: Cloudflare D1 (SQLite)
-- **Storage**: Cloudflare R2
 - **AI**: Vercel AI SDK (multi-provider support)
 
 ## AI Provider Configuration
@@ -147,18 +144,9 @@ Supported providers:
 - Azure OpenAI
 - Groq, Together AI, etc.
 
-## Authentication
+## Local-first mode
 
-Cloud API routes under `/v1/*` require a bearer token managed by the CLI.
-
-Run the login flow to authenticate your session:
-
-```bash
-# Start the standard OAuth device flow (Firebase-linked)
-scrimble login
-```
-
-After login, `scrimble init --from-cloud` can bootstrap local project/plan state from the cloud registry.
+Scrimble CLI is local-first for planning and orchestration: `.scrimble/` is the canonical state, and core command flows do not require Scrimble-owned network access. `login`, `logout`, and `sync` remain as compatibility shims that print migration guidance.
 
 ## License
 

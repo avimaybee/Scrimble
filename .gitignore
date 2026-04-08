@@ -31,8 +31,10 @@ coverage/
 # Turbo
 .turbo/
 
-# Local Scrimble state (for development)
-.scrimble/session.json
+# Local Scrimble runtime noise
+.scrimble/runtime/
+.scrimble/telemetry.ndjson
+.scrimble/*.log
 
 .agents
 .github/*

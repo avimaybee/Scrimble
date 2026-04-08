@@ -8,7 +8,6 @@ export default class Import extends Command {
   static override examples = [
     '<%= config.bin %> import',
     '<%= config.bin %> import --goal "Ship stable runtime"',
-    '<%= config.bin %> import --from-cloud --project-id my-project',
   ];
 
   static override flags = {
@@ -27,14 +26,6 @@ export default class Import extends Command {
     }),
     'ai-model': Flags.string({
       description: 'AI model (defaults to provider-specific recommended model)',
-    }),
-    'from-cloud': Flags.boolean({
-      description: 'Bootstrap from authenticated cloud project and canonical plan registry',
-      default: true,
-      allowNo: true,
-    }),
-    'project-id': Flags.string({
-      description: 'Cloud project id to bootstrap (defaults to repo slug)',
     }),
     'skip-preflight': Flags.boolean({
       description: 'Skip Gemini/Conductor preflight checks',
@@ -58,16 +49,8 @@ export default class Import extends Command {
     if (flags['ai-model']) {
       initArgs.push('--ai-model', flags['ai-model']);
     }
-    if (flags['project-id']) {
-      initArgs.push('--project-id', flags['project-id']);
-    }
     if (flags['skip-preflight']) {
       initArgs.push('--skip-preflight');
-    }
-    if (flags['from-cloud']) {
-      initArgs.push('--from-cloud');
-    } else {
-      initArgs.push('--no-from-cloud');
     }
 
     this.log('');

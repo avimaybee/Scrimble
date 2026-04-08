@@ -17,6 +17,7 @@ import type {
   AssignmentsState,
   FileLeasesState,
   IntentState,
+  LedgerApprovalState,
   TasksState,
   WorkersState,
 } from '@scrimble/shared';
@@ -51,6 +52,7 @@ interface LedgerDocument {
   fileLeases: FileLeasesState;
   workers: WorkersState;
   intent: IntentState;
+  approval: LedgerApprovalState;
 }
 
 interface LoadLegacyResult {
@@ -60,6 +62,7 @@ interface LoadLegacyResult {
   fileLeases: FileLeasesState;
   workers: WorkersState;
   intent: IntentState;
+  approval: LedgerApprovalState;
 }
 
 export function getLedgerPaths(cwd: string = process.cwd()): LedgerPaths {
@@ -195,6 +198,14 @@ function defaultIntentState(): IntentState {
   };
 }
 
+function defaultApprovalState(): LedgerApprovalState {
+  return {
+    version: SCHEMA_VERSION,
+    approved: false,
+    updatedAt: nowIso(),
+  };
+}
+
 function defaultLedgerDocument(): LedgerDocument {
   return {
     version: SCHEMA_VERSION,
@@ -204,6 +215,7 @@ function defaultLedgerDocument(): LedgerDocument {
     fileLeases: defaultFileLeasesState(),
     workers: defaultWorkersState(),
     intent: defaultIntentState(),
+    approval: defaultApprovalState(),
   };
 }
 
@@ -237,6 +249,11 @@ function normalizeLedgerDocument(input: Partial<LedgerDocument>): LedgerDocument
       ...(input.intent ?? {}),
       updatedAt: input.intent?.updatedAt ?? defaults.intent.updatedAt,
     },
+    approval: {
+      ...defaults.approval,
+      ...(input.approval ?? {}),
+      updatedAt: input.approval?.updatedAt ?? defaults.approval.updatedAt,
+    },
   };
 }
 
@@ -258,6 +275,7 @@ async function loadLegacyDocument(cwd: string): Promise<LoadLegacyResult> {
     fileLeases: fileLeases.value ?? defaultFileLeasesState(),
     workers: workers.value ?? defaultWorkersState(),
     intent: intent.value ?? defaultIntentState(),
+    approval: defaultApprovalState(),
   };
 }
 
@@ -287,6 +305,7 @@ async function loadLedgerDocument(cwd: string = process.cwd()): Promise<LedgerDo
       fileLeases: legacy.fileLeases,
       workers: legacy.workers,
       intent: legacy.intent,
+      approval: legacy.approval,
     });
     await saveLedgerDocument(migrated, cwd);
     return migrated;
@@ -417,6 +436,7 @@ export async function loadLedgerState(cwd: string = process.cwd()): Promise<{
   fileLeases: FileLeasesState;
   workers: WorkersState;
   intent: IntentState;
+  approval: LedgerApprovalState;
 }> {
   const document = await loadLedgerDocument(cwd);
   return {
@@ -425,6 +445,32 @@ export async function loadLedgerState(cwd: string = process.cwd()): Promise<{
     fileLeases: document.fileLeases,
     workers: document.workers,
     intent: document.intent,
+    approval: document.approval,
   };
+}
+
+export async function loadLedgerApprovalState(cwd: string = process.cwd()): Promise<LedgerApprovalState> {
+  const document = await loadLedgerDocument(cwd);
+  return document.approval;
+}
+
+export async function saveLedgerApprovalState(
+  state: LedgerApprovalState,
+  cwd: string = process.cwd(),
+): Promise<void> {
+  const paths = getLedgerPaths(cwd);
+  await withLedgerWriteLock(paths.ledgerFile, async () => {
+    const document = await loadLedgerDocument(cwd);
+    await saveLedgerDocument(
+      {
+        ...document,
+        approval: {
+          ...state,
+          updatedAt: nowIso(),
+        },
+      },
+      cwd,
+    );
+  });
 }
 

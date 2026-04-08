@@ -15,6 +15,7 @@ import { appendLedgerEvent, completeExecutionRecord, startExecutionRecord } from
 import {
   loadAssignmentsState,
   loadFileLeasesState,
+  loadLedgerApprovalState,
   loadTasksState,
   loadWorkersState,
   saveWorkersState,
@@ -129,6 +130,22 @@ export class LedgerSupervisor {
     const parallel = Math.max(1, options.parallel ?? 1);
     const timeoutMs = options.timeoutMs ?? 300_000;
     const maxTasks = options.maxTasks ?? Number.POSITIVE_INFINITY;
+
+    const [tasksSnapshot, approvalState] = await Promise.all([
+      loadTasksState(cwd),
+      loadLedgerApprovalState(cwd),
+    ]);
+    if (tasksSnapshot.tasks.length > 0 && !approvalState.approved) {
+      await appendLedgerEvent(
+        'run_paused',
+        {
+          reason: 'approval_required',
+          suggestedCommand: 'scrimble approve',
+        },
+        cwd,
+      );
+      throw new Error('Ledger execution is not approved. Run `scrimble approve` before `scrimble run`.');
+    }
 
     await appendLedgerEvent('run_started', {
       worker: workerSelection,

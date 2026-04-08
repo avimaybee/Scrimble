@@ -11,6 +11,7 @@ const factoryMocks = vi.hoisted(() => ({
 vi.mock('../workers/factory.js', () => factoryMocks);
 
 import { createTask, getTask } from '../ledger/operations.js';
+import { saveLedgerApprovalState } from '../ledger/storage.js';
 import { LedgerSupervisor } from './supervisor.js';
 
 function createFakeDriver(
@@ -115,6 +116,15 @@ describe('ledger supervisor', () => {
     testDir = path.join(tmpdir(), `scheduler-supervisor-${Date.now()}`);
     await fs.mkdir(testDir, { recursive: true });
     await fs.mkdir(path.join(testDir, '.git'), { recursive: true });
+    await saveLedgerApprovalState(
+      {
+        version: 1,
+        approved: true,
+        approvedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      testDir,
+    );
     factoryMocks.getWorkerDriver.mockReset();
   });
 
@@ -224,6 +234,33 @@ describe('ledger supervisor', () => {
     expect(startedWorkers).toHaveLength(2);
     expect(startedWorkers.filter((worker) => worker === 'gemini')).toHaveLength(1);
     expect(startedWorkers.filter((worker) => worker === 'copilot')).toHaveLength(1);
+  });
+
+  it('requires approval before dispatching ledger tasks', async () => {
+    await saveLedgerApprovalState(
+      {
+        version: 1,
+        approved: false,
+        updatedAt: new Date().toISOString(),
+      },
+      testDir,
+    );
+    await createTask(
+      {
+        id: 'task-unapproved',
+        title: 'Task unapproved',
+        objective: 'Should not run',
+        doneCriteria: 'Done',
+        ownedFiles: ['src/unapproved.ts'],
+      },
+      testDir,
+    );
+    factoryMocks.getWorkerDriver.mockImplementation((kind: WorkerKind) =>
+      createFakeDriver(kind, ['src/unapproved.ts']),
+    );
+
+    const supervisor = new LedgerSupervisor();
+    await expect(supervisor.run({ cwd: testDir, maxTasks: 1 })).rejects.toThrow('Ledger execution is not approved');
   });
 });
 

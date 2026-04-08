@@ -6,6 +6,18 @@ import {
   scrimbleConfigSchema,
 } from '@scrimble/shared';
 
+function sanitizeLegacyCloudFields(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+
+  const record = { ...(value as Record<string, unknown>) };
+  delete record['auth'];
+  delete record['cloudEndpoint'];
+  delete record['projectId'];
+  return record;
+}
+
 function interpolateEnv(value: unknown): unknown {
   if (typeof value === 'string') {
     return value.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, envName: string) => process.env[envName] ?? '');
@@ -27,7 +39,7 @@ function interpolateEnv(value: unknown): unknown {
 export async function loadScrimbleConfig(cwd = process.cwd()) {
   const configPath = path.join(cwd, SCRIMBLE_DIR, CONFIG_FILE);
   const rawConfig = await fs.readFile(configPath, 'utf8');
-  const parsed = JSON.parse(rawConfig) as unknown;
+  const parsed = sanitizeLegacyCloudFields(JSON.parse(rawConfig) as unknown);
   const withEnvInterpolation = interpolateEnv(parsed);
   return scrimbleConfigSchema.parse(withEnvInterpolation);
 }

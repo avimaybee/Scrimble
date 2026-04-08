@@ -47,12 +47,34 @@ export const authSessionSchema = z.object({
   createdAt: z.string().datetime(),
 }).strict();
 
+export const plannerWorkerSchema = z.enum(['gemini', 'copilot', 'auto']);
+
+export const workerPreferencesSchema = z.object({
+  defaultWorker: plannerWorkerSchema.optional(),
+  allowParallel: z.boolean().optional(),
+  maxParallelWorkers: z.number().int().positive().optional(),
+}).strict();
+
+export const executionDefaultsSchema = z.object({
+  worker: plannerWorkerSchema.optional(),
+  timeoutSeconds: z.number().int().positive().optional(),
+  maxParallelTasks: z.number().int().positive().optional(),
+  maxRetriesPerTask: z.number().int().nonnegative().optional(),
+}).strict();
+
+export const verificationDefaultsSchema = z.object({
+  enabled: z.boolean().optional(),
+  commands: z.array(z.string()).optional(),
+}).strict();
+
 // Local config schema
 export const scrimbleConfigSchema = z.object({
+  schemaVersion: z.number().int().positive().default(1),
   ai: aiConfigSchema,
-  auth: authConfigSchema.optional(),
-  projectId: z.string().optional(),
-  cloudEndpoint: z.string().url().optional(),
+  plannerWorker: plannerWorkerSchema.optional(),
+  workerPreferences: workerPreferencesSchema.optional(),
+  executionDefaults: executionDefaultsSchema.optional(),
+  verificationDefaults: verificationDefaultsSchema.optional(),
 }).strict();
 
 // Project schemas

@@ -27,11 +27,6 @@ export default class Done extends Command {
       description: 'Additional verification command (repeatable)',
       multiple: true,
     }),
-    cloud: Flags.boolean({
-      description: 'Emit completion to cloud history when supported by provider',
-      default: true,
-      allowNo: true,
-    }),
   };
 
   async run(): Promise<void> {
@@ -42,7 +37,6 @@ export default class Done extends Command {
       const completeOptions = {
         force: flags.force,
         skipVerification: flags['no-verify'],
-        cloud: flags.cloud,
         ...(flags.reason ? { reason: flags.reason } : {}),
         ...(flags['verify-command'] && flags['verify-command'].length > 0
           ? { verifyCommands: flags['verify-command'] }
@@ -59,11 +53,6 @@ export default class Done extends Command {
       this.log('');
       this.log(chalk.green('✓ Task completion recorded.'));
       this.log(chalk.dim(`Completed: ${result.completedTask.title}`));
-      if (flags.cloud && result.cloudRecorded) {
-        this.log(chalk.dim('Cloud history updated.'));
-      } else if (flags.cloud && result.cloudError) {
-        this.log(chalk.yellow(`⚠ Cloud history update failed: ${result.cloudError}`));
-      }
       if (result.nextTask) {
         this.log(chalk.cyan(`Next active: ${result.nextTask.title}`));
       } else {

@@ -35,17 +35,18 @@ export async function resolveCloudClientConfig(cwd = process.cwd()): Promise<Clo
 
   await fs.access(configPath);
   const config = await loadScrimbleConfig(cwd);
+  const configRecord = config as unknown as Record<string, unknown>;
   const project = await readJson<Record<string, unknown>>(projectPath, {});
   const session = await readJson<Record<string, unknown>>(sessionPath, {});
 
   const projectIdRaw =
-    (typeof config.projectId === 'string' ? config.projectId : undefined) ??
+    (typeof configRecord['projectId'] === 'string' ? configRecord['projectId'] : undefined) ??
     (typeof project['id'] === 'string' ? project['id'] : undefined) ??
     (typeof project['name'] === 'string' ? project['name'] : undefined) ??
     path.basename(cwd);
 
   return {
-    baseUrl: config.cloudEndpoint ?? 'https://api.scrimble.dev',
+    baseUrl: typeof configRecord['cloudEndpoint'] === 'string' ? configRecord['cloudEndpoint'] : 'https://api.scrimble.dev',
     projectId: slug(projectIdRaw),
     ...(typeof session['accessToken'] === 'string' ? { accessToken: session['accessToken'] } : {}),
   };

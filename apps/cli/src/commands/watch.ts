@@ -1,13 +1,15 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import * as fs from 'node:fs/promises';
-import { createRepoWatcher, evaluateProactiveSignals, type RepoWatchEvent } from '../lib/watch/index.js';
+import { createRepoWatcher, type RepoWatchEvent } from '../lib/watch/index.js';
 import { runVerification } from '../lib/verify/index.js';
-import { loadPlanState, readLatestVerification, type LocalPlanState } from '../lib/local/index.js';
+import { readLatestVerification } from '../lib/local/index.js';
 import { getActiveTrack, getNextTask, loadConductorWorkspace, parsePlan } from '../lib/conductor/index.js';
 import { loadRuntimeState } from '../lib/conductor/runtime.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 import { getScrimblePaths } from '../lib/local/index.js';
+import { loadLedgerState } from '../lib/ledger/storage.js';
+import { evaluateLedgerProactiveSignals } from '../lib/watch/proactive.js';
 
 interface WatchState {
   paused: boolean;
@@ -140,7 +142,7 @@ export default class Watch extends Command {
     }
 
     let verificationInFlight = false;
-    let planCache: LocalPlanState = await loadPlanState();
+    let ledgerCache = await loadLedgerState();
     const conductorWorkspace = await loadConductorWorkspace();
     let alertsInWindow = 0;
     let alertWindowStartedAt = Date.now();
@@ -188,10 +190,12 @@ export default class Watch extends Command {
             }
           }
 
-          planCache = await loadPlanState();
-          const proactiveSignals = evaluateProactiveSignals({
+          ledgerCache = await loadLedgerState();
+          const proactiveSignals = evaluateLedgerProactiveSignals({
             events,
-            plan: planCache,
+            tasks: ledgerCache.tasks,
+            assignments: ledgerCache.assignments,
+            workers: ledgerCache.workers,
             verificationResult,
           });
 
@@ -356,6 +360,7 @@ export default class Watch extends Command {
     this.log(chalk.dim(`Verification on change: ${flags.verify ? 'enabled' : 'disabled'}`));
     this.log(chalk.dim(`Alert throttle: ${flags['max-alerts-per-minute']} alerts/minute`));
     this.log(chalk.dim(`Signal cooldown: ${flags['signal-cooldown-ms']}ms`));
+    this.log(chalk.dim('Ledger-aware signals: enabled'));
     if (conductorWorkspace.exists) {
       this.log(chalk.dim('Conductor-aware signals: enabled'));
     }

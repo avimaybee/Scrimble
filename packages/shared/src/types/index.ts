@@ -224,10 +224,32 @@ export interface AuthSession {
   createdAt: string;
 }
 
+export type PlannerWorker = 'gemini' | 'copilot' | 'auto';
+
+export interface WorkerPreferences {
+  defaultWorker?: PlannerWorker;
+  allowParallel?: boolean;
+  maxParallelWorkers?: number;
+}
+
+export interface ExecutionDefaults {
+  worker?: PlannerWorker;
+  timeoutSeconds?: number;
+  maxParallelTasks?: number;
+  maxRetriesPerTask?: number;
+}
+
+export interface VerificationDefaults {
+  enabled?: boolean;
+  commands?: string[];
+}
+
 // Local config
 export interface ScrimbleConfig {
+  schemaVersion: number;
   ai: AIConfig;
-  auth?: AuthConfig;
-  projectId?: ProjectID;
-  cloudEndpoint?: string;
+  plannerWorker?: PlannerWorker;
+  workerPreferences?: WorkerPreferences;
+  executionDefaults?: ExecutionDefaults;
+  verificationDefaults?: VerificationDefaults;
 }

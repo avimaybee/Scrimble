@@ -11,7 +11,7 @@ import {
   loadPlanState,
   loadProjectState,
 } from '../lib/local/index.js';
-import { getAIConfigurationStatus, getAuthStatus } from '../lib/onboarding.js';
+import { getAIConfigurationStatus } from '../lib/onboarding.js';
 import { detectStaleness } from '../lib/staleness.js';
 import { getTaskProvider } from '../lib/tasks/index.js';
 
@@ -120,17 +120,6 @@ async function ensureOnboarding(
   log: (message?: string) => void,
   runCommand: (id: string) => Promise<unknown>,
 ): Promise<boolean> {
-  let authStatus = await getAuthStatus(cwd);
-  if (!authStatus.isAuthenticated) {
-    log(chalk.yellow('\n🔐 Authentication required. Starting `scrimble login`...\n'));
-    await runCommand('login');
-    authStatus = await getAuthStatus(cwd);
-    if (!authStatus.isAuthenticated) {
-      log(chalk.red('\nLogin did not produce a valid session.\n'));
-      return false;
-    }
-  }
-
   let projectInitialized = await isProjectInitialized(cwd);
   if (!projectInitialized) {
     log(chalk.yellow('\n🚀 Project initialization required. Starting `scrimble init`...\n'));

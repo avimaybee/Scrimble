@@ -1,6 +1,5 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
-import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
@@ -12,6 +11,7 @@ import {
   scrimbleConfigSchema,
 } from '@scrimble/shared';
 import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../../lib/ai/provider.js';
+import { loadScrimbleConfig } from '../../lib/config/load-config.js';
 import { writeSecureJson } from '../../lib/security.js';
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -116,8 +116,7 @@ export default class ConfigSetAi extends Command {
 
     let existingConfig: ReturnType<typeof scrimbleConfigSchema.parse>;
     try {
-      const raw = await fs.readFile(configPath, 'utf8');
-      existingConfig = scrimbleConfigSchema.parse(JSON.parse(raw) as unknown);
+      existingConfig = await loadScrimbleConfig(cwd);
     } catch (error) {
       if (isNodeError(error) && error.code === 'ENOENT') {
         this.log(chalk.red('\nMissing .scrimble/config.json. Run `scrimble init` first.\n'));
