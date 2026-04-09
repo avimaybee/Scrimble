@@ -2,6 +2,8 @@ import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { stdin as input, stdout as output } from 'node:process';
+import { createInterface } from 'node:readline/promises';
 import {
   SCRIMBLE_DIR,
   CONFIG_FILE,
@@ -9,11 +11,10 @@ import {
   SESSION_FILE,
   aiProviderSchema,
   scrimbleConfigSchema,
+  type InteractionMode,
 } from '@scrimble/shared';
 import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
 import { recordTelemetry } from '../lib/telemetry.js';
-import { runPreflight } from '../lib/gemini/index.js';
-import { loadConductorWorkspace, getActiveTrack } from '../lib/conductor/index.js';
 import { pathExists } from '../lib/fs/index.js';
 import { detectStack } from '../lib/init/stack-detection.js';
 import { setupLocalScaffold } from '../lib/init/local-scaffold.js';
@@ -21,6 +22,58 @@ import { setupLocalScaffold } from '../lib/init/local-scaffold.js';
 interface ExistingStateAssessment {
   hasExistingDir: boolean;
   isFullyInitialized: boolean;
+}
+
+const INTERACTION_MODES: InteractionMode[] = ['guide', 'balanced', 'operator'];
+
+function parseInteractionMode(value: string): InteractionMode {
+  if (INTERACTION_MODES.includes(value as InteractionMode)) {
+    return value as InteractionMode;
+  }
+  throw new Error(`Unsupported interaction mode: ${value}`);
+}
+
+function promptable(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+async function promptInteractionMode(
+  log: (message?: string) => void,
+  current: InteractionMode = 'guide',
+): Promise<InteractionMode> {
+  const modes = [...INTERACTION_MODES];
+  const defaultIndex = Math.max(0, modes.indexOf(current));
+
+  log('');
+  log(chalk.bold('How should Scrimble collaborate by default?'));
+  log(chalk.dim('  1. guide - plan-first, confirmation-heavy'));
+  log(chalk.dim('  2. balanced - confirm before execution'));
+  log(chalk.dim('  3. operator - automate routine setup/planning'));
+
+  const rl = createInterface({ input, output });
+  try {
+    for (;;) {
+      const answer = (await rl.question(`Mode [${defaultIndex + 1}]: `)).trim();
+      if (!answer) {
+        const fallback = modes[defaultIndex];
+        return fallback ?? 'guide';
+      }
+      const numeric = Number.parseInt(answer, 10);
+      if (Number.isInteger(numeric) && numeric >= 1 && numeric <= modes.length) {
+        const selected = modes[numeric - 1];
+        if (selected) {
+          return selected;
+        }
+      }
+      const normalized = answer.toLowerCase();
+      if (INTERACTION_MODES.includes(normalized as InteractionMode)) {
+        return normalized as InteractionMode;
+      }
+      log(chalk.yellow(`Invalid mode: ${answer}`));
+    }
+  } finally {
+    rl.close();
+  }
 }
 
 async function assessExistingScrimbleState(cwd: string): Promise<ExistingStateAssessment> {
@@ -40,57 +93,14 @@ async function assessExistingScrimbleState(cwd: string): Promise<ExistingStateAs
   };
 }
 
-async function runPreflightChecks(
-  cwd: string,
-  skipPreflight: boolean,
-  log: (message?: string) => void,
-): Promise<Awaited<ReturnType<typeof runPreflight>> | null> {
-  if (skipPreflight) {
-    return null;
-  }
-
-  log('');
-  log(chalk.bold('Gemini Preflight:'));
-  const preflight = await runPreflight(cwd);
-
-  if (preflight.gemini.available) {
-    log(chalk.green(`  ✓ Gemini CLI: v${preflight.gemini.version ?? 'unknown'}`));
-  } else {
-    log(chalk.yellow('  ⚠ Gemini CLI: not found'));
-  }
-
-  if (preflight.headlessAuth.available) {
-    log(chalk.green('  ✓ Headless auth: available'));
-  } else {
-    log(chalk.yellow('  ⚠ Headless auth: not configured'));
-  }
-
-  if (preflight.conductor.installed && preflight.conductor.enabled) {
-    log(chalk.green('  ✓ Conductor extension: installed'));
-  } else if (preflight.conductor.installed) {
-    log(chalk.yellow('  ⚠ Conductor extension: installed but disabled'));
-  } else {
-    log(chalk.yellow('  ⚠ Conductor extension: not installed'));
-  }
-
-  if (preflight.folderTrust.enabled && !preflight.folderTrust.workspaceTrusted) {
-    log(chalk.yellow('  ⚠ Workspace is not in Gemini trusted folders'));
-  }
-
-  for (const warning of preflight.warnings) {
-    log(chalk.yellow(`  ⚠ ${warning}`));
-  }
-
-  return preflight;
-}
-
 export default class Init extends Command {
-  static override description = 'Initialize Scrimble in the current repository with Gemini-Conductor integration';
+  static override description = 'Initialize local Scrimble scaffold for conversational orchestration';
 
   static override examples = [
     '<%= config.bin %> init',
-    '<%= config.bin %> init --goal "Build a REST API for user management"',
-    '<%= config.bin %> init --skip-preflight',
+    '<%= config.bin %> init --goal "Ship a stable local orchestrator"',
+    '<%= config.bin %> init --ai-provider github-copilot --ai-model gpt-4.1',
+    '<%= config.bin %> init --interaction-mode balanced',
   ];
 
   static override flags = {
@@ -111,9 +121,9 @@ export default class Init extends Command {
     'ai-model': Flags.string({
       description: 'AI model (defaults to provider-specific recommended model)',
     }),
-    'skip-preflight': Flags.boolean({
-      description: 'Skip Gemini/Conductor preflight checks',
-      default: false,
+    'interaction-mode': Flags.string({
+      description: 'Default interaction style for conversation flow',
+      options: [...INTERACTION_MODES],
     }),
   };
 
@@ -151,34 +161,21 @@ export default class Init extends Command {
     }
 
     const selectedProvider = aiProviderSchema.parse(flags['ai-provider']);
+    let interactionMode: InteractionMode = flags['interaction-mode']
+      ? parseInteractionMode(flags['interaction-mode'])
+      : 'guide';
+    if (!flags['interaction-mode'] && promptable()) {
+      interactionMode = await promptInteractionMode(this.log.bind(this), interactionMode);
+    }
     const defaultAIConfig = buildDefaultAIConfig(selectedProvider, flags['ai-model']);
     this.log(chalk.dim(`  AI provider: ${selectedProvider}`));
     this.log(chalk.dim(`  AI model: ${defaultAIConfig.model}`));
-
-    const conductorWorkspace = await loadConductorWorkspace(cwd);
-    if (conductorWorkspace.exists) {
-      this.log(chalk.green('  ✓ Conductor workspace detected'));
-      const activeTrack = getActiveTrack(conductorWorkspace);
-      if (activeTrack) {
-        this.log(chalk.dim(`    Active track: ${activeTrack.title}`));
-      }
-      this.log(chalk.dim(`    Tracks: ${conductorWorkspace.tracks.length}`));
-    } else {
-      this.log(chalk.dim('  No conductor/ workspace found'));
-    }
-
-    const preflight = await runPreflightChecks(cwd, flags['skip-preflight'], this.log.bind(this));
-    if (preflight && !preflight.canProceed && !conductorWorkspace.exists) {
-      this.log('');
-      this.log(chalk.red('  ✗ Preflight failed and no Conductor workspace is available.'));
-      this.log(chalk.dim('    Resolve the errors above, or run with --skip-preflight to initialize local scaffolding only.'));
-      this.log('');
-      return;
-    }
+    this.log(chalk.dim(`  Interaction mode: ${interactionMode}`));
 
     let config = scrimbleConfigSchema.parse({
       schemaVersion: 1,
       ai: defaultAIConfig,
+      interactionMode,
       plannerWorker: 'auto',
       workerPreferences: {
         defaultWorker: 'auto',
@@ -202,11 +199,7 @@ export default class Init extends Command {
       stack,
       initialized: new Date().toISOString(),
       goal: flags.goal ?? null,
-      conductor: {
-        exists: conductorWorkspace.exists,
-        trackCount: conductorWorkspace.tracks.length,
-        ...(conductorWorkspace.exists ? { detectedAt: new Date().toISOString() } : {}),
-      },
+      localFirst: true,
     };
 
     await setupLocalScaffold({
@@ -233,26 +226,16 @@ export default class Init extends Command {
     this.log(chalk.green('  ✓ project.json created'));
     this.log(chalk.green('  ✓ research-summary.md created'));
     this.log(chalk.green('  ✓ runtime/ directory created'));
-    if (conductorWorkspace.exists) {
-      this.log(chalk.green(`  ✓ Conductor workspace adopted (${conductorWorkspace.tracks.length} tracks)`));
-    }
     this.log('');
 
     const keyPlaceholder = getDefaultApiKeyPlaceholder(selectedProvider);
     this.log(chalk.bold('Next steps:'));
-    if (conductorWorkspace.exists) {
-      this.log(chalk.dim('  1. Run `scrimble status` to see Conductor track state'));
-      this.log(chalk.dim('  2. Run `scrimble approve <track>` to approve a track for execution'));
-      this.log(chalk.dim('  3. Run `scrimble run` to start autonomous execution'));
-    } else {
-      this.log(chalk.dim('  1. Edit .scrimble/config.json to configure your AI provider'));
-      this.log(chalk.dim(`  2. Set your API key: export ${keyPlaceholder.slice(2, -1)}="your-key"`));
-      if (selectedProvider === 'github-copilot') {
-        this.log(chalk.dim('     GitHub Copilot users: set GITHUB_COPILOT_TOKEN from your Copilot auth/session token.'));
-      }
-      this.log(chalk.dim('  3. Run `scrimble workers` to check local worker health'));
-      this.log(chalk.dim('  4. Run `scrimble generate` to build a local task graph'));
+    this.log(chalk.dim('  1. Run `scrimble` and describe your goal in plain language'));
+    this.log(chalk.dim(`  2. If needed, set your API key env var: ${keyPlaceholder.slice(2, -1)}="your-key"`));
+    if (selectedProvider === 'github-copilot') {
+      this.log(chalk.dim('     GitHub Copilot users: set GITHUB_COPILOT_TOKEN from your Copilot auth/session token.'));
     }
+    this.log(chalk.dim('  3. Use `scrimble doctor` for worker readiness diagnostics'));
     this.log('');
 
     await recordTelemetry({
@@ -260,8 +243,6 @@ export default class Init extends Command {
       payload: {
         provider: selectedProvider,
         model: defaultAIConfig.model,
-        conductorExists: conductorWorkspace.exists,
-        conductorTracks: conductorWorkspace.tracks.length,
         localFirst: true,
       },
     });

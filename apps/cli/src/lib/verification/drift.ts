@@ -1,7 +1,7 @@
 import type { LedgerTask } from '@scrimble/shared';
-import { detectOutOfLeaseEdits } from '../scheduler/parallel.js';
+import { detectOutOfScopeEdits } from '../scheduler/parallel.js';
 
-export type DriftFindingType = 'out_of_lease' | 'stale_verification' | 'dependency_invalidated';
+export type DriftFindingType = 'out_of_scope' | 'stale_verification' | 'dependency_invalidated';
 export type DriftSeverity = 'warn' | 'error';
 
 export interface DriftFinding {
@@ -50,13 +50,13 @@ export function detectDependencyInvalidation(
 export function analyzeTaskDrift(input: DriftAnalysisInput): DriftAnalysisResult {
   const findings: DriftFinding[] = [];
 
-  const leaseValidation = detectOutOfLeaseEdits(input.task, input.touchedFiles);
-  if (!leaseValidation.valid) {
+  const scopeValidation = detectOutOfScopeEdits(input.task, input.touchedFiles);
+  if (!scopeValidation.valid) {
     findings.push({
-      type: 'out_of_lease',
+      type: 'out_of_scope',
       severity: 'error',
-      message: 'Worker touched files outside owned lease.',
-      files: leaseValidation.outOfLeaseFiles,
+      message: 'Worker touched files outside owned scope.',
+      files: scopeValidation.outOfScopeFiles,
     });
   }
 

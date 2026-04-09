@@ -37,7 +37,7 @@ function parseTypeFilter(value: string | undefined): LedgerEventType[] | undefin
 }
 
 export default class Logs extends Command {
-  static override description = 'Show local runtime ledger events';
+  static override description = 'Show recent local progress activity (with optional raw events)';
 
   static override examples = [
     '<%= config.bin %> logs',

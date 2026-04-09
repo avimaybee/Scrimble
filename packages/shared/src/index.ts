@@ -7,9 +7,7 @@ export {
   aiProviderSchema,
   aiOptionsSchema,
   aiConfigSchema,
-  authProviderSchema,
-  authConfigSchema,
-  authSessionSchema,
+  interactionModeSchema,
   scrimbleConfigSchema,
   projectStatusSchema,
   createProjectSchema,
@@ -70,5 +68,3 @@ export const LEDGER_ASSIGNMENTS_FILE = 'assignments.json';
 export const LEDGER_FILE_LEASES_FILE = 'file-leases.json';
 export const INTENT_FILE = 'intent.json';
 export const LEDGER_FILE = 'ledger.json';
-
-export const DEFAULT_CLOUD_ENDPOINT = 'https://api.scrimble.dev';

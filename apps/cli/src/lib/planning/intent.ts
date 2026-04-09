@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Intent, IntentCaptureInput, IntentState } from '@scrimble/shared';
-import { loadIntentState, saveIntentState } from '../ledger/storage.js';
+import { mutateLedger, readLedger } from '../ledger/storage.js';
 
 function splitIntoItems(value: string): string[] {
   return value
@@ -67,8 +67,8 @@ export function mergeIntentNotes(
 }
 
 export async function loadCurrentIntent(cwd: string = process.cwd()): Promise<Intent | null> {
-  const state = await loadIntentState(cwd);
-  return state.intent;
+  const ledger = await readLedger(cwd);
+  return ledger.intent.intent;
 }
 
 export async function saveCurrentIntent(
@@ -76,19 +76,21 @@ export async function saveCurrentIntent(
   options: { reason: string; cwd?: string } = { reason: 'intent_update' },
 ): Promise<IntentState> {
   const cwd = options.cwd ?? process.cwd();
-  const state = await loadIntentState(cwd);
-  const history = state.intent
-    ? [...state.history, { intent: state.intent, reason: options.reason, changedAt: new Date().toISOString() }]
-    : state.history;
+  return mutateLedger(cwd, (ledger) => {
+    const state = ledger.intent;
+    const history = state.intent
+      ? [...state.history, { intent: state.intent, reason: options.reason, changedAt: new Date().toISOString() }]
+      : state.history;
 
-  const nextState: IntentState = {
-    version: state.version,
-    intent,
-    history,
-    updatedAt: new Date().toISOString(),
-  };
-  await saveIntentState(nextState, cwd);
-  return nextState;
+    const nextState: IntentState = {
+      version: state.version,
+      intent,
+      history,
+      updatedAt: new Date().toISOString(),
+    };
+    ledger.intent = nextState;
+    return nextState;
+  });
 }
 
 export async function captureIntent(input: IntentCaptureInput, cwd: string = process.cwd()): Promise<Intent> {

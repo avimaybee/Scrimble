@@ -286,12 +286,11 @@ export class GeminiDriver implements WorkerDriver {
     lines.push('');
     lines.push('## Constraints');
     lines.push('- Modify only owned files.');
-    lines.push('- Stop and report if you need files outside the lease.');
+    lines.push('- Stop and report if you need files outside the owned scope.');
     lines.push('');
     lines.push('## Ledger Context');
     lines.push(`- Total tasks: ${ledgerState.tasks.tasks.length}`);
     lines.push(`- Active assignments: ${ledgerState.assignments.assignments.length}`);
-    lines.push(`- Active file leases: ${ledgerState.fileLeases.leases.length}`);
 
     if (context.length > 0) {
       lines.push('');

@@ -37,7 +37,6 @@ describe('Gemini Preflight', () => {
         gemini: { available: true, path: 'gemini', version: '1.2.3' },
         headlessAuth: { available: true },
         folderTrust: { enabled: true, workspaceTrusted: true },
-        conductor: { installed: true, enabled: true, version: '0.5.0' },
         canProceed: true,
         warnings: [],
         errors: [],
@@ -48,7 +47,6 @@ describe('Gemini Preflight', () => {
       expect(formatted).toContain('✓ Gemini CLI: v1.2.3');
       expect(formatted).toContain('✓ Headless Auth: configured');
       expect(formatted).toContain('✓ Folder Trust: workspace trusted');
-      expect(formatted).toContain('✓ Conductor: v0.5.0');
       expect(formatted).toContain('Ready to proceed');
     });
 
@@ -57,10 +55,9 @@ describe('Gemini Preflight', () => {
         gemini: { available: false, error: 'Gemini CLI not found' },
         headlessAuth: { available: false, error: 'Auth not configured' },
         folderTrust: { enabled: true, workspaceTrusted: false },
-        conductor: { installed: false, enabled: false, error: 'Not installed' },
         canProceed: false,
         warnings: ['Workspace not trusted'],
-        errors: ['Gemini CLI not found', 'Auth not configured', 'Not installed'],
+        errors: ['Gemini CLI not found', 'Auth not configured'],
       };
 
       const formatted = formatPreflightResult(result);
@@ -68,7 +65,6 @@ describe('Gemini Preflight', () => {
       expect(formatted).toContain('✗ Gemini CLI: Gemini CLI not found');
       expect(formatted).toContain('✗ Headless Auth: Auth not configured');
       expect(formatted).toContain('⚠ Folder Trust: workspace not trusted');
-      expect(formatted).toContain('✗ Conductor: Not installed');
       expect(formatted).toContain('Cannot proceed');
       expect(formatted).toContain('Warnings:');
     });
@@ -78,7 +74,6 @@ describe('Gemini Preflight', () => {
         gemini: { available: true, path: 'gemini', version: '1.0.0' },
         headlessAuth: { available: true },
         folderTrust: { enabled: false, workspaceTrusted: false },
-        conductor: { installed: true, enabled: true },
         canProceed: true,
         warnings: [],
         errors: [],
@@ -86,21 +81,6 @@ describe('Gemini Preflight', () => {
 
       const formatted = formatPreflightResult(result);
       expect(formatted).toContain('✓ Folder Trust: disabled (all folders trusted)');
-    });
-
-    it('handles conductor installed but disabled', () => {
-      const result: PreflightResult = {
-        gemini: { available: true, path: 'gemini', version: '1.0.0' },
-        headlessAuth: { available: true },
-        folderTrust: { enabled: true, workspaceTrusted: true },
-        conductor: { installed: true, enabled: false },
-        canProceed: true,
-        warnings: ['Conductor disabled'],
-        errors: [],
-      };
-
-      const formatted = formatPreflightResult(result);
-      expect(formatted).toContain('⚠ Conductor: installed but disabled');
     });
   });
 });

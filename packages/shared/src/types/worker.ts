@@ -5,7 +5,7 @@
  * Both Gemini CLI and GitHub Copilot CLI implement this interface.
  */
 
-import type { WorkerKind, LedgerTask, TasksState, AssignmentsState, FileLeasesState } from './ledger.js';
+import type { WorkerKind, LedgerTask, TasksState, AssignmentsState } from './ledger.js';
 
 // --- Worker Capabilities ---
 
@@ -175,7 +175,7 @@ export type FailureKind =
   | 'context_overflow' // Context too large
   | 'parse_error' // Failed to parse output
   | 'verification_failed' // Task completed but verification failed
-  | 'lease_violation' // Edited files outside lease
+  | 'scope_violation' // Edited files outside owned scope
   | 'unknown'; // Unclassified failure
 
 /** Detailed failure classification. */
@@ -250,8 +250,6 @@ export interface LedgerState {
   tasks: TasksState;
   /** Assignments state. */
   assignments: AssignmentsState;
-  /** File leases state. */
-  fileLeases: FileLeasesState;
 }
 
 // --- Worker Driver Interface ---

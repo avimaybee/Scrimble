@@ -36,14 +36,14 @@ describe('drift detector', () => {
     expect(invalid).toEqual(['dep-2']);
   });
 
-  it('reports lease violations in drift analysis', () => {
+  it('reports ownership-scope violations in drift analysis', () => {
     const result = analyzeTaskDrift({
       task: makeTask(),
       touchedFiles: ['src/owned.ts', 'src/not-owned.ts'],
       dependencyStatuses: [{ taskId: 'dep-1', status: 'completed' }],
     });
     expect(result.valid).toBe(false);
-    expect(result.findings.some((finding) => finding.type === 'out_of_lease')).toBe(true);
+    expect(result.findings.some((finding) => finding.type === 'out_of_scope')).toBe(true);
   });
 });
 

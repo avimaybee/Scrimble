@@ -3,8 +3,6 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  acquireFileLease,
-  checkLeaseConflict,
   completeTask,
   createTask,
   getBlockedTasks,
@@ -14,7 +12,7 @@ import {
   releaseTask,
   setAssignmentStatus,
 } from './operations.js';
-import { loadAssignmentsState, loadFileLeasesState, loadTasksState } from './storage.js';
+import { readLedger } from './storage.js';
 
 describe('ledger operations', () => {
   let testDir: string;
@@ -76,31 +74,12 @@ describe('ledger operations', () => {
     expect(assignment.sessionId).toBe('session-1');
 
     await setAssignmentStatus('task-a', 'in_progress', { cwd: testDir });
-    const assignmentsState = await loadAssignmentsState(testDir);
-    expect(assignmentsState.assignments[0]?.status).toBe('in_progress');
-    expect(assignmentsState.assignments[0]?.startedAt).toBeDefined();
+    const ledger = await readLedger(testDir);
+    expect(ledger.assignments.assignments[0]?.status).toBe('in_progress');
+    expect(ledger.assignments.assignments[0]?.startedAt).toBeDefined();
   });
 
-  it('detects and prevents conflicting file leases', async () => {
-    await acquireFileLease('task-a', 'gemini', { paths: ['src/auth/index.ts'], globs: [] }, testDir);
-
-    const check = await checkLeaseConflict(
-      'task-b',
-      {
-        paths: ['src/auth/index.ts'],
-        globs: [],
-      },
-      testDir,
-    );
-    expect(check.canLease).toBe(false);
-    expect(check.conflicts).toHaveLength(1);
-
-    await expect(
-      acquireFileLease('task-b', 'copilot', { paths: ['src/auth/index.ts'], globs: [] }, testDir),
-    ).rejects.toThrow(/Lease conflict/);
-  });
-
-  it('completes task and releases leases', async () => {
+  it('completes task and clears active assignment binding', async () => {
     await createTask(
       {
         id: 'task-a',
@@ -112,16 +91,13 @@ describe('ledger operations', () => {
       testDir,
     );
     await leaseTask('task-a', 'gemini', { cwd: testDir });
-    await acquireFileLease('task-a', 'gemini', { paths: ['src/a.ts'], globs: [] }, testDir);
 
     await completeTask('task-a', { cwd: testDir });
 
-    const tasksState = await loadTasksState(testDir);
-    const task = tasksState.tasks.find((entry) => entry.id === 'task-a');
+    const ledger = await readLedger(testDir);
+    const task = ledger.tasks.tasks.find((entry) => entry.id === 'task-a');
     expect(task?.status).toBe('completed');
-
-    const leasesState = await loadFileLeasesState(testDir);
-    expect(leasesState.leases).toHaveLength(0);
+    expect(ledger.assignments.assignments).toHaveLength(0);
   });
 
   it('releases task back to pending and clears assignment', async () => {
@@ -138,11 +114,9 @@ describe('ledger operations', () => {
     await leaseTask('task-a', 'gemini', { cwd: testDir });
     await releaseTask('task-a', { cwd: testDir });
 
-    const tasksState = await loadTasksState(testDir);
-    expect(tasksState.tasks.find((entry) => entry.id === 'task-a')?.status).toBe('pending');
-
-    const assignmentsState = await loadAssignmentsState(testDir);
-    expect(assignmentsState.assignments).toHaveLength(0);
+    const ledger = await readLedger(testDir);
+    expect(ledger.tasks.tasks.find((entry) => entry.id === 'task-a')?.status).toBe('pending');
+    expect(ledger.assignments.assignments).toHaveLength(0);
   });
 
   it('computes dependency chain recursively', async () => {

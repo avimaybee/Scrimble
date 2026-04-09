@@ -15,19 +15,23 @@ import {
 } from '@scrimble/shared';
 import type {
   AssignmentsState,
-  FileLeasesState,
   IntentState,
   LedgerApprovalState,
+  LedgerDocument,
+  OrchestrationState,
   TasksState,
   WorkersState,
 } from '@scrimble/shared';
 
 const SCHEMA_VERSION = 1;
 const LEDGER_FILE_NAME = 'ledger.json';
-const ledgerWriteLocks = new Map<string, Promise<void>>();
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
 export interface LedgerPaths {
@@ -44,25 +48,14 @@ export interface LedgerPaths {
   legacyWorkers: string;
 }
 
-interface LedgerDocument {
-  version: number;
-  updatedAt: string;
-  tasks: TasksState;
-  assignments: AssignmentsState;
-  fileLeases: FileLeasesState;
-  workers: WorkersState;
-  intent: IntentState;
-  approval: LedgerApprovalState;
-}
-
 interface LoadLegacyResult {
   foundAny: boolean;
   tasks: TasksState;
   assignments: AssignmentsState;
-  fileLeases: FileLeasesState;
   workers: WorkersState;
   intent: IntentState;
   approval: LedgerApprovalState;
+  orchestration: OrchestrationState;
 }
 
 export function getLedgerPaths(cwd: string = process.cwd()): LedgerPaths {
@@ -95,7 +88,6 @@ export async function ensureLedgerDirs(cwd: string = process.cwd()): Promise<voi
 async function writeTextAtomic(filePath: string, content: string): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${Date.now()}.${process.pid}.${randomUUID()}.tmp`;
-
   try {
     await fs.writeFile(tempPath, content, 'utf8');
     try {
@@ -114,26 +106,6 @@ async function writeTextAtomic(filePath: string, content: string): Promise<void>
   }
 }
 
-async function withLedgerWriteLock<T>(ledgerFilePath: string, operation: () => Promise<T>): Promise<T> {
-  const previous = ledgerWriteLocks.get(ledgerFilePath) ?? Promise.resolve();
-  let releaseCurrent: (() => void) | undefined;
-  const current = new Promise<void>((resolve) => {
-    releaseCurrent = resolve;
-  });
-  const tail = previous.then(() => current);
-  ledgerWriteLocks.set(ledgerFilePath, tail);
-
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    releaseCurrent?.();
-    if (ledgerWriteLocks.get(ledgerFilePath) === tail) {
-      ledgerWriteLocks.delete(ledgerFilePath);
-    }
-  }
-}
-
 export async function writeJsonAtomic<T>(filePath: string, value: T): Promise<void> {
   await writeTextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
@@ -141,20 +113,13 @@ export async function writeJsonAtomic<T>(filePath: string, value: T): Promise<vo
 async function readJsonOptional<T>(filePath: string): Promise<{ found: boolean; value?: T }> {
   try {
     const content = await fs.readFile(filePath, 'utf8');
-    return {
-      found: true,
-      value: JSON.parse(content) as T,
-    };
+    return { found: true, value: JSON.parse(content) as T };
   } catch (error) {
     if (isNodeError(error) && error.code === 'ENOENT') {
       return { found: false };
     }
     throw error;
   }
-}
-
-function nowIso(): string {
-  return new Date().toISOString();
 }
 
 function defaultTasksState(): TasksState {
@@ -169,14 +134,6 @@ function defaultAssignmentsState(): AssignmentsState {
   return {
     version: SCHEMA_VERSION,
     assignments: [],
-    updatedAt: nowIso(),
-  };
-}
-
-function defaultFileLeasesState(): FileLeasesState {
-  return {
-    version: SCHEMA_VERSION,
-    leases: [],
     updatedAt: nowIso(),
   };
 }
@@ -206,16 +163,24 @@ function defaultApprovalState(): LedgerApprovalState {
   };
 }
 
+function defaultOrchestrationState(): OrchestrationState {
+  return {
+    version: SCHEMA_VERSION,
+    sessionId: randomUUID(),
+    updatedAt: nowIso(),
+  };
+}
+
 function defaultLedgerDocument(): LedgerDocument {
   return {
     version: SCHEMA_VERSION,
     updatedAt: nowIso(),
     tasks: defaultTasksState(),
     assignments: defaultAssignmentsState(),
-    fileLeases: defaultFileLeasesState(),
     workers: defaultWorkersState(),
     intent: defaultIntentState(),
     approval: defaultApprovalState(),
+    orchestration: defaultOrchestrationState(),
   };
 }
 
@@ -234,11 +199,6 @@ function normalizeLedgerDocument(input: Partial<LedgerDocument>): LedgerDocument
       ...(input.assignments ?? {}),
       updatedAt: input.assignments?.updatedAt ?? defaults.assignments.updatedAt,
     },
-    fileLeases: {
-      ...defaults.fileLeases,
-      ...(input.fileLeases ?? {}),
-      updatedAt: input.fileLeases?.updatedAt ?? defaults.fileLeases.updatedAt,
-    },
     workers: {
       ...defaults.workers,
       ...(input.workers ?? {}),
@@ -254,41 +214,36 @@ function normalizeLedgerDocument(input: Partial<LedgerDocument>): LedgerDocument
       ...(input.approval ?? {}),
       updatedAt: input.approval?.updatedAt ?? defaults.approval.updatedAt,
     },
+    orchestration: {
+      ...defaults.orchestration,
+      ...(input.orchestration ?? {}),
+      updatedAt: input.orchestration?.updatedAt ?? defaults.orchestration.updatedAt,
+    },
   };
 }
 
 async function loadLegacyDocument(cwd: string): Promise<LoadLegacyResult> {
   const paths = getLedgerPaths(cwd);
-  const [tasks, assignments, fileLeases, workers, intent] = await Promise.all([
+  const [tasks, assignments, workers, intent, fileLeases] = await Promise.all([
     readJsonOptional<TasksState>(paths.legacyTasks),
     readJsonOptional<AssignmentsState>(paths.legacyAssignments),
-    readJsonOptional<FileLeasesState>(paths.legacyFileLeases),
     readJsonOptional<WorkersState>(paths.legacyWorkers),
     readJsonOptional<IntentState>(paths.legacyIntent),
+    readJsonOptional<unknown>(paths.legacyFileLeases),
   ]);
-
-  const foundAny = tasks.found || assignments.found || fileLeases.found || workers.found || intent.found;
+  const foundAny = tasks.found || assignments.found || workers.found || intent.found || fileLeases.found;
   return {
     foundAny,
     tasks: tasks.value ?? defaultTasksState(),
     assignments: assignments.value ?? defaultAssignmentsState(),
-    fileLeases: fileLeases.value ?? defaultFileLeasesState(),
     workers: workers.value ?? defaultWorkersState(),
     intent: intent.value ?? defaultIntentState(),
     approval: defaultApprovalState(),
+    orchestration: defaultOrchestrationState(),
   };
 }
 
-async function saveLedgerDocument(document: LedgerDocument, cwd: string = process.cwd()): Promise<void> {
-  await ensureLedgerDirs(cwd);
-  const paths = getLedgerPaths(cwd);
-  await writeJsonAtomic(paths.ledgerFile, {
-    ...document,
-    updatedAt: nowIso(),
-  });
-}
-
-async function loadLedgerDocument(cwd: string = process.cwd()): Promise<LedgerDocument> {
+export async function readLedger(cwd: string = process.cwd()): Promise<LedgerDocument> {
   const paths = getLedgerPaths(cwd);
   const current = await readJsonOptional<LedgerDocument>(paths.ledgerFile);
   if (current.found && current.value) {
@@ -297,180 +252,40 @@ async function loadLedgerDocument(cwd: string = process.cwd()): Promise<LedgerDo
 
   const legacy = await loadLegacyDocument(cwd);
   if (legacy.foundAny) {
-    const migrated: LedgerDocument = normalizeLedgerDocument({
+    const migrated = normalizeLedgerDocument({
       version: SCHEMA_VERSION,
       updatedAt: nowIso(),
       tasks: legacy.tasks,
       assignments: legacy.assignments,
-      fileLeases: legacy.fileLeases,
       workers: legacy.workers,
       intent: legacy.intent,
       approval: legacy.approval,
+      orchestration: legacy.orchestration,
     });
-    await saveLedgerDocument(migrated, cwd);
+    await writeLedger(migrated, cwd);
     return migrated;
   }
 
   return defaultLedgerDocument();
 }
 
-export async function loadTasksState(cwd: string = process.cwd()): Promise<TasksState> {
-  const document = await loadLedgerDocument(cwd);
-  return document.tasks;
-}
-
-export async function saveTasksState(state: TasksState, cwd: string = process.cwd()): Promise<void> {
+export async function writeLedger(document: LedgerDocument, cwd: string = process.cwd()): Promise<void> {
+  await ensureLedgerDirs(cwd);
   const paths = getLedgerPaths(cwd);
-  await withLedgerWriteLock(paths.ledgerFile, async () => {
-    const document = await loadLedgerDocument(cwd);
-    await saveLedgerDocument(
-      {
-        ...document,
-        tasks: {
-          ...state,
-          updatedAt: nowIso(),
-        },
-      },
-      cwd,
-    );
+  const normalized = normalizeLedgerDocument({
+    ...document,
+    updatedAt: nowIso(),
   });
+  await writeJsonAtomic(paths.ledgerFile, normalized);
 }
 
-export async function loadAssignmentsState(cwd: string = process.cwd()): Promise<AssignmentsState> {
-  const document = await loadLedgerDocument(cwd);
-  return document.assignments;
-}
-
-export async function saveAssignmentsState(
-  state: AssignmentsState,
-  cwd: string = process.cwd(),
-): Promise<void> {
-  const paths = getLedgerPaths(cwd);
-  await withLedgerWriteLock(paths.ledgerFile, async () => {
-    const document = await loadLedgerDocument(cwd);
-    await saveLedgerDocument(
-      {
-        ...document,
-        assignments: {
-          ...state,
-          updatedAt: nowIso(),
-        },
-      },
-      cwd,
-    );
-  });
-}
-
-export async function loadFileLeasesState(cwd: string = process.cwd()): Promise<FileLeasesState> {
-  const document = await loadLedgerDocument(cwd);
-  return document.fileLeases;
-}
-
-export async function saveFileLeasesState(
-  state: FileLeasesState,
-  cwd: string = process.cwd(),
-): Promise<void> {
-  const paths = getLedgerPaths(cwd);
-  await withLedgerWriteLock(paths.ledgerFile, async () => {
-    const document = await loadLedgerDocument(cwd);
-    await saveLedgerDocument(
-      {
-        ...document,
-        fileLeases: {
-          ...state,
-          updatedAt: nowIso(),
-        },
-      },
-      cwd,
-    );
-  });
-}
-
-export async function loadWorkersState(cwd: string = process.cwd()): Promise<WorkersState> {
-  const document = await loadLedgerDocument(cwd);
-  return document.workers;
-}
-
-export async function saveWorkersState(state: WorkersState, cwd: string = process.cwd()): Promise<void> {
-  const paths = getLedgerPaths(cwd);
-  await withLedgerWriteLock(paths.ledgerFile, async () => {
-    const document = await loadLedgerDocument(cwd);
-    await saveLedgerDocument(
-      {
-        ...document,
-        workers: {
-          ...state,
-          updatedAt: nowIso(),
-        },
-      },
-      cwd,
-    );
-  });
-}
-
-export async function loadIntentState(cwd: string = process.cwd()): Promise<IntentState> {
-  const document = await loadLedgerDocument(cwd);
-  return document.intent;
-}
-
-export async function saveIntentState(state: IntentState, cwd: string = process.cwd()): Promise<void> {
-  const paths = getLedgerPaths(cwd);
-  await withLedgerWriteLock(paths.ledgerFile, async () => {
-    const document = await loadLedgerDocument(cwd);
-    await saveLedgerDocument(
-      {
-        ...document,
-        intent: {
-          ...state,
-          updatedAt: nowIso(),
-        },
-      },
-      cwd,
-    );
-  });
-}
-
-export async function loadLedgerState(cwd: string = process.cwd()): Promise<{
-  tasks: TasksState;
-  assignments: AssignmentsState;
-  fileLeases: FileLeasesState;
-  workers: WorkersState;
-  intent: IntentState;
-  approval: LedgerApprovalState;
-}> {
-  const document = await loadLedgerDocument(cwd);
-  return {
-    tasks: document.tasks,
-    assignments: document.assignments,
-    fileLeases: document.fileLeases,
-    workers: document.workers,
-    intent: document.intent,
-    approval: document.approval,
-  };
-}
-
-export async function loadLedgerApprovalState(cwd: string = process.cwd()): Promise<LedgerApprovalState> {
-  const document = await loadLedgerDocument(cwd);
-  return document.approval;
-}
-
-export async function saveLedgerApprovalState(
-  state: LedgerApprovalState,
-  cwd: string = process.cwd(),
-): Promise<void> {
-  const paths = getLedgerPaths(cwd);
-  await withLedgerWriteLock(paths.ledgerFile, async () => {
-    const document = await loadLedgerDocument(cwd);
-    await saveLedgerDocument(
-      {
-        ...document,
-        approval: {
-          ...state,
-          updatedAt: nowIso(),
-        },
-      },
-      cwd,
-    );
-  });
+export async function mutateLedger<T>(
+  cwd: string,
+  mutator: (ledger: LedgerDocument) => T | Promise<T>,
+): Promise<T> {
+  const ledger = await readLedger(cwd);
+  const result = await mutator(ledger);
+  await writeLedger(ledger, cwd);
+  return result;
 }
 

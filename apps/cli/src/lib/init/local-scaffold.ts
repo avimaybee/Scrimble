@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { CONFIG_FILE, PROJECT_FILE, RESEARCH_FILE, scrimbleConfigSchema } from '@scrimble/shared';
-import { ensureRuntimeDirs } from '../conductor/runtime.js';
+import { ensureLedgerDirs } from '../ledger/storage.js';
 import { writeSecureJson } from '../security.js';
 import type { DetectedStack } from './stack-detection.js';
 
@@ -23,7 +23,7 @@ export async function setupLocalScaffold(input: LocalScaffoldInput): Promise<voi
   await fs.mkdir(path.join(input.scrimbleDir, 'prompts'), { recursive: true });
   await fs.mkdir(path.join(input.scrimbleDir, 'rules'), { recursive: true });
 
-  await ensureRuntimeDirs(input.cwd);
+  await ensureLedgerDirs(input.cwd);
 
   await writeSecureJson(path.join(input.scrimbleDir, CONFIG_FILE), input.config);
   await writeSecureJson(path.join(input.scrimbleDir, PROJECT_FILE), input.projectData);

@@ -29,7 +29,8 @@ function formatRepoContext(repoContext?: RepoContext): string {
 
 export function buildArchitecturePrompt(input: ArchitecturePromptInput): string {
   const constraints = [
-    'Cloudflare-only backend boundary is mandatory.',
+    'Local-first runtime boundary is mandatory (.scrimble is the source of truth).',
+    'No Scrimble-owned backend service calls in default flows.',
     ...(input.constraints ?? []),
   ];
 
@@ -50,37 +51,23 @@ ${constraints.map((constraint) => `- ${constraint}`).join('\n')}
 ${stackHints}
 
 ## Your Job Right Now
-Produce an architecture proposal that can be implemented incrementally and safely in this repository.
+Propose the smallest set of code changes that solves the goal safely in this repository.
 
 ## Requirements
-1. Keep CLI-first user experience as the primary surface.
-2. Keep local-first state in .scrimble/ with cloud sync support.
-3. Preserve one-active-chunk execution model.
-4. Include durable generation/replan orchestration on Cloudflare.
-5. Include explicit boundaries between local CLI runtime and cloud services.
+1. Keep it stupidly simple.
+2. Prefer the fewest moving parts and the fewest files changed.
+3. Keep conversational CLI-first flow and local .scrimble state as the product boundary.
+4. Do not invent abstractions, extension points, or speculative architecture.
 
 ## Do Not Touch
-- Do not introduce non-Cloudflare backend infrastructure.
+- Do not introduce Scrimble backend service dependencies.
 - Do not convert this into a dashboard-first architecture.
 - Do not propose team-collaboration scope for V1.
 
-## Done When
-- Architecture includes components, data flow, and failure/recovery strategy.
-- Architecture names concrete implementation seams for Phase 1/2 work.
-- Risks and mitigations are explicit and tied to this repo context.
-
-## Verification Signals
-- Proposal references existing repo constraints and stack.
-- Proposal has no contradictory runtime assumptions.
-- Proposal contains migration-safe sequence, not a big-bang rewrite.
-
 ## Output Format
-Return exactly these sections:
-1. Architecture Summary
-2. Runtime Components
-3. Data Model and Storage
-4. Local-Cloud Sync Model
-5. Failure Modes and Recovery
-6. Incremental Implementation Plan
-7. Open Questions`;
+Return exactly:
+- Smallest viable change (2-4 sentences).
+- Files to edit (bullet list with one-line reason each).
+- Why this is enough (1-3 bullets).
+- Risks/unknowns (say "None" if none).`;
 }

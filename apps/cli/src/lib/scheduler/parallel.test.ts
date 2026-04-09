@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { FileLease, LedgerTask } from '@scrimble/shared';
-import { checkParallelDispatch, detectOutOfLeaseEdits, validateParallelBatch } from './parallel.js';
+import type { LedgerTask } from '@scrimble/shared';
+import { detectOutOfLeaseEdits, detectOutOfScopeEdits, hasExplicitOwnership } from './parallel.js';
 
 function makeTask(overrides: Partial<LedgerTask> = {}): LedgerTask {
   return {
@@ -22,37 +22,24 @@ function makeTask(overrides: Partial<LedgerTask> = {}): LedgerTask {
   };
 }
 
-describe('scheduler parallel safety', () => {
-  it('rejects dispatch when ownership overlaps active lease', () => {
-    const task = makeTask({ id: 'task-b', ownedFiles: ['src/auth/index.ts'] });
-    const leases: FileLease[] = [
-      {
-        taskId: 'task-a',
-        worker: 'gemini',
-        paths: ['src/auth/index.ts'],
-        globs: [],
-        leasedAt: new Date().toISOString(),
-      },
-    ];
-
-    const check = checkParallelDispatch(task, [], leases);
-    expect(check.allowed).toBe(false);
-    expect(check.conflicts).toEqual(['task-a']);
+describe('scheduler ownership scope safety', () => {
+  it('requires explicit ownership for execution safety', () => {
+    const task = makeTask({ id: 'task-b', ownedFiles: [] });
+    expect(hasExplicitOwnership(task)).toBe(false);
   });
 
-  it('rejects parallel batch with duplicate ownership', () => {
-    const result = validateParallelBatch([
-      makeTask({ id: 'task-a', ownedFiles: ['src/shared.ts'] }),
-      makeTask({ id: 'task-b', ownedFiles: ['src/shared.ts'] }),
-    ]);
-    expect(result.allowed).toBe(false);
+  it('detects out-of-scope edits', () => {
+    const task = makeTask({ ownedFiles: ['src/task.ts'] });
+    const validation = detectOutOfScopeEdits(task, ['src/task.ts', 'src/other.ts']);
+    expect(validation.valid).toBe(false);
+    expect(validation.outOfScopeFiles).toEqual(['src/other.ts']);
   });
 
-  it('detects out-of-lease edits', () => {
+  it('keeps backward-compatible out-of-lease alias', () => {
     const task = makeTask({ ownedFiles: ['src/task.ts'] });
     const validation = detectOutOfLeaseEdits(task, ['src/task.ts', 'src/other.ts']);
     expect(validation.valid).toBe(false);
-    expect(validation.outOfLeaseFiles).toEqual(['src/other.ts']);
+    expect(validation.outOfScopeFiles).toEqual(['src/other.ts']);
   });
 });
 

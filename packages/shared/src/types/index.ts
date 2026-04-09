@@ -1,6 +1,6 @@
 // Core entity types for Scrimble
 
-// Conductor and runtime types for the Gemini-Conductor pivot
+// Gemini preflight types
 export * from './conductor.js';
 
 // Native ledger types for multi-worker orchestration
@@ -203,27 +203,6 @@ export interface AIOptions {
   topP?: number;
 }
 
-export type AuthProvider = 'custom' | 'firebase';
-
-export interface AuthConfig {
-  provider: AuthProvider;
-  clientId: string;
-  deviceCodeEndpoint: string;
-  tokenEndpoint: string;
-  scope?: string | undefined;
-  audience?: string | undefined;
-}
-
-export interface AuthSession {
-  provider: AuthProvider;
-  accessToken: string;
-  tokenType: string;
-  scope?: string | undefined;
-  refreshToken?: string | undefined;
-  expiresAt?: string | undefined;
-  createdAt: string;
-}
-
 export type PlannerWorker = 'gemini' | 'copilot' | 'auto';
 
 export interface WorkerPreferences {
@@ -244,10 +223,13 @@ export interface VerificationDefaults {
   commands?: string[];
 }
 
+export type InteractionMode = 'guide' | 'balanced' | 'operator';
+
 // Local config
 export interface ScrimbleConfig {
   schemaVersion: number;
   ai: AIConfig;
+  interactionMode: InteractionMode;
   plannerWorker?: PlannerWorker;
   workerPreferences?: WorkerPreferences;
   executionDefaults?: ExecutionDefaults;

@@ -1,6 +1,6 @@
 /**
  * Gemini CLI preflight detection.
- * Checks for Gemini CLI availability, headless auth, folder trust, and Conductor extension.
+ * Checks for Gemini CLI availability, headless auth, and folder trust.
  */
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
@@ -10,7 +10,6 @@ import type {
   GeminiStatus,
   HeadlessAuthStatus,
   FolderTrustStatus,
-  ConductorExtensionStatus,
   PreflightResult,
 } from '@scrimble/shared';
 
@@ -165,69 +164,12 @@ export async function detectFolderTrust(workspacePath: string): Promise<FolderTr
   };
 }
 
-/** Detect Conductor extension status. */
-export async function detectConductorExtension(): Promise<ConductorExtensionStatus> {
-  // Check for Conductor in Gemini extensions
-  const homeDir = os.homedir();
-  const extensionPaths = [
-    path.join(homeDir, '.gemini', 'extensions'),
-    path.join(homeDir, '.config', 'gemini', 'extensions'),
-  ];
-
-  for (const extPath of extensionPaths) {
-    try {
-      const entries = await fs.readdir(extPath);
-      const conductorDir = entries.find((e) => e.toLowerCase().includes('conductor'));
-      if (conductorDir) {
-        const manifestPath = path.join(extPath, conductorDir, 'package.json');
-        try {
-          const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as { version?: string };
-          return {
-            installed: true,
-            enabled: true, // Assume enabled if present
-            ...(manifest.version ? { version: manifest.version } : {}),
-          };
-        } catch {
-          return {
-            installed: true,
-            enabled: true,
-          };
-        }
-      }
-    } catch {
-      // Continue checking
-    }
-  }
-
-  // Try listing extensions via CLI
-  const result = await execCapture('gemini', ['extensions', 'list']);
-  if (result.exitCode === 0) {
-    const hasConductor = result.stdout.toLowerCase().includes('conductor');
-    if (hasConductor) {
-      const versionMatch = result.stdout.match(/conductor.*?(\d+\.\d+\.\d+)/i);
-      const version = versionMatch ? versionMatch[1] : undefined;
-      return {
-        installed: true,
-        enabled: !result.stdout.includes('(disabled)'),
-        ...(version ? { version } : {}),
-      };
-    }
-  }
-
-  return {
-    installed: false,
-    enabled: false,
-    error: 'Conductor extension not found. Install with: gemini extensions install https://github.com/gemini-cli-extensions/conductor',
-  };
-}
-
 /** Run complete preflight checks. */
 export async function runPreflight(workspacePath: string = process.cwd()): Promise<PreflightResult> {
-  const [gemini, headlessAuth, folderTrust, conductor] = await Promise.all([
+  const [gemini, headlessAuth, folderTrust] = await Promise.all([
     detectGemini(),
     detectHeadlessAuth(),
     detectFolderTrust(workspacePath),
-    detectConductorExtension(),
   ]);
 
   const errors: string[] = [];
@@ -242,17 +184,9 @@ export async function runPreflight(workspacePath: string = process.cwd()): Promi
     errors.push(headlessAuth.error ?? 'Headless auth not configured');
   }
 
-  if (!conductor.installed) {
-    errors.push(conductor.error ?? 'Conductor extension not installed');
-  }
-
   // Warnings
   if (folderTrust.enabled && !folderTrust.workspaceTrusted) {
     warnings.push('Workspace not in trusted folders. Gemini may prompt for trust approval.');
-  }
-
-  if (conductor.installed && !conductor.enabled) {
-    warnings.push('Conductor extension is installed but disabled. Enable with: gemini extensions enable conductor');
   }
 
   const canProceed = errors.length === 0;
@@ -261,7 +195,6 @@ export async function runPreflight(workspacePath: string = process.cwd()): Promi
     gemini,
     headlessAuth,
     folderTrust,
-    conductor,
     canProceed,
     warnings,
     errors,
@@ -295,19 +228,10 @@ export function formatPreflightResult(result: PreflightResult): string {
     lines.push('⚠ Folder Trust: workspace not trusted');
   }
 
-  // Conductor
-  if (result.conductor.installed && result.conductor.enabled) {
-    lines.push(`✓ Conductor: v${result.conductor.version ?? 'unknown'}`);
-  } else if (result.conductor.installed) {
-    lines.push('⚠ Conductor: installed but disabled');
-  } else {
-    lines.push(`✗ Conductor: ${result.conductor.error}`);
-  }
-
   // Summary
   lines.push('');
   if (result.canProceed) {
-    lines.push('Ready to proceed with Conductor setup.');
+    lines.push('Ready to proceed with local Gemini execution.');
   } else {
     lines.push('Cannot proceed. Please resolve the errors above.');
   }

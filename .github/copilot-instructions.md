@@ -63,35 +63,26 @@ pnpm test
 Package-scoped commands:
 
 ```bash
-pnpm --filter @scrimble/cli run lint
-pnpm --filter @scrimble/cli run build
-pnpm --filter @scrimble/cli test
-
-pnpm --filter @scrimble/api run lint
-pnpm --filter @scrimble/api run build
-pnpm --filter @scrimble/api test
+pnpm --filter scrimble run lint
+pnpm --filter scrimble run build
+pnpm --filter scrimble test
 ```
 
 Run a single test (Vitest):
 
 ```bash
-pnpm --filter @scrimble/api exec vitest run src/path/to/file.test.ts
-pnpm --filter @scrimble/cli exec vitest run src/path/to/file.test.ts
-pnpm --filter @scrimble/api exec vitest run -t "test name"
+pnpm --filter scrimble exec vitest run src/path/to/file.test.ts
+pnpm --filter scrimble exec vitest run -t "test name"
 ```
 
 ### High-Level Architecture
 
 - Monorepo uses **pnpm workspaces + Turborepo** (`turbo.json`) with `apps/*` and `packages/*`.
 - **CLI (`apps/cli`)** is oclif-based and local-first:
-  - State lives in `.scrimble/` and is managed by `apps/cli/src/lib/local/state.ts`.
-  - Commands in `apps/cli/src/commands/*` drive execution flow (`import`, `replan`, `sync`, `watch`, etc.).
-- **API (`apps/api`)** runs on Cloudflare Workers + Hono:
-  - Entry router is `apps/api/src/index.ts`.
-  - `GenerationProgressHub` Durable Object orchestrates generation/replan and streams progress (`/events`, `/stream`).
-  - D1 is the historical source of truth for runs/revisions/chunks (`generation_runs`, `plan_revisions`, `chunks`).
-  - R2 stores run artifacts (`apps/api/src/lib/storage.ts`).
-- **Shared contracts (`packages/shared`)** contain canonical TS types + Zod schemas used across CLI/API.
+  - Canonical orchestration state lives in `.scrimble/ledger.json`.
+  - `scrimble` (root) is conversation-first and orchestrates internal agent tools.
+  - Runtime artifacts and attempts stay under `.scrimble/runtime/`.
+- **Shared contracts (`packages/shared`)** contain canonical TS types + Zod schemas used by the CLI.
 
 ### Key Conventions
 
@@ -100,16 +91,9 @@ pnpm --filter @scrimble/api exec vitest run -t "test name"
   - CLI lint uses `tsconfig.lint.json` (`noEmit`)
   - CLI build uses `tsc -b`
   - Do **not** reintroduce `tsc -b --force`.
-- Keep cloud run lifecycle explicit with `runId`:
-  - API creates D1 run records before queuing DO.
-  - DO receives `runId` and updates D1 run status.
-- Keep status authority in D1:
-  - `/v1/generation/:id` and `/v1/replan/:id` read latest run from D1.
-  - DO in-memory job state is for orchestration/SSE context, not durable history.
-- Keep plan persistence model:
-  - `plan_revisions.plan_data` is lightweight metadata.
-  - `chunks` table is the execution source of truth.
-- Keep sync behavior hash-based:
-  - `scrimble sync` uses Last-Write-Wins with hash latch (`lastRemotePlanHash`) and no local event queue.
-- Keep proactive watch passive:
-  - Use execution signals (test/build artifacts), not filename relevance heuristics.
+- Keep root invocation compatibility in `apps/cli/bin/run.js`:
+  - quoted requests and `--prompt` route into `root --prompt`.
+  - removed workflow commands print migration guidance.
+- Keep worker execution local and capability-aware:
+  - Copilot prompt mode must include unattended tool permission flags.
+  - Gemini checkpointing flag must only be passed when supported.

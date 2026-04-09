@@ -2,9 +2,11 @@
  * Scrimble Native Ledger Types
  *
  * The ledger is the canonical source of truth for task state, assignments,
- * and file ownership. Provider artifacts (GEMINI.md, AGENTS.md, conductor/)
+ * and ownership scope. Provider artifacts (GEMINI.md, AGENTS.md, conductor/)
  * are supplemental context only.
  */
+
+import type { IntentState } from './intent.js';
 
 // --- Worker Identity ---
 
@@ -77,22 +79,6 @@ export interface LedgerTask {
   attemptCount: number;
   /** Maximum retry attempts before marking failed. */
   maxRetries: number;
-}
-
-/** A file lease granting exclusive modification rights. */
-export interface FileLease {
-  /** Task that holds this lease. */
-  taskId: string;
-  /** Worker executing the task. */
-  worker: WorkerKind;
-  /** Exact file paths owned. */
-  paths: string[];
-  /** Glob patterns owned (e.g., "src/auth/**"). */
-  globs: string[];
-  /** When the lease was acquired. */
-  leasedAt: string;
-  /** When the lease expires (optional timeout). */
-  expiresAt?: string;
 }
 
 /** Assignment binding a task to a worker. */
@@ -191,16 +177,6 @@ export interface AssignmentsState {
   updatedAt: string;
 }
 
-/** Root container for file leases in the ledger document. */
-export interface FileLeasesState {
-  /** Schema version for migrations. */
-  version: number;
-  /** All active file leases. */
-  leases: FileLease[];
-  /** Timestamp of last modification. */
-  updatedAt: string;
-}
-
 /** Root container for worker health in the ledger document. */
 export interface WorkersState {
   /** Schema version for migrations. */
@@ -225,6 +201,117 @@ export interface LedgerApprovalState {
   updatedAt: string;
 }
 
+/** Snapshot of a conversational plan for interruption-safe resume. */
+export interface OrchestrationPlanState {
+  id: string;
+  request: string;
+  goal: string;
+  requiresConfirmation: boolean;
+  createdAt: string;
+  steps: Array<{
+    action: string;
+    summary: string;
+    mutating: boolean;
+  }>;
+}
+
+/** Snapshot of the latest conversational execution result. */
+export interface OrchestrationExecutionSummaryState {
+  planId: string;
+  request: string;
+  summary: string;
+  completedAt: string;
+  results: Array<{
+    action: string;
+    summary: string;
+  }>;
+}
+
+/** Pending approval boundary for the operator loop. */
+export interface OrchestrationBoundaryState {
+  id: string;
+  action: string;
+  actionSummary: string;
+  reason: string;
+  scope: {
+    parallel: number;
+    maxTasks: number;
+    args: Record<string, unknown>;
+  };
+  choices: Array<'proceed' | 'pause' | 'redirect'>;
+  requestedAt: string;
+}
+
+/** Single completed operator step. */
+export interface OrchestrationStepState {
+  action: string;
+  summary: string;
+  completedAt: string;
+}
+
+/** Durable state for an active conversational operator run. */
+export interface OrchestrationActiveRunState {
+  request: string;
+  startedAt: string;
+  updatedAt: string;
+  stepCount: number;
+  completedSteps: OrchestrationStepState[];
+  currentStep?: {
+    action: string;
+    actionSummary: string;
+    rationale: string;
+    requiresConfirmation: boolean;
+    expectedOutcome: string;
+    pauseCondition: string;
+    plannedAt: string;
+  };
+  resumableContext?: {
+    history: string[];
+  };
+  pauseState?: {
+    kind: 'boundary' | 'guard' | 'blocked' | 'manual';
+    reason: string;
+    nextSuggestedAction?: string;
+  };
+  pendingBoundary?: OrchestrationBoundaryState;
+  lastPauseReason?: string;
+  lastRedirect?: string;
+}
+
+/** Snapshot of the latest operator-loop outcome. */
+export interface OrchestrationRunOutcomeState {
+  status: 'completed' | 'paused' | 'blocked' | 'redirected' | 'failed';
+  request: string;
+  summary: string;
+  reason?: string;
+  nextSuggestedAction?: string;
+  completedAt: string;
+}
+
+/** Conversational orchestration continuity state stored in the ledger document. */
+export interface OrchestrationState {
+  version: number;
+  sessionId: string;
+  lastProposedPlan?: OrchestrationPlanState;
+  lastConfirmedPlan?: OrchestrationPlanState;
+  lastExecutionSummary?: OrchestrationExecutionSummaryState;
+  activeRun?: OrchestrationActiveRunState;
+  lastRunOutcome?: OrchestrationRunOutcomeState;
+  updatedAt: string;
+}
+
+/** Canonical whole-document ledger persisted in `.scrimble/ledger.json`. */
+export interface LedgerDocument {
+  version: number;
+  updatedAt: string;
+  tasks: TasksState;
+  assignments: AssignmentsState;
+  workers: WorkersState;
+  intent: IntentState;
+  approval: LedgerApprovalState;
+  orchestration: OrchestrationState;
+}
+
 // --- Ledger Events ---
 
 /** Event types for the append-only event log. */
@@ -242,10 +329,6 @@ export type LedgerEventType =
   | 'assignment_started'
   | 'assignment_completed'
   | 'assignment_conflicted'
-  // File lease lifecycle
-  | 'lease_acquired'
-  | 'lease_released'
-  | 'lease_violation'
   // Verification
   | 'verification_started'
   | 'verification_passed'
@@ -284,8 +367,6 @@ export interface LedgerSummary {
   tasksByStatus: Record<TaskStatus, number>;
   /** Active assignments. */
   activeAssignments: number;
-  /** Active file leases. */
-  activeLeases: number;
   /** Available workers. */
   availableWorkers: WorkerKind[];
   /** Blocked tasks. */
@@ -308,12 +389,3 @@ export interface TaskQuery {
   limit?: number;
 }
 
-/** Result of a file lease check. */
-export interface LeaseCheckResult {
-  /** Whether files can be leased. */
-  canLease: boolean;
-  /** Conflicting leases if canLease is false. */
-  conflicts: FileLease[];
-  /** Reason for conflict. */
-  reason?: string;
-}

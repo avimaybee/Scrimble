@@ -26,28 +26,8 @@ export const aiConfigSchema = z.object({
   options: aiOptionsSchema.optional(),
 }).strict();
 
-export const authProviderSchema = z.enum(['custom', 'firebase']);
-
-export const authConfigSchema = z.object({
-  provider: authProviderSchema,
-  clientId: z.string().min(1),
-  deviceCodeEndpoint: z.string().url(),
-  tokenEndpoint: z.string().url(),
-  scope: z.string().optional(),
-  audience: z.string().optional(),
-}).strict();
-
-export const authSessionSchema = z.object({
-  provider: authProviderSchema,
-  accessToken: z.string().min(1),
-  tokenType: z.string().min(1),
-  scope: z.string().optional(),
-  refreshToken: z.string().optional(),
-  expiresAt: z.string().datetime().optional(),
-  createdAt: z.string().datetime(),
-}).strict();
-
 export const plannerWorkerSchema = z.enum(['gemini', 'copilot', 'auto']);
+export const interactionModeSchema = z.enum(['guide', 'balanced', 'operator']);
 
 export const workerPreferencesSchema = z.object({
   defaultWorker: plannerWorkerSchema.optional(),
@@ -71,6 +51,7 @@ export const verificationDefaultsSchema = z.object({
 export const scrimbleConfigSchema = z.object({
   schemaVersion: z.number().int().positive().default(1),
   ai: aiConfigSchema,
+  interactionMode: interactionModeSchema.default('guide'),
   plannerWorker: plannerWorkerSchema.optional(),
   workerPreferences: workerPreferencesSchema.optional(),
   executionDefaults: executionDefaultsSchema.optional(),
@@ -198,9 +179,7 @@ export const firebaseApproveRequestSchema = z.object({
 // Only export schema-derived types for use with zod inference
 export type AIProviderFromSchema = z.infer<typeof aiProviderSchema>;
 export type AIConfigFromSchema = z.infer<typeof aiConfigSchema>;
-export type AuthProviderFromSchema = z.infer<typeof authProviderSchema>;
-export type AuthConfigFromSchema = z.infer<typeof authConfigSchema>;
-export type AuthSessionFromSchema = z.infer<typeof authSessionSchema>;
+export type InteractionModeFromSchema = z.infer<typeof interactionModeSchema>;
 export type ScrimbleConfigFromSchema = z.infer<typeof scrimbleConfigSchema>;
 export type ProjectStatusFromSchema = z.infer<typeof projectStatusSchema>;
 export type ChunkStatusFromSchema = z.infer<typeof chunkStatusSchema>;

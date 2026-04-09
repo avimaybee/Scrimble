@@ -11,7 +11,7 @@ const factoryMocks = vi.hoisted(() => ({
 vi.mock('../workers/factory.js', () => factoryMocks);
 
 import { createTask, getTask } from '../ledger/operations.js';
-import { saveLedgerApprovalState } from '../ledger/storage.js';
+import { mutateLedger } from '../ledger/storage.js';
 import { LedgerSupervisor } from './supervisor.js';
 
 function createFakeDriver(
@@ -20,7 +20,9 @@ function createFakeDriver(
   options: {
     available?: boolean;
     onStart?: (worker: WorkerKind) => void;
+    onFinish?: (worker: WorkerKind) => void;
     resolveTouchedFiles?: (prompt: string) => string[];
+    delayMs?: number;
   } = {},
 ): WorkerDriver {
   let executionPrompt = '';
@@ -55,6 +57,10 @@ function createFakeDriver(
       };
     },
     async waitForCompletion(): Promise<ExecutionResult> {
+      if (options.delayMs && options.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, options.delayMs));
+      }
+      options.onFinish?.(kind);
       const resolvedTouchedFiles = options.resolveTouchedFiles
         ? options.resolveTouchedFiles(executionPrompt)
         : touchedFiles;
@@ -116,15 +122,14 @@ describe('ledger supervisor', () => {
     testDir = path.join(tmpdir(), `scheduler-supervisor-${Date.now()}`);
     await fs.mkdir(testDir, { recursive: true });
     await fs.mkdir(path.join(testDir, '.git'), { recursive: true });
-    await saveLedgerApprovalState(
-      {
-        version: 1,
+    await mutateLedger(testDir, (ledger) => {
+      ledger.approval = {
+        ...ledger.approval,
         approved: true,
         approvedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      },
-      testDir,
-    );
+      };
+    });
     factoryMocks.getWorkerDriver.mockReset();
   });
 
@@ -182,8 +187,11 @@ describe('ledger supervisor', () => {
     expect(task?.status).toBe('blocked');
   });
 
-  it('does not overbook a single-capacity worker in parallel batch routing', async () => {
+  it('runs one active task at a time even when parallel is requested', async () => {
     const startedWorkers: WorkerKind[] = [];
+    const finishedWorkers: WorkerKind[] = [];
+    let activeExecutions = 0;
+    let observedOverlap = false;
     await fs.mkdir(path.join(testDir, 'src'), { recursive: true });
     await fs.writeFile(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;\n', 'utf8');
     await fs.writeFile(path.join(testDir, 'src', 'b.ts'), 'export const b = 1;\n', 'utf8');
@@ -215,7 +223,18 @@ describe('ledger supervisor', () => {
     factoryMocks.getWorkerDriver.mockImplementation((kind: WorkerKind) =>
       createFakeDriver(kind, [], {
         available: true,
-        onStart: (worker) => startedWorkers.push(worker),
+        delayMs: 20,
+        onStart: (worker) => {
+          startedWorkers.push(worker);
+          activeExecutions += 1;
+          if (activeExecutions > 1) {
+            observedOverlap = true;
+          }
+        },
+        onFinish: (worker) => {
+          finishedWorkers.push(worker);
+          activeExecutions = Math.max(0, activeExecutions - 1);
+        },
         resolveTouchedFiles: (prompt) => {
           if (prompt.includes('task:task-3')) {
             return ['src/a.ts'];
@@ -232,19 +251,18 @@ describe('ledger supervisor', () => {
     await supervisor.run({ cwd: testDir, parallel: 2, maxTasks: 2 });
 
     expect(startedWorkers).toHaveLength(2);
-    expect(startedWorkers.filter((worker) => worker === 'gemini')).toHaveLength(1);
-    expect(startedWorkers.filter((worker) => worker === 'copilot')).toHaveLength(1);
+    expect(finishedWorkers).toHaveLength(2);
+    expect(observedOverlap).toBe(false);
   });
 
   it('requires approval before dispatching ledger tasks', async () => {
-    await saveLedgerApprovalState(
-      {
-        version: 1,
+    await mutateLedger(testDir, (ledger) => {
+      ledger.approval = {
+        ...ledger.approval,
         approved: false,
         updatedAt: new Date().toISOString(),
-      },
-      testDir,
-    );
+      };
+    });
     await createTask(
       {
         id: 'task-unapproved',
@@ -260,7 +278,9 @@ describe('ledger supervisor', () => {
     );
 
     const supervisor = new LedgerSupervisor();
-    await expect(supervisor.run({ cwd: testDir, maxTasks: 1 })).rejects.toThrow('Ledger execution is not approved');
+    await expect(supervisor.run({ cwd: testDir, maxTasks: 1 })).rejects.toThrow(
+      'requires a confirmed conversational plan',
+    );
   });
 });
 
