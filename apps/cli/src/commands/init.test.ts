@@ -64,11 +64,13 @@ describe('init command local-first setup', () => {
       string,
       unknown
     >;
-    expect(config['schemaVersion']).toBe(1);
+    expect(config['schemaVersion']).toBe(2);
     expect(config['interactionMode']).toBe('guide');
     expect(config['auth']).toBeUndefined();
     expect(config['projectId']).toBeUndefined();
     expect(config['cloudEndpoint']).toBeUndefined();
+    expect(Array.isArray(config['profiles'])).toBe(true);
+    expect(typeof config['activeProfileId']).toBe('string');
 
     const sessionExists = await fs
       .access(path.join(tempDir, '.scrimble', 'session.json'))

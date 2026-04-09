@@ -1,18 +1,20 @@
 import { createHash } from 'node:crypto';
 import type { LedgerTask, WorkerDriver, WorkerHealth, WorkerKind } from '@scrimble/shared';
 import {
-  completeTask,
+  completeActiveTask,
+  failActiveTask,
   getReadyTasks,
   getTask,
-  leaseTask,
-  releaseTask,
-  setAssignmentStatus,
+  startNextReadyTask,
+  updateActiveExecution,
   updateTaskStatus,
+  blockActiveTask,
+  clearActiveExecution,
 } from '../ledger/operations.js';
 import { appendLedgerEvent, completeExecutionRecord, startExecutionRecord } from '../ledger/records.js';
 import { mutateLedger, readLedger } from '../ledger/storage.js';
 import { getWorkerDriver } from '../workers/factory.js';
-import { detectOutOfScopeEdits, hasExplicitOwnership } from './parallel.js';
+import { detectOutOfScopeEdits, hasExplicitOwnership } from './ownership.js';
 import { routeTask } from './router.js';
 import { analyzeTaskDrift, verifyTaskExecution } from '../verification/index.js';
 
@@ -66,12 +68,21 @@ function toWorkerHealthMap(ledgerWorkers: WorkerHealth[]): Record<WorkerKind, Wo
   };
 }
 
+function normalizeBoundedExecution(options: SupervisorRunOptions): { parallel: number; maxTasks: number } {
+  const requestedParallel = options.parallel ?? 1;
+  const requestedMaxTasks = options.maxTasks ?? 1;
+  return {
+    parallel: requestedParallel > 1 ? 1 : Math.max(1, requestedParallel),
+    maxTasks: requestedMaxTasks > 1 ? 1 : Math.max(1, requestedMaxTasks),
+  };
+}
+
 export class LedgerSupervisor {
   async run(options: SupervisorRunOptions = {}): Promise<SupervisorRunResult> {
     const cwd = options.cwd ?? process.cwd();
     const workerSelection = options.worker ?? 'auto';
     const timeoutMs = options.timeoutMs ?? 300_000;
-    const maxTasks = options.maxTasks ?? Number.POSITIVE_INFINITY;
+    const bounded = normalizeBoundedExecution(options);
 
     const ledger = await readLedger(cwd);
     if (ledger.tasks.tasks.length > 0 && !ledger.approval.approved) {
@@ -86,12 +97,27 @@ export class LedgerSupervisor {
       throw new Error('Ledger execution requires a confirmed conversational plan before dispatch.');
     }
 
+    if (ledger.runtime.activeExecution) {
+      await appendLedgerEvent(
+        'run_paused',
+        {
+          reason: 'active_execution_present',
+          taskId: ledger.runtime.activeExecution.taskId,
+        },
+        cwd,
+      );
+      throw new Error(`Cannot start a new run while task ${ledger.runtime.activeExecution.taskId} is still active.`);
+    }
+
     await appendLedgerEvent(
       'run_started',
       {
         worker: workerSelection,
-        parallel: 1,
+        parallel: bounded.parallel,
+        maxTasks: bounded.maxTasks,
         timeoutMs,
+        ...(options.parallel && options.parallel > 1 ? { normalizedParallel: options.parallel } : {}),
+        ...(options.maxTasks && options.maxTasks > 1 ? { normalizedMaxTasks: options.maxTasks } : {}),
       },
       cwd,
     );
@@ -135,21 +161,11 @@ export class LedgerSupervisor {
       skippedTaskIds: [],
     };
 
-    let processed = 0;
-    while (processed < maxTasks) {
-      const readyTasks = await getReadyTasks(cwd);
-      if (readyTasks.length === 0) {
-        break;
-      }
-
-      const nextTask = readyTasks[0];
-      if (!nextTask) {
-        break;
-      }
-
+    const readyTasks = await getReadyTasks(cwd);
+    const nextTask = readyTasks[0];
+    if (nextTask) {
       if (!hasExplicitOwnership(nextTask)) {
-        await releaseTask(nextTask.id, {
-          toStatus: 'blocked',
+        await updateTaskStatus(nextTask.id, 'blocked', {
           error: 'Task has no explicit owned files; execution was paused for safety.',
           cwd,
         });
@@ -162,46 +178,36 @@ export class LedgerSupervisor {
           cwd,
         );
         result.skippedTaskIds.push(nextTask.id);
-        processed += 1;
-        continue;
-      }
-
-      const workersForRouting = Object.values(workerHealthByKind);
-      if (!workersForRouting.some((worker) => worker.available)) {
-        break;
-      }
-
-      let worker: WorkerKind;
-      try {
-        worker = routeTask(nextTask, {
-          workers: workersForRouting,
-          ...(workerSelection === 'auto' ? {} : { manualWorker: workerSelection }),
-        }).worker;
-      } catch {
-        break;
-      }
-
-      const taskResult = await this.runSingleTask(nextTask, {
-        worker,
-        cwd,
-        timeoutMs,
-      });
-      processed += 1;
-
-      const workerState = workerHealthByKind[taskResult.worker];
-      if (taskResult.status === 'completed') {
-        result.completedTaskIds.push(taskResult.taskId);
-        workerState.tasksCompleted += 1;
-      } else if (taskResult.status === 'failed') {
-        result.failedTaskIds.push(taskResult.taskId);
-        workerState.tasksFailed += 1;
-      } else if (taskResult.status === 'conflicted') {
-        result.conflictedTaskIds.push(taskResult.taskId);
-        workerState.tasksFailed += 1;
-      } else if (taskResult.status === 'retry') {
-        result.retriedTaskIds.push(taskResult.taskId);
       } else {
-        result.skippedTaskIds.push(taskResult.taskId);
+        const workersForRouting = Object.values(workerHealthByKind);
+        const availableWorkers = workersForRouting.filter((worker) => worker.available);
+        if (availableWorkers.length > 0) {
+          const worker = routeTask(nextTask, {
+            workers: workersForRouting,
+            ...(workerSelection === 'auto' ? {} : { manualWorker: workerSelection }),
+          }).worker;
+          const taskResult = await this.runSingleTask(nextTask, {
+            worker,
+            cwd,
+            timeoutMs,
+          });
+
+          const workerState = workerHealthByKind[taskResult.worker];
+          if (taskResult.status === 'completed') {
+            result.completedTaskIds.push(taskResult.taskId);
+            workerState.tasksCompleted += 1;
+          } else if (taskResult.status === 'failed') {
+            result.failedTaskIds.push(taskResult.taskId);
+            workerState.tasksFailed += 1;
+          } else if (taskResult.status === 'conflicted') {
+            result.conflictedTaskIds.push(taskResult.taskId);
+            workerState.tasksFailed += 1;
+          } else if (taskResult.status === 'retry') {
+            result.retriedTaskIds.push(taskResult.taskId);
+          } else {
+            result.skippedTaskIds.push(taskResult.taskId);
+          }
+        }
       }
     }
 
@@ -240,14 +246,19 @@ export class LedgerSupervisor {
     const driver = createDriver(worker, input.cwd);
 
     try {
-      await leaseTask(task.id, worker, { cwd: input.cwd });
-      await appendLedgerEvent('task_leased', { taskId: task.id, worker }, input.cwd);
+      const activeTask = await startNextReadyTask({
+        worker,
+        taskId: task.id,
+        phase: 'dispatching',
+        statusMessage: `Dispatching ${task.id}`,
+        cwd: input.cwd,
+      });
 
       const contextArtifacts = await driver.discoverContextArtifacts();
       const ledger = await readLedger(input.cwd);
-      const prompt = driver.buildPrompt(task, contextArtifacts, {
+      const prompt = driver.buildPrompt(activeTask, contextArtifacts, {
         tasks: ledger.tasks,
-        assignments: ledger.assignments,
+        runtime: ledger.runtime,
       });
 
       const promptHash = createHash('sha256').update(prompt).digest('hex').slice(0, 16);
@@ -260,8 +271,11 @@ export class LedgerSupervisor {
         input.cwd,
       );
 
-      await updateTaskStatus(task.id, 'running', { incrementAttempt: true, error: null, cwd: input.cwd });
-      await setAssignmentStatus(task.id, 'in_progress', { cwd: input.cwd });
+      await updateActiveExecution({
+        phase: 'executing',
+        statusMessage: `Executing ${task.id}`,
+        cwd: input.cwd,
+      });
 
       const handle = await driver.startExecution(prompt, {
         timeout: input.timeoutMs,
@@ -272,6 +286,12 @@ export class LedgerSupervisor {
       });
       const execution = await driver.waitForCompletion(handle);
       const touchedFiles = driver.extractTouchedFiles(execution);
+
+      await updateActiveExecution({
+        phase: 'verifying',
+        statusMessage: `Verifying ${task.id}`,
+        cwd: input.cwd,
+      });
 
       const scopeValidation = detectOutOfScopeEdits(task, touchedFiles);
       if (!scopeValidation.valid) {
@@ -290,9 +310,8 @@ export class LedgerSupervisor {
           },
           input.cwd,
         );
-        await setAssignmentStatus(task.id, 'conflicted', { cwd: input.cwd });
-        await releaseTask(task.id, {
-          toStatus: 'blocked',
+        await blockActiveTask({
+          taskId: task.id,
           error: message,
           cwd: input.cwd,
         });
@@ -309,19 +328,18 @@ export class LedgerSupervisor {
       }
 
       if (execution.success) {
-        await updateTaskStatus(task.id, 'verify_pending', { cwd: input.cwd, error: null });
         await appendLedgerEvent('verification_started', { taskId: task.id, worker }, input.cwd);
 
         const verification = await verifyTaskExecution({
-          task,
+          task: activeTask,
           cwd: input.cwd,
           touchedFiles,
         });
         const latestTasks = (await readLedger(input.cwd)).tasks;
         const drift = analyzeTaskDrift({
-          task,
+          task: activeTask,
           touchedFiles,
-          dependencyStatuses: task.dependencies.map((dependencyId) => ({
+          dependencyStatuses: activeTask.dependencies.map((dependencyId) => ({
             taskId: dependencyId,
             status: latestTasks.tasks.find((candidate) => candidate.id === dependencyId)?.status ?? 'blocked',
           })),
@@ -356,7 +374,12 @@ export class LedgerSupervisor {
             },
             input.cwd,
           );
-          await releaseTask(task.id, { toStatus: 'failed', error: failureMessage, cwd: input.cwd });
+          await failActiveTask({
+            taskId: task.id,
+            toStatus: 'failed',
+            error: failureMessage,
+            cwd: input.cwd,
+          });
           return { status: 'failed', taskId: task.id, worker, error: failureMessage };
         }
 
@@ -383,7 +406,7 @@ export class LedgerSupervisor {
           },
           input.cwd,
         );
-        await completeTask(task.id, { worker, cwd: input.cwd });
+        await completeActiveTask({ taskId: task.id, cwd: input.cwd });
         return { status: 'completed', taskId: task.id, worker };
       }
 
@@ -404,22 +427,52 @@ export class LedgerSupervisor {
       );
 
       const latestTask = await getTask(task.id, input.cwd);
-      const attemptCount = latestTask?.attemptCount ?? task.attemptCount;
-      if (failure.retryable && attemptCount < task.maxRetries) {
-        await releaseTask(task.id, { toStatus: 'pending', error: failure.message, cwd: input.cwd });
+      const attemptCount = latestTask?.attemptCount ?? activeTask.attemptCount;
+      if (failure.retryable && attemptCount < activeTask.maxRetries) {
+        await failActiveTask({
+          taskId: task.id,
+          toStatus: 'ready',
+          error: failure.message,
+          cwd: input.cwd,
+        });
         await appendLedgerEvent('task_retried', { taskId: task.id, worker, reason: failure.message }, input.cwd);
         return { status: 'retry', taskId: task.id, worker };
       }
 
-      await releaseTask(task.id, { toStatus: 'failed', error: failure.message, cwd: input.cwd });
+      await failActiveTask({
+        taskId: task.id,
+        toStatus: 'failed',
+        error: failure.message,
+        cwd: input.cwd,
+      });
       await appendLedgerEvent('task_failed', { taskId: task.id, worker, error: failure.message }, input.cwd);
       return { status: 'failed', taskId: task.id, worker, error: failure.message };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await releaseTask(task.id, { toStatus: 'failed', error: message, cwd: input.cwd });
+      try {
+        await failActiveTask({
+          taskId: task.id,
+          toStatus: 'failed',
+          error: message,
+          cwd: input.cwd,
+        });
+      } catch {
+        try {
+          await clearActiveExecution({ taskId: task.id, cwd: input.cwd });
+        } catch (clearError) {
+          await appendLedgerEvent(
+            'run_failed',
+            {
+              taskId: task.id,
+              error: clearError instanceof Error ? clearError.message : String(clearError),
+            },
+            input.cwd,
+          );
+        }
+        await updateTaskStatus(task.id, 'failed', { error: message, cwd: input.cwd });
+      }
       await appendLedgerEvent('task_failed', { taskId: task.id, worker, error: message }, input.cwd);
       return { status: 'failed', taskId: task.id, worker, error: message };
     }
   }
 }
-

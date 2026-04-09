@@ -14,7 +14,7 @@ const configMocks = vi.hoisted(() => ({
 }));
 
 const providerMocks = vi.hoisted(() => ({
-  createLanguageModel: vi.fn(),
+  createLanguageModelFromScrimbleConfig: vi.fn(),
 }));
 
 const toolMocks = vi.hoisted(() => ({
@@ -41,7 +41,26 @@ vi.mock('./tools.js', async () => {
 });
 
 import { ConversationalOrchestrator, isMutatingPlan } from './orchestrator.js';
-import type { AgentPlan, AgentToolCall } from './types.js';
+import type { AgentPlan } from './types.js';
+
+function makeTask(id: string, status: 'pending' | 'completed' | 'blocked' = 'pending'): Record<string, unknown> {
+  return {
+    id,
+    title: id,
+    objective: id,
+    doneCriteria: 'done',
+    ownedFiles: [`src/${id}.ts`],
+    allowedFiles: [],
+    verificationCommands: [],
+    dependencies: [],
+    riskScore: 2,
+    status,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    attemptCount: 0,
+    maxRetries: 1,
+  };
+}
 
 function makeLedger(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -52,9 +71,8 @@ function makeLedger(overrides: Record<string, unknown> = {}): Record<string, unk
       tasks: [],
       updatedAt: '2026-01-01T00:00:00.000Z',
     },
-    assignments: {
+    runtime: {
       version: 1,
-      assignments: [],
       updatedAt: '2026-01-01T00:00:00.000Z',
     },
     workers: {
@@ -82,7 +100,7 @@ function makeLedger(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
-describe('conversational orchestrator tool loop', () => {
+describe('conversational orchestrator', () => {
   beforeEach(() => {
     toolMocks.runAgentTool.mockReset();
     aiMocks.generateText.mockReset();
@@ -90,10 +108,21 @@ describe('conversational orchestrator tool loop', () => {
     ledgerStorageMocks.readLedger.mockReset();
     ledgerStorageMocks.mutateLedger.mockReset();
     configMocks.loadScrimbleConfig.mockResolvedValue({
-      schemaVersion: 1,
-      ai: { provider: 'openai', model: 'gpt-4o', apiKey: 'sk-test' },
+      schemaVersion: 2,
+      activeProfileId: 'profile-openai',
+      profiles: [
+        {
+          id: 'profile-openai',
+          name: 'OpenAI profile',
+          provider: 'openai',
+          modelStrategy: 'explicit',
+          model: 'gpt-4o',
+          auth: { strategy: 'api_key', apiKey: 'sk-test' },
+        },
+      ],
+      interactionMode: 'guide',
     });
-    providerMocks.createLanguageModel.mockReturnValue({ model: 'mock' });
+    providerMocks.createLanguageModelFromScrimbleConfig.mockReturnValue({ model: 'mock' });
     aiMocks.generateText.mockResolvedValue({
       text: 'planned',
       toolCalls: [],
@@ -108,8 +137,8 @@ describe('conversational orchestrator tool loop', () => {
         };
       }
       return {
-        action: 'check_status',
-        summary: 'status ok',
+        action,
+        summary: `${action} ok`,
         details: [],
       };
     });
@@ -134,8 +163,8 @@ describe('conversational orchestrator tool loop', () => {
         };
       }
       return {
-        action: 'check_status',
-        summary: 'status ok',
+        action,
+        summary: `${action} ok`,
         details: [],
       };
     });
@@ -146,12 +175,6 @@ describe('conversational orchestrator tool loop', () => {
     expect(plan.calls.map((call) => call.action)).toEqual(['check_setup', 'configure_ai']);
     expect(plan.requiresConfirmation).toBe(true);
     expect(aiMocks.generateText).not.toHaveBeenCalled();
-    expect(toolMocks.runAgentTool).toHaveBeenCalledWith(
-      'check_setup',
-      expect.objectContaining({ request: 'ship feature' }),
-      {},
-    );
-    expect(ledgerStorageMocks.mutateLedger).toHaveBeenCalled();
   });
 
   it('builds plan from LLM tool calls', async () => {
@@ -201,10 +224,9 @@ describe('conversational orchestrator tool loop', () => {
     expect(plan.previewResults).toHaveLength(2);
     expect(plan.requiresConfirmation).toBe(true);
     expect(isMutatingPlan(plan)).toBe(true);
-    expect(ledgerStorageMocks.mutateLedger).toHaveBeenCalled();
   });
 
-  it('executes only mutating calls from a proposed plan', async () => {
+  it('executes mutating calls from a proposed plan', async () => {
     const plan: AgentPlan = {
       id: 'plan-1',
       request: 'ship auth',
@@ -229,181 +251,153 @@ describe('conversational orchestrator tool loop', () => {
     });
 
     const orchestrator = new ConversationalOrchestrator('D:\\repo');
-    const progress: string[] = [];
-    const result = await orchestrator.executePlan(plan, {
-      onProgress: (line: string) => progress.push(line),
-    });
+    const result = await orchestrator.executePlan(plan);
 
     expect(toolMocks.runAgentTool).toHaveBeenCalledTimes(1);
-    expect(toolMocks.runAgentTool).toHaveBeenCalledWith(
-      'execute_tasks',
-      expect.objectContaining({ request: 'ship auth' }),
-      { worker: 'auto' },
-      expect.objectContaining({ execute: expect.any(Object) }),
-    );
-    expect(ledgerStorageMocks.mutateLedger).toHaveBeenCalled();
     expect(result.results).toHaveLength(2);
-    expect(progress.length).toBeGreaterThan(0);
   });
 
-  it('continues looping after execute_tasks and uses bounded execution defaults', async () => {
-    const orchestrator = new ConversationalOrchestrator('D:\\repo');
-    const makePlan = (id: string, request: string, calls: AgentToolCall[]): AgentPlan => ({
-      id,
-      request,
-      goal: request,
-      calls,
-      steps: calls.map((call) => ({
-        action: call.action,
-        summary: call.action,
-        mutating: call.mutating,
-      })),
-      previewResults: [],
-      requiresConfirmation: calls.some((call) => call.mutating),
-      createdAt: '2026-01-01T00:00:00.000Z',
+  it('handles read-only requests deterministically and writes only planning/completion boundaries', async () => {
+    toolMocks.runAgentTool.mockImplementation(async (action: string) => {
+      if (action === 'check_setup') {
+        return { action: 'check_setup', summary: 'setup ok', details: [] };
+      }
+      if (action === 'check_status') {
+        return { action: 'check_status', summary: 'Progress: 0/0 tasks complete.', details: ['Pending tasks: 0'] };
+      }
+      return { action, summary: `${action} ok`, details: [] };
     });
 
-    const proposeSpy = vi.spyOn(orchestrator, 'proposePlan')
-      .mockResolvedValueOnce(makePlan('p1', 'ship feature', [
-        { id: 'c1', action: 'execute_tasks', args: {}, mutating: true },
-      ]))
-      .mockResolvedValueOnce(makePlan('p2', 'ship feature', [
-        { id: 'c2', action: 'generate_or_update_tasks', args: {}, mutating: true },
-      ]))
-      .mockResolvedValueOnce(makePlan('p3', 'ship feature', [
-        { id: 'c3', action: 'check_status', args: {}, mutating: false },
-      ]));
-
-    const executeSpy = vi.spyOn(orchestrator, 'executePlan')
-      .mockResolvedValueOnce({
-        summary: 'execute step',
-        results: [{ action: 'execute_tasks', summary: 'executed one task', details: ['Failed tasks: none', 'Conflicted tasks: none'] }],
-      })
-      .mockResolvedValueOnce({
-        summary: 'task graph step',
-        results: [{ action: 'generate_or_update_tasks', summary: 'updated graph', details: [] }],
-      });
-
-    const result = await orchestrator.runRequest('ship feature', {
+    const orchestrator = new ConversationalOrchestrator('D:\\repo');
+    const result = await orchestrator.runRequest('show status', {
       interactionMode: 'operator',
       autoConfirm: true,
     });
 
-    expect(result.status).toBe('paused');
-    expect(result.reason).toBe('no_next_action');
-    expect(proposeSpy).toHaveBeenCalledTimes(3);
-    expect(executeSpy).toHaveBeenCalledTimes(2);
-    expect(executeSpy).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        calls: [expect.objectContaining({ action: 'execute_tasks', args: expect.objectContaining({ parallel: 1, maxTasks: 1 }) })],
-      }),
-      expect.objectContaining({ parallel: 1, maxTasks: 1 }),
-    );
+    expect(result.status).toBe('completed');
+    expect(result.results[0]?.action).toBe('check_status');
+    expect(ledgerStorageMocks.mutateLedger).toHaveBeenCalledTimes(2);
+    const orchestration = (ledgerStorageMocks.current as Record<string, any>)['orchestration'];
+    expect(orchestration.lastRunOutcome.status).toBe('completed');
+    expect(orchestration.activeRun).toBeUndefined();
   });
 
-  it('requires boundary confirmation for bounded execution in balanced mode', async () => {
-    const orchestrator = new ConversationalOrchestrator('D:\\repo');
-    vi.spyOn(orchestrator, 'proposePlan').mockResolvedValue({
-      id: 'p1',
-      request: 'run tasks',
-      goal: 'run tasks',
-      calls: [{ id: 'c1', action: 'execute_tasks', args: {}, mutating: true }],
-      steps: [{ action: 'execute_tasks', summary: 'execute', mutating: true }],
-      previewResults: [],
-      requiresConfirmation: true,
-      createdAt: '2026-01-01T00:00:00.000Z',
-    });
-    const executeSpy = vi.spyOn(orchestrator, 'executePlan').mockResolvedValue({
-      summary: 'executed',
-      results: [{ action: 'execute_tasks', summary: 'executed', details: ['Failed tasks: none', 'Conflicted tasks: none'] }],
+  it('routes missing setup to configure_ai deterministically', async () => {
+    toolMocks.runAgentTool.mockImplementation(async (action: string) => {
+      if (action === 'check_setup') {
+        return {
+          action: 'check_setup',
+          summary: 'Setup missing.',
+          details: ['AI config is missing or invalid.'],
+          setupRequired: true,
+        };
+      }
+      return { action, summary: `${action} ok`, details: [] };
     });
 
-    const boundaryResolver = vi.fn().mockResolvedValue({ kind: 'pause' });
-    const result = await orchestrator.runRequest('run tasks', {
+    const orchestrator = new ConversationalOrchestrator('D:\\repo');
+    const resolver = vi.fn().mockResolvedValue({ kind: 'pause' });
+    const result = await orchestrator.runRequest('ship feature', {
       interactionMode: 'balanced',
-      resolveBoundary: boundaryResolver,
+      resolveBoundary: resolver,
+    });
+
+    expect(result.status).toBe('paused');
+    expect(result.boundary?.action).toBe('configure_ai');
+    expect(resolver).toHaveBeenCalledTimes(1);
+  });
+
+  it('pauses with a single setup blocker when setup remains unresolved after configure_ai', async () => {
+    let checkSetupCalls = 0;
+    let configureCalls = 0;
+    toolMocks.runAgentTool.mockImplementation(async (action: string) => {
+      if (action === 'check_setup') {
+        checkSetupCalls += 1;
+        return {
+          action: 'check_setup',
+          summary: 'Before I can continue, I need to fix: No active AI profile is configured.',
+          details: ['No active AI profile is configured.'],
+          setupRequired: true,
+        };
+      }
+      if (action === 'configure_ai') {
+        configureCalls += 1;
+        return {
+          action: 'configure_ai',
+          summary: 'Updated AI provider profile, but setup/auth still needs attention.',
+          details: ['Remaining setup issue: No active AI profile is configured.'],
+          setupRequired: true,
+        };
+      }
+      return { action, summary: `${action} ok`, details: [] };
+    });
+
+    const orchestrator = new ConversationalOrchestrator('D:\\repo');
+    const result = await orchestrator.runRequest('continue with planning', {
+      interactionMode: 'operator',
+      resolveBoundary: vi.fn().mockResolvedValue({ kind: 'proceed' }),
+    });
+
+    expect(result.status).toBe('paused');
+    expect(result.reason).toBe('setup_required');
+    expect(configureCalls).toBe(1);
+    expect(checkSetupCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('pauses for execution approval in balanced mode with a ready task', async () => {
+    ledgerStorageMocks.current = makeLedger({
+      tasks: {
+        version: 1,
+        tasks: [makeTask('task-1', 'pending')],
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+
+    const orchestrator = new ConversationalOrchestrator('D:\\repo');
+    const resolver = vi.fn().mockResolvedValue({ kind: 'pause' });
+    const result = await orchestrator.runRequest('ship feature', {
+      interactionMode: 'balanced',
+      resolveBoundary: resolver,
     });
 
     expect(result.status).toBe('paused');
     expect(result.boundary?.action).toBe('execute_tasks');
-    expect(boundaryResolver).toHaveBeenCalledTimes(1);
-    expect(executeSpy).not.toHaveBeenCalled();
-  });
-
-  it('normalizes broad execute scope to single-task execution in conversational mode', async () => {
-    const orchestrator = new ConversationalOrchestrator('D:\\repo');
-    const makePlan = (id: string, request: string, calls: AgentToolCall[]): AgentPlan => ({
-      id,
-      request,
-      goal: request,
-      calls,
-      steps: calls.map((call) => ({ action: call.action, summary: call.action, mutating: call.mutating })),
-      previewResults: [],
-      requiresConfirmation: calls.some((call) => call.mutating),
-      createdAt: '2026-01-01T00:00:00.000Z',
-    });
-    vi.spyOn(orchestrator, 'proposePlan')
-      .mockResolvedValueOnce(makePlan('p1', 'run broadly', [
-        { id: 'c1', action: 'execute_tasks', args: { parallel: 2, maxTasks: 3 }, mutating: true },
-      ]))
-      .mockResolvedValueOnce(makePlan('p2', 'run broadly', [
-        { id: 'c2', action: 'check_status', args: {}, mutating: false },
-      ]));
-    const executeSpy = vi.spyOn(orchestrator, 'executePlan').mockResolvedValue({
-      summary: 'executed',
-      results: [{ action: 'execute_tasks', summary: 'executed', details: ['Failed tasks: none', 'Conflicted tasks: none'] }],
-    });
-    const boundaryResolver = vi.fn().mockResolvedValue({ kind: 'pause' });
-    const result = await orchestrator.runRequest('run broadly', {
-      interactionMode: 'operator',
-      resolveBoundary: boundaryResolver,
-    });
-
-    expect(result.status).toBe('paused');
-    expect(result.reason).toBe('no_next_action');
-    expect(boundaryResolver).not.toHaveBeenCalled();
-    expect(executeSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        calls: [expect.objectContaining({ action: 'execute_tasks', args: expect.objectContaining({ parallel: 1, maxTasks: 1 }) })],
-      }),
-      expect.objectContaining({ parallel: 1, maxTasks: 1 }),
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(toolMocks.runAgentTool).not.toHaveBeenCalledWith(
+      'execute_tasks',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
     );
   });
 
   it('absorbs redirects inside orchestrator loop', async () => {
+    ledgerStorageMocks.current = makeLedger({
+      tasks: {
+        version: 1,
+        tasks: [makeTask('task-1', 'pending')],
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    toolMocks.runAgentTool.mockImplementation(async (action: string) => {
+      if (action === 'check_setup') {
+        return { action: 'check_setup', summary: 'setup ok', details: [] };
+      }
+      if (action === 'check_status') {
+        return { action: 'check_status', summary: 'status ok', details: [] };
+      }
+      return { action, summary: `${action} ok`, details: ['Failed tasks: none', 'Conflicted tasks: none'] };
+    });
+
     const orchestrator = new ConversationalOrchestrator('D:\\repo');
-    const makePlan = (request: string, calls: AgentToolCall[]): AgentPlan => ({
-      id: `p-${request}`,
-      request,
-      goal: request,
-      calls,
-      steps: calls.map((call) => ({ action: call.action, summary: call.action, mutating: call.mutating })),
-      previewResults: [],
-      requiresConfirmation: calls.some((call) => call.mutating),
-      createdAt: '2026-01-01T00:00:00.000Z',
-    });
-
-    const proposeSpy = vi.spyOn(orchestrator, 'proposePlan')
-      .mockResolvedValueOnce(makePlan('initial work', [
-        { id: 'c1', action: 'generate_or_update_tasks', args: {}, mutating: true },
-      ]))
-      .mockResolvedValueOnce(makePlan('show status', [
-        { id: 'c2', action: 'check_status', args: {}, mutating: false },
-      ]));
-    vi.spyOn(orchestrator, 'executePlan').mockResolvedValue({
-      summary: 'status ok',
-      results: [{ action: 'check_status', summary: 'status ok', details: [] }],
-    });
-
-    const result = await orchestrator.runRequest('initial work', {
+    const result = await orchestrator.runRequest('ship feature', {
       interactionMode: 'guide',
       resolveBoundary: vi.fn().mockResolvedValue({ kind: 'redirect', request: 'show status' }),
     });
 
     expect(result.status).toBe('completed');
     expect(result.lastRequest).toBe('show status');
-    expect(proposeSpy).toHaveBeenNthCalledWith(2, 'show status', expect.any(Object));
+    expect(result.results.some((entry) => entry.action === 'check_status')).toBe(true);
   });
 
   it('resumes pending boundaries and pauses when approval is deferred', async () => {
@@ -416,13 +410,11 @@ describe('conversational orchestrator tool loop', () => {
           request: 'finish migration',
           startedAt: '2026-01-01T00:00:00.000Z',
           updatedAt: '2026-01-01T00:00:00.000Z',
-          stepCount: 2,
-          completedSteps: [],
           pendingBoundary: {
             id: 'boundary-1',
             action: 'execute_tasks',
-            actionSummary: 'Start working through the planned tasks.',
-            reason: 'Execution requires confirmation.',
+            actionSummary: 'Start the next task.',
+            reason: 'I need your approval to start the next bounded task.',
             scope: { parallel: 1, maxTasks: 1, args: {} },
             choices: ['proceed', 'pause', 'redirect'],
             requestedAt: '2026-01-01T00:00:00.000Z',
@@ -442,6 +434,83 @@ describe('conversational orchestrator tool loop', () => {
     expect(result.lastRequest).toBe('finish migration');
   });
 
+  it('resumes an approved boundary without requesting the same boundary twice', async () => {
+    ledgerStorageMocks.current = makeLedger({
+      tasks: {
+        version: 1,
+        tasks: [makeTask('task-1', 'pending')],
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      orchestration: {
+        version: 1,
+        sessionId: 'session-1',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        activeRun: {
+          request: 'finish migration',
+          startedAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+          completedSteps: [
+            {
+              action: 'show_plan',
+              summary: 'Plan review complete.',
+              completedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          lastCompletedStep: {
+            action: 'show_plan',
+            summary: 'Plan review complete.',
+            completedAt: '2026-01-01T00:00:00.000Z',
+          },
+          pendingBoundary: {
+            id: 'boundary-1',
+            action: 'execute_tasks',
+            actionSummary: 'Start the next task.',
+            reason: 'I need your approval to start the next bounded task.',
+            scope: { parallel: 1, maxTasks: 1, args: {} },
+            choices: ['proceed', 'pause', 'redirect'],
+            requestedAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      },
+    });
+
+    toolMocks.runAgentTool.mockImplementation(async (action: string) => {
+      if (action === 'check_setup') {
+        return { action: 'check_setup', summary: 'setup ok', details: [] };
+      }
+      if (action === 'execute_tasks') {
+        const ledger = ledgerStorageMocks.current as Record<string, any>;
+        const tasks = ledger['tasks']?.['tasks'];
+        if (Array.isArray(tasks) && tasks[0]) {
+          tasks[0].status = 'completed';
+        }
+        return {
+          action: 'execute_tasks',
+          summary: 'Worked through the plan: 1 completed, 0 failed, 0 conflicted.',
+          details: ['Failed tasks: none', 'Conflicted tasks: none'],
+        };
+      }
+      return { action, summary: `${action} ok`, details: [] };
+    });
+
+    const orchestrator = new ConversationalOrchestrator('D:\\repo');
+    const resolver = vi.fn().mockResolvedValue({ kind: 'proceed' });
+    const result = await orchestrator.resumeActiveRun({
+      interactionMode: 'balanced',
+      resolveBoundary: resolver,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(result.reason).not.toBe('I need your approval to start the next bounded task.');
+    expect(result.results.some((entry) => entry.action === 'execute_tasks')).toBe(true);
+    expect(toolMocks.runAgentTool).toHaveBeenCalledWith(
+      'execute_tasks',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
   it('resumes pending boundaries and supports redirect without restating the request', async () => {
     ledgerStorageMocks.current = makeLedger({
       orchestration: {
@@ -452,13 +521,11 @@ describe('conversational orchestrator tool loop', () => {
           request: 'finish migration',
           startedAt: '2026-01-01T00:00:00.000Z',
           updatedAt: '2026-01-01T00:00:00.000Z',
-          stepCount: 1,
-          completedSteps: [],
           pendingBoundary: {
             id: 'boundary-1',
             action: 'execute_tasks',
-            actionSummary: 'Start working through the planned tasks.',
-            reason: 'Execution requires confirmation.',
+            actionSummary: 'Start the next task.',
+            reason: 'I need your approval to start the next bounded task.',
             scope: { parallel: 1, maxTasks: 1, args: {} },
             choices: ['proceed', 'pause', 'redirect'],
             requestedAt: '2026-01-01T00:00:00.000Z',
@@ -467,31 +534,23 @@ describe('conversational orchestrator tool loop', () => {
       },
     });
 
-    const orchestrator = new ConversationalOrchestrator('D:\\repo');
-    const makePlan = (request: string, calls: AgentToolCall[]): AgentPlan => ({
-      id: `p-${request}`,
-      request,
-      goal: request,
-      calls,
-      steps: calls.map((call) => ({ action: call.action, summary: call.action, mutating: call.mutating })),
-      previewResults: [],
-      requiresConfirmation: calls.some((call) => call.mutating),
-      createdAt: '2026-01-01T00:00:00.000Z',
-    });
-    const proposeSpy = vi.spyOn(orchestrator, 'proposePlan').mockResolvedValue(
-      makePlan('show status', [{ id: 'c1', action: 'check_status', args: {}, mutating: false }]),
-    );
-    vi.spyOn(orchestrator, 'executePlan').mockResolvedValue({
-      summary: 'status ok',
-      results: [{ action: 'check_status', summary: 'status ok', details: [] }],
+    toolMocks.runAgentTool.mockImplementation(async (action: string) => {
+      if (action === 'check_setup') {
+        return { action: 'check_setup', summary: 'setup ok', details: [] };
+      }
+      if (action === 'check_status') {
+        return { action: 'check_status', summary: 'status ok', details: [] };
+      }
+      return { action, summary: `${action} ok`, details: [] };
     });
 
+    const orchestrator = new ConversationalOrchestrator('D:\\repo');
     const result = await orchestrator.resumeActiveRun({
       interactionMode: 'guide',
       resolveBoundary: vi.fn().mockResolvedValue({ kind: 'redirect', request: 'show status' }),
     });
 
+    expect(result.status).toBe('completed');
     expect(result.lastRequest).toBe('show status');
-    expect(proposeSpy).toHaveBeenCalledWith('show status', expect.any(Object));
   });
 });

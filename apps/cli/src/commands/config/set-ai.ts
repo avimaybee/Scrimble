@@ -1,17 +1,23 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import * as path from 'node:path';
-import { stdin as input, stdout as output } from 'node:process';
-import { createInterface } from 'node:readline/promises';
 import {
   type AIProvider,
   CONFIG_FILE,
   SCRIMBLE_DIR,
+  aiModelStrategySchema,
+  aiProfileAuthStrategySchema,
   aiProviderSchema,
-  scrimbleConfigSchema,
 } from '@scrimble/shared';
-import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../../lib/ai/provider.js';
 import { loadScrimbleConfig } from '../../lib/config/load-config.js';
+import {
+  buildProviderProfile,
+  getActiveProfile,
+  upsertProfile,
+} from '../../lib/ai/profiles.js';
+import { describeProfileModel } from '../../lib/ai/provider.js';
+import { getDefaultAuthStrategy, providerSupportsAutoModel } from '../../lib/ai/provider-catalog.js';
+import { runProviderSetupStudio } from '../../lib/ai/setup-studio.js';
 import { writeSecureJson } from '../../lib/security.js';
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -21,7 +27,7 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 function toEnvReference(envName: string): string {
   const trimmed = envName.trim();
   if (!/^[A-Z0-9_]+$/.test(trimmed)) {
-    throw new Error('api-key-env must be uppercase letters, numbers, or underscores (e.g. OPENAI_API_KEY).');
+    throw new Error('Environment variable names must be uppercase letters, numbers, or underscores.');
   }
   return `\${${trimmed}}`;
 }
@@ -30,63 +36,13 @@ function promptable(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
 }
 
-async function promptProvider(
-  rl: ReturnType<typeof createInterface>,
-  log: (message?: string) => void,
-  currentProvider: AIProvider,
-): Promise<AIProvider> {
-  const providers = [...aiProviderSchema.options] as AIProvider[];
-  const defaultIndex = Math.max(0, providers.indexOf(currentProvider));
-
-  log(chalk.bold('Select an AI provider:'));
-  for (const [index, provider] of providers.entries()) {
-    const currentMarker = provider === currentProvider ? ' (current)' : '';
-    log(chalk.dim(`  ${index + 1}. ${provider}${currentMarker}`));
-  }
-
-  for (;;) {
-    const answer = (await rl.question(`Provider [${defaultIndex + 1}]: `)).trim();
-    if (!answer) {
-      const provider = providers[defaultIndex];
-      if (!provider) {
-        throw new Error('Unable to resolve default provider.');
-      }
-      return provider;
-    }
-
-    const asNumber = Number.parseInt(answer, 10);
-    if (Number.isInteger(asNumber) && asNumber >= 1 && asNumber <= providers.length) {
-      const selected = providers[asNumber - 1];
-      if (!selected) {
-        throw new Error('Selected provider index is out of range.');
-      }
-      return selected;
-    }
-
-    const normalized = answer.toLowerCase();
-    if (providers.includes(normalized as AIProvider)) {
-      return aiProviderSchema.parse(normalized);
-    }
-
-    log(chalk.yellow(`Invalid provider selection: ${answer}`));
-  }
-}
-
-async function promptWithDefault(
-  rl: ReturnType<typeof createInterface>,
-  label: string,
-  defaultValue: string,
-): Promise<string> {
-  const answer = (await rl.question(`${label} [${defaultValue}]: `)).trim();
-  return answer || defaultValue;
-}
-
 export default class ConfigSetAi extends Command {
-  static override description = 'Configure AI provider/model/api key for this Scrimble project';
+  static override description = 'Configure provider profiles, auth strategy, and model strategy for this project';
 
   static override examples = [
     '<%= config.bin %> config set-ai',
-    '<%= config.bin %> config set-ai --provider openai --model gpt-4o --api-key-env OPENAI_API_KEY',
+    '<%= config.bin %> config set-ai --provider openai --model gpt-4o --api-key-env OPENAI_API_KEY --non-interactive',
+    '<%= config.bin %> config set-ai --provider github-copilot --auth-strategy env_token --model-strategy auto --non-interactive',
   ];
 
   static override flags = {
@@ -94,14 +50,38 @@ export default class ConfigSetAi extends Command {
       description: 'AI provider',
       options: [...aiProviderSchema.options],
     }),
+    'profile-name': Flags.string({
+      description: 'Profile display name',
+    }),
+    'model-strategy': Flags.string({
+      description: 'Model strategy',
+      options: [...aiModelStrategySchema.options],
+    }),
     model: Flags.string({
-      description: 'AI model identifier',
+      description: 'Explicit model identifier (required when model-strategy=explicit in non-interactive mode)',
+    }),
+    'auth-strategy': Flags.string({
+      description: 'Auth strategy',
+      options: [...aiProfileAuthStrategySchema.options],
+    }),
+    'base-url': Flags.string({
+      description: 'Optional provider base URL override',
     }),
     'api-key': Flags.string({
-      description: 'Raw API key value to store in config',
+      description: 'API key value (BYOK providers)',
     }),
     'api-key-env': Flags.string({
-      description: 'Environment variable name to reference (stored as ${ENV_NAME})',
+      description: 'Environment variable name for API key reference (stored as ${ENV_NAME})',
+    }),
+    token: Flags.string({
+      description: 'Explicit GitHub token (Copilot advanced path)',
+    }),
+    'token-env': Flags.string({
+      description: 'Environment variable name for explicit GitHub token reference',
+    }),
+    'non-interactive': Flags.boolean({
+      description: 'Apply flags directly instead of launching setup studio',
+      default: false,
     }),
   };
 
@@ -110,11 +90,14 @@ export default class ConfigSetAi extends Command {
     if (flags['api-key'] && flags['api-key-env']) {
       throw new Error('Use either --api-key or --api-key-env, not both.');
     }
+    if (flags.token && flags['token-env']) {
+      throw new Error('Use either --token or --token-env, not both.');
+    }
 
     const cwd = process.cwd();
     const configPath = path.join(cwd, SCRIMBLE_DIR, CONFIG_FILE);
 
-    let existingConfig: ReturnType<typeof scrimbleConfigSchema.parse>;
+    let existingConfig: Awaited<ReturnType<typeof loadScrimbleConfig>>;
     try {
       existingConfig = await loadScrimbleConfig(cwd);
     } catch (error) {
@@ -126,93 +109,84 @@ export default class ConfigSetAi extends Command {
       throw error;
     }
 
-    let provider: AIProvider =
-      flags.provider ? aiProviderSchema.parse(flags.provider) : existingConfig.ai.provider;
-
-    let model =
-      flags.model?.trim() ??
-      (provider === existingConfig.ai.provider
-        ? existingConfig.ai.model
-        : buildDefaultAIConfig(provider).model);
-
-    let apiKey =
-      flags['api-key']?.trim() ??
-      (flags['api-key-env'] ? toEnvReference(flags['api-key-env']) : undefined) ??
-      (provider === existingConfig.ai.provider ? existingConfig.ai.apiKey?.trim() : undefined) ??
-      '';
-
-    if ((!flags.provider || !flags.model || !apiKey) && promptable()) {
-      this.log('');
-      this.log(chalk.bold('🤖 AI setup wizard'));
-      this.log('');
-
-      const rl = createInterface({ input, output });
-      try {
-        if (!flags.provider) {
-          provider = await promptProvider(rl, this.log.bind(this), provider);
-        }
-
-        if (!flags.model) {
-          const defaultModel = provider === existingConfig.ai.provider
-            ? existingConfig.ai.model
-            : buildDefaultAIConfig(provider).model;
-          model = await promptWithDefault(rl, 'Model', defaultModel);
-        }
-
-        if (!flags['api-key'] && !flags['api-key-env']) {
-          const defaultApiKey =
-            provider === existingConfig.ai.provider
-              ? existingConfig.ai.apiKey?.trim() || getDefaultApiKeyPlaceholder(provider)
-              : getDefaultApiKeyPlaceholder(provider);
-          apiKey = await promptWithDefault(
-            rl,
-            'API key or ${ENV_VAR} reference',
-            defaultApiKey,
-          );
-        }
-      } finally {
-        rl.close();
+    if (promptable() && !flags['non-interactive']) {
+      const studioResult = await runProviderSetupStudio({
+        config: existingConfig,
+        reason: 'Configure provider, authentication method, and model strategy.',
+        seed: {
+          ...(flags.provider ? { provider: aiProviderSchema.parse(flags.provider) } : {}),
+          ...(flags.model ? { model: flags.model.trim() } : {}),
+          ...(flags['profile-name'] ? { profileName: flags['profile-name'].trim() } : {}),
+        },
+      });
+      if (!studioResult) {
+        this.log(chalk.yellow('\nProvider setup cancelled.\n'));
+        return;
       }
+
+      await writeSecureJson(configPath, studioResult.config);
+      const active = getActiveProfile(studioResult.config);
+      this.log('');
+      this.log(chalk.green('✓ Provider profile updated.'));
+      if (active) {
+        this.log(chalk.dim(`  Active profile: ${active.name} (${active.id})`));
+        this.log(chalk.dim(`  Provider: ${active.provider}`));
+        this.log(chalk.dim(`  Model: ${describeProfileModel(active)}`));
+        this.log(chalk.dim(`  Auth: ${active.auth.strategy}`));
+      }
+      this.log('');
+      return;
     }
 
-    if (!model.trim()) {
-      throw new Error('AI model is required. Provide --model or run interactively.');
-    }
-    if (!apiKey.trim()) {
-      throw new Error('AI API key is required. Provide --api-key, --api-key-env, or run interactively.');
+    const activeProfile = getActiveProfile(existingConfig);
+    const selectedProvider = flags.provider
+      ? aiProviderSchema.parse(flags.provider)
+      : activeProfile?.provider
+        ?? 'openai';
+    const selectedModelStrategy = flags['model-strategy']
+      ? aiModelStrategySchema.parse(flags['model-strategy'])
+      : flags.model
+        ? 'explicit'
+        : activeProfile?.provider === selectedProvider
+          ? activeProfile.modelStrategy
+          : providerSupportsAutoModel(selectedProvider) ? 'auto' : 'explicit';
+    const selectedAuthStrategy = flags['auth-strategy']
+      ? aiProfileAuthStrategySchema.parse(flags['auth-strategy'])
+      : activeProfile?.provider === selectedProvider
+        ? activeProfile.auth.strategy
+        : getDefaultAuthStrategy(selectedProvider, false);
+    const selectedModel = flags.model?.trim() || (selectedModelStrategy === 'explicit'
+      ? activeProfile?.provider === selectedProvider ? activeProfile.model : undefined
+      : undefined);
+    if (selectedModelStrategy === 'explicit' && !selectedModel) {
+      throw new Error('Explicit model strategy requires --model in non-interactive mode.');
     }
 
-    const providerDefaults = buildDefaultAIConfig(provider, model.trim());
-    const baseUrl =
-      provider === existingConfig.ai.provider
-        ? existingConfig.ai.baseUrl ?? providerDefaults.baseUrl
-        : providerDefaults.baseUrl;
-
-    const updatedConfig = scrimbleConfigSchema.parse({
-      ...existingConfig,
-      ai: {
-        provider,
-        model: model.trim(),
-        apiKey: apiKey.trim(),
-        ...(baseUrl ? { baseUrl } : {}),
-        ...(existingConfig.ai.options ? { options: existingConfig.ai.options } : {}),
-      },
+    const apiKeyInput = flags['api-key']?.trim() || (flags['api-key-env'] ? toEnvReference(flags['api-key-env']) : undefined);
+    const tokenInput = flags.token?.trim() || (flags['token-env'] ? toEnvReference(flags['token-env']) : undefined);
+    const profile = buildProviderProfile({
+      id: activeProfile?.provider === selectedProvider ? activeProfile.id : undefined,
+      name: flags['profile-name']?.trim() || (activeProfile?.provider === selectedProvider ? activeProfile.name : undefined),
+      provider: selectedProvider,
+      modelStrategy: selectedModelStrategy,
+      ...(selectedModel ? { model: selectedModel } : {}),
+      authStrategy: selectedAuthStrategy,
+      ...(apiKeyInput ? { apiKey: apiKeyInput } : activeProfile?.auth.apiKey ? { apiKey: activeProfile.auth.apiKey } : {}),
+      ...(tokenInput ? { token: tokenInput } : activeProfile?.auth.token ? { token: activeProfile.auth.token } : {}),
+      ...(flags['base-url']?.trim() ? { baseUrl: flags['base-url'].trim() } : activeProfile?.baseUrl ? { baseUrl: activeProfile.baseUrl } : {}),
+      options: activeProfile?.provider === selectedProvider ? activeProfile.options : undefined,
+      interactive: false,
     });
 
-    await writeSecureJson(configPath, updatedConfig);
-
-    const apiKeyValue = updatedConfig.ai.apiKey ?? '';
-    const envReferenced = /^\$\{[A-Z0-9_]+\}$/.test(apiKeyValue);
+    const merged = upsertProfile(existingConfig, profile, true);
+    await writeSecureJson(configPath, merged);
 
     this.log('');
-    this.log(chalk.green('✓ AI configuration updated.'));
-    this.log(chalk.dim(`  Provider: ${updatedConfig.ai.provider}`));
-    this.log(chalk.dim(`  Model: ${updatedConfig.ai.model}`));
-    this.log(
-      chalk.dim(
-        `  API key: ${envReferenced ? apiKeyValue : '[stored value]'}`,
-      ),
-    );
+    this.log(chalk.green('✓ Provider profile updated.'));
+    this.log(chalk.dim(`  Active profile: ${profile.name} (${profile.id})`));
+    this.log(chalk.dim(`  Provider: ${profile.provider}`));
+    this.log(chalk.dim(`  Model: ${describeProfileModel(profile)}`));
+    this.log(chalk.dim(`  Auth strategy: ${profile.auth.strategy}`));
     this.log('');
   }
 }

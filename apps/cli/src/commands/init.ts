@@ -10,10 +10,16 @@ import {
   PROJECT_FILE,
   SESSION_FILE,
   aiProviderSchema,
-  scrimbleConfigSchema,
   type InteractionMode,
 } from '@scrimble/shared';
-import { buildDefaultAIConfig, getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
+import { getDefaultApiKeyPlaceholder } from '../lib/ai/provider.js';
+import {
+  buildDefaultScrimbleConfig,
+  buildProviderProfile,
+  describeProfileModel,
+  getActiveProfile,
+  upsertProfile,
+} from '../lib/ai/profiles.js';
 import { recordTelemetry } from '../lib/telemetry.js';
 import { pathExists } from '../lib/fs/index.js';
 import { detectStack } from '../lib/init/stack-detection.js';
@@ -167,31 +173,33 @@ export default class Init extends Command {
     if (!flags['interaction-mode'] && promptable()) {
       interactionMode = await promptInteractionMode(this.log.bind(this), interactionMode);
     }
-    const defaultAIConfig = buildDefaultAIConfig(selectedProvider, flags['ai-model']);
-    this.log(chalk.dim(`  AI provider: ${selectedProvider}`));
-    this.log(chalk.dim(`  AI model: ${defaultAIConfig.model}`));
-    this.log(chalk.dim(`  Interaction mode: ${interactionMode}`));
-
-    let config = scrimbleConfigSchema.parse({
-      schemaVersion: 1,
-      ai: defaultAIConfig,
-      interactionMode,
-      plannerWorker: 'auto',
-      workerPreferences: {
-        defaultWorker: 'auto',
-        allowParallel: false,
-        maxParallelWorkers: 1,
-      },
-      executionDefaults: {
-        worker: 'auto',
-        timeoutSeconds: 300,
-        maxParallelTasks: 1,
-        maxRetriesPerTask: 1,
-      },
-      verificationDefaults: {
-        enabled: true,
-      },
+    let config = buildDefaultScrimbleConfig(interactionMode, selectedProvider);
+    const activeProfile = getActiveProfile(config);
+    if (!activeProfile) {
+      throw new Error('Unable to build default AI profile.');
+    }
+    const customizedProfile = buildProviderProfile({
+      id: activeProfile.id,
+      name: activeProfile.name,
+      provider: selectedProvider,
+      modelStrategy: flags['ai-model'] ? 'explicit' : activeProfile.modelStrategy,
+      model: flags['ai-model']?.trim() || activeProfile.model,
+      baseUrl: activeProfile.baseUrl,
+      authStrategy: activeProfile.auth.strategy,
+      apiKey: activeProfile.auth.apiKey,
+      token: activeProfile.auth.token,
+      options: activeProfile.options,
+      interactive: false,
     });
+    config = upsertProfile(config, customizedProfile, true);
+    const configuredProfile = getActiveProfile(config);
+    if (!configuredProfile) {
+      throw new Error('Failed to resolve active profile after initialization.');
+    }
+
+    this.log(chalk.dim(`  AI provider: ${selectedProvider}`));
+    this.log(chalk.dim(`  AI model: ${describeProfileModel(configuredProfile)}`));
+    this.log(chalk.dim(`  Interaction mode: ${interactionMode}`));
 
     let projectData: Record<string, unknown> = {
       name: repoName,
@@ -231,9 +239,11 @@ export default class Init extends Command {
     const keyPlaceholder = getDefaultApiKeyPlaceholder(selectedProvider);
     this.log(chalk.bold('Next steps:'));
     this.log(chalk.dim('  1. Run `scrimble` and describe your goal in plain language'));
-    this.log(chalk.dim(`  2. If needed, set your API key env var: ${keyPlaceholder.slice(2, -1)}="your-key"`));
     if (selectedProvider === 'github-copilot') {
-      this.log(chalk.dim('     GitHub Copilot users: set GITHUB_COPILOT_TOKEN from your Copilot auth/session token.'));
+      this.log(chalk.dim('  2. Authenticate Copilot (recommended): `copilot login`'));
+      this.log(chalk.dim('     Non-interactive fallback: set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.'));
+    } else {
+      this.log(chalk.dim(`  2. If needed, set your API key env var: ${keyPlaceholder.slice(2, -1)}="your-key"`));
     }
     this.log(chalk.dim('  3. Use `scrimble doctor` for worker readiness diagnostics'));
     this.log('');
@@ -242,7 +252,7 @@ export default class Init extends Command {
       event: 'project_initialized',
       payload: {
         provider: selectedProvider,
-        model: defaultAIConfig.model,
+        model: describeProfileModel(configuredProfile),
         localFirst: true,
       },
     });

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "updatedAt": "2026-04-09T17:44:33.683Z",
+  "profiles": {
+    "profile-openai": {
+      "profileId": "profile-openai",
+      "provider": "openai",
+      "authStrategy": "api_key",
+      "authStatus": "ready",
+      "authSource": "profile",
+      "modelStrategy": "explicit",
+      "model": "gpt-4o",
+      "modelAvailability": "available",
+      "capability": {
+        "source": "cached",
+        "availableModels": [
+          "gpt-4o",
+          "gpt-4.1"
+        ],
+        "validatedAt": "2026-04-09T16:56:14.108Z",
+        "stale": true
+      },
+      "issues": [],
+      "usabilityIssues": [],
+      "validatedAt": "2026-04-09T16:56:14.108Z"
+    }
+  }
+}

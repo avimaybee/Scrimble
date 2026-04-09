@@ -7,7 +7,12 @@ export {
   aiProviderSchema,
   aiOptionsSchema,
   aiConfigSchema,
+  aiModelStrategySchema,
+  aiProfileAuthStrategySchema,
+  aiProfileAuthSchema,
+  aiProviderProfileSchema,
   interactionModeSchema,
+  legacyScrimbleConfigSchema,
   scrimbleConfigSchema,
   projectStatusSchema,
   createProjectSchema,
@@ -35,6 +40,7 @@ export const SCRIMBLE_DIR = '.scrimble';
 export const CONFIG_FILE = 'config.json';
 export const PROJECT_FILE = 'project.json';
 export const PLAN_FILE = 'plan.json';
+export const PROVIDER_VALIDATION_CACHE_FILE = 'provider-validation-cache.json';
 export const CURRENT_CHUNK_FILE = 'current-chunk.md';
 export const ARCHITECTURE_FILE = 'architecture.md';
 export const RESEARCH_FILE = 'research-summary.md';
@@ -61,7 +67,7 @@ export const RUNTIME_EVENTS_FILE = 'events.ndjson';
 export const RUNTIME_ATTEMPTS_DIR = 'attempts';
 export const RUNTIME_WORKERS_FILE = 'workers.json';
 
-// Scrimble ledger paths (task/assignment truth)
+// Scrimble ledger paths (task/runtime truth)
 export const LEDGER_DIR = 'ledger';
 export const LEDGER_TASKS_FILE = 'tasks.json';
 export const LEDGER_ASSIGNMENTS_FILE = 'assignments.json';

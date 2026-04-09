@@ -5,7 +5,7 @@
  * Both Gemini CLI and GitHub Copilot CLI implement this interface.
  */
 
-import type { WorkerKind, LedgerTask, TasksState, AssignmentsState } from './ledger.js';
+import type { WorkerKind, LedgerTask, RuntimeState, TasksState } from './ledger.js';
 
 // --- Worker Capabilities ---
 
@@ -214,8 +214,6 @@ export interface RoutingFactors {
   contextRelevance: Record<WorkerKind, number>;
   /** Historical success rate. */
   successRate: Record<WorkerKind, number>;
-  /** Current worker load. */
-  workerLoad: Record<WorkerKind, number>;
   /** Manual preference if set. */
   manualPreference?: WorkerKind;
 }
@@ -234,6 +232,8 @@ export interface WorkerPreflightResult {
   version?: string;
   /** Whether authentication is configured. */
   authConfigured: boolean;
+  /** Detected credential source when available. */
+  authSource?: string;
   /** Capabilities if available. */
   capabilities?: WorkerCapabilities;
   /** Warnings (non-blocking issues). */
@@ -248,8 +248,8 @@ export interface WorkerPreflightResult {
 export interface LedgerState {
   /** Tasks state. */
   tasks: TasksState;
-  /** Assignments state. */
-  assignments: AssignmentsState;
+  /** Runtime execution state. */
+  runtime: RuntimeState;
 }
 
 // --- Worker Driver Interface ---

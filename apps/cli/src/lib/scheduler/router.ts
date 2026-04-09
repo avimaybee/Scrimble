@@ -32,12 +32,6 @@ function chooseByAvailability(workers: WorkerHealth[]): WorkerHealth | undefined
   if (available.length === 0) {
     return undefined;
   }
-
-  const idle = available.find((worker) => !worker.currentTaskId);
-  if (idle) {
-    return idle;
-  }
-
   return available[0];
 }
 
@@ -97,10 +91,8 @@ export function routeTask(task: LedgerTask, input: RouteTaskInput): RoutingDecis
 
   return {
     worker: selected.kind,
-    reason: selected.currentTaskId
-      ? `Selected ${selected.kind} by deterministic worker priority`
-      : `Selected idle worker ${selected.kind}`,
-    confidence: selected.currentTaskId ? 0.7 : 0.8,
+    reason: `Selected ${selected.kind} by deterministic worker priority`,
+    confidence: 0.8,
     alternatives: sortWorkers(availableWorkers)
       .filter((worker) => worker.kind !== selected.kind)
       .map((worker) => worker.kind),

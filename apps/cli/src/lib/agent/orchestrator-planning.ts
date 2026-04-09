@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { generateText, tool } from 'ai';
 import { z } from 'zod';
 import {
+  aiModelStrategySchema,
+  aiProfileAuthStrategySchema,
   aiProviderSchema,
   CONFIG_FILE,
   SCRIMBLE_DIR,
@@ -11,7 +13,7 @@ import {
   type LedgerDocument,
   type LedgerTask,
 } from '@scrimble/shared';
-import { createLanguageModel } from '../ai/provider.js';
+import { createLanguageModelFromScrimbleConfig } from '../ai/provider.js';
 import { loadScrimbleConfig } from '../config/load-config.js';
 import { runAgentTool, toToolArgs } from './tools.js';
 import {
@@ -36,18 +38,11 @@ const ROOT_SYSTEM_PROMPT = [
   'Satisfy the user request by calling tools.',
   'Prefer the smallest tool sequence that fully solves the request.',
   'For execution requests, call show_plan before execute_tasks.',
+  'For consistency/recovery requests, call repair_state before execution.',
+  'For failed or blocked tasks, call recover_failed_tasks before execute_tasks.',
   'For setup gaps, call check_setup and configure_ai.',
   'Avoid cloud/backend assumptions.',
 ].join(' ');
-
-function toModelConfig(config: Awaited<ReturnType<typeof loadScrimbleConfig>>['ai']) {
-  return {
-    provider: config.provider,
-    model: config.model,
-    ...(config.apiKey ? { apiKey: config.apiKey } : {}),
-    ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
-  };
-}
 
 export function normalizeGoal(request: string): string {
   return request.replace(/\s+/g, ' ').trim();
@@ -198,7 +193,7 @@ async function canLoadLLM(cwd: string): Promise<boolean> {
   try {
     await fs.access(path.join(scrimbleDir, CONFIG_FILE));
     const config = await loadScrimbleConfig(cwd);
-    createLanguageModel(toModelConfig(config.ai));
+    createLanguageModelFromScrimbleConfig(config);
     return true;
   } catch {
     return false;
@@ -241,12 +236,17 @@ function buildToolset(
       execute: async () => callTool('check_setup'),
     }),
     configure_ai: tool({
-      description: 'Configure AI provider/model/key and scaffold .scrimble if missing.',
+      description: 'Configure AI provider profiles and scaffold .scrimble if missing.',
       parameters: z
         .object({
           provider: aiProviderSchema.optional(),
+          profileName: z.string().optional(),
+          modelStrategy: aiModelStrategySchema.optional(),
           model: z.string().optional(),
+          authStrategy: aiProfileAuthStrategySchema.optional(),
           apiKey: z.string().optional(),
+          token: z.string().optional(),
+          baseUrl: z.string().optional(),
         })
         .strict(),
       execute: async (args) => callTool('configure_ai', toToolArgs(args)),
@@ -277,6 +277,24 @@ function buildToolset(
         })
         .strict(),
       execute: async (args) => callTool('execute_tasks', toToolArgs(args)),
+    }),
+    repair_state: tool({
+      description: 'Apply deterministic repair for inconsistent runtime/orchestration state.',
+      parameters: z
+        .object({
+          strategy: z.enum(['auto', 'clear_stale_execution', 'mark_failed_and_continue']).optional(),
+        })
+        .strict(),
+      execute: async (args) => callTool('repair_state', toToolArgs(args)),
+    }),
+    recover_failed_tasks: tool({
+      description: 'Recover failed/blocked tasks back into executable state for retry.',
+      parameters: z
+        .object({
+          limit: z.number().int().min(1).max(5).optional(),
+        })
+        .strict(),
+      execute: async (args) => callTool('recover_failed_tasks', toToolArgs(args)),
     }),
     check_status: tool({
       description: 'Read local orchestration status from the ledger.',
@@ -343,7 +361,7 @@ export async function proposePlan(
   }
 
   const config = await loadScrimbleConfig(cwd);
-  const model = createLanguageModel(toModelConfig(config.ai));
+  const model = createLanguageModelFromScrimbleConfig(config);
   const tools = buildToolset(cwd, normalizedRequest, goal, 'plan', options);
   const result = await generateText({
     model,
@@ -422,8 +440,9 @@ export async function executePlan(
   };
 
   const results: AgentToolResult[] = [...plan.previewResults];
+  const hasMutatingCalls = plan.calls.some((call) => call.mutating);
   for (const call of plan.calls) {
-    if (!call.mutating) {
+    if (hasMutatingCalls && !call.mutating) {
       continue;
     }
 
@@ -467,7 +486,106 @@ function hasDependencyReady(task: LedgerTask, index: Map<string, LedgerTask>): b
 function readyTaskCount(ledger: LedgerDocument): number {
   const tasks = ledger.tasks.tasks;
   const index = new Map(tasks.map((task) => [task.id, task] as const));
-  return tasks.filter((task) => task.status === 'pending' && hasDependencyReady(task, index)).length;
+  return tasks.filter((task) => (task.status === 'ready') || (task.status === 'pending' && hasDependencyReady(task, index)))
+    .length;
+}
+
+function recoverableTaskCount(ledger: LedgerDocument): number {
+  return ledger.tasks.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
+}
+
+function detectStateInconsistency(ledger: LedgerDocument): string | undefined {
+  const activeExecution = ledger.runtime.activeExecution;
+  const activeRun = ledger.orchestration.activeRun;
+  const tasks = ledger.tasks.tasks;
+  const inProgressTasks = tasks.filter((task) => task.status === 'in_progress');
+  if (activeExecution) {
+    const task = tasks.find((entry) => entry.id === activeExecution.taskId);
+    if (!task) {
+      return `Active execution references missing task "${activeExecution.taskId}".`;
+    }
+    if (task.status !== 'in_progress') {
+      return `Active execution task "${task.id}" is ${task.status} instead of in_progress.`;
+    }
+    if (!activeRun) {
+      return 'Runtime has an active execution but no active orchestration run.';
+    }
+    if (activeRun.pendingBoundary) {
+      return 'Runtime is executing while orchestration is paused on an approval boundary.';
+    }
+  }
+  if (!activeExecution && inProgressTasks.length > 0) {
+    return `Found ${inProgressTasks.length} in_progress task(s) with no runtime active execution.`;
+  }
+  return undefined;
+}
+
+function isRepairRequest(request: string): boolean {
+  return /\b(repair state|repair|fix state|clear stale|consistency)\b/.test(request.toLowerCase());
+}
+
+function tokenizeForOverlap(value: string): Set<string> {
+  return new Set(
+    value
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 3),
+  );
+}
+
+function overlapScore(left: Set<string>, right: Set<string>): number {
+  if (left.size === 0 || right.size === 0) {
+    return 0;
+  }
+  let overlap = 0;
+  for (const token of left) {
+    if (right.has(token)) {
+      overlap += 1;
+    }
+  }
+  return overlap / Math.max(left.size, right.size);
+}
+
+function planHasCriticalQualityGaps(ledger: LedgerDocument): boolean {
+  return ledger.tasks.tasks.some((task) =>
+    task.ownedFiles.length === 0 ||
+    task.objective.startsWith('Audit current repository state for goal:') ||
+    task.objective === 'Run verification commands and resolve failing checks');
+}
+
+function shouldReplanForRequest(request: string, ledger: LedgerDocument): { replan: boolean; reason?: string } {
+  const normalized = request.trim().toLowerCase();
+  if (!normalized) {
+    return { replan: false };
+  }
+
+  if (/\b(replan|refresh plan|new goal|change direction|pivot|different approach)\b/.test(normalized)) {
+    return { replan: true, reason: 'The request explicitly asks for a fresh plan.' };
+  }
+
+  if (planHasCriticalQualityGaps(ledger)) {
+    return { replan: true, reason: 'Current task graph quality is outdated and should be replanned before execution.' };
+  }
+
+  const intent = ledger.intent.intent;
+  if (!intent) {
+    return { replan: false };
+  }
+
+  if (ledger.intent.updatedAt > ledger.tasks.updatedAt) {
+    return { replan: true, reason: 'Intent was updated after the task graph and requires replanning.' };
+  }
+
+  const requestTokens = tokenizeForOverlap(normalized);
+  const goalTokens = tokenizeForOverlap(intent.goal);
+  const similarity = overlapScore(requestTokens, goalTokens);
+  const shiftSignal = /\b(instead|switch|change|new|different|replace|drop)\b/.test(normalized);
+  if (shiftSignal && similarity < 0.25) {
+    return { replan: true, reason: 'Request conflicts with the current goal and should replan before execution.' };
+  }
+
+  return { replan: false };
 }
 
 export function isReadOnlyRequest(request: string): boolean {
@@ -511,11 +629,40 @@ export function selectDeterministicStep(input: {
   ledger: LedgerDocument;
   setupResult: AgentToolResult;
 }): OperatorStep | undefined {
+  const lastCompletedAction = input.ledger.orchestration.activeRun?.lastCompletedStep?.action;
+
   if (input.setupResult.setupRequired === true) {
     return toOperatorStep(
       { id: randomUUID(), action: 'configure_ai', args: {}, mutating: true },
       input.interactionMode,
       'Local prerequisites are missing, so setup must be completed before continuing.',
+    );
+  }
+
+  const consistencyIssue = detectStateInconsistency(input.ledger);
+  if (consistencyIssue) {
+    return toOperatorStep(
+      {
+        id: randomUUID(),
+        action: 'repair_state',
+        args: { strategy: 'auto' },
+        mutating: true,
+      },
+      input.interactionMode,
+      `State consistency check failed: ${consistencyIssue}`,
+    );
+  }
+
+  if (isRepairRequest(input.request) && lastCompletedAction !== 'repair_state') {
+    return toOperatorStep(
+      {
+        id: randomUUID(),
+        action: 'repair_state',
+        args: { strategy: 'auto' },
+        mutating: true,
+      },
+      input.interactionMode,
+      'The request asks for recovery, so apply deterministic state repair first.',
     );
   }
 
@@ -542,7 +689,35 @@ export function selectDeterministicStep(input: {
     );
   }
 
+  const replan = shouldReplanForRequest(input.request, input.ledger);
+  if (replan.replan) {
+    return toOperatorStep(
+      {
+        id: randomUUID(),
+        action: 'generate_or_update_tasks',
+        args: { goal: normalizeGoal(input.request), replan: true },
+        mutating: true,
+      },
+      input.interactionMode,
+      replan.reason ?? 'Planning signals indicate a replan is needed before continuing.',
+    );
+  }
+
   if (readyTaskCount(input.ledger) > 0) {
+    const hasReviewedPlan = (input.ledger.orchestration.activeRun?.completedSteps ?? [])
+      .some((step) => step.action === 'show_plan');
+    if (!hasReviewedPlan || lastCompletedAction === 'generate_or_update_tasks') {
+      return toOperatorStep(
+        {
+          id: randomUUID(),
+          action: 'show_plan',
+          args: {},
+          mutating: false,
+        },
+        input.interactionMode,
+        'Ready tasks exist, so first review rationale/scope/warnings before executing a bounded step.',
+      );
+    }
     return toOperatorStep(
       {
         id: randomUUID(),
@@ -552,6 +727,33 @@ export function selectDeterministicStep(input: {
       },
       input.interactionMode,
       'Ready tasks exist, so the next safe step is to execute one bounded task.',
+    );
+  }
+
+  const recoverableTasks = recoverableTaskCount(input.ledger);
+  if (recoverableTasks > 0) {
+    if (lastCompletedAction !== 'recover_failed_tasks') {
+      return toOperatorStep(
+        {
+          id: randomUUID(),
+          action: 'recover_failed_tasks',
+          args: { limit: 1 },
+          mutating: true,
+        },
+        input.interactionMode,
+        `Detected ${recoverableTasks} failed/blocked task(s); recover one task into an executable state before next execution.`,
+      );
+    }
+
+    return toOperatorStep(
+      {
+        id: randomUUID(),
+        action: 'generate_or_update_tasks',
+        args: { goal: normalizeGoal(input.request), replan: true },
+        mutating: true,
+      },
+      input.interactionMode,
+      'Recovered tasks still need a refreshed executable plan, so replan from current intent and state.',
     );
   }
 

@@ -19,6 +19,9 @@ function toBoundaryState(boundary: OperatorBoundary): OrchestrationBoundaryState
     action: boundary.action,
     actionSummary: boundary.actionSummary,
     reason: boundary.reason,
+    ...(boundary.category ? { category: boundary.category } : {}),
+    ...(boundary.riskLevel ? { riskLevel: boundary.riskLevel } : {}),
+    ...(boundary.nextStepHint ? { nextStepHint: boundary.nextStepHint } : {}),
     scope: boundary.scope,
     choices: boundary.choices,
     requestedAt: nowIso(),
@@ -121,14 +124,19 @@ export function writeStepCompletionState(
 
 export function writeRunOutcome(ledger: LedgerDocument, result: OperatorRunResult): void {
   const orchestration = ensureOrchestrationState(ledger);
-  orchestration.lastRunOutcome = {
+  const outcome = {
     status: result.status,
     request: result.lastRequest,
     summary: result.summary,
     ...(result.reason ? { reason: result.reason } : {}),
     ...(result.nextSuggestedAction ? { nextSuggestedAction: result.nextSuggestedAction } : {}),
+    ...(result.recoveryKind ? { recoveryKind: result.recoveryKind } : {}),
+    ...(result.recoveryActions ? { recoveryActions: result.recoveryActions } : {}),
+    ...(result.lastFailure ? { lastFailure: result.lastFailure } : {}),
     completedAt: nowIso(),
   };
+  orchestration.lastRunOutcome = outcome;
+  orchestration.recentOutcomes = [...(orchestration.recentOutcomes ?? []), outcome].slice(-8);
   orchestration.updatedAt = nowIso();
 }
 

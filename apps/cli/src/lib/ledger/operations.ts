@@ -1,6 +1,6 @@
 import type {
-  Assignment,
-  AssignmentStatus,
+  ActiveExecutionPhase,
+  ActiveExecutionState,
   LedgerTask,
   TaskStatus,
   WorkerKind,
@@ -22,17 +22,41 @@ export interface CreateLedgerTaskInput {
   maxRetries?: number;
 }
 
-export interface LeaseTaskOptions {
-  force?: boolean;
-  sessionId?: string;
+export interface StartNextReadyTaskOptions {
+  worker: WorkerKind;
+  taskId?: string;
+  phase?: ActiveExecutionPhase;
+  statusMessage?: string;
+  cwd?: string;
+}
+
+export interface CompleteActiveTaskOptions {
+  taskId?: string;
+  cwd?: string;
+}
+
+export interface FailActiveTaskOptions extends CompleteActiveTaskOptions {
+  toStatus?: Extract<TaskStatus, 'failed' | 'ready' | 'pending'>;
+  error: string;
+}
+
+export interface BlockActiveTaskOptions extends CompleteActiveTaskOptions {
+  error: string;
+}
+
+export interface UpdateActiveExecutionOptions {
+  phase?: ActiveExecutionPhase;
+  statusMessage?: string | null;
+  cwd?: string;
+}
+
+export interface ClearActiveExecutionOptions {
+  taskId?: string;
+  cwd?: string;
 }
 
 function nowIso(): string {
   return new Date().toISOString();
-}
-
-function assignmentForTask(assignments: Assignment[], taskId: string): Assignment | undefined {
-  return assignments.find((entry) => entry.taskId === taskId);
 }
 
 function taskIndex(tasks: LedgerTask[]): Map<string, LedgerTask> {
@@ -41,6 +65,48 @@ function taskIndex(tasks: LedgerTask[]): Map<string, LedgerTask> {
 
 function areDependenciesMet(task: LedgerTask, index: Map<string, LedgerTask>): boolean {
   return task.dependencies.every((dependencyId) => index.get(dependencyId)?.status === 'completed');
+}
+
+function isReadyTask(task: LedgerTask, index: Map<string, LedgerTask>): boolean {
+  return task.status === 'ready' || (task.status === 'pending' && areDependenciesMet(task, index));
+}
+
+function refreshReadyTaskStatuses(tasks: LedgerTask[]): void {
+  const index = taskIndex(tasks);
+  const timestamp = nowIso();
+  for (const task of tasks) {
+    if (task.status === 'pending' && areDependenciesMet(task, index)) {
+      task.status = 'ready';
+      task.updatedAt = timestamp;
+      continue;
+    }
+    if (task.status === 'ready' && !areDependenciesMet(task, index)) {
+      task.status = 'pending';
+      task.updatedAt = timestamp;
+    }
+  }
+}
+
+function requireTask(tasks: LedgerTask[], taskId: string): LedgerTask {
+  const task = tasks.find((entry) => entry.id === taskId);
+  if (!task) {
+    throw new Error(`Task not found: ${taskId}`);
+  }
+  return task;
+}
+
+function requireActiveTask(
+  tasks: LedgerTask[],
+  activeExecution: ActiveExecutionState | undefined,
+  expectedTaskId?: string,
+): LedgerTask {
+  if (!activeExecution) {
+    throw new Error('No active execution to transition.');
+  }
+  if (expectedTaskId && activeExecution.taskId !== expectedTaskId) {
+    throw new Error(`Active execution task mismatch: expected ${expectedTaskId}, got ${activeExecution.taskId}`);
+  }
+  return requireTask(tasks, activeExecution.taskId);
 }
 
 export async function createTask(
@@ -74,6 +140,7 @@ export async function createTask(
     };
 
     tasksState.tasks.push(task);
+    refreshReadyTaskStatuses(tasksState.tasks);
     tasksState.updatedAt = nowIso();
     return task;
   });
@@ -88,7 +155,7 @@ export async function getReadyTasks(cwd: string = process.cwd()): Promise<Ledger
   const ledger = await readLedger(cwd);
   const tasks = ledger.tasks.tasks;
   const index = taskIndex(tasks);
-  return tasks.filter((task) => task.status === 'pending' && areDependenciesMet(task, index));
+  return tasks.filter((task) => isReadyTask(task, index));
 }
 
 export async function getBlockedTasks(cwd: string = process.cwd()): Promise<LedgerTask[]> {
@@ -105,11 +172,7 @@ export async function updateTaskStatus(
 ): Promise<LedgerTask> {
   const cwd = options.cwd ?? process.cwd();
   return mutateLedger(cwd, (ledger) => {
-    const task = ledger.tasks.tasks.find((entry) => entry.id === taskId);
-    if (!task) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-
+    const task = requireTask(ledger.tasks.tasks, taskId);
     task.status = status;
     task.updatedAt = nowIso();
     if (options.incrementAttempt) {
@@ -121,127 +184,145 @@ export async function updateTaskStatus(
       task.error = options.error;
     }
 
+    refreshReadyTaskStatuses(ledger.tasks.tasks);
     ledger.tasks.updatedAt = nowIso();
     return task;
   });
 }
 
-export async function leaseTask(
-  taskId: string,
-  worker: WorkerKind,
-  options: LeaseTaskOptions & { cwd?: string } = {},
-): Promise<Assignment> {
+export async function getActiveExecution(cwd: string = process.cwd()): Promise<ActiveExecutionState | null> {
+  const ledger = await readLedger(cwd);
+  return ledger.runtime.activeExecution ?? null;
+}
+
+export async function startNextReadyTask(options: StartNextReadyTaskOptions): Promise<LedgerTask> {
   const cwd = options.cwd ?? process.cwd();
   return mutateLedger(cwd, (ledger) => {
-    const tasksState = ledger.tasks;
-    const assignmentsState = ledger.assignments;
-    const currentTask = tasksState.tasks.find((entry) => entry.id === taskId);
-
-    if (!currentTask) {
-      throw new Error(`Task not found: ${taskId}`);
+    if (ledger.runtime.activeExecution) {
+      throw new Error(`An active execution already exists for task ${ledger.runtime.activeExecution.taskId}.`);
     }
 
-    const index = taskIndex(tasksState.tasks);
-    if (!options.force) {
-      if (currentTask.status !== 'pending') {
-        throw new Error(`Task is not pending: ${taskId}`);
+    const tasks = ledger.tasks.tasks;
+    refreshReadyTaskStatuses(tasks);
+    const index = taskIndex(tasks);
+
+    let task: LedgerTask | undefined;
+    if (options.taskId) {
+      task = tasks.find((entry) => entry.id === options.taskId);
+      if (!task) {
+        throw new Error(`Task not found: ${options.taskId}`);
       }
-      if (!areDependenciesMet(currentTask, index)) {
-        throw new Error(`Task dependencies are not satisfied: ${taskId}`);
+      if (!isReadyTask(task, index)) {
+        throw new Error(`Task is not ready for execution: ${options.taskId}`);
       }
+    } else {
+      task = tasks.find((entry) => isReadyTask(entry, index));
     }
 
-    currentTask.status = 'leased';
-    currentTask.updatedAt = nowIso();
+    if (!task) {
+      throw new Error('No ready task available to start.');
+    }
 
     const timestamp = nowIso();
-    const existing = assignmentForTask(assignmentsState.assignments, taskId);
-    if (existing) {
-      existing.worker = worker;
-      existing.status = 'assigned';
-      existing.leasedAt = timestamp;
-      existing.lastHeartbeat = timestamp;
-      delete existing.startedAt;
-      delete existing.completedAt;
-      if (options.sessionId) {
-        existing.sessionId = options.sessionId;
-      } else {
-        delete existing.sessionId;
-      }
-      tasksState.updatedAt = nowIso();
-      assignmentsState.updatedAt = nowIso();
-      return existing;
-    }
+    task.status = 'in_progress';
+    task.updatedAt = timestamp;
+    task.attemptCount += 1;
+    delete task.error;
 
-    const assignment: Assignment = {
-      taskId,
-      worker,
-      status: 'assigned',
-      leasedAt: timestamp,
-      lastHeartbeat: timestamp,
-      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+    ledger.runtime.activeExecution = {
+      taskId: task.id,
+      workerId: options.worker,
+      startedAt: timestamp,
+      attempt: task.attemptCount,
+      phase: options.phase ?? 'dispatching',
+      ...(options.statusMessage ? { statusMessage: options.statusMessage } : {}),
     };
-    assignmentsState.assignments.push(assignment);
-    tasksState.updatedAt = nowIso();
-    assignmentsState.updatedAt = nowIso();
-    return assignment;
+    ledger.tasks.updatedAt = timestamp;
+    ledger.runtime.updatedAt = timestamp;
+    return task;
   });
 }
 
-export async function setAssignmentStatus(
-  taskId: string,
-  status: AssignmentStatus,
-  options: { sessionId?: string | null; cwd?: string } = {},
-): Promise<Assignment> {
+export async function updateActiveExecution(options: UpdateActiveExecutionOptions = {}): Promise<ActiveExecutionState> {
   const cwd = options.cwd ?? process.cwd();
   return mutateLedger(cwd, (ledger) => {
-    const assignmentsState = ledger.assignments;
-    const assignment = assignmentForTask(assignmentsState.assignments, taskId);
-    if (!assignment) {
-      throw new Error(`Assignment not found for task: ${taskId}`);
+    const active = ledger.runtime.activeExecution;
+    if (!active) {
+      throw new Error('No active execution to update.');
     }
 
-    assignment.status = status;
-    assignment.lastHeartbeat = nowIso();
-    if (status === 'in_progress' && !assignment.startedAt) {
-      assignment.startedAt = nowIso();
+    if (options.phase) {
+      active.phase = options.phase;
     }
-    if (status === 'done') {
-      assignment.completedAt = nowIso();
+    if (options.statusMessage === null) {
+      delete active.statusMessage;
+    } else if (typeof options.statusMessage === 'string') {
+      active.statusMessage = options.statusMessage;
     }
-    if (options.sessionId === null) {
-      delete assignment.sessionId;
-    } else if (options.sessionId) {
-      assignment.sessionId = options.sessionId;
-    }
-    assignmentsState.updatedAt = nowIso();
-    return assignment;
+
+    ledger.runtime.updatedAt = nowIso();
+    return active;
   });
 }
 
-export async function releaseTask(
-  taskId: string,
-  options: { toStatus?: Extract<TaskStatus, 'pending' | 'blocked' | 'failed'>; error?: string; cwd?: string } = {},
-): Promise<LedgerTask> {
+export async function clearActiveExecution(options: ClearActiveExecutionOptions = {}): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
-  const nextStatus = options.toStatus ?? 'pending';
-  return mutateLedger(cwd, (ledger) => {
-    const task = ledger.tasks.tasks.find((entry) => entry.id === taskId);
-    if (!task) {
-      throw new Error(`Task not found: ${taskId}`);
+  await mutateLedger(cwd, (ledger) => {
+    const active = ledger.runtime.activeExecution;
+    if (!active) {
+      return;
     }
+    if (options.taskId && active.taskId !== options.taskId) {
+      throw new Error(`Active execution task mismatch: expected ${options.taskId}, got ${active.taskId}`);
+    }
+    delete ledger.runtime.activeExecution;
+    ledger.runtime.updatedAt = nowIso();
+  });
+}
 
-    task.status = nextStatus;
+export async function completeActiveTask(options: CompleteActiveTaskOptions = {}): Promise<LedgerTask> {
+  const cwd = options.cwd ?? process.cwd();
+  return mutateLedger(cwd, (ledger) => {
+    const task = requireActiveTask(ledger.tasks.tasks, ledger.runtime.activeExecution, options.taskId);
+    task.status = 'completed';
     task.updatedAt = nowIso();
-    if (options.error) {
-      task.error = options.error;
-    } else if (nextStatus === 'pending') {
-      delete task.error;
-    }
+    delete task.error;
 
-    ledger.assignments.assignments = ledger.assignments.assignments.filter((entry) => entry.taskId !== taskId);
+    delete ledger.runtime.activeExecution;
+    refreshReadyTaskStatuses(ledger.tasks.tasks);
     ledger.tasks.updatedAt = nowIso();
-    ledger.assignments.updatedAt = nowIso();
+    ledger.runtime.updatedAt = nowIso();
+    return task;
+  });
+}
+
+export async function failActiveTask(options: FailActiveTaskOptions): Promise<LedgerTask> {
+  const cwd = options.cwd ?? process.cwd();
+  return mutateLedger(cwd, (ledger) => {
+    const task = requireActiveTask(ledger.tasks.tasks, ledger.runtime.activeExecution, options.taskId);
+    task.status = options.toStatus ?? 'failed';
+    task.updatedAt = nowIso();
+    task.error = options.error;
+
+    delete ledger.runtime.activeExecution;
+    refreshReadyTaskStatuses(ledger.tasks.tasks);
+    ledger.tasks.updatedAt = nowIso();
+    ledger.runtime.updatedAt = nowIso();
+    return task;
+  });
+}
+
+export async function blockActiveTask(options: BlockActiveTaskOptions): Promise<LedgerTask> {
+  const cwd = options.cwd ?? process.cwd();
+  return mutateLedger(cwd, (ledger) => {
+    const task = requireActiveTask(ledger.tasks.tasks, ledger.runtime.activeExecution, options.taskId);
+    task.status = 'blocked';
+    task.updatedAt = nowIso();
+    task.error = options.error;
+
+    delete ledger.runtime.activeExecution;
+    ledger.tasks.updatedAt = nowIso();
+    ledger.runtime.updatedAt = nowIso();
     return task;
   });
 }
@@ -250,26 +331,7 @@ export async function completeTask(
   taskId: string,
   options: { worker?: WorkerKind; cwd?: string } = {},
 ): Promise<LedgerTask> {
-  const cwd = options.cwd ?? process.cwd();
-  return mutateLedger(cwd, (ledger) => {
-    const task = ledger.tasks.tasks.find((entry) => entry.id === taskId);
-    if (!task) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-
-    task.status = 'completed';
-    task.updatedAt = nowIso();
-    delete task.error;
-
-    const assignment = assignmentForTask(ledger.assignments.assignments, taskId);
-    if (assignment && options.worker) {
-      assignment.worker = options.worker;
-    }
-    ledger.assignments.assignments = ledger.assignments.assignments.filter((entry) => entry.taskId !== taskId);
-    ledger.tasks.updatedAt = nowIso();
-    ledger.assignments.updatedAt = nowIso();
-    return task;
-  });
+  return completeActiveTask({ taskId, cwd: options.cwd ?? process.cwd() });
 }
 
 export async function getTaskGraph(cwd: string = process.cwd()): Promise<{
@@ -311,4 +373,3 @@ export async function getDependencyChain(taskId: string, cwd: string = process.c
   walk(taskId);
   return chain;
 }
-

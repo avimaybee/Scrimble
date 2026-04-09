@@ -26,6 +26,78 @@ export const aiConfigSchema = z.object({
   options: aiOptionsSchema.optional(),
 }).strict();
 
+export const aiModelStrategySchema = z.enum(['auto', 'explicit']);
+export const aiProfileAuthStrategySchema = z.enum([
+  'api_key',
+  'copilot_login',
+  'env_token',
+  'gh_cli',
+  'personal_access_token',
+]);
+
+export const aiProfileAuthSchema = z.discriminatedUnion('strategy', [
+  z.object({
+    strategy: z.literal('api_key'),
+    apiKey: z.string().optional(),
+  }).strict(),
+  z.object({
+    strategy: z.literal('copilot_login'),
+  }).strict(),
+  z.object({
+    strategy: z.literal('env_token'),
+  }).strict(),
+  z.object({
+    strategy: z.literal('gh_cli'),
+  }).strict(),
+  z.object({
+    strategy: z.literal('personal_access_token'),
+    token: z.string().optional(),
+  }).strict(),
+]);
+
+export const aiProviderProfileSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  provider: aiProviderSchema,
+  modelStrategy: aiModelStrategySchema,
+  model: z.string().min(1).optional(),
+  baseUrl: z.string().url().optional(),
+  auth: aiProfileAuthSchema,
+  options: aiOptionsSchema.optional(),
+}).strict().superRefine((profile, ctx) => {
+  if (profile.modelStrategy === 'explicit' && !profile.model?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Explicit model strategy requires a model.',
+      path: ['model'],
+    });
+  }
+
+  if (profile.provider === 'github-copilot') {
+    if (!['copilot_login', 'env_token', 'gh_cli', 'personal_access_token'].includes(profile.auth.strategy)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'GitHub Copilot profiles must use a Copilot auth strategy.',
+        path: ['auth', 'strategy'],
+      });
+    }
+  } else if (profile.auth.strategy !== 'api_key') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `${profile.provider} profiles must use api_key auth strategy.`,
+      path: ['auth', 'strategy'],
+    });
+  }
+
+  if (profile.provider === 'azure' && !profile.baseUrl?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Azure profiles require baseUrl.',
+      path: ['baseUrl'],
+    });
+  }
+});
+
 export const plannerWorkerSchema = z.enum(['gemini', 'copilot', 'auto']);
 export const interactionModeSchema = z.enum(['guide', 'balanced', 'operator']);
 
@@ -47,10 +119,21 @@ export const verificationDefaultsSchema = z.object({
   commands: z.array(z.string()).optional(),
 }).strict();
 
-// Local config schema
-export const scrimbleConfigSchema = z.object({
+export const legacyScrimbleConfigSchema = z.object({
   schemaVersion: z.number().int().positive().default(1),
   ai: aiConfigSchema,
+  interactionMode: interactionModeSchema.default('guide'),
+  plannerWorker: plannerWorkerSchema.optional(),
+  workerPreferences: workerPreferencesSchema.optional(),
+  executionDefaults: executionDefaultsSchema.optional(),
+  verificationDefaults: verificationDefaultsSchema.optional(),
+}).strict();
+
+// Local config schema
+export const scrimbleConfigSchema = z.object({
+  schemaVersion: z.number().int().positive().default(2),
+  activeProfileId: z.string().min(1).optional(),
+  profiles: z.array(aiProviderProfileSchema).default([]),
   interactionMode: interactionModeSchema.default('guide'),
   plannerWorker: plannerWorkerSchema.optional(),
   workerPreferences: workerPreferencesSchema.optional(),
@@ -179,8 +262,13 @@ export const firebaseApproveRequestSchema = z.object({
 // Only export schema-derived types for use with zod inference
 export type AIProviderFromSchema = z.infer<typeof aiProviderSchema>;
 export type AIConfigFromSchema = z.infer<typeof aiConfigSchema>;
+export type AIModelStrategyFromSchema = z.infer<typeof aiModelStrategySchema>;
+export type AIProfileAuthStrategyFromSchema = z.infer<typeof aiProfileAuthStrategySchema>;
+export type AIProfileAuthFromSchema = z.infer<typeof aiProfileAuthSchema>;
+export type AIProviderProfileFromSchema = z.infer<typeof aiProviderProfileSchema>;
 export type InteractionModeFromSchema = z.infer<typeof interactionModeSchema>;
 export type ScrimbleConfigFromSchema = z.infer<typeof scrimbleConfigSchema>;
+export type LegacyScrimbleConfigFromSchema = z.infer<typeof legacyScrimbleConfigSchema>;
 export type ProjectStatusFromSchema = z.infer<typeof projectStatusSchema>;
 export type ChunkStatusFromSchema = z.infer<typeof chunkStatusSchema>;
 export type ChunkDefinitionFromSchema = z.infer<typeof chunkDefinitionSchema>;

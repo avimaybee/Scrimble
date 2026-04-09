@@ -1,6 +1,8 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
+import { refreshProfileHealth } from '../lib/ai/provider.js';
+import { describeProfileModel, getActiveProfile } from '../lib/ai/profiles.js';
 import { getWorkerDriver } from '../lib/workers/factory.js';
 
 export default class Doctor extends Command {
@@ -43,13 +45,42 @@ export default class Doctor extends Command {
 
     try {
       const config = await loadScrimbleConfig(process.cwd());
-      checks.push({
-        name: 'config.json',
-        status: 'pass',
-        message: `Found ✓ (provider=${config.ai.provider}, model=${config.ai.model})`,
-      });
+      const activeProfile = getActiveProfile(config);
+      if (!activeProfile) {
+        checks.push({
+          name: 'config.json',
+          status: 'fail',
+          message: 'Found, but no active profile is configured (run `scrimble config set-ai`).',
+        });
+      } else {
+        const health = await refreshProfileHealth(activeProfile, { cwd: process.cwd() });
+        checks.push({
+          name: 'config.json',
+          status: health.usableNow ? 'pass' : health.issues.length > 0 ? 'fail' : 'warn',
+          message: `Active profile=${activeProfile.name} (${activeProfile.provider}/${describeProfileModel(activeProfile)}) [capabilities=${health.capabilitySource}, model=${health.modelAvailability}]`,
+        });
+        checks.push({
+          name: 'profile auth',
+          status: health.status === 'ready' ? 'pass' : health.status === 'invalid' ? 'fail' : 'warn',
+          message: health.status === 'ready'
+            ? `Configured=${health.authStrategy}, using=${health.resolvedAuthStrategy}${health.authSource ? ` (${health.authSource})` : ''}`
+            : health.usabilityIssues[0] ?? health.issues[0] ?? 'Profile auth could not be resolved.',
+        });
+        checks.push({
+          name: 'validation freshness',
+          status: health.validationFreshness === 'fresh' ? 'pass' : 'warn',
+          message: `${health.validationFreshness} (validated ${health.validatedAt})`,
+        });
+        for (const issue of [...health.issues.slice(1), ...health.usabilityIssues.slice(1)]) {
+          checks.push({
+            name: 'profile issue',
+            status: 'warn',
+            message: issue,
+          });
+        }
+      }
     } catch {
-      checks.push({ name: 'config.json', status: 'warn', message: 'Missing/invalid (run `scrimble init`)' });
+      checks.push({ name: 'config.json', status: 'warn', message: 'Missing/invalid (run `scrimble init` then `scrimble config set-ai`)' });
     }
 
     for (const workerKind of ['gemini', 'copilot'] as const) {
@@ -59,7 +90,7 @@ export default class Doctor extends Command {
         checks.push({
           name: `${workerKind} worker`,
           status: 'pass',
-          message: `Ready ✓${preflight.version ? ` (${preflight.version})` : ''}`,
+          message: `Ready ✓${preflight.version ? ` (${preflight.version})` : ''}${preflight.authSource ? ` [auth=${preflight.authSource}]` : ''}`,
         });
       } else if (preflight.errors.length > 0) {
         checks.push({

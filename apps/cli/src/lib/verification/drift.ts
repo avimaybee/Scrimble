@@ -1,5 +1,5 @@
 import type { LedgerTask } from '@scrimble/shared';
-import { detectOutOfScopeEdits } from '../scheduler/parallel.js';
+import { detectOutOfScopeEdits } from '../scheduler/ownership.js';
 
 export type DriftFindingType = 'out_of_scope' | 'stale_verification' | 'dependency_invalidated';
 export type DriftSeverity = 'warn' | 'error';

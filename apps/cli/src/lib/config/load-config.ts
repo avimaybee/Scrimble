@@ -3,31 +3,40 @@ import * as path from 'node:path';
 import {
   CONFIG_FILE,
   SCRIMBLE_DIR,
+  legacyScrimbleConfigSchema,
   scrimbleConfigSchema,
 } from '@scrimble/shared';
+import {
+  migrateLegacyScrimbleConfig,
+  normalizeScrimbleConfig,
+} from '../ai/profiles.js';
+import { writeSecureJson } from '../security.js';
 
-function interpolateEnv(value: unknown): unknown {
-  if (typeof value === 'string') {
-    return value.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, envName: string) => process.env[envName] ?? '');
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isLegacyConfig(value: unknown): boolean {
+  return isRecord(value) && 'ai' in value && !('profiles' in value);
+}
+
+function normalizeConfigObject(value: unknown) {
+  if (isLegacyConfig(value)) {
+    const legacy = legacyScrimbleConfigSchema.parse(value);
+    return migrateLegacyScrimbleConfig(legacy);
   }
 
-  if (Array.isArray(value)) {
-    return value.map((entry) => interpolateEnv(entry));
-  }
-
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, interpolateEnv(entry)]),
-    );
-  }
-
-  return value;
+  const parsed = scrimbleConfigSchema.parse(value);
+  return normalizeScrimbleConfig(parsed);
 }
 
 export async function loadScrimbleConfig(cwd = process.cwd()) {
   const configPath = path.join(cwd, SCRIMBLE_DIR, CONFIG_FILE);
   const rawConfig = await fs.readFile(configPath, 'utf8');
   const parsed = JSON.parse(rawConfig) as unknown;
-  const withEnvInterpolation = interpolateEnv(parsed);
-  return scrimbleConfigSchema.parse(withEnvInterpolation);
+  const normalized = normalizeConfigObject(parsed);
+  if (JSON.stringify(parsed) !== JSON.stringify(normalized)) {
+    await writeSecureJson(configPath, normalized);
+  }
+  return normalized;
 }

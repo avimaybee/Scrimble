@@ -65,14 +65,14 @@ describe('scheduler router', () => {
     expect(decision.worker).toBe('copilot');
   });
 
-  it('prefers an idle worker over a busy one', () => {
+  it('falls back to deterministic worker priority when no preference is set', () => {
     const workers: WorkerHealth[] = [
-      { kind: 'gemini', available: true, currentTaskId: 'task-active', tasksCompleted: 3, tasksFailed: 0 },
+      { kind: 'gemini', available: true, tasksCompleted: 3, tasksFailed: 0 },
       { kind: 'copilot', available: true, tasksCompleted: 10, tasksFailed: 4 },
     ];
 
     const decision = routeTask(makeTask(), { workers });
-    expect(decision.worker).toBe('copilot');
+    expect(decision.worker).toBe('gemini');
   });
 });
 

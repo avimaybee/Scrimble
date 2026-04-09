@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "updatedAt": "2026-04-09T10:53:41.660Z",
+  "tasks": {
+    "version": 1,
+    "tasks": [],
+    "updatedAt": "2026-04-09T10:53:41.658Z"
+  },
+  "assignments": {
+    "version": 1,
+    "assignments": [],
+    "updatedAt": "2026-04-09T10:53:41.658Z"
+  },
+  "workers": {
+    "version": 1,
+    "workers": [],
+    "updatedAt": "2026-04-09T10:53:41.658Z"
+  },
+  "intent": {
+    "version": 1,
+    "intent": null,
+    "history": [],
+    "updatedAt": "2026-04-09T10:53:41.658Z"
+  },
+  "approval": {
+    "version": 1,
+    "approved": false,
+    "updatedAt": "2026-04-09T10:53:41.658Z"
+  },
+  "orchestration": {
+    "version": 1,
+    "sessionId": "9d2caa3c-e3f6-4606-8d18-a5fd54d48378",
+    "updatedAt": "2026-04-09T10:53:41.659Z",
+    "activeRun": {
+      "request": "show current local status",
+      "startedAt": "2026-04-09T10:53:41.659Z",
+      "updatedAt": "2026-04-09T10:53:41.659Z",
+      "pendingBoundary": {
+        "id": "90bec05a-7d71-42f9-9c48-aef5b17ca3ae",
+        "action": "configure_ai",
+        "actionSummary": "Set up your model configuration.",
+        "reason": "I need your approval to update setup/configuration.",
+        "scope": {
+          "parallel": 1,
+          "maxTasks": 1,
+          "args": {}
+        },
+        "choices": [
+          "proceed",
+          "pause",
+          "redirect"
+        ],
+        "requestedAt": "2026-04-09T10:53:41.659Z"
+      },
+      "lastPauseReason": "Paused: I need your approval to update setup/configuration."
+    },
+    "lastRunOutcome": {
+      "status": "paused",
+      "request": "show current local status",
+      "summary": "Paused: I need your approval to update setup/configuration.",
+      "reason": "I need your approval to update setup/configuration.",
+      "nextSuggestedAction": "Confirm this boundary or redirect me.",
+      "completedAt": "2026-04-09T10:53:41.659Z"
+    }
+  }
+}

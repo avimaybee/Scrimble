@@ -6,12 +6,16 @@ const orchestratorMocks = vi.hoisted(() => ({
   loadSessionState: vi.fn(),
 }));
 
-const readlineMocks = vi.hoisted(() => ({
-  createInterface: vi.fn(),
+const shellMocks = vi.hoisted(() => ({
+  runOperatorShell: vi.fn(),
 }));
 
 const configMocks = vi.hoisted(() => ({
   loadScrimbleConfig: vi.fn(),
+}));
+
+const discoveryMocks = vi.hoisted(() => ({
+  ensureDiscoveryFoundation: vi.fn(),
 }));
 
 vi.mock('../lib/agent/orchestrator.js', () => ({
@@ -21,8 +25,9 @@ vi.mock('../lib/agent/orchestrator.js', () => ({
     loadSessionState = orchestratorMocks.loadSessionState;
   },
 }));
-vi.mock('node:readline/promises', () => readlineMocks);
+vi.mock('../lib/shell/run-operator-shell.js', () => shellMocks);
 vi.mock('../lib/config/load-config.js', () => configMocks);
+vi.mock('../lib/discovery/plaintext.js', () => discoveryMocks);
 
 import Root from './root.js';
 
@@ -58,6 +63,27 @@ function completedResult(summary = 'Completed.'): {
   };
 }
 
+function validConfig(mode: 'guide' | 'balanced' | 'operator' = 'guide') {
+  return {
+    schemaVersion: 2,
+    activeProfileId: 'profile-openai',
+    profiles: [
+      {
+        id: 'profile-openai',
+        name: 'OpenAI profile',
+        provider: 'openai',
+        modelStrategy: 'explicit',
+        model: 'gpt-4o',
+        auth: {
+          strategy: 'api_key',
+          apiKey: 'sk-test',
+        },
+      },
+    ],
+    interactionMode: mode,
+  };
+}
+
 describe('root conversational command', () => {
   const stdinTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
   const stdoutTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
@@ -66,11 +92,13 @@ describe('root conversational command', () => {
     orchestratorMocks.runRequest.mockReset();
     orchestratorMocks.resumeActiveRun.mockReset();
     orchestratorMocks.loadSessionState.mockReset();
-    readlineMocks.createInterface.mockReset();
+    shellMocks.runOperatorShell.mockReset();
     configMocks.loadScrimbleConfig.mockReset();
+    discoveryMocks.ensureDiscoveryFoundation.mockReset();
     orchestratorMocks.loadSessionState.mockResolvedValue(null);
     orchestratorMocks.resumeActiveRun.mockResolvedValue(completedResult('resumed'));
-    configMocks.loadScrimbleConfig.mockRejectedValue(new Error('missing config'));
+    configMocks.loadScrimbleConfig.mockResolvedValue(validConfig());
+    discoveryMocks.ensureDiscoveryFoundation.mockResolvedValue(true);
     Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
     Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
   });
@@ -105,6 +133,10 @@ describe('root conversational command', () => {
         autoConfirm: false,
       }),
     );
+    expect(discoveryMocks.ensureDiscoveryFoundation).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: 'show status',
+    }));
+    expect(shellMocks.runOperatorShell).not.toHaveBeenCalled();
     expect(logs.join('\n')).toContain('Report');
     expect(logs.join('\n')).toContain('Read local status.');
   });
@@ -132,159 +164,87 @@ describe('root conversational command', () => {
     expect(logs.join('\n')).toContain('Execution failed: worker crashed');
   });
 
-  it('captures interaction mode during first interactive turn when config is missing', async () => {
-    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    orchestratorMocks.runRequest.mockResolvedValue(completedResult('status ok'));
-    const question = vi.fn()
-      .mockResolvedValueOnce('summarize progress')
-      .mockResolvedValueOnce('2')
-      .mockResolvedValueOnce('exit');
-    readlineMocks.createInterface.mockReturnValue({
-      question,
-      close: vi.fn(),
-    });
+  it('exits when one-shot discovery cannot continue', async () => {
+    discoveryMocks.ensureDiscoveryFoundation.mockResolvedValue(false);
 
     const logs: string[] = [];
     const command = makeCommand(
       {
-        flags: { prompt: undefined, yes: false, verbose: false },
+        flags: { prompt: 'run tasks', yes: false, verbose: false },
         argv: [],
       },
       logs,
     );
 
-    await command.run();
-    expect(logs.join('\n')).toContain('How hands-on should I be by default?');
-    expect(logs.join('\n')).toContain("I'll default to balanced");
-    expect(orchestratorMocks.runRequest).toHaveBeenCalledWith(
-      'summarize progress',
-      expect.objectContaining({
-        interactionMode: 'balanced',
-      }),
-    );
-  });
-
-  it('shows active-run resume hints in interactive mode', async () => {
-    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    configMocks.loadScrimbleConfig.mockResolvedValue({ interactionMode: 'guide' });
-    orchestratorMocks.loadSessionState.mockResolvedValue({
-      version: 1,
-      sessionId: 'session-42',
-      activeRun: {
-        request: 'finish migration',
-        startedAt: '2026-01-01T00:00:00.000Z',
-        updatedAt: '2026-01-01T00:00:00.000Z',
-        stepCount: 2,
-        completedSteps: [],
-        pendingBoundary: {
-          id: 'boundary-1',
-          action: 'execute_tasks',
-          actionSummary: 'Start working through the planned tasks.',
-          reason: 'Execution requires confirmation.',
-          scope: { parallel: 1, maxTasks: 1, args: {} },
-          choices: ['proceed', 'pause', 'redirect'],
-          requestedAt: '2026-01-01T00:00:00.000Z',
-        },
-      },
-      updatedAt: '2026-01-01T00:00:00.000Z',
-    });
-    readlineMocks.createInterface.mockReturnValue({
-      question: vi.fn()
-        .mockResolvedValueOnce('n')
-        .mockResolvedValueOnce('exit'),
-      close: vi.fn(),
-    });
-
-    const logs: string[] = [];
-    const command = makeCommand(
-      {
-        flags: { prompt: undefined, yes: false, verbose: false },
-        argv: [],
-      },
-      logs,
-    );
-
-    await command.run();
-    expect(logs.join('\n')).toContain('In-progress request: finish migration');
-    expect(logs.join('\n')).toContain('Waiting on approval');
-  });
-
-  it('resumes active runs without requiring the user to restate the request', async () => {
-    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    configMocks.loadScrimbleConfig.mockResolvedValue({ interactionMode: 'balanced' });
-    orchestratorMocks.loadSessionState.mockResolvedValue({
-      version: 1,
-      sessionId: 'session-42',
-      activeRun: {
-        request: 'finish migration',
-        startedAt: '2026-01-01T00:00:00.000Z',
-        updatedAt: '2026-01-01T00:00:00.000Z',
-        stepCount: 2,
-        completedSteps: [],
-        lastPauseReason: 'Waiting for approval.',
-      },
-      updatedAt: '2026-01-01T00:00:00.000Z',
-    });
-    orchestratorMocks.resumeActiveRun.mockResolvedValue(completedResult('resumed work'));
-    const question = vi.fn()
-      .mockResolvedValueOnce('y')
-      .mockResolvedValueOnce('exit');
-    readlineMocks.createInterface.mockReturnValue({
-      question,
-      close: vi.fn(),
-    });
-
-    const logs: string[] = [];
-    const command = makeCommand(
-      {
-        flags: { prompt: undefined, yes: false, verbose: false },
-        argv: [],
-      },
-      logs,
-    );
-
-    await command.run();
-    expect(orchestratorMocks.resumeActiveRun).toHaveBeenCalledTimes(1);
+    await expect(command.run()).rejects.toThrow('EXIT_1');
     expect(orchestratorMocks.runRequest).not.toHaveBeenCalled();
-    expect(logs.join('\n')).toContain('resumed work');
   });
 
-  it('resolves configure boundary and collects setup interactively', async () => {
+  it('launches the operator shell in interactive mode without prompt', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    configMocks.loadScrimbleConfig.mockResolvedValue({ interactionMode: 'guide' });
-
-    let capturedSetup: Record<string, unknown> | undefined;
-    let capturedDecision: unknown;
-    orchestratorMocks.runRequest.mockImplementation(async (_request: string, options: Record<string, unknown>) => {
-      const boundary = {
-        id: 'boundary-config',
-        action: 'configure_ai',
-        actionSummary: 'Set up your model configuration.',
-        reason: 'Model configuration changes require explicit confirmation.',
-        scope: { parallel: 1, maxTasks: 1, args: {} },
-        choices: ['proceed', 'pause', 'redirect'],
-      };
-      capturedDecision = await (options['resolveBoundary'] as (boundary: unknown) => Promise<unknown>)(boundary);
-      capturedSetup = options['setup'] as Record<string, unknown>;
-      return completedResult('configured');
+    configMocks.loadScrimbleConfig.mockResolvedValue({
+      ...validConfig('balanced'),
+      profiles: [
+        {
+          id: 'profile-openai',
+          name: 'OpenAI profile',
+          provider: 'openai',
+          modelStrategy: 'explicit',
+          model: 'gpt-5',
+          auth: {
+            strategy: 'api_key',
+            apiKey: 'sk-test',
+          },
+        },
+      ],
     });
+    shellMocks.runOperatorShell.mockResolvedValue(undefined);
 
-    const question = vi.fn()
-      .mockResolvedValueOnce('configure model')
-      .mockResolvedValueOnce('y')
-      .mockResolvedValueOnce('openai')
-      .mockResolvedValueOnce('gpt-4o')
-      .mockResolvedValueOnce('${OPENAI_API_KEY}')
-      .mockResolvedValueOnce('exit');
-    readlineMocks.createInterface.mockReturnValue({
-      question,
-      close: vi.fn(),
-    });
+    const logs: string[] = [];
+    const command = makeCommand(
+      {
+        flags: { prompt: undefined, yes: false, verbose: true },
+        argv: [],
+      },
+      logs,
+    );
 
+    await command.run();
+
+    expect(shellMocks.runOperatorShell).toHaveBeenCalledWith(expect.objectContaining({
+      interactionMode: 'balanced',
+      config: expect.objectContaining({
+        activeProfileId: 'profile-openai',
+      }),
+      verbose: true,
+    }));
+    expect(orchestratorMocks.runRequest).not.toHaveBeenCalled();
+    expect(logs).toHaveLength(0);
+  });
+
+  it('does not launch shell in one-shot prompt mode even when interactive', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+    orchestratorMocks.runRequest.mockResolvedValue(completedResult('Prompt completed'));
+
+    const logs: string[] = [];
+    const command = makeCommand(
+      {
+        flags: { prompt: 'summarize', yes: false, verbose: false },
+        argv: [],
+      },
+      logs,
+    );
+
+    await command.run();
+
+    expect(orchestratorMocks.runRequest).toHaveBeenCalledTimes(1);
+    expect(shellMocks.runOperatorShell).not.toHaveBeenCalled();
+    expect(logs.join('\n')).toContain('Prompt completed');
+  });
+
+  it('requires --prompt in non-interactive mode', async () => {
     const logs: string[] = [];
     const command = makeCommand(
       {
@@ -294,54 +254,9 @@ describe('root conversational command', () => {
       logs,
     );
 
-    await command.run();
-    expect(capturedDecision).toEqual({ kind: 'proceed' });
-    expect(capturedSetup).toMatchObject({
-      provider: 'openai',
-      model: 'gpt-4o',
-      apiKey: '${OPENAI_API_KEY}',
-    });
-  });
-
-  it('returns redirect decisions from boundary prompts', async () => {
-    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    configMocks.loadScrimbleConfig.mockResolvedValue({ interactionMode: 'guide' });
-
-    let capturedDecision: unknown;
-    orchestratorMocks.runRequest.mockImplementation(async (_request: string, options: Record<string, unknown>) => {
-      const boundary = {
-        id: 'boundary-exec',
-        action: 'execute_tasks',
-        actionSummary: 'Start working through the planned tasks.',
-        reason: 'Execution requires confirmation.',
-        scope: { parallel: 1, maxTasks: 1, args: {} },
-        choices: ['proceed', 'pause', 'redirect'],
-      };
-      capturedDecision = await (options['resolveBoundary'] as (boundary: unknown) => Promise<unknown>)(boundary);
-      return completedResult('redirected');
-    });
-
-    const question = vi.fn()
-      .mockResolvedValueOnce('implement auth')
-      .mockResolvedValueOnce('show status instead')
-      .mockResolvedValueOnce('exit');
-    readlineMocks.createInterface.mockReturnValue({
-      question,
-      close: vi.fn(),
-    });
-
-    const logs: string[] = [];
-    const command = makeCommand(
-      {
-        flags: { prompt: undefined, yes: false, verbose: false },
-        argv: [],
-      },
-      logs,
-    );
-
-    await command.run();
-    expect(capturedDecision).toEqual({ kind: 'redirect', request: 'show status instead' });
+    await expect(command.run()).rejects.toThrow('EXIT_1');
+    expect(logs.join('\n')).toContain('Provide a request with `scrimble --prompt');
+    expect(shellMocks.runOperatorShell).not.toHaveBeenCalled();
   });
 
   it('pauses boundary resolution in non-interactive one-shot mode without --yes', async () => {

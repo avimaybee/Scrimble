@@ -2,7 +2,7 @@
  * Gemini CLI preflight detection.
  * Checks for Gemini CLI availability, headless auth, and folder trust.
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -14,17 +14,50 @@ import type {
 } from '@scrimble/shared';
 
 /** Execute a command and capture output. */
+async function resolveWindowsGeminiShim(
+  command: string,
+  args: string[],
+): Promise<{ command: string; args: string[] } | null> {
+  if (process.platform !== 'win32' || (command !== 'gemini' && command !== 'gemini-cli')) {
+    return null;
+  }
+  const appData = process.env['APPDATA'];
+  if (!appData) {
+    return null;
+  }
+  const loader = path.join(appData, 'npm', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
+  try {
+    await fs.access(loader);
+    return {
+      command: process.execPath,
+      args: ['--no-warnings=DEP0040', loader, ...args],
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function execCapture(
   command: string,
   args: string[],
   timeoutMs = 10000,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const windowsShim = await resolveWindowsGeminiShim(command, args);
   return new Promise((resolve) => {
-    const proc = spawn(command, args, {
-      shell: true,
-      timeout: timeoutMs,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const spawnCommand = windowsShim?.command ?? command;
+    const spawnArgs = windowsShim?.args ?? args;
+
+    let proc: ChildProcess;
+    try {
+      proc = spawn(spawnCommand, spawnArgs, {
+        timeout: timeoutMs,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      const err = error as Error;
+      resolve({ stdout: '', stderr: err.message, exitCode: 1 });
+      return;
+    }
 
     let stdout = '';
     let stderr = '';
@@ -37,11 +70,11 @@ async function execCapture(
     });
 
     proc.on('error', (err) => {
-      resolve({ stdout, stderr: err.message, exitCode: 1 });
+      stderr += `\n${err.message}`;
     });
 
     proc.on('close', (code) => {
-      resolve({ stdout, stderr, exitCode: code ?? 0 });
+      resolve({ stdout, stderr, exitCode: code ?? 1 });
     });
   });
 }
@@ -92,16 +125,6 @@ export async function detectHeadlessAuth(): Promise<HeadlessAuthStatus> {
     } catch {
       // Continue checking
     }
-  }
-
-  // Try running gemini auth status
-  const result = await execCapture('gemini', ['auth', 'status']);
-  const authOutput = `${result.stdout}\n${result.stderr}`.toLowerCase();
-  if (
-    result.exitCode === 0 &&
-    (authOutput.includes('authenticated') || authOutput.includes('logged in') || authOutput.includes('authorized'))
-  ) {
-    return { available: true };
   }
 
   return {

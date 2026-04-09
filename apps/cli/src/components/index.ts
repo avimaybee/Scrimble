@@ -4,3 +4,4 @@ export * from './PromptView.js';
 export * from './RootDashboard.js';
 export * from './StatusBar.js';
 export * from './VerificationResult.js';
+export * from './shell/index.js';

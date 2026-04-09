@@ -41,7 +41,7 @@ scrimble/
 Scrimble now defaults to a conversation-first workflow:
 
 ```bash
-# interactive REPL
+# interactive operator shell (TTY)
 scrimble
 
 # one-shot request
@@ -49,8 +49,8 @@ scrimble --prompt "inspect current state and propose an execution plan"
 scrimble "implement the next milestone"
 ```
 
-For mutating requests, Scrimble selects one bounded next action, asks at policy boundaries, executes, observes the result, and loops until done, blocked, redirected, or paused.
-Runs are resumable: if a session ends mid-run, the next interactive launch can continue from the active run state (including pending approval boundaries).
+In interactive TTY mode, `scrimble` launches a full-screen operator shell with a startup context panel, status strip, transcript, approval card, and bottom composer. One-shot and non-TTY usage stay text based.
+For mutating requests, Scrimble selects one bounded next action, asks at policy boundaries, executes, observes the result, and loops until done, blocked, redirected, or paused. Runs are resumable: if a session ends mid-run, the next interactive launch can continue from the active run state (including pending approval boundaries).
 
 ## Interaction Modes
 
@@ -60,7 +60,7 @@ Scrimble stores a persistent interaction preference in `.scrimble/config.json`:
 - `balanced`: plans automatically and confirms before execution
 - `operator`: handles routine setup/planning automatically and pauses for higher-risk changes
 
-On first run, Scrimble asks for your goal first, then asks which mode you want.
+If no config exists yet, Scrimble uses `guide` by default until you save your preferred mode in `.scrimble/config.json` (for example through `scrimble config set-ai`).
 
 Permission checks are policy-based at action boundaries:
 - read-only inspection/status actions run automatically
@@ -72,9 +72,9 @@ Permission checks are policy-based at action boundaries:
 
 | Command | Description |
 |---------|-------------|
-| `scrimble` | Main conversational orchestrator (interactive REPL in TTY, one-shot with `--prompt` or quoted request) |
+| `scrimble` | Main conversational orchestrator (interactive operator shell in TTY, one-shot with `--prompt` or quoted request) |
 | `scrimble init` | Initialize Scrimble in current repository |
-| `scrimble config set-ai` | Run the AI provider/model/key setup wizard |
+| `scrimble config set-ai` | Launch provider setup studio (TTY) or apply profile flags non-interactively |
 | `scrimble doctor` | Check local configuration and worker readiness |
 | `scrimble logs` | Show local runtime ledger events |
 
@@ -130,32 +130,53 @@ pnpm --filter scrimble test
 - **CLI**: oclif + TypeScript
 - **AI**: Vercel AI SDK (multi-provider support)
 
-## AI Provider Configuration
+## AI Provider Profiles
 
-Configure your AI provider in `.scrimble/config.json`:
-
-```json
-{
-  "ai": {
-    "provider": "openai",
-    "model": "gpt-4o",
-    "apiKey": "${OPENAI_API_KEY}"
-  }
-}
-```
-
-GitHub Copilot subscription example:
+Scrimble now stores provider setup as profiles in `.scrimble/config.json`:
 
 ```json
 {
-  "ai": {
-    "provider": "github-copilot",
-    "model": "gpt-4.1",
-    "apiKey": "${GITHUB_COPILOT_TOKEN}",
-    "baseUrl": "https://api.githubcopilot.com"
-  }
+  "activeProfileId": "openai-main",
+  "profiles": [
+    {
+      "id": "openai-main",
+      "name": "OpenAI Main",
+      "provider": "openai",
+      "modelStrategy": "explicit",
+      "model": "gpt-4o",
+      "auth": {
+        "strategy": "api_key",
+        "apiKey": "${OPENAI_API_KEY}"
+      }
+    }
+  ]
 }
 ```
+
+GitHub Copilot subscription-backed profile example:
+
+```json
+{
+  "activeProfileId": "copilot-main",
+  "profiles": [
+    {
+      "id": "copilot-main",
+      "name": "Copilot Main",
+      "provider": "github-copilot",
+      "modelStrategy": "auto",
+      "auth": {
+        "strategy": "copilot_login"
+      }
+    }
+  ]
+}
+```
+
+Copilot auth strategies:
+- `copilot_login` (recommended interactive path)
+- `env_token` (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`)
+- `gh_cli` (GitHub CLI fallback)
+- `personal_access_token` (advanced/manual)
 
 Supported providers:
 - OpenAI (GPT-4, GPT-4o, etc.)

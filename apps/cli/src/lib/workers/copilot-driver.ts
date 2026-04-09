@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type {
   ContextArtifact,
@@ -30,19 +31,52 @@ function readNumber(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined;
 }
 
+async function resolveWindowsCopilotShim(
+  command: string,
+  args: string[],
+): Promise<{ command: string; args: string[] } | null> {
+  if (process.platform !== 'win32' || command !== 'copilot') {
+    return null;
+  }
+  const appData = process.env['APPDATA'];
+  if (!appData) {
+    return null;
+  }
+  const loader = path.join(appData, 'npm', 'node_modules', '@github', 'copilot', 'npm-loader.js');
+  try {
+    await fs.access(loader);
+    return {
+      command: process.execPath,
+      args: [loader, ...args],
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function execCapture(
   command: string,
   args: string[],
   cwd: string,
   timeout = 10_000,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const windowsShim = await resolveWindowsCopilotShim(command, args);
   return new Promise((resolve) => {
-    const proc = spawn(command, args, {
-      cwd,
-      shell: true,
-      timeout,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const spawnCommand = windowsShim?.command ?? command;
+    const spawnArgs = windowsShim?.args ?? args;
+
+    let proc: ChildProcess;
+    try {
+      proc = spawn(spawnCommand, spawnArgs, {
+        cwd,
+        timeout,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      const err = error as Error;
+      resolve({ stdout: '', stderr: err.message, exitCode: 1 });
+      return;
+    }
 
     let stdout = '';
     let stderr = '';
@@ -65,11 +99,54 @@ function combinedOutput(result: { stdout: string; stderr: string }): string {
   return `${result.stdout}\n${result.stderr}`;
 }
 
-function hasCopilotAuthEnv(): boolean {
-  return ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'].some((name) => {
+function resolveCopilotAuthEnvSource(): string | undefined {
+  for (const name of ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN']) {
     const value = process.env[name];
-    return typeof value === 'string' && value.trim().length > 0;
-  });
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return `env:${name}`;
+    }
+  }
+  return undefined;
+}
+
+function parseTokenOutput(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const firstLine = trimmed.split(/\r?\n/)[0]?.trim();
+  if (!firstLine || firstLine.length < 10) {
+    return undefined;
+  }
+  if (firstLine.toLowerCase().includes('login') || firstLine.toLowerCase().includes('auth')) {
+    return undefined;
+  }
+  return firstLine;
+}
+
+async function detectCopilotAuthSource(cwd: string, copilotPath: string): Promise<string | undefined> {
+  const envSource = resolveCopilotAuthEnvSource();
+  if (envSource) {
+    return envSource;
+  }
+
+  const copilotTokenCommands: Array<string[]> = [
+    ['auth', 'token'],
+    ['token'],
+  ];
+  for (const args of copilotTokenCommands) {
+    const result = await execCapture(copilotPath, args, cwd);
+    if (result.exitCode === 0 && parseTokenOutput(result.stdout)) {
+      return 'copilot_login';
+    }
+  }
+
+  const ghToken = await execCapture('gh', ['auth', 'token'], cwd);
+  if (ghToken.exitCode === 0 && parseTokenOutput(ghToken.stdout)) {
+    return 'gh_cli';
+  }
+
+  return undefined;
 }
 
 export function classifyCopilotAuthProbe(
@@ -233,31 +310,19 @@ export class CopilotDriver implements WorkerDriver {
     const warnings: string[] = [];
     const errors: string[] = [];
     const cliAvailable = versionResult.exitCode === 0;
-    let authConfigured = false;
-    let authMissing = false;
-
-    if (cliAvailable) {
-      const probeResult = await execCapture(
-        this.copilotPath,
-        ['-p', 'Reply with OK.', '--output-format=json', '--no-ask-user', '--allow-all-tools'],
-        this.cwd,
-      );
-      const classified = classifyCopilotAuthProbe(probeResult, hasCopilotAuthEnv());
-      authMissing = classified.authMissing;
-      authConfigured = classified.authConfigured;
-    }
-
-    const available = cliAvailable && !authMissing;
+    const authSource = await detectCopilotAuthSource(this.cwd, this.copilotPath);
+    const authConfigured = Boolean(authSource);
+    const available = cliAvailable;
     if (!cliAvailable) {
       errors.push(`Copilot CLI unavailable: ${versionResult.stderr || versionResult.stdout || 'unknown error'}`);
     }
     if (loginHelpResult.exitCode !== 0) {
       warnings.push('Copilot CLI did not expose `copilot login`; auth remediation instructions may vary.');
     }
-    if (authMissing) {
-      errors.push('Copilot authentication is required. Run `copilot login` or set COPILOT_GITHUB_TOKEN.');
-    } else if (!authConfigured) {
-      warnings.push('Copilot auth readiness could not be confirmed; run `copilot login` if needed.');
+    if (!authConfigured) {
+      warnings.push(
+        'Copilot auth readiness could not be confirmed; run `copilot login`, set env token, or use `gh auth login`.',
+      );
     }
 
     const helpOutput = combinedOutput(helpResult);
@@ -278,6 +343,7 @@ export class CopilotDriver implements WorkerDriver {
       cliPath: this.copilotPath,
       ...(version ? { version } : {}),
       authConfigured,
+      ...(authSource ? { authSource } : {}),
       capabilities: this.capabilities(),
       warnings,
       errors,
@@ -339,7 +405,7 @@ export class CopilotDriver implements WorkerDriver {
     lines.push('');
     lines.push('Ledger state:');
     lines.push(`- Tasks: ${ledgerState.tasks.tasks.length}`);
-    lines.push(`- Assignments: ${ledgerState.assignments.assignments.length}`);
+    lines.push(`- Active execution: ${ledgerState.runtime.activeExecution?.taskId ?? 'none'}`);
 
     if (context.length > 0) {
       lines.push('');

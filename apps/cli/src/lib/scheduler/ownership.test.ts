@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { LedgerTask } from '@scrimble/shared';
-import { detectOutOfLeaseEdits, detectOutOfScopeEdits, hasExplicitOwnership } from './parallel.js';
+import { detectOutOfScopeEdits, hasExplicitOwnership } from './ownership.js';
 
 function makeTask(overrides: Partial<LedgerTask> = {}): LedgerTask {
   return {
@@ -13,7 +13,7 @@ function makeTask(overrides: Partial<LedgerTask> = {}): LedgerTask {
     verificationCommands: [],
     dependencies: [],
     riskScore: 4,
-    status: 'pending',
+    status: 'ready',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     attemptCount: 0,
@@ -34,12 +34,4 @@ describe('scheduler ownership scope safety', () => {
     expect(validation.valid).toBe(false);
     expect(validation.outOfScopeFiles).toEqual(['src/other.ts']);
   });
-
-  it('keeps backward-compatible out-of-lease alias', () => {
-    const task = makeTask({ ownedFiles: ['src/task.ts'] });
-    const validation = detectOutOfLeaseEdits(task, ['src/task.ts', 'src/other.ts']);
-    expect(validation.valid).toBe(false);
-    expect(validation.outOfScopeFiles).toEqual(['src/other.ts']);
-  });
 });
-

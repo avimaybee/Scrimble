@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
   CONDUCTOR_DIR,
@@ -36,19 +37,52 @@ function readNumber(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined;
 }
 
+async function resolveWindowsGeminiShim(
+  command: string,
+  args: string[],
+): Promise<{ command: string; args: string[] } | null> {
+  if (process.platform !== 'win32' || (command !== 'gemini' && command !== 'gemini-cli')) {
+    return null;
+  }
+  const appData = process.env['APPDATA'];
+  if (!appData) {
+    return null;
+  }
+  const loader = path.join(appData, 'npm', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
+  try {
+    await fs.access(loader);
+    return {
+      command: process.execPath,
+      args: ['--no-warnings=DEP0040', loader, ...args],
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function execCapture(
   command: string,
   args: string[],
   cwd: string,
   timeout = 10_000,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const windowsShim = await resolveWindowsGeminiShim(command, args);
   return new Promise((resolve) => {
-    const proc = spawn(command, args, {
-      cwd,
-      shell: true,
-      timeout,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const spawnCommand = windowsShim?.command ?? command;
+    const spawnArgs = windowsShim?.args ?? args;
+
+    let proc: ChildProcess;
+    try {
+      proc = spawn(spawnCommand, spawnArgs, {
+        cwd,
+        timeout,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      const err = error as Error;
+      resolve({ stdout: '', stderr: err.message, exitCode: 1 });
+      return;
+    }
 
     let stdout = '';
     let stderr = '';
@@ -290,7 +324,7 @@ export class GeminiDriver implements WorkerDriver {
     lines.push('');
     lines.push('## Ledger Context');
     lines.push(`- Total tasks: ${ledgerState.tasks.tasks.length}`);
-    lines.push(`- Active assignments: ${ledgerState.assignments.assignments.length}`);
+    lines.push(`- Active execution: ${ledgerState.runtime.activeExecution?.taskId ?? 'none'}`);
 
     if (context.length > 0) {
       lines.push('');

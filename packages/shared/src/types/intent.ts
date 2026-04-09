@@ -9,26 +9,81 @@ import type { LedgerTask, WorkerKind } from './ledger.js';
 
 // --- Intent Model ---
 
+/** Discovery mode used to collect project foundation. */
+export type DiscoveryMode = 'interactive' | 'autogenerate' | 'custom';
+
+/** Discovery step used for resume/recovery. */
+export type DiscoveryStep =
+  | 'scan_summary'
+  | 'mode_selection'
+  | 'autogenerate_goal'
+  | 'interactive_questions'
+  | 'custom_brief'
+  | 'draft_review';
+
+/** Inferred stack and repository baseline for planning. */
+export interface InferredStackSummary {
+  projectType: 'greenfield' | 'brownfield';
+  repoName: string;
+  repoPath: string;
+  branch?: string;
+  languages: string[];
+  frameworks: string[];
+  packageManager?: string;
+}
+
+/** Lightweight scan output used to ground discovery prompts. */
+export interface RepoScanSummary {
+  projectType: 'greenfield' | 'brownfield';
+  repoName: string;
+  repoPath: string;
+  branch?: string;
+  languages: string[];
+  frameworks: string[];
+  packageManager?: string;
+  readmeSummary?: string;
+  configSummary: string[];
+  hasScrimbleDir: boolean;
+  hasConductorArtifacts: boolean;
+  conductorArtifacts: string[];
+}
+
 /** Normalized user intent for a project. */
 export interface Intent {
   /** Unique intent identifier. */
   id: string;
+  /** Human-readable project name. */
+  projectName: string;
   /** User's goal in natural language. */
   goal: string;
+  /** Product vision statement used for planning context. */
+  productVision: string;
   /** Product assumptions derived from goal. */
   productAssumptions: string[];
+  /** Product-level constraints. */
+  productConstraints: string[];
   /** Technical constraints. */
+  technicalConstraints: string[];
+  /** Backward-compatible alias of technical constraints. */
   constraints: string[];
   /** Success criteria. */
   successCriteria: string[];
+  /** Explicit non-goals/out-of-scope list. */
+  nonGoals: string[];
   /** Out of scope items. */
   outOfScope: string[];
   /** Target audience/users. */
-  targetUsers?: string;
+  targetUsers: string;
   /** Timeline preference. */
-  timeline?: 'asap' | 'flexible' | 'long_term';
+  timeline: 'asap' | 'flexible' | 'long_term';
   /** Quality preference. */
-  qualityPreference?: 'prototype' | 'production' | 'enterprise';
+  qualityPreference: 'prototype' | 'production' | 'enterprise';
+  /** Inferred or user-confirmed stack baseline. */
+  inferredStack: InferredStackSummary;
+  /** Design/UX direction for user-facing products when relevant. */
+  designDirection?: string;
+  /** Source mode used to build this foundation. */
+  discoveryMode: DiscoveryMode;
   /** When intent was captured. */
   createdAt: string;
   /** When intent was last updated. */
@@ -49,10 +104,18 @@ export interface IntentCaptureInput {
 export interface RepoContextSummary {
   /** Repository name. */
   name: string;
+  /** Repository path when known. */
+  path?: string;
+  /** Current branch when known. */
+  branch?: string;
+  /** Project maturity inference. */
+  projectType?: 'greenfield' | 'brownfield';
   /** Primary language. */
   primaryLanguage?: string;
   /** Detected frameworks. */
   frameworks: string[];
+  /** Package manager when known. */
+  packageManager?: string;
   /** Existing README summary. */
   readmeSummary?: string;
   /** Key directories. */
@@ -77,7 +140,7 @@ export interface TaskGraph {
   tasks: LedgerTask[];
   /** Dependency edges. */
   edges: TaskEdge[];
-  /** Phases for human readability (optional grouping). */
+  /** Workstream groups for human-readable review (optional). */
   phases: TaskPhase[];
   /** When graph was generated. */
   generatedAt: string;
@@ -85,11 +148,11 @@ export interface TaskGraph {
   metadata: TaskGraphMetadata;
 }
 
-/** A phase grouping related tasks. */
+/** A workstream grouping related tasks. */
 export interface TaskPhase {
   /** Phase identifier. */
   id: string;
-  /** Phase title. */
+  /** Workstream title. */
   title: string;
   /** Task IDs in this phase. */
   taskIds: string[];
@@ -101,14 +164,52 @@ export interface TaskPhase {
 export interface TaskGraphMetadata {
   /** Total estimated complexity (sum of task risk scores). */
   totalComplexity: number;
-  /** Number of parallel-safe task groups. */
-  parallelGroups: number;
   /** Critical path length (longest dependency chain). */
   criticalPathLength: number;
-  /** Estimated total duration in hours (rough). */
-  estimatedHours?: number;
+  /** Ratio of tasks with explicit ownership (0-1). */
+  ownershipCoverage: number;
+  /** Ratio of tasks with explicit verification commands (0-1). */
+  verificationCoverage: number;
+  /** Aggregate grounding score for intent + repo signals (0-1). */
+  groundingScore: number;
+  /** Number of planner warnings emitted for this graph. */
+  warningCount: number;
+  /** Workstreams used to derive this graph. */
+  workstreams: string[];
   /** Provider artifacts used as context. */
   contextSourcesUsed: string[];
+}
+
+/** Scrimble foundation artifact used during planning. */
+export interface FoundationContextArtifact {
+  path: string;
+  content: string;
+}
+
+/** Scripts discovered for verification inference. */
+export interface PlanningScriptCatalog {
+  packageManager?: string;
+  rootScripts: string[];
+  workspaceScripts: ScriptCatalogEntry[];
+}
+
+/** Workspace package scripts used for scoped verification inference. */
+export interface ScriptCatalogEntry {
+  path: string;
+  name?: string;
+  scripts: string[];
+}
+
+/** Structured planner warning emitted during task synthesis. */
+export interface PlanningWarning {
+  code:
+    | 'ownership_weak'
+    | 'verification_missing'
+    | 'requirements_ambiguous'
+    | 'conflicting_repo_signals'
+    | 'foundation_context_missing';
+  message: string;
+  taskId?: string;
 }
 
 // --- Task Generation ---
@@ -119,8 +220,14 @@ export interface TaskGenerationInput {
   intent: Intent;
   /** Repo context for grounding. */
   repoContext: RepoContextSummary;
+  /** Repository scan summary from discovery. */
+  repoScan?: RepoScanSummary;
   /** Existing file structure. */
   existingFiles: string[];
+  /** Foundation artifacts under .scrimble/context. */
+  foundationContext?: FoundationContextArtifact[];
+  /** Scripts used for verification inference. */
+  scriptCatalog?: PlanningScriptCatalog;
   /** Provider context artifacts. */
   contextArtifacts: ContextArtifactRef[];
   /** Worker preferences. */
@@ -153,6 +260,8 @@ export interface TaskGenerationOutput {
   graph: TaskGraph;
   /** Warnings during generation. */
   warnings: string[];
+  /** Structured planning-quality warnings. */
+  qualityWarnings: PlanningWarning[];
   /** Suggestions for improvement. */
   suggestions: string[];
 }
@@ -193,9 +302,22 @@ export interface IntentState {
   version: number;
   /** Current intent. */
   intent: Intent | null;
+  /** Discovery/onboarding continuity state. */
+  discovery: IntentDiscoveryState;
   /** History of intent refinements. */
   history: IntentHistoryEntry[];
   /** Timestamp of last modification. */
+  updatedAt: string;
+}
+
+/** Persistent discovery/onboarding state. */
+export interface IntentDiscoveryState {
+  status: 'not_started' | 'in_progress' | 'draft_ready' | 'approved' | 'skipped';
+  mode?: DiscoveryMode;
+  step?: DiscoveryStep;
+  questionIndex?: number;
+  scan?: RepoScanSummary;
+  draft?: Intent;
   updatedAt: string;
 }
 

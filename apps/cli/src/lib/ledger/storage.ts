@@ -14,12 +14,14 @@ import {
   SCRIMBLE_DIR,
 } from '@scrimble/shared';
 import type {
-  AssignmentsState,
+  ActiveExecutionPhase,
   IntentState,
   LedgerApprovalState,
   LedgerDocument,
   OrchestrationState,
+  RuntimeState,
   TasksState,
+  WorkerKind,
   WorkersState,
 } from '@scrimble/shared';
 
@@ -51,7 +53,7 @@ export interface LedgerPaths {
 interface LoadLegacyResult {
   foundAny: boolean;
   tasks: TasksState;
-  assignments: AssignmentsState;
+  runtime: RuntimeState;
   workers: WorkersState;
   intent: IntentState;
   approval: LedgerApprovalState;
@@ -130,10 +132,9 @@ function defaultTasksState(): TasksState {
   };
 }
 
-function defaultAssignmentsState(): AssignmentsState {
+function defaultRuntimeState(): RuntimeState {
   return {
     version: SCHEMA_VERSION,
-    assignments: [],
     updatedAt: nowIso(),
   };
 }
@@ -150,6 +151,10 @@ function defaultIntentState(): IntentState {
   return {
     version: SCHEMA_VERSION,
     intent: null,
+    discovery: {
+      status: 'not_started',
+      updatedAt: nowIso(),
+    },
     history: [],
     updatedAt: nowIso(),
   };
@@ -176,7 +181,7 @@ function defaultLedgerDocument(): LedgerDocument {
     version: SCHEMA_VERSION,
     updatedAt: nowIso(),
     tasks: defaultTasksState(),
-    assignments: defaultAssignmentsState(),
+    runtime: defaultRuntimeState(),
     workers: defaultWorkersState(),
     intent: defaultIntentState(),
     approval: defaultApprovalState(),
@@ -194,10 +199,10 @@ function normalizeLedgerDocument(input: Partial<LedgerDocument>): LedgerDocument
       ...(input.tasks ?? {}),
       updatedAt: input.tasks?.updatedAt ?? defaults.tasks.updatedAt,
     },
-    assignments: {
-      ...defaults.assignments,
-      ...(input.assignments ?? {}),
-      updatedAt: input.assignments?.updatedAt ?? defaults.assignments.updatedAt,
+    runtime: {
+      ...defaults.runtime,
+      ...(input.runtime ?? {}),
+      updatedAt: input.runtime?.updatedAt ?? defaults.runtime.updatedAt,
     },
     workers: {
       ...defaults.workers,
@@ -222,20 +227,77 @@ function normalizeLedgerDocument(input: Partial<LedgerDocument>): LedgerDocument
   };
 }
 
+interface LegacyAssignmentEntry {
+  taskId?: string;
+  worker?: string;
+  status?: string;
+  leasedAt?: string;
+  startedAt?: string;
+}
+
+interface LegacyAssignmentsState {
+  assignments?: LegacyAssignmentEntry[];
+}
+
+function isWorkerKind(value: string | undefined): value is WorkerKind {
+  return value === 'gemini' || value === 'copilot';
+}
+
+function toLegacyPhase(status: string | undefined): ActiveExecutionPhase {
+  if (status === 'assigned' || status === 'unassigned') {
+    return 'dispatching';
+  }
+  if (status === 'in_progress' || status === 'needs_retry') {
+    return 'executing';
+  }
+  return 'executing';
+}
+
+function runtimeFromLegacyAssignments(
+  assignmentsState: LegacyAssignmentsState | undefined,
+  tasksState: TasksState,
+): RuntimeState {
+  const defaultRuntime = defaultRuntimeState();
+  const assignments = assignmentsState?.assignments ?? [];
+  const active = assignments.find((entry) => isWorkerKind(entry.worker) && typeof entry.taskId === 'string');
+  if (!active || !active.taskId || !isWorkerKind(active.worker)) {
+    return defaultRuntime;
+  }
+
+  const task = tasksState.tasks.find((entry) => entry.id === active.taskId);
+  if (!task || task.status === 'completed' || task.status === 'failed' || task.status === 'blocked') {
+    return defaultRuntime;
+  }
+
+  const startedAt = active.startedAt ?? active.leasedAt ?? nowIso();
+  return {
+    version: SCHEMA_VERSION,
+    activeExecution: {
+      taskId: active.taskId,
+      workerId: active.worker,
+      startedAt,
+      attempt: Math.max(task.attemptCount, 1),
+      phase: toLegacyPhase(active.status),
+    },
+    updatedAt: nowIso(),
+  };
+}
+
 async function loadLegacyDocument(cwd: string): Promise<LoadLegacyResult> {
   const paths = getLedgerPaths(cwd);
   const [tasks, assignments, workers, intent, fileLeases] = await Promise.all([
     readJsonOptional<TasksState>(paths.legacyTasks),
-    readJsonOptional<AssignmentsState>(paths.legacyAssignments),
+    readJsonOptional<LegacyAssignmentsState>(paths.legacyAssignments),
     readJsonOptional<WorkersState>(paths.legacyWorkers),
     readJsonOptional<IntentState>(paths.legacyIntent),
     readJsonOptional<unknown>(paths.legacyFileLeases),
   ]);
   const foundAny = tasks.found || assignments.found || workers.found || intent.found || fileLeases.found;
+  const taskState = tasks.value ?? defaultTasksState();
   return {
     foundAny,
-    tasks: tasks.value ?? defaultTasksState(),
-    assignments: assignments.value ?? defaultAssignmentsState(),
+    tasks: taskState,
+    runtime: runtimeFromLegacyAssignments(assignments.value, taskState),
     workers: workers.value ?? defaultWorkersState(),
     intent: intent.value ?? defaultIntentState(),
     approval: defaultApprovalState(),
@@ -256,7 +318,7 @@ export async function readLedger(cwd: string = process.cwd()): Promise<LedgerDoc
       version: SCHEMA_VERSION,
       updatedAt: nowIso(),
       tasks: legacy.tasks,
-      assignments: legacy.assignments,
+      runtime: legacy.runtime,
       workers: legacy.workers,
       intent: legacy.intent,
       approval: legacy.approval,

@@ -3,14 +3,15 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  completeTask,
+  blockActiveTask,
+  completeActiveTask,
   createTask,
+  failActiveTask,
+  getActiveExecution,
   getBlockedTasks,
   getDependencyChain,
   getReadyTasks,
-  leaseTask,
-  releaseTask,
-  setAssignmentStatus,
+  startNextReadyTask,
 } from './operations.js';
 import { readLedger } from './storage.js';
 
@@ -56,7 +57,7 @@ describe('ledger operations', () => {
     expect(blocked.map((task) => task.id)).toEqual(['task-b']);
   });
 
-  it('leases task and updates assignment state', async () => {
+  it('starts one ready task and creates activeExecution state', async () => {
     await createTask(
       {
         id: 'task-a',
@@ -68,18 +69,22 @@ describe('ledger operations', () => {
       testDir,
     );
 
-    const assignment = await leaseTask('task-a', 'gemini', { sessionId: 'session-1', cwd: testDir });
-    expect(assignment.status).toBe('assigned');
-    expect(assignment.worker).toBe('gemini');
-    expect(assignment.sessionId).toBe('session-1');
+    const started = await startNextReadyTask({
+      taskId: 'task-a',
+      worker: 'gemini',
+      cwd: testDir,
+    });
+    expect(started.status).toBe('in_progress');
 
-    await setAssignmentStatus('task-a', 'in_progress', { cwd: testDir });
-    const ledger = await readLedger(testDir);
-    expect(ledger.assignments.assignments[0]?.status).toBe('in_progress');
-    expect(ledger.assignments.assignments[0]?.startedAt).toBeDefined();
+    const active = await getActiveExecution(testDir);
+    expect(active).toMatchObject({
+      taskId: 'task-a',
+      workerId: 'gemini',
+      attempt: 1,
+    });
   });
 
-  it('completes task and clears active assignment binding', async () => {
+  it('completes active task and clears active execution', async () => {
     await createTask(
       {
         id: 'task-a',
@@ -90,17 +95,17 @@ describe('ledger operations', () => {
       },
       testDir,
     );
-    await leaseTask('task-a', 'gemini', { cwd: testDir });
+    await startNextReadyTask({ taskId: 'task-a', worker: 'gemini', cwd: testDir });
 
-    await completeTask('task-a', { cwd: testDir });
+    await completeActiveTask({ taskId: 'task-a', cwd: testDir });
 
     const ledger = await readLedger(testDir);
     const task = ledger.tasks.tasks.find((entry) => entry.id === 'task-a');
     expect(task?.status).toBe('completed');
-    expect(ledger.assignments.assignments).toHaveLength(0);
+    expect(ledger.runtime.activeExecution).toBeUndefined();
   });
 
-  it('releases task back to pending and clears assignment', async () => {
+  it('returns retryable active task to ready while clearing active execution', async () => {
     await createTask(
       {
         id: 'task-a',
@@ -111,12 +116,46 @@ describe('ledger operations', () => {
       },
       testDir,
     );
-    await leaseTask('task-a', 'gemini', { cwd: testDir });
-    await releaseTask('task-a', { cwd: testDir });
+    await startNextReadyTask({ taskId: 'task-a', worker: 'gemini', cwd: testDir });
+
+    await failActiveTask({
+      taskId: 'task-a',
+      toStatus: 'ready',
+      error: 'temporary failure',
+      cwd: testDir,
+    });
 
     const ledger = await readLedger(testDir);
-    expect(ledger.tasks.tasks.find((entry) => entry.id === 'task-a')?.status).toBe('pending');
-    expect(ledger.assignments.assignments).toHaveLength(0);
+    const task = ledger.tasks.tasks.find((entry) => entry.id === 'task-a');
+    expect(task?.status).toBe('ready');
+    expect(task?.error).toBe('temporary failure');
+    expect(ledger.runtime.activeExecution).toBeUndefined();
+  });
+
+  it('blocks active task and clears active execution', async () => {
+    await createTask(
+      {
+        id: 'task-a',
+        title: 'Task A',
+        objective: 'Build A',
+        doneCriteria: 'A works',
+        ownedFiles: ['src/a.ts'],
+      },
+      testDir,
+    );
+    await startNextReadyTask({ taskId: 'task-a', worker: 'gemini', cwd: testDir });
+
+    await blockActiveTask({
+      taskId: 'task-a',
+      error: 'scope violation',
+      cwd: testDir,
+    });
+
+    const ledger = await readLedger(testDir);
+    const task = ledger.tasks.tasks.find((entry) => entry.id === 'task-a');
+    expect(task?.status).toBe('blocked');
+    expect(task?.error).toBe('scope violation');
+    expect(ledger.runtime.activeExecution).toBeUndefined();
   });
 
   it('computes dependency chain recursively', async () => {
@@ -157,4 +196,3 @@ describe('ledger operations', () => {
     expect(chain).toEqual(['task-b', 'task-a']);
   });
 });
-

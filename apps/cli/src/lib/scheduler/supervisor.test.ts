@@ -163,7 +163,7 @@ describe('ledger supervisor', () => {
     expect(task?.status).toBe('completed');
   });
 
-  it('marks task blocked on out-of-lease edits', async () => {
+  it('marks task blocked on out-of-scope edits', async () => {
     await createTask(
       {
         id: 'task-2',
@@ -187,11 +187,9 @@ describe('ledger supervisor', () => {
     expect(task?.status).toBe('blocked');
   });
 
-  it('runs one active task at a time even when parallel is requested', async () => {
+  it('runs only one task attempt per invocation even when broader scope is requested', async () => {
     const startedWorkers: WorkerKind[] = [];
     const finishedWorkers: WorkerKind[] = [];
-    let activeExecutions = 0;
-    let observedOverlap = false;
     await fs.mkdir(path.join(testDir, 'src'), { recursive: true });
     await fs.writeFile(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;\n', 'utf8');
     await fs.writeFile(path.join(testDir, 'src', 'b.ts'), 'export const b = 1;\n', 'utf8');
@@ -226,14 +224,9 @@ describe('ledger supervisor', () => {
         delayMs: 20,
         onStart: (worker) => {
           startedWorkers.push(worker);
-          activeExecutions += 1;
-          if (activeExecutions > 1) {
-            observedOverlap = true;
-          }
         },
         onFinish: (worker) => {
           finishedWorkers.push(worker);
-          activeExecutions = Math.max(0, activeExecutions - 1);
         },
         resolveTouchedFiles: (prompt) => {
           if (prompt.includes('task:task-3')) {
@@ -250,9 +243,12 @@ describe('ledger supervisor', () => {
     const supervisor = new LedgerSupervisor();
     await supervisor.run({ cwd: testDir, parallel: 2, maxTasks: 2 });
 
-    expect(startedWorkers).toHaveLength(2);
-    expect(finishedWorkers).toHaveLength(2);
-    expect(observedOverlap).toBe(false);
+    expect(startedWorkers).toHaveLength(1);
+    expect(finishedWorkers).toHaveLength(1);
+    const task3 = await getTask('task-3', testDir);
+    const task4 = await getTask('task-4', testDir);
+    expect([task3?.status, task4?.status]).toContain('completed');
+    expect([task3?.status, task4?.status]).toContain('ready');
   });
 
   it('requires approval before dispatching ledger tasks', async () => {

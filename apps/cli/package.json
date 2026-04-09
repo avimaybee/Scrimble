@@ -14,11 +14,14 @@
     "oclif.manifest.json"
   ],
   "scripts": {
-    "build": "tsc -b",
-    "dev": "tsc -b --watch",
+    "build": "pnpm run clean && tsc -b && pnpm run sync:dist-commands",
+    "dev": "pnpm run clean && tsc -b --watch",
     "lint": "tsc -p tsconfig.lint.json",
     "test": "vitest run --passWithNoTests",
-    "clean": "rimraf dist oclif.manifest.json tsconfig.tsbuildinfo"
+    "validate:scenarios": "vitest run src/lib/validation/harness.test.ts",
+    "clean": "rimraf dist oclif.manifest.json tsconfig.tsbuildinfo",
+    "sync:dist-commands": "node ./scripts/sync-dist-commands.mjs",
+    "check:dist-commands": "node ./scripts/sync-dist-commands.mjs --check"
   },
   "dependencies": {
     "@oclif/core": "^4.2.0",

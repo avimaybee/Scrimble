@@ -42,11 +42,12 @@ describe('ledger storage', () => {
   it('loads default whole-document state when ledger is missing', async () => {
     const ledger = await readLedger(testDir);
     expect(ledger.tasks.tasks).toEqual([]);
-    expect(ledger.assignments.assignments).toEqual([]);
+    expect(ledger.runtime.activeExecution).toBeUndefined();
     expect(ledger.workers.workers).toEqual([]);
     expect(ledger.intent.intent).toBeNull();
     expect(ledger.orchestration.sessionId).toBeTruthy();
-    expect(ledger.orchestration.lastProposedPlan).toBeUndefined();
+    expect(ledger.orchestration.activeRun).toBeUndefined();
+    expect(ledger.orchestration.lastRunOutcome).toBeUndefined();
   });
 
   it('writes and reads the whole ledger document', async () => {
@@ -119,6 +120,7 @@ describe('ledger storage', () => {
 
     const loaded = await readLedger(testDir);
     expect(loaded.tasks.tasks[0]?.id).toBe('legacy-task');
+    expect(loaded.runtime.activeExecution).toBeUndefined();
 
     const ledgerContent = JSON.parse(await fs.readFile(paths.ledgerFile, 'utf8')) as {
       tasks?: { tasks?: Array<{ id: string }> };
@@ -131,35 +133,12 @@ describe('ledger storage', () => {
     ledger.orchestration = {
       version: 1,
       sessionId: 'session-123',
-      lastProposedPlan: {
-        id: 'plan-1',
-        request: 'implement feature',
-        goal: 'implement feature',
-        requiresConfirmation: true,
-        createdAt: new Date().toISOString(),
-        steps: [{ action: 'check_setup', summary: 'check setup', mutating: false }],
-      },
-      lastConfirmedPlan: {
-        id: 'plan-1',
-        request: 'implement feature',
-        goal: 'implement feature',
-        requiresConfirmation: true,
-        createdAt: new Date().toISOString(),
-        steps: [{ action: 'execute_tasks', summary: 'execute', mutating: true }],
-      },
-      lastExecutionSummary: {
-        planId: 'plan-1',
-        request: 'implement feature',
-        summary: 'Executed successfully.',
-        completedAt: new Date().toISOString(),
-        results: [{ action: 'execute_tasks', summary: 'done' }],
-      },
       activeRun: {
         request: 'implement feature',
         startedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        stepCount: 2,
         completedSteps: [{ action: 'generate_or_update_tasks', summary: 'planned', completedAt: new Date().toISOString() }],
+        lastCompletedStep: { action: 'generate_or_update_tasks', summary: 'planned', completedAt: new Date().toISOString() },
         pendingBoundary: {
           id: 'boundary-1',
           action: 'execute_tasks',
@@ -185,8 +164,7 @@ describe('ledger storage', () => {
 
     const loaded = await readLedger(testDir);
     expect(loaded.orchestration.sessionId).toBe('session-123');
-    expect(loaded.orchestration.lastProposedPlan?.id).toBe('plan-1');
-    expect(loaded.orchestration.lastExecutionSummary?.summary).toBe('Executed successfully.');
+    expect(loaded.orchestration.activeRun?.lastCompletedStep?.action).toBe('generate_or_update_tasks');
     expect(loaded.orchestration.activeRun?.pendingBoundary?.action).toBe('execute_tasks');
     expect(loaded.orchestration.lastRunOutcome?.status).toBe('paused');
   });

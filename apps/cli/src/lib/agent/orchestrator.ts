@@ -1,32 +1,44 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { generateText, tool } from 'ai';
-import { z } from 'zod';
-import {
-  aiProviderSchema,
-  type InteractionMode,
-  type OrchestrationActiveRunState,
-  type OrchestrationBoundaryState,
-  type OrchestrationExecutionSummaryState,
-  type OrchestrationPlanState,
-  type OrchestrationState,
-  CONFIG_FILE,
-  SCRIMBLE_DIR,
-} from '@scrimble/shared';
-import { createLanguageModel } from '../ai/provider.js';
-import { loadScrimbleConfig } from '../config/load-config.js';
+import type { InteractionMode, OrchestrationState } from '@scrimble/shared';
+import { SCRIMBLE_DIR } from '@scrimble/shared';
 import { mutateLedger, readLedger } from '../ledger/storage.js';
-import { runAgentTool, toToolArgs } from './tools.js';
+import { runAgentTool } from './tools.js';
+import {
+  buildProgressPrompt,
+  buildSingleCallPlan,
+  executePlan as executePlannedCalls,
+  isReadOnlyRequest,
+  nextStepFromPlan,
+  normalizeGoal,
+  proposePlan as proposePlanForRequest,
+  selectDeterministicStep,
+  type ProposePlanOptions,
+} from './orchestrator-planning.js';
+import {
+  isMutatingAction,
+  permissionPolicyForCall,
+  toBoundary,
+} from './orchestrator-policy.js';
+import {
+  clearActiveRun,
+  writeBoundaryState,
+  writePlanningState,
+  writeRunOutcome,
+  writeStepCompletionState,
+} from './orchestrator-state.js';
 import type {
   AgentExecutionResult,
   AgentPlan,
-  AgentPlanStep,
   AgentToolAction,
   AgentToolCall,
   AgentToolResult,
   ExecutePlanOptions,
   OperatorBoundary,
+  OperatorFailureContext,
+  OperatorRecoveryAction,
+  OperatorRecoveryKind,
   OperatorBoundaryResolution,
   OperatorEvent,
   OperatorRunOptions,
@@ -34,347 +46,161 @@ import type {
   OperatorStep,
 } from './types.js';
 
-const MUTATING_ACTIONS = new Set<AgentToolAction>([
-  'configure_ai',
-  'generate_or_update_tasks',
-  'execute_tasks',
-]);
 const DEFAULT_OPERATOR_MAX_STEPS = 12;
-
-const ROOT_SYSTEM_PROMPT = [
-  'You are the Scrimble local orchestrator.',
-  'Satisfy the user request by calling tools.',
-  'Prefer the smallest tool sequence that fully solves the request.',
-  'For execution requests, call show_plan before execute_tasks.',
-  'For setup gaps, call check_setup and configure_ai.',
-  'Avoid cloud/backend assumptions.',
-].join(' ');
-
-function toModelConfig(config: Awaited<ReturnType<typeof loadScrimbleConfig>>['ai']) {
-  return {
-    provider: config.provider,
-    model: config.model,
-    ...(config.apiKey ? { apiKey: config.apiKey } : {}),
-    ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
-  };
-}
-
-function normalizeGoal(request: string): string {
-  return request.replace(/\s+/g, ' ').trim();
-}
-
-function isMutatingAction(action: AgentToolAction): boolean {
-  return MUTATING_ACTIONS.has(action);
-}
-
-function actionSummary(action: AgentToolAction): string {
-  switch (action) {
-    case 'inspect_repo':
-      return 'Look through the repository and current progress.';
-    case 'check_setup':
-      return 'Check whether local setup is ready.';
-    case 'configure_ai':
-      return 'Set up your model configuration.';
-    case 'generate_or_update_tasks':
-      return 'Break your goal into actionable work.';
-    case 'show_plan':
-      return 'Outline the next steps.';
-    case 'execute_tasks':
-      return 'Start working through the planned tasks.';
-    case 'check_status':
-      return 'Summarize current progress.';
-    case 'show_logs':
-      return 'Review recent runtime activity.';
-    case 'doctor':
-      return 'Run diagnostics and suggest fixes.';
-    default: {
-      const exhaustive: never = action;
-      return `Unknown action: ${String(exhaustive)}`;
-    }
-  }
-}
-
-interface PermissionPolicyDecision {
-  requiresConfirmation: boolean;
-  reason: string;
-  scope: {
-    parallel: number;
-    maxTasks: number;
-    args: Record<string, unknown>;
-  };
-}
 
 function callSignature(call: AgentToolCall): string {
   return `${call.action}:${JSON.stringify(call.args)}`;
 }
 
-function withBoundedExecuteDefaults(call: AgentToolCall): AgentToolCall {
-  if (call.action !== 'execute_tasks') {
-    return call;
-  }
-  const args = toToolArgs(call.args);
-  return {
-    ...call,
-    args: {
-      ...args,
-      parallel: 1,
-      maxTasks: 1,
-    },
-  };
-}
-
-function permissionPolicyForCall(call: AgentToolCall, interactionMode: InteractionMode): PermissionPolicyDecision {
-  if (!call.mutating) {
-    return {
-      requiresConfirmation: false,
-      reason: 'Read-only actions run automatically.',
-      scope: { parallel: 1, maxTasks: 1, args: toToolArgs(call.args) },
-    };
-  }
-
-  if (call.action === 'configure_ai') {
-    return {
-      requiresConfirmation: true,
-      reason: 'Model configuration changes require explicit confirmation.',
-      scope: { parallel: 1, maxTasks: 1, args: toToolArgs(call.args) },
-    };
-  }
-
-  if (call.action === 'generate_or_update_tasks') {
-    return {
-      requiresConfirmation: interactionMode === 'guide',
-      reason: interactionMode === 'guide'
-        ? 'Guide mode confirms task-graph updates.'
-        : 'Task-graph updates can run automatically in this mode.',
-      scope: { parallel: 1, maxTasks: 1, args: toToolArgs(call.args) },
-    };
-  }
-
-  if (call.action === 'execute_tasks') {
-    const normalized = withBoundedExecuteDefaults(call);
-    const args = toToolArgs(normalized.args);
-    const parallel = typeof args['parallel'] === 'number' ? args['parallel'] : 1;
-    const maxTasks = typeof args['maxTasks'] === 'number' ? args['maxTasks'] : 1;
-
-    if (interactionMode === 'operator') {
-      return {
-        requiresConfirmation: false,
-        reason: 'Operator mode can start the next task step automatically.',
-        scope: { parallel, maxTasks, args },
-      };
-    }
-
-    return {
-      requiresConfirmation: true,
-      reason: 'Starting the next task step needs confirmation in this mode.',
-      scope: { parallel, maxTasks, args },
-    };
-  }
-
-  return {
-    requiresConfirmation: interactionMode === 'guide',
-    reason: interactionMode === 'guide'
-      ? 'Mutating actions require confirmation in guide mode.'
-      : 'Mutating action can run automatically in this mode.',
-    scope: { parallel: 1, maxTasks: 1, args: toToolArgs(call.args) },
-  };
-}
-
-function toBoundary(call: AgentToolCall, decision: PermissionPolicyDecision): OperatorBoundary {
+function toToolCall(step: OperatorStep): AgentToolCall {
   return {
     id: randomUUID(),
-    action: call.action,
-    actionSummary: actionSummary(call.action),
-    reason: decision.reason,
-    scope: {
-      parallel: decision.scope.parallel,
-      maxTasks: decision.scope.maxTasks,
-      args: decision.scope.args,
-    },
-    choices: ['proceed', 'pause', 'redirect'],
+    action: step.action,
+    args: step.args,
+    mutating: isMutatingAction(step.action),
   };
 }
 
-function toBoundaryState(boundary: OperatorBoundary): OrchestrationBoundaryState {
+function toBoundaryFromState(
+  state: NonNullable<NonNullable<OrchestrationState['activeRun']>['pendingBoundary']>,
+): OperatorBoundary {
   return {
-    id: boundary.id,
-    action: boundary.action,
-    actionSummary: boundary.actionSummary,
-    reason: boundary.reason,
-    scope: boundary.scope,
-    choices: boundary.choices,
-    requestedAt: new Date().toISOString(),
+    id: state.id,
+    action: state.action as AgentToolCall['action'],
+    actionSummary: state.actionSummary,
+    reason: state.reason,
+    ...(state.category ? { category: state.category } : {}),
+    ...(state.riskLevel ? { riskLevel: state.riskLevel } : {}),
+    ...(state.nextStepHint ? { nextStepHint: state.nextStepHint } : {}),
+    scope: state.scope,
+    choices: [...state.choices],
   };
 }
 
-function expectedOutcomeForAction(action: AgentToolAction): string {
-  switch (action) {
-    case 'configure_ai':
-      return 'Required model configuration is updated so planning/execution can continue.';
-    case 'generate_or_update_tasks':
-      return 'Task graph is refreshed to reflect the current goal.';
-    case 'execute_tasks':
-      return 'The next bounded task step is executed and progress advances.';
-    case 'check_status':
-      return 'Latest progress and blockers are summarized.';
-    case 'show_logs':
-      return 'Recent runtime activity is surfaced.';
-    default:
-      return 'Context is updated for the next operator decision.';
-  }
-}
-
-function pauseConditionForAction(action: AgentToolAction): string {
-  switch (action) {
-    case 'configure_ai':
-      return 'pause if credentials or setup details are missing';
-    case 'generate_or_update_tasks':
-      return 'pause if no safe next task can be derived';
-    case 'execute_tasks':
-      return 'pause if execution fails, conflicts, or needs approval';
-    default:
-      return 'pause if no safe next action is available';
-  }
-}
-
-function nextStepFromPlan(plan: AgentPlan, interactionMode: InteractionMode): OperatorStep | undefined {
-  const nextCall = plan.calls.find((call) => call.mutating);
-  if (!nextCall) {
-    return undefined;
-  }
-  const normalizedCall = withBoundedExecuteDefaults(nextCall);
-  const policy = permissionPolicyForCall(normalizedCall, interactionMode);
-  const rationale =
-    plan.steps.find((step) => step.action === normalizedCall.action)?.summary ??
-    actionSummary(normalizedCall.action);
-  return {
-    action: normalizedCall.action,
-    args: toToolArgs(normalizedCall.args),
-    actionSummary: actionSummary(normalizedCall.action),
-    rationale,
-    requiresConfirmation: policy.requiresConfirmation,
-    expectedOutcome: expectedOutcomeForAction(normalizedCall.action),
-    pauseCondition: pauseConditionForAction(normalizedCall.action),
-  };
-}
-
-function toActiveRunStepState(step: OperatorStep): NonNullable<OrchestrationActiveRunState['currentStep']> {
+function completedStepFallback(step: OperatorStep, execution: AgentExecutionResult): AgentToolResult {
   return {
     action: step.action,
-    actionSummary: step.actionSummary,
-    rationale: step.rationale,
-    requiresConfirmation: step.requiresConfirmation,
-    expectedOutcome: step.expectedOutcome,
-    pauseCondition: step.pauseCondition,
-    plannedAt: new Date().toISOString(),
+    summary: execution.summary || `Completed ${step.action}.`,
+    details: execution.summary ? [execution.summary] : [],
   };
 }
 
-function planOnlyToolResult(action: AgentToolAction, args: Record<string, unknown>): AgentToolResult {
-  const argText = JSON.stringify(args);
+function executionBlockerReason(result: AgentToolResult): string | undefined {
+  const failedDetail = result.details.find((detail) => detail.startsWith('Failed tasks:'));
+  const conflictedDetail = result.details.find((detail) => detail.startsWith('Conflicted tasks:'));
+  const hasFailures = Boolean(failedDetail && !failedDetail.endsWith('none'));
+  const hasConflicts = Boolean(conflictedDetail && !conflictedDetail.endsWith('none'));
+  if (!hasFailures && !hasConflicts) {
+    return undefined;
+  }
+  return (hasFailures ? failedDetail : conflictedDetail) ?? 'Execution reported unresolved blockers.';
+}
+
+function recoveryActionsFor(kind: OperatorRecoveryKind): OperatorRecoveryAction[] {
+  switch (kind) {
+    case 'resume_active_run':
+      return [
+        { kind: 'resume_active_run', label: 'Resume', description: 'Resume the active run from the current step.' },
+        { kind: 'show_plan', label: 'Show plan', description: 'Inspect the current plan before continuing.' },
+        { kind: 'inspect_logs', label: 'Inspect logs', description: 'Inspect runtime logs for context before resuming.' },
+      ];
+    case 'pending_approval':
+      return [
+        { kind: 'pending_approval', label: 'Approve boundary', description: 'Approve and continue the requested action.' },
+        { kind: 'show_plan', label: 'Inspect plan', description: 'Review rationale, scope, and warnings before approving.' },
+        { kind: 'inspect_logs', label: 'Inspect logs', description: 'Inspect supporting runtime details before deciding.' },
+      ];
+    case 'retry_task':
+      return [
+        { kind: 'retry_task', label: 'Retry task', description: 'Retry the failed/bocked task in one bounded step.' },
+        { kind: 'replan', label: 'Replan', description: 'Regenerate tasks from the latest intent and repo state.' },
+        { kind: 'inspect_logs', label: 'Inspect logs', description: 'Inspect detailed failure and conflict events.' },
+      ];
+    case 'state_inconsistent':
+      return [
+        { kind: 'clear_stale_execution', label: 'Repair state', description: 'Clear stale runtime execution and repair mismatched in_progress tasks.' },
+        { kind: 'mark_failed_and_continue', label: 'Mark failed and continue', description: 'Mark stale in_progress attempts as failed and continue from clean state.' },
+        { kind: 'inspect_logs', label: 'Inspect logs', description: 'Inspect state mismatch context before applying repair.' },
+      ];
+    case 'dismiss_completed':
+      return [
+        { kind: 'show_plan', label: 'Review next plan', description: 'Inspect current plan and next ready tasks.' },
+        { kind: 'dismiss_completed', label: 'Dismiss completed run', description: 'Clear completed-run context from startup and continue.' },
+      ];
+    case 'replan':
+      return [
+        { kind: 'replan', label: 'Replan', description: 'Regenerate the task graph from current goal and state.' },
+        { kind: 'show_plan', label: 'Show plan', description: 'Inspect the generated plan before execution.' },
+        { kind: 'revise_foundation', label: 'Revise foundation', description: 'Revise project foundation if direction changed.' },
+      ];
+    default:
+      return [
+        { kind: 'show_plan', label: 'Inspect plan', description: 'Review current plan and readiness state.' },
+        { kind: 'inspect_logs', label: 'Inspect logs', description: 'Inspect runtime detail and decide next action.' },
+      ];
+  }
+}
+
+function parseFailureContextFromResult(result: AgentToolResult): OperatorFailureContext | undefined {
+  if (result.action !== 'execute_tasks') {
+    return undefined;
+  }
+  const failedLine = result.details.find((detail) => detail.startsWith('Failed tasks:'));
+  const conflictedLine = result.details.find((detail) => detail.startsWith('Conflicted tasks:'));
+  const verificationLine = result.details.find((detail) => detail.toLowerCase().includes('verification'));
+  const warningLine = result.details.find((detail) => detail.toLowerCase().includes('planning warnings'));
+  const hasFailure = Boolean(failedLine && !failedLine.endsWith('none'));
+  const hasConflict = Boolean(conflictedLine && !conflictedLine.endsWith('none'));
+  if (!hasFailure && !hasConflict && !verificationLine && !warningLine) {
+    return undefined;
+  }
+
+  const taskIds = [failedLine, conflictedLine]
+    .filter((line): line is string => Boolean(line))
+    .flatMap((line) => line.split(':').slice(1).join(':').split(','))
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && entry !== 'none');
   return {
-    action,
-    summary: `Planned ${action} (waiting for confirmation).`,
-    details: argText === '{}' ? ['No arguments supplied.'] : [`Arguments: ${argText}`],
-    dryRun: true,
+    source: hasConflict ? 'ownership' : verificationLine ? 'verification' : 'execution',
+    ...(taskIds[0] ? { taskId: taskIds[0] } : {}),
+    ...(verificationLine ? { detail: verificationLine } : warningLine ? { detail: warningLine } : {}),
   };
 }
 
-function normalizeToolResult(
-  action: AgentToolAction,
-  result: unknown,
-  callId: string,
-): AgentToolResult {
-  if (result && typeof result === 'object' && !Array.isArray(result)) {
-    const record = result as Partial<AgentToolResult>;
-    if (typeof record.summary === 'string' && Array.isArray(record.details)) {
-      return {
-        action,
-        summary: record.summary,
-        details: record.details.map((entry) => String(entry)),
-        ...(record.dryRun === true ? { dryRun: true } : {}),
-        ...(record.setupRequired === true ? { setupRequired: true } : {}),
-        callId,
-      };
+function detectConsistencyIssue(ledger: Awaited<ReturnType<typeof readLedger>>): string | undefined {
+  const activeExecution = ledger.runtime.activeExecution;
+  const activeRun = ledger.orchestration.activeRun;
+  const inProgressTasks = ledger.tasks.tasks.filter((task) => task.status === 'in_progress');
+  if (activeExecution) {
+    const activeTask = ledger.tasks.tasks.find((task) => task.id === activeExecution.taskId);
+    if (!activeTask) {
+      return `Runtime active execution references missing task "${activeExecution.taskId}".`;
+    }
+    if (activeTask.status !== 'in_progress') {
+      return `Runtime active execution task "${activeTask.id}" is ${activeTask.status}.`;
+    }
+    if (!activeRun) {
+      return 'Runtime active execution exists with no active orchestration run.';
+    }
+    if (activeRun.pendingBoundary) {
+      return 'Active execution is running while orchestration is paused for approval.';
     }
   }
-
-  return {
-    action,
-    summary: `Tool ${action} completed.`,
-    details: [typeof result === 'string' ? result : JSON.stringify(result)],
-    callId,
-  };
-}
-
-function buildSteps(calls: AgentToolCall[]): AgentPlanStep[] {
-  return calls.map((call) => ({
-    action: call.action,
-    summary: actionSummary(call.action),
-    mutating: call.mutating,
-  }));
-}
-
-function buildSingleCallPlan(plan: AgentPlan, call: AgentToolCall): AgentPlan {
-  const normalizedCall = withBoundedExecuteDefaults(call);
-  const matchingStep =
-    plan.steps.find((step) => step.action === normalizedCall.action) ??
-    { action: normalizedCall.action, summary: actionSummary(normalizedCall.action), mutating: normalizedCall.mutating };
-  const previewResults = plan.previewResults.filter((result) =>
-    result.action === 'check_setup' && result.dryRun !== true
-  );
-  return {
-    ...plan,
-    calls: [normalizedCall],
-    steps: [matchingStep],
-    previewResults,
-    requiresConfirmation: normalizedCall.mutating,
-  };
-}
-
-function buildProgressPrompt(request: string, history: string[]): string {
-  if (history.length === 0) {
-    return request;
+  if (!activeExecution && inProgressTasks.length > 0) {
+    return `Found ${inProgressTasks.length} in_progress task(s) with no active runtime execution.`;
   }
-  return [
-    `Current request: ${request}`,
-    'Completed steps:',
-    ...history.map((entry) => `- ${entry}`),
-    'Choose the next best action to continue.',
-    'Do not repeat completed steps unless recovery is required.',
-  ].join('\n');
+  return undefined;
 }
 
-function fallbackPlan(request: string): AgentPlan {
-  const goal = normalizeGoal(request);
-  const calls: AgentToolCall[] = [
-    {
-      id: randomUUID(),
-      action: 'check_setup',
-      args: {},
-      mutating: false,
-    },
-    {
-      id: randomUUID(),
-      action: 'configure_ai',
-      args: {},
-      mutating: true,
-    },
-  ];
-  return {
-    id: randomUUID(),
-    request: request.trim(),
-    goal,
-    calls,
-    steps: buildSteps(calls),
-    previewResults: [],
-    requiresConfirmation: true,
-    createdAt: new Date().toISOString(),
-  };
+function wantsRepairRequest(request: string): boolean {
+  return /\b(repair state|repair|fix state|clear stale|consistency)\b/.test(request.toLowerCase());
 }
 
-function setupNeedsAttention(result: AgentToolResult): boolean {
-  return result.setupRequired === true;
+function hasNoRemainingWork(tasks: ReadonlyArray<{ status: string }>): boolean {
+  if (tasks.length === 0) {
+    return false;
+  }
+  return tasks.every((task) => task.status === 'completed');
 }
 
 async function hasScrimbleDir(cwd: string): Promise<boolean> {
@@ -386,118 +212,59 @@ async function hasScrimbleDir(cwd: string): Promise<boolean> {
   }
 }
 
-function toOrchestrationPlanState(plan: AgentPlan): OrchestrationPlanState {
-  return {
-    id: plan.id,
-    request: plan.request,
-    goal: plan.goal,
-    requiresConfirmation: plan.requiresConfirmation,
-    createdAt: plan.createdAt,
-    steps: plan.steps.map((step) => ({
-      action: step.action,
-      summary: step.summary,
-      mutating: step.mutating,
-    })),
-  };
+interface RunLoopConfig {
+  resetActiveRun: boolean;
+  approvedBoundaryAction?: AgentToolAction;
 }
 
-function toOrchestrationExecutionSummary(
-  plan: AgentPlan,
-  execution: AgentExecutionResult,
-): OrchestrationExecutionSummaryState {
-  return {
-    planId: plan.id,
-    request: plan.request,
-    summary: execution.summary,
-    completedAt: new Date().toISOString(),
-    results: execution.results.map((result) => ({
-      action: result.action,
-      summary: result.summary,
-    })),
+function buildProgressSignature(
+  ledger: Awaited<ReturnType<typeof readLedger>>,
+  setupRequired: boolean,
+): string {
+  const statusCounts = {
+    pending: 0,
+    ready: 0,
+    inProgress: 0,
+    completed: 0,
+    blocked: 0,
+    failed: 0,
   };
-}
-
-function buildSetupRequiredPlan(request: string, goal: string, setupResult: AgentToolResult): AgentPlan {
-  const setupCall: AgentToolCall = {
-    id: randomUUID(),
-    action: 'check_setup',
-    args: {},
-    mutating: false,
-  };
-  const configureCall: AgentToolCall = {
-    id: randomUUID(),
-    action: 'configure_ai',
-    args: {},
-    mutating: true,
-  };
-
-  return {
-    id: randomUUID(),
-    request,
-    goal,
-    calls: [setupCall, configureCall],
-    steps: buildSteps([setupCall, configureCall]),
-    previewResults: [
-      { ...setupResult, callId: setupCall.id },
-      { ...planOnlyToolResult('configure_ai', {}), callId: configureCall.id },
-    ],
-    requiresConfirmation: true,
-    createdAt: new Date().toISOString(),
-  };
-}
-
-function ensureSetupCallFirst(
-  calls: AgentToolCall[],
-  previewResults: AgentToolResult[],
-  setupResult: AgentToolResult,
-): { calls: AgentToolCall[]; previewResults: AgentToolResult[] } {
-  const existingIndex = calls.findIndex((call) => call.action === 'check_setup');
-  if (existingIndex === -1) {
-    const setupCall: AgentToolCall = {
-      id: randomUUID(),
-      action: 'check_setup',
-      args: {},
-      mutating: false,
-    };
-    return {
-      calls: [setupCall, ...calls],
-      previewResults: [{ ...setupResult, callId: setupCall.id }, ...previewResults],
-    };
+  for (const task of ledger.tasks.tasks) {
+    switch (task.status) {
+      case 'pending':
+        statusCounts.pending += 1;
+        break;
+      case 'ready':
+        statusCounts.ready += 1;
+        break;
+      case 'in_progress':
+        statusCounts.inProgress += 1;
+        break;
+      case 'completed':
+        statusCounts.completed += 1;
+        break;
+      case 'blocked':
+        statusCounts.blocked += 1;
+        break;
+      case 'failed':
+        statusCounts.failed += 1;
+        break;
+      default:
+        break;
+    }
   }
 
-  const setupCall = calls[existingIndex];
-  if (!setupCall) {
-    return { calls, previewResults };
-  }
-
-  const reorderedCalls: AgentToolCall[] = existingIndex === 0
-    ? calls
-    : [setupCall, ...calls.slice(0, existingIndex), ...calls.slice(existingIndex + 1)];
-  const hasSetupPreview = previewResults.some((result) => result.callId === setupCall.id);
-
-  return {
-    calls: reorderedCalls,
-    previewResults: hasSetupPreview
-      ? previewResults
-      : [{ ...setupResult, callId: setupCall.id }, ...previewResults],
-  };
-}
-
-async function canLoadLLM(cwd: string): Promise<boolean> {
-  const scrimbleDir = path.join(cwd, SCRIMBLE_DIR);
-  try {
-    await fs.access(path.join(scrimbleDir, CONFIG_FILE));
-    const config = await loadScrimbleConfig(cwd);
-    createLanguageModel(toModelConfig(config.ai));
-    return true;
-  } catch {
-    return false;
-  }
+  return JSON.stringify({
+    setupRequired,
+    statusCounts,
+    activeExecutionTaskId: ledger.runtime.activeExecution?.taskId ?? null,
+    activeExecutionPhase: ledger.runtime.activeExecution?.phase ?? null,
+    pendingBoundaryAction: ledger.orchestration.activeRun?.pendingBoundary?.action ?? null,
+    lastCompletedAction: ledger.orchestration.activeRun?.lastCompletedStep?.action ?? null,
+  });
 }
 
 export class ConversationalOrchestrator {
-  private sessionState: OrchestrationState | undefined;
-
   constructor(private readonly cwd: string = process.cwd()) {}
 
   async loadSessionState(): Promise<OrchestrationState | null> {
@@ -507,391 +274,16 @@ export class ConversationalOrchestrator {
     return (await readLedger(this.cwd)).orchestration;
   }
 
-  private cloneOrchestrationState(state: OrchestrationState): OrchestrationState {
-    return {
-      ...state,
-      ...(state.lastProposedPlan
-        ? {
-            lastProposedPlan: {
-              ...state.lastProposedPlan,
-              steps: state.lastProposedPlan.steps.map((step) => ({ ...step })),
-            },
-          }
-        : {}),
-      ...(state.lastConfirmedPlan
-        ? {
-            lastConfirmedPlan: {
-              ...state.lastConfirmedPlan,
-              steps: state.lastConfirmedPlan.steps.map((step) => ({ ...step })),
-            },
-          }
-        : {}),
-      ...(state.lastExecutionSummary
-        ? {
-            lastExecutionSummary: {
-              ...state.lastExecutionSummary,
-              results: state.lastExecutionSummary.results.map((result) => ({ ...result })),
-            },
-          }
-        : {}),
-      ...(state.activeRun
-        ? {
-            activeRun: {
-              ...state.activeRun,
-              completedSteps: state.activeRun.completedSteps.map((step) => ({ ...step })),
-              ...(state.activeRun.currentStep ? { currentStep: { ...state.activeRun.currentStep } } : {}),
-              ...(state.activeRun.pendingBoundary ? { pendingBoundary: { ...state.activeRun.pendingBoundary } } : {}),
-              ...(state.activeRun.pauseState ? { pauseState: { ...state.activeRun.pauseState } } : {}),
-              ...(state.activeRun.resumableContext
-                ? { resumableContext: { history: [...state.activeRun.resumableContext.history] } }
-                : {}),
-            },
-          }
-        : {}),
-      ...(state.lastRunOutcome ? { lastRunOutcome: { ...state.lastRunOutcome } } : {}),
-    };
-  }
-
-  private async withSessionState<T>(seed: OrchestrationState, work: () => Promise<T>): Promise<T> {
-    const previous = this.sessionState;
-    this.sessionState = this.cloneOrchestrationState(seed);
-    try {
-      return await work();
-    } finally {
-      this.sessionState = previous;
-    }
-  }
-
-  private async updateOrchestrationState(
-    update: (current: OrchestrationState) => OrchestrationState,
-  ): Promise<void> {
-    if (this.sessionState) {
-      this.sessionState = update(this.sessionState);
-      return;
-    }
-    if (!(await hasScrimbleDir(this.cwd))) {
-      return;
-    }
-    await mutateLedger(this.cwd, (ledger) => {
-      const current = ledger.orchestration;
-      ledger.orchestration = {
-        ...update(current),
-        version: current.version,
-        sessionId: current.sessionId || randomUUID(),
-        updatedAt: new Date().toISOString(),
-      };
-    });
-  }
-
-  private async flushSessionState(): Promise<void> {
-    if (!this.sessionState) {
-      return;
-    }
-    if (!(await hasScrimbleDir(this.cwd))) {
-      return;
-    }
-    const snapshot = this.cloneOrchestrationState(this.sessionState);
-    await mutateLedger(this.cwd, (ledger) => {
-      ledger.orchestration = {
-        ...snapshot,
-        version: snapshot.version,
-        sessionId: snapshot.sessionId || ledger.orchestration.sessionId || randomUUID(),
-        updatedAt: new Date().toISOString(),
-      };
-    });
-  }
-
-  private async recordProposedPlan(plan: AgentPlan): Promise<void> {
-    await this.updateOrchestrationState((current) => ({
-      ...current,
-      lastProposedPlan: toOrchestrationPlanState(plan),
-    }));
-  }
-
-  private async recordConfirmedPlan(plan: AgentPlan): Promise<void> {
-    await this.updateOrchestrationState((current) => ({
-      ...current,
-      lastConfirmedPlan: toOrchestrationPlanState(plan),
-    }));
-  }
-
-  private async recordExecutionSummary(plan: AgentPlan, execution: AgentExecutionResult): Promise<void> {
-    await this.updateOrchestrationState((current) => ({
-      ...current,
-      lastExecutionSummary: toOrchestrationExecutionSummary(plan, execution),
-    }));
-  }
-
-  private async recordActiveRun(state?: OrchestrationActiveRunState): Promise<void> {
-    await this.updateOrchestrationState((current) => {
-      if (state) {
-        return {
-          ...current,
-          activeRun: state,
-        };
-      }
-      const { activeRun: _activeRun, ...withoutActiveRun } = current;
-      return withoutActiveRun;
-    });
-  }
-
-  private async recordRunOutcome(result: OperatorRunResult): Promise<void> {
-    await this.updateOrchestrationState((current) => {
-      const withOutcome: OrchestrationState = {
-        ...current,
-        lastRunOutcome: {
-          status: result.status,
-          request: result.lastRequest,
-          summary: result.summary,
-          ...(result.reason ? { reason: result.reason } : {}),
-          ...(result.nextSuggestedAction ? { nextSuggestedAction: result.nextSuggestedAction } : {}),
-          completedAt: new Date().toISOString(),
-        },
-      };
-      if (result.status === 'paused' || result.status === 'blocked') {
-        return withOutcome;
-      }
-      const { activeRun: _activeRun, ...withoutActiveRun } = withOutcome;
-      return withoutActiveRun;
-    });
-  }
-
-  private buildToolset(
-    request: string,
-    goal: string,
-    mode: 'plan' | 'execute',
-    options: ExecutePlanOptions = {},
-  ) {
-    const context = {
-      cwd: this.cwd,
-      request,
-      goal,
-      ...(options.setup ? { setup: options.setup } : {}),
-    };
-
-    const callTool = async (
-      action: AgentToolAction,
-      args: Record<string, unknown> = {},
-    ): Promise<AgentToolResult> => {
-      if (mode === 'plan' && isMutatingAction(action)) {
-        return planOnlyToolResult(action, args);
-      }
-      return runAgentTool(action, context, args, {
-        ...(mode === 'execute' ? { execute: options } : {}),
-      });
-    };
-
-    return {
-      inspect_repo: tool({
-        description: 'Inspect repository structure and local ledger state.',
-        parameters: z.object({}).strict(),
-        execute: async () => callTool('inspect_repo'),
-      }),
-      check_setup: tool({
-        description: 'Check local setup, worker readiness, and config.',
-        parameters: z.object({}).strict(),
-        execute: async () => callTool('check_setup'),
-      }),
-      configure_ai: tool({
-        description: 'Configure AI provider/model/key and scaffold .scrimble if missing.',
-        parameters: z.object({
-          provider: aiProviderSchema.optional(),
-          model: z.string().optional(),
-          apiKey: z.string().optional(),
-        }).strict(),
-        execute: async (args) => callTool('configure_ai', toToolArgs(args)),
-      }),
-      generate_or_update_tasks: tool({
-        description: 'Generate or replan the local ledger task graph for a goal.',
-        parameters: z.object({
-          goal: z.string().optional(),
-          replan: z.boolean().optional(),
-        }).strict(),
-        execute: async (args) => callTool('generate_or_update_tasks', toToolArgs(args)),
-      }),
-      show_plan: tool({
-        description: 'Show ready tasks and next execution items.',
-        parameters: z.object({}).strict(),
-        execute: async () => callTool('show_plan'),
-      }),
-      execute_tasks: tool({
-        description: 'Run tasks through LedgerSupervisor.',
-        parameters: z.object({
-          worker: z.enum(['auto', 'gemini', 'copilot']).optional(),
-          parallel: z.number().int().min(1).max(8).optional(),
-          timeoutSeconds: z.number().int().min(10).max(7200).optional(),
-          maxTasks: z.number().int().min(0).optional(),
-        }).strict(),
-        execute: async (args) => callTool('execute_tasks', toToolArgs(args)),
-      }),
-      check_status: tool({
-        description: 'Read local orchestration status from the ledger.',
-        parameters: z.object({}).strict(),
-        execute: async () => callTool('check_status'),
-      }),
-      show_logs: tool({
-        description: 'Read recent local runtime events.',
-        parameters: z.object({
-          limit: z.number().int().min(1).max(100).optional(),
-        }).strict(),
-        execute: async (args) => callTool('show_logs', toToolArgs(args)),
-      }),
-      doctor: tool({
-        description: 'Run local health diagnostics.',
-        parameters: z.object({}).strict(),
-        execute: async () => callTool('doctor'),
-      }),
-    };
-  }
-
-  async proposePlan(request: string, options: ExecutePlanOptions = {}): Promise<AgentPlan> {
-    const normalizedRequest = request.trim();
-    const goal = normalizeGoal(request);
-    if (!normalizedRequest) {
-      const fallback = fallbackPlan('check local status');
-      const preview = await runAgentTool('check_status', { cwd: this.cwd, request: 'check local status', goal }, {});
-      const firstCall = fallback.calls[0];
-      const plan: AgentPlan = {
-        ...fallback,
-        previewResults: [{ ...preview, ...(firstCall ? { callId: firstCall.id } : {}) }],
-      };
-      await this.recordProposedPlan(plan);
-      return plan;
-    }
-
-    const context = {
-      cwd: this.cwd,
-      request: normalizedRequest,
-      goal,
-      ...(options.setup ? { setup: options.setup } : {}),
-    };
-    const setupResult = await runAgentTool('check_setup', context, {});
-    if (setupNeedsAttention(setupResult)) {
-      const setupPlan = buildSetupRequiredPlan(normalizedRequest, goal, setupResult);
-      await this.recordProposedPlan(setupPlan);
-      return setupPlan;
-    }
-
-    if (!(await canLoadLLM(this.cwd))) {
-      const plan = fallbackPlan(normalizedRequest);
-      const firstCall = plan.calls[0];
-      const fallbackPlanResult: AgentPlan = {
-        ...plan,
-        previewResults: [{ ...setupResult, ...(firstCall ? { callId: firstCall.id } : {}) }],
-      };
-      await this.recordProposedPlan(fallbackPlanResult);
-      return fallbackPlanResult;
-    }
-
-    const config = await loadScrimbleConfig(this.cwd);
-    const model = createLanguageModel(toModelConfig(config.ai));
-    const tools = this.buildToolset(normalizedRequest, goal, 'plan', options);
-    const result = await generateText({
-      model,
-      system: ROOT_SYSTEM_PROMPT,
-      prompt: normalizedRequest,
-      tools,
-      maxSteps: 8,
-    });
-
-    const calls: AgentToolCall[] = [];
-    for (const call of result.toolCalls) {
-      const action = call.toolName as AgentToolAction;
-      calls.push({
-        id: call.toolCallId,
-        action,
-        args: toToolArgs(call.args),
-        mutating: isMutatingAction(action),
-      });
-    }
-
-    if (calls.length === 0) {
-      const fallbackCall: AgentToolCall = {
-        id: randomUUID(),
-        action: 'check_status',
-        args: {},
-        mutating: false,
-      };
-      const fallbackPreview = await runAgentTool(
-        'check_status',
-        context,
-        {},
-      );
-      const { calls: callsWithSetup, previewResults: previewsWithSetup } = ensureSetupCallFirst(
-        [fallbackCall],
-        [{ ...fallbackPreview, callId: fallbackCall.id }],
-        setupResult,
-      );
-      const fallbackStatusPlan: AgentPlan = {
-        id: randomUUID(),
-        request: normalizedRequest,
-        goal,
-        calls: callsWithSetup,
-        steps: buildSteps(callsWithSetup),
-        previewResults: previewsWithSetup,
-        requiresConfirmation: false,
-        createdAt: new Date().toISOString(),
-      };
-      await this.recordProposedPlan(fallbackStatusPlan);
-      return fallbackStatusPlan;
-    }
-
-    const previewResultsFromModel: AgentToolResult[] = result.toolResults
-      .map((toolResult) => {
-        const action = toolResult.toolName as AgentToolAction;
-        return normalizeToolResult(action, toolResult.result, toolResult.toolCallId);
-      });
-    const { calls: callsWithSetup, previewResults } = ensureSetupCallFirst(calls, previewResultsFromModel, setupResult);
-
-    const llmPlan: AgentPlan = {
-      id: randomUUID(),
-      request: normalizedRequest,
-      goal,
-      calls: callsWithSetup,
-      steps: buildSteps(callsWithSetup),
-      previewResults,
-      requiresConfirmation: callsWithSetup.some((call) => call.mutating),
-      createdAt: new Date().toISOString(),
-    };
-    await this.recordProposedPlan(llmPlan);
-    return llmPlan;
+  async proposePlan(request: string, options: ProposePlanOptions = {}): Promise<AgentPlan> {
+    return proposePlanForRequest(this.cwd, request, options);
   }
 
   async executePlan(plan: AgentPlan, options: ExecutePlanOptions = {}): Promise<AgentExecutionResult> {
-    const context = {
-      cwd: this.cwd,
-      request: plan.request,
-      goal: plan.goal,
-      ...(options.setup ? { setup: options.setup } : {}),
-    };
-
-    const results: AgentToolResult[] = [...plan.previewResults];
-    for (const call of plan.calls) {
-      if (!call.mutating) {
-        continue;
-      }
-      options.onProgress?.(`→ ${actionSummary(call.action)}`);
-      const result = await runAgentTool(call.action, context, call.args, { execute: options });
-      const withCallId: AgentToolResult = {
-        ...result,
-        callId: call.id,
-      };
-      results.push(withCallId);
-      options.onProgress?.(`✓ ${withCallId.summary}`);
-    }
-
-    const execution: AgentExecutionResult = {
-      summary: results.map((entry) => entry.summary).join(' '),
-      results,
-    };
-    await this.recordConfirmedPlan(plan);
-    await this.recordExecutionSummary(plan, execution);
-    return execution;
+    return executePlannedCalls(this.cwd, plan, options);
   }
 
   async runRequest(request: string, options: OperatorRunOptions): Promise<OperatorRunResult> {
-    const ledger = await readLedger(this.cwd);
-    return this.withSessionState(ledger.orchestration, async () => this.runLoop(request, options));
+    return this.runLoop(request, options, { resetActiveRun: true });
   }
 
   async resumeActiveRun(options: OperatorRunOptions): Promise<OperatorRunResult> {
@@ -904,133 +296,197 @@ export class ConversationalOrchestrator {
         lastRequest: '',
         nextSuggestedAction: 'Start a new request.',
         reason: 'no_active_run',
+        recoveryKind: 'resume_active_run',
+        recoveryActions: recoveryActionsFor('dismiss_completed'),
         results: [],
       };
       if (state) {
-        await this.withSessionState(state, async () => {
-          await this.recordRunOutcome(paused);
-          await this.flushSessionState();
+        await mutateLedger(this.cwd, (ledger) => {
+          writeRunOutcome(ledger, paused);
         });
       }
       return paused;
     }
 
-    return this.withSessionState(state, async () => {
-      let resumedRequest = active.request;
-      let seedState: OrchestrationActiveRunState = {
-        ...active,
-        completedSteps: [...active.completedSteps],
-        ...(active.resumableContext ? { resumableContext: { history: [...active.resumableContext.history] } } : {}),
-      };
+    let resumedRequest = active.request;
+    let approvedBoundaryAction: AgentToolAction | undefined;
+    options.onEvent?.({
+      type: 'resumed',
+      message: `Resuming active run for "${resumedRequest}".`,
+      request: resumedRequest,
+    });
 
+    const resumeLedger = await readLedger(this.cwd);
+    const resumeIssue = detectConsistencyIssue(resumeLedger);
+    if (resumeIssue && !wantsRepairRequest(resumedRequest)) {
+      const paused: OperatorRunResult = {
+        status: 'paused',
+        summary: 'Resume paused due to runtime/orchestration consistency mismatch.',
+        lastRequest: resumedRequest,
+        nextSuggestedAction: 'Apply state repair before resuming normal execution.',
+        reason: resumeIssue,
+        recoveryKind: 'state_inconsistent',
+        recoveryActions: recoveryActionsFor('state_inconsistent'),
+        lastFailure: {
+          source: 'consistency',
+          detail: resumeIssue,
+        },
+        results: [],
+      };
+      await mutateLedger(this.cwd, (ledger) => {
+        writeBoundaryState(ledger, {
+          request: resumedRequest,
+          pauseReason: paused.summary,
+        });
+        writeRunOutcome(ledger, paused);
+      });
+      return paused;
+    }
+
+    if (active.pendingBoundary && !options.autoConfirm) {
+      const boundary = toBoundaryFromState(active.pendingBoundary);
       options.onEvent?.({
-        type: 'resumed',
-        message: `Resuming active run for "${resumedRequest}".`,
+        type: 'boundary_requested',
+        message: boundary.reason,
         request: resumedRequest,
+        action: boundary.action,
+        boundary,
       });
 
-      if (active.pendingBoundary && !options.autoConfirm) {
-        const boundary: OperatorBoundary = {
-          id: active.pendingBoundary.id,
-          action: active.pendingBoundary.action as AgentToolAction,
-          actionSummary: active.pendingBoundary.actionSummary,
-          reason: active.pendingBoundary.reason,
-          scope: active.pendingBoundary.scope,
-          choices: [...active.pendingBoundary.choices],
-        };
+      const resolution: OperatorBoundaryResolution = options.resolveBoundary
+        ? await options.resolveBoundary(boundary)
+        : { kind: 'pause' };
 
+      if (resolution.kind === 'redirect') {
+        resumedRequest = resolution.request.trim() || resumedRequest;
         options.onEvent?.({
-          type: 'boundary_requested',
-          message: boundary.reason,
+          type: 'redirected',
+          message: `Redirected to: ${resumedRequest}`,
           request: resumedRequest,
-          action: boundary.action,
-          boundary,
+          reason: boundary.reason,
         });
-
-        const resolution: OperatorBoundaryResolution = options.resolveBoundary
-          ? await options.resolveBoundary(boundary)
-          : { kind: 'pause' };
-
-        if (resolution.kind === 'redirect') {
-          resumedRequest = resolution.request.trim() || resumedRequest;
-          const { pendingBoundary: _pendingBoundary, ...withoutPending } = seedState;
-          seedState = {
-            ...withoutPending,
+        await mutateLedger(this.cwd, (ledger) => {
+          writeBoundaryState(ledger, {
             request: resumedRequest,
-            updatedAt: new Date().toISOString(),
-            lastRedirect: resumedRequest,
-            pauseState: {
-              kind: 'manual',
-              reason: 'Run was redirected by the user.',
-            },
-            resumableContext: { history: [] },
-          };
-        } else if (resolution.kind !== 'proceed') {
-          const paused: OperatorRunResult = {
-            status: 'paused',
-            summary: `Paused: ${boundary.reason}`,
+            pauseReason: 'Run redirected by user input.',
+          });
+          writeRunOutcome(ledger, {
+            status: 'redirected',
+            summary: `Redirected to: ${resumedRequest}`,
             lastRequest: resumedRequest,
-            boundary,
-            nextSuggestedAction: 'Confirm this boundary or redirect me.',
+            nextSuggestedAction: 'Continuing with redirected request.',
             reason: boundary.reason,
             results: [],
-          };
-          await this.recordActiveRun(seedState);
-          await this.recordRunOutcome(paused);
-          await this.flushSessionState();
-          return paused;
-        } else {
-          const { pendingBoundary: _pendingBoundary, ...withoutPending } = seedState;
-          seedState = {
-            ...withoutPending,
-            updatedAt: new Date().toISOString(),
-          };
-        }
-      } else if (active.pendingBoundary && options.autoConfirm) {
-        const { pendingBoundary: _pendingBoundary, ...withoutPending } = seedState;
-        seedState = {
-          ...withoutPending,
-          updatedAt: new Date().toISOString(),
+          });
+        });
+      } else if (resolution.kind !== 'proceed') {
+        const paused: OperatorRunResult = {
+          status: 'paused',
+          summary: `Paused: ${boundary.reason}`,
+          lastRequest: resumedRequest,
+          boundary,
+          nextSuggestedAction: 'Confirm this boundary or redirect me.',
+          reason: boundary.reason,
+          recoveryKind: 'pending_approval',
+          recoveryActions: recoveryActionsFor('pending_approval'),
+          results: [],
         };
+        await mutateLedger(this.cwd, (ledger) => {
+          writeBoundaryState(ledger, {
+            request: resumedRequest,
+            boundary,
+            pauseReason: paused.summary,
+          });
+          writeRunOutcome(ledger, paused);
+        });
+        return paused;
+      } else {
+        approvedBoundaryAction = boundary.action;
+        await mutateLedger(this.cwd, (ledger) => {
+          writeBoundaryState(ledger, {
+            request: resumedRequest,
+            clearPauseReason: true,
+          });
+        });
       }
+    } else if (active.pendingBoundary && options.autoConfirm) {
+      approvedBoundaryAction = active.pendingBoundary.action as AgentToolAction;
+      await mutateLedger(this.cwd, (ledger) => {
+        writeBoundaryState(ledger, {
+          request: resumedRequest,
+          clearPauseReason: true,
+        });
+      });
+    }
 
-      return this.runLoop(resumedRequest, options, seedState);
+    return this.runLoop(resumedRequest, options, {
+      resetActiveRun: false,
+      ...(approvedBoundaryAction ? { approvedBoundaryAction } : {}),
     });
   }
 
   private async runLoop(
     request: string,
     options: OperatorRunOptions,
-    resumeState?: OrchestrationActiveRunState,
+    config: RunLoopConfig,
   ): Promise<OperatorRunResult> {
     const emit = (event: OperatorEvent): void => {
       options.onEvent?.(event);
     };
 
+    let activeRequest = request.trim() || 'check local status';
     const setupRef = options.setup ?? {};
     const maxSteps = Math.max(1, options.maxSteps ?? DEFAULT_OPERATOR_MAX_STEPS);
-    let activeRequest = request.trim() || 'check local status';
-    let historyForRequest: string[] = resumeState?.resumableContext ? [...resumeState.resumableContext.history] : [];
-    let planningPrompt = activeRequest;
-    let stepCount = resumeState?.stepCount ?? 0;
     const results: AgentToolResult[] = [];
-    const signatureCounts = new Map<string, number>();
-    const fingerprintCounts = new Map<string, number>();
-    const completedSteps: OrchestrationActiveRunState['completedSteps'] = resumeState
-      ? [...resumeState.completedSteps]
-      : [];
-    const { pendingBoundary: _pendingBoundary, pauseState: _pauseState, ...resumeWithoutPending } = resumeState ?? {};
-    let activeRunState: OrchestrationActiveRunState = {
-      ...(resumeState ? resumeWithoutPending : {}),
-      request: activeRequest,
-      startedAt: resumeState?.startedAt ?? new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      stepCount,
-      completedSteps: [...completedSteps],
-      ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-    };
-    await this.recordActiveRun(activeRunState);
-    await this.flushSessionState();
+    let stepCount = 0;
+    let lastSignature = '';
+    let lastProgressSignature = '';
+    let repeatedSignatureCount = 0;
+    let approvedBoundaryAction = config.approvedBoundaryAction;
+
+    if (config.resetActiveRun) {
+      const ledger = await readLedger(this.cwd);
+      if (ledger.orchestration.activeRun) {
+        await mutateLedger(this.cwd, (document) => {
+          clearActiveRun(document);
+        });
+      }
+    }
+
+    const initialLedger = await readLedger(this.cwd);
+    const stateIssue = detectConsistencyIssue(initialLedger);
+    if (stateIssue && !wantsRepairRequest(activeRequest)) {
+      const paused: OperatorRunResult = {
+        status: 'paused',
+        summary: 'State mismatch detected between runtime/orchestration/task graph.',
+        lastRequest: activeRequest,
+        nextSuggestedAction: 'Run a repair action before continuing execution.',
+        reason: stateIssue,
+        recoveryKind: 'state_inconsistent',
+        recoveryActions: recoveryActionsFor('state_inconsistent'),
+        lastFailure: {
+          source: 'consistency',
+          detail: stateIssue,
+        },
+        results,
+      };
+      emit({
+        type: 'paused',
+        message: paused.summary,
+        request: activeRequest,
+        reason: stateIssue,
+        ...(paused.recoveryActions ? { recoveryActions: paused.recoveryActions } : {}),
+        ...(paused.lastFailure ? { lastFailure: paused.lastFailure } : {}),
+      });
+      await mutateLedger(this.cwd, (document) => {
+        writeBoundaryState(document, {
+          request: activeRequest,
+          pauseReason: paused.summary,
+        });
+        writeRunOutcome(document, paused);
+      });
+      return paused;
+    }
 
     while (stepCount < maxSteps) {
       emit({
@@ -1039,95 +495,101 @@ export class ConversationalOrchestrator {
         request: activeRequest,
       });
 
-      const plan = await this.proposePlan(planningPrompt, { setup: setupRef });
-      const step = nextStepFromPlan(plan, options.interactionMode);
-
-      if (!step) {
-        if (completedSteps.length > 0) {
-          const paused: OperatorRunResult = {
-            status: 'paused',
-            summary: 'I do not see a clear next action from the current state.',
-            lastRequest: activeRequest,
-            nextSuggestedAction: 'Provide a narrower instruction or redirect me to a specific next step.',
-            reason: 'no_next_action',
-            results,
-          };
-          emit({
-            type: 'paused',
-            message: paused.summary,
-            request: activeRequest,
-            summary: paused.summary,
-            ...(paused.reason ? { reason: paused.reason } : {}),
-          });
-          activeRunState = {
-            ...activeRunState,
-            request: activeRequest,
-            updatedAt: new Date().toISOString(),
-            lastPauseReason: paused.summary,
-            pauseState: {
-              kind: 'manual',
-              reason: paused.summary,
-              ...(paused.nextSuggestedAction ? { nextSuggestedAction: paused.nextSuggestedAction } : {}),
-            },
-            ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-          };
-          await this.recordActiveRun(activeRunState);
-          await this.recordRunOutcome(paused);
-          await this.flushSessionState();
-          return paused;
-        }
-
-        const readOnlyExecution = await this.executePlan(plan, {
-          setup: setupRef,
-          planId: plan.id,
-        });
-        const nonDry = readOnlyExecution.results.filter((entry) => entry.dryRun !== true);
-        results.push(...nonDry);
-        const completed: OperatorRunResult = {
-          status: 'completed',
-          summary: readOnlyExecution.summary,
+      const ledger = await readLedger(this.cwd);
+      const completedSteps = ledger.orchestration.activeRun?.completedSteps ?? [];
+      const planningPrompt = buildProgressPrompt(
+        activeRequest,
+        completedSteps.map((step) => ({ action: step.action, summary: step.summary })),
+      );
+      const setupResult = await runAgentTool(
+        'check_setup',
+        {
+          cwd: this.cwd,
+          request: activeRequest,
+          goal: normalizeGoal(activeRequest),
+          ...(setupRef ? { setup: setupRef } : {}),
+        },
+        {},
+      );
+      const lastCompletedAction = ledger.orchestration.activeRun?.lastCompletedStep?.action;
+      if (setupResult.setupRequired === true && lastCompletedAction === 'configure_ai') {
+        const paused: OperatorRunResult = {
+          status: 'paused',
+          summary: 'Provider setup is still incomplete and execution is waiting for setup/auth updates.',
           lastRequest: activeRequest,
-          nextSuggestedAction: 'Ask for the next goal when ready.',
+          nextSuggestedAction: 'Complete provider setup/authentication, then resume.',
+          reason: 'setup_required',
+          recoveryKind: 'resume_active_run',
+          recoveryActions: [
+            {
+              kind: 'resume_active_run',
+              label: 'Resume after setup',
+              description: 'Finish provider setup/authentication first, then resume this run.',
+            },
+          ],
           results,
         };
         emit({
-          type: 'completed',
-          message: completed.summary,
+          type: 'paused',
+          message: paused.summary,
           request: activeRequest,
-          summary: completed.summary,
+          ...(paused.reason ? { reason: paused.reason } : {}),
+          ...(paused.recoveryActions ? { recoveryActions: paused.recoveryActions } : {}),
         });
-        await this.recordActiveRun(undefined);
-        await this.recordRunOutcome(completed);
-        await this.flushSessionState();
-        return completed;
+        await mutateLedger(this.cwd, (document) => {
+          writeBoundaryState(document, {
+            request: activeRequest,
+            pauseReason: paused.summary,
+          });
+          writeRunOutcome(document, paused);
+        });
+        return paused;
       }
 
-      const normalizedCall: AgentToolCall = {
-        id: randomUUID(),
-        action: step.action,
-        args: step.args,
-        mutating: true,
-      };
-      activeRunState = {
-        ...activeRunState,
+      let plan: AgentPlan | undefined;
+      let step = selectDeterministicStep({
         request: activeRequest,
-        updatedAt: new Date().toISOString(),
-        currentStep: toActiveRunStepState(step),
-        ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-      };
-      await this.recordActiveRun(activeRunState);
-      await this.flushSessionState();
+        interactionMode: options.interactionMode,
+        ledger,
+        setupResult,
+      });
+      if (!step) {
+        plan = await this.proposePlan(planningPrompt, { setup: setupRef, setupResult });
+        step = nextStepFromPlan(plan, options.interactionMode);
+      }
 
-      const signature = callSignature(normalizedCall);
-      const signatureCount = (signatureCounts.get(signature) ?? 0) + 1;
-      signatureCounts.set(signature, signatureCount);
-      if (signatureCount > 2) {
+      if (!step) {
+        if (hasNoRemainingWork(ledger.tasks.tasks)) {
+          const completed: OperatorRunResult = {
+            status: 'completed',
+            summary: 'Nothing more to do in the current task graph.',
+            lastRequest: activeRequest,
+            nextSuggestedAction: 'Ask for a new goal when ready.',
+            recoveryKind: 'dismiss_completed',
+            recoveryActions: recoveryActionsFor('dismiss_completed'),
+            results,
+          };
+          emit({
+            type: 'completed',
+            message: completed.summary,
+            request: activeRequest,
+            summary: completed.summary,
+          });
+          await mutateLedger(this.cwd, (document) => {
+            writeRunOutcome(document, completed);
+            clearActiveRun(document);
+          });
+          return completed;
+        }
+
         const paused: OperatorRunResult = {
           status: 'paused',
-          summary: "I'm repeating the same step and pausing to avoid spinning.",
+          summary: 'I do not know the next safe action from the current state.',
           lastRequest: activeRequest,
-          nextSuggestedAction: 'Give a narrower instruction or redirect me.',
-          reason: 'repeated_action_signature',
+          nextSuggestedAction: 'Provide a narrower instruction or redirect me to the next step.',
+          reason: 'no_next_action',
+          recoveryKind: 'replan',
+          recoveryActions: recoveryActionsFor('retry_task'),
           results,
         };
         emit({
@@ -1136,58 +598,89 @@ export class ConversationalOrchestrator {
           request: activeRequest,
           summary: paused.summary,
           ...(paused.reason ? { reason: paused.reason } : {}),
+          ...(paused.recoveryActions ? { recoveryActions: paused.recoveryActions } : {}),
         });
-          activeRunState = {
-            ...activeRunState,
+        await mutateLedger(this.cwd, (document) => {
+          writeBoundaryState(document, {
             request: activeRequest,
-            updatedAt: new Date().toISOString(),
-            lastPauseReason: paused.summary,
-            pauseState: {
-              kind: 'guard',
-              reason: paused.summary,
-              ...(paused.nextSuggestedAction ? { nextSuggestedAction: paused.nextSuggestedAction } : {}),
-            },
-            ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-          };
-        await this.recordActiveRun(activeRunState);
-        await this.recordRunOutcome(paused);
-        await this.flushSessionState();
+            pauseReason: paused.summary,
+          });
+          writeRunOutcome(document, paused);
+        });
         return paused;
       }
 
-      const policy = permissionPolicyForCall(normalizedCall, options.interactionMode);
-      const boundary = toBoundary(normalizedCall, policy);
-      if (policy.requiresConfirmation && !options.autoConfirm) {
+      const call = toToolCall(step);
+      const signature = callSignature(call);
+      const progressSignature = buildProgressSignature(ledger, setupResult.setupRequired === true);
+      const sameSignature = signature === lastSignature;
+      const unchangedState = sameSignature && progressSignature === lastProgressSignature;
+      if (sameSignature && unchangedState) {
+        repeatedSignatureCount += 1;
+      } else {
+        repeatedSignatureCount = 1;
+      }
+      lastSignature = signature;
+      lastProgressSignature = progressSignature;
+
+      if (sameSignature && unchangedState && repeatedSignatureCount > 1) {
+        const nextSuggestedAction = setupResult.setupRequired === true
+          ? 'Complete provider setup/authentication, then resume.'
+          : 'Change the state (or redirect the request) before retrying the same action.';
+        const paused: OperatorRunResult = {
+          status: 'paused',
+          summary: 'I would repeat the same action without state change, so I am pausing to avoid a loop.',
+          lastRequest: activeRequest,
+          nextSuggestedAction,
+          reason: 'no_progress_repeated_action',
+          recoveryKind: 'resume_active_run',
+          recoveryActions: [
+            {
+              kind: 'resume_active_run',
+              label: 'Resume after changes',
+              description: 'Apply the blocking change, then resume this run.',
+            },
+          ],
+          results,
+        };
+        emit({
+          type: 'paused',
+          message: paused.summary,
+          request: activeRequest,
+          summary: paused.summary,
+          ...(paused.reason ? { reason: paused.reason } : {}),
+          ...(paused.recoveryActions ? { recoveryActions: paused.recoveryActions } : {}),
+        });
+        await mutateLedger(this.cwd, (document) => {
+          writeBoundaryState(document, {
+            request: activeRequest,
+            pauseReason: paused.summary,
+          });
+          writeRunOutcome(document, paused);
+        });
+        return paused;
+      }
+
+      const policy = permissionPolicyForCall(call, options.interactionMode);
+      const boundary = toBoundary(call, policy);
+      const boundaryAlreadyApproved = approvedBoundaryAction === call.action;
+      if (boundaryAlreadyApproved) {
+        approvedBoundaryAction = undefined;
+      } else if (policy.requiresConfirmation && !options.autoConfirm) {
         emit({
           type: 'boundary_requested',
           message: boundary.reason,
           request: activeRequest,
-          action: normalizedCall.action,
+          action: call.action,
           boundary,
         });
-        activeRunState = {
-          ...activeRunState,
-          request: activeRequest,
-          updatedAt: new Date().toISOString(),
-          pendingBoundary: toBoundaryState(boundary),
-          lastPauseReason: boundary.reason,
-          pauseState: {
-            kind: 'boundary',
-            reason: boundary.reason,
-            nextSuggestedAction: 'Approve, pause, or redirect this boundary.',
-          },
-          ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-        };
-        await this.recordActiveRun(activeRunState);
-        await this.flushSessionState();
 
         const resolution: OperatorBoundaryResolution = options.resolveBoundary
           ? await options.resolveBoundary(boundary)
           : { kind: 'pause' };
 
         if (resolution.kind === 'redirect') {
-          const redirectedRequest = resolution.request.trim();
-          const nextRequest = redirectedRequest || activeRequest;
+          const nextRequest = resolution.request.trim() || activeRequest;
           emit({
             type: 'redirected',
             message: `Redirected to: ${nextRequest}`,
@@ -1195,24 +688,23 @@ export class ConversationalOrchestrator {
             reason: boundary.reason,
           });
           activeRequest = nextRequest;
-          planningPrompt = activeRequest;
-          historyForRequest = [];
-          signatureCounts.clear();
-          fingerprintCounts.clear();
-          const { pendingBoundary: _pendingBoundary, lastPauseReason: _lastPauseReason, ...withoutBoundary } = activeRunState;
-          activeRunState = {
-            ...withoutBoundary,
-            request: activeRequest,
-            updatedAt: new Date().toISOString(),
-            lastRedirect: activeRequest,
-            pauseState: {
-              kind: 'manual',
-              reason: 'Run redirected by user input.',
-            },
-            resumableContext: { history: [] },
-          };
-          await this.recordActiveRun(activeRunState);
-          await this.flushSessionState();
+          lastSignature = '';
+          lastProgressSignature = '';
+          repeatedSignatureCount = 0;
+          await mutateLedger(this.cwd, (document) => {
+            writeBoundaryState(document, {
+              request: activeRequest,
+              pauseReason: 'Run redirected by user input.',
+            });
+            writeRunOutcome(document, {
+              status: 'redirected',
+              summary: `Redirected to: ${activeRequest}`,
+              lastRequest: activeRequest,
+              nextSuggestedAction: 'Continuing with redirected request.',
+              reason: boundary.reason,
+              results: [],
+            });
+          });
           continue;
         }
 
@@ -1224,6 +716,8 @@ export class ConversationalOrchestrator {
             boundary,
             nextSuggestedAction: 'Confirm this boundary or redirect me.',
             reason: boundary.reason,
+            recoveryKind: 'pending_approval',
+            recoveryActions: recoveryActionsFor('pending_approval'),
             results,
           };
           emit({
@@ -1232,146 +726,89 @@ export class ConversationalOrchestrator {
             request: activeRequest,
             boundary,
             reason: boundary.reason,
+            ...(paused.recoveryActions ? { recoveryActions: paused.recoveryActions } : {}),
           });
-          activeRunState = {
-            ...activeRunState,
-            request: activeRequest,
-            updatedAt: new Date().toISOString(),
-            pendingBoundary: toBoundaryState(boundary),
-            lastPauseReason: paused.summary,
-            pauseState: {
-              kind: 'boundary',
-              reason: boundary.reason,
-              ...(paused.nextSuggestedAction ? { nextSuggestedAction: paused.nextSuggestedAction } : {}),
-            },
-            ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-          };
-          await this.recordActiveRun(activeRunState);
-          await this.recordRunOutcome(paused);
-          await this.flushSessionState();
+          await mutateLedger(this.cwd, (document) => {
+            writeBoundaryState(document, {
+              request: activeRequest,
+              boundary,
+              pauseReason: paused.summary,
+            });
+            writeRunOutcome(document, paused);
+          });
           return paused;
         }
       }
 
-      const {
-        pendingBoundary: _pendingBoundary,
-        lastPauseReason: _lastPauseReason,
-        pauseState: _pauseState,
-        ...withoutBoundary
-      } = activeRunState;
-      activeRunState = {
-        ...withoutBoundary,
-        request: activeRequest,
-        updatedAt: new Date().toISOString(),
-        ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-      };
-      await this.recordActiveRun(activeRunState);
-      await this.flushSessionState();
+      await mutateLedger(this.cwd, (document) => {
+        writePlanningState(document, { request: activeRequest, step });
+      });
 
       emit({
         type: 'step_started',
         message: `${step.actionSummary} (${step.rationale})`,
         request: activeRequest,
-        action: normalizedCall.action,
+        action: call.action,
       });
 
-      const singleStepPlan = buildSingleCallPlan(plan, normalizedCall);
       try {
+        const singleStepPlan = plan
+          ? {
+              ...buildSingleCallPlan(plan, call),
+              request: activeRequest,
+              goal: normalizeGoal(activeRequest),
+            }
+          : {
+              id: randomUUID(),
+              request: activeRequest,
+              goal: normalizeGoal(activeRequest),
+              calls: [call],
+              steps: [{ action: call.action, summary: step.rationale, mutating: call.mutating }],
+              previewResults: [],
+              requiresConfirmation: call.mutating,
+              createdAt: new Date().toISOString(),
+            };
+
         const execution = await this.executePlan(singleStepPlan, {
           setup: setupRef,
           planId: singleStepPlan.id,
-          ...(normalizedCall.action === 'execute_tasks'
+          ...(call.action === 'execute_tasks'
             ? {
-                parallel:
-                  typeof normalizedCall.args['parallel'] === 'number' ? normalizedCall.args['parallel'] : 1,
-                maxTasks:
-                  typeof normalizedCall.args['maxTasks'] === 'number' ? normalizedCall.args['maxTasks'] : 1,
+                parallel: typeof call.args['parallel'] === 'number' ? call.args['parallel'] : 1,
+                maxTasks: typeof call.args['maxTasks'] === 'number' ? call.args['maxTasks'] : 1,
               }
             : {}),
         });
-        const latestResult = [...execution.results]
-          .reverse()
-          .find((entry) => entry.action === normalizedCall.action && entry.dryRun !== true);
-        if (latestResult) {
-          results.push(latestResult);
-          completedSteps.push({
-            action: latestResult.action,
-            summary: latestResult.summary,
-            completedAt: new Date().toISOString(),
-          });
-          historyForRequest.push(`${latestResult.action}: ${latestResult.summary}`);
-          const fingerprint = `${signature}:${latestResult.summary}`;
-          const fingerprintCount = (fingerprintCounts.get(fingerprint) ?? 0) + 1;
-          fingerprintCounts.set(fingerprint, fingerprintCount);
-          if (fingerprintCount > 2) {
-            const paused: OperatorRunResult = {
-              status: 'paused',
-              summary: "I'm not seeing meaningful state change, so I paused.",
-              lastRequest: activeRequest,
-              nextSuggestedAction: 'Provide a narrower instruction or redirect me.',
-              reason: 'repeated_no_state_change',
-              results,
-            };
-            emit({
-              type: 'paused',
-              message: paused.summary,
-              request: activeRequest,
-              ...(paused.reason ? { reason: paused.reason } : {}),
-            });
-            activeRunState = {
-              ...activeRunState,
-              request: activeRequest,
-              updatedAt: new Date().toISOString(),
-              stepCount: stepCount + 1,
-              completedSteps: [...completedSteps],
-              lastPauseReason: paused.summary,
-              pauseState: {
-                kind: 'guard',
-                reason: paused.summary,
-                ...(paused.nextSuggestedAction ? { nextSuggestedAction: paused.nextSuggestedAction } : {}),
-              },
-              resumableContext: { history: [...historyForRequest] },
-            };
-            await this.recordActiveRun(activeRunState);
-            await this.recordRunOutcome(paused);
-            await this.flushSessionState();
-            return paused;
-          }
-        }
 
-        stepCount += 1;
-        activeRunState = {
-          ...activeRunState,
-          request: activeRequest,
-          updatedAt: new Date().toISOString(),
-          stepCount,
-          completedSteps: [...completedSteps],
-          resumableContext: { history: [...historyForRequest] },
-        };
-        await this.recordActiveRun(activeRunState);
-        await this.flushSessionState();
+        const latestResult =
+          [...execution.results]
+            .reverse()
+            .find((entry) => entry.action === call.action && entry.dryRun !== true) ??
+          completedStepFallback(step, execution);
+
+        results.push(latestResult);
 
         emit({
           type: 'step_completed',
-          message: latestResult?.summary ?? execution.summary,
+          message: latestResult.summary,
           request: activeRequest,
-          action: normalizedCall.action,
-          ...(latestResult ? { result: latestResult } : {}),
+          action: call.action,
+          result: latestResult,
         });
 
-        if (normalizedCall.action === 'execute_tasks' && latestResult) {
-          const failedDetail = latestResult.details.find((detail) => detail.startsWith('Failed tasks:'));
-          const conflictedDetail = latestResult.details.find((detail) => detail.startsWith('Conflicted tasks:'));
-          const hasFailures = Boolean(failedDetail && !failedDetail.endsWith('none'));
-          const hasConflicts = Boolean(conflictedDetail && !conflictedDetail.endsWith('none'));
-          if (hasFailures || hasConflicts) {
-            const blockerReason = (hasFailures ? failedDetail : conflictedDetail) ?? 'Execution reported unresolved blockers.';
+        if (call.action === 'execute_tasks') {
+          const blockerReason = executionBlockerReason(latestResult);
+          if (blockerReason) {
+            const failureContext = parseFailureContextFromResult(latestResult);
             const blocked: OperatorRunResult = {
               status: 'blocked',
               summary: 'Execution finished with failures or conflicts and needs attention.',
               lastRequest: activeRequest,
-              nextSuggestedAction: 'Inspect logs/status and resolve blockers before continuing.',
+              nextSuggestedAction: 'Inspect status/logs and resolve blockers before continuing.',
               reason: blockerReason,
+              recoveryKind: 'retry_task',
+              recoveryActions: recoveryActionsFor('retry_task'),
+              ...(failureContext ? { lastFailure: failureContext } : {}),
               results,
             };
             emit({
@@ -1379,25 +816,49 @@ export class ConversationalOrchestrator {
               message: blocked.summary,
               request: activeRequest,
               reason: blockerReason,
+              ...(blocked.recoveryActions ? { recoveryActions: blocked.recoveryActions } : {}),
+              ...(blocked.lastFailure ? { lastFailure: blocked.lastFailure } : {}),
             });
-            activeRunState = {
-              ...activeRunState,
-              request: activeRequest,
-              updatedAt: new Date().toISOString(),
-              lastPauseReason: blocked.summary,
-              pauseState: {
-                kind: 'blocked',
-                reason: blocked.summary,
-                ...(blocked.nextSuggestedAction ? { nextSuggestedAction: blocked.nextSuggestedAction } : {}),
-              },
-              resumableContext: { history: [...historyForRequest] },
-            };
-            await this.recordActiveRun(activeRunState);
-            await this.recordRunOutcome(blocked);
-            await this.flushSessionState();
+            await mutateLedger(this.cwd, (document) => {
+              writeStepCompletionState(document, { request: activeRequest, result: latestResult });
+              writeBoundaryState(document, {
+                request: activeRequest,
+                pauseReason: blocked.summary,
+              });
+              writeRunOutcome(document, blocked);
+            });
             return blocked;
           }
         }
+
+        const readOnlyTurn = isReadOnlyRequest(activeRequest) && !call.mutating;
+        if (readOnlyTurn) {
+          const completed: OperatorRunResult = {
+            status: 'completed',
+            summary: latestResult.summary,
+            lastRequest: activeRequest,
+            nextSuggestedAction: 'Ask for the next goal when ready.',
+            recoveryKind: 'dismiss_completed',
+            recoveryActions: recoveryActionsFor('dismiss_completed'),
+            results,
+          };
+          emit({
+            type: 'completed',
+            message: completed.summary,
+            request: activeRequest,
+            summary: completed.summary,
+          });
+          await mutateLedger(this.cwd, (document) => {
+            writeStepCompletionState(document, { request: activeRequest, result: latestResult });
+            writeRunOutcome(document, completed);
+            clearActiveRun(document);
+          });
+          return completed;
+        }
+
+        await mutateLedger(this.cwd, (document) => {
+          writeStepCompletionState(document, { request: activeRequest, result: latestResult });
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const failed: OperatorRunResult = {
@@ -1406,6 +867,12 @@ export class ConversationalOrchestrator {
           lastRequest: activeRequest,
           nextSuggestedAction: 'Investigate the failure and retry with a narrower step.',
           reason: message,
+          recoveryKind: 'retry_task',
+          recoveryActions: recoveryActionsFor('retry_task'),
+          lastFailure: {
+            source: 'runtime',
+            detail: message,
+          },
           results,
         };
         emit({
@@ -1413,34 +880,30 @@ export class ConversationalOrchestrator {
           message: failed.summary,
           request: activeRequest,
           reason: message,
+          ...(failed.recoveryActions ? { recoveryActions: failed.recoveryActions } : {}),
+          ...(failed.lastFailure ? { lastFailure: failed.lastFailure } : {}),
         });
-        activeRunState = {
-          ...activeRunState,
-          request: activeRequest,
-          updatedAt: new Date().toISOString(),
-          lastPauseReason: failed.summary,
-          pauseState: {
-            kind: 'blocked',
-            reason: failed.summary,
-            ...(failed.nextSuggestedAction ? { nextSuggestedAction: failed.nextSuggestedAction } : {}),
-          },
-          resumableContext: { history: [...historyForRequest] },
-        };
-        await this.recordActiveRun(activeRunState);
-        await this.recordRunOutcome(failed);
-        await this.flushSessionState();
+        await mutateLedger(this.cwd, (document) => {
+          writeBoundaryState(document, {
+            request: activeRequest,
+            pauseReason: failed.summary,
+          });
+          writeRunOutcome(document, failed);
+        });
         return failed;
       }
 
-      planningPrompt = buildProgressPrompt(activeRequest, historyForRequest);
+      stepCount += 1;
     }
 
     const paused: OperatorRunResult = {
       status: 'paused',
-      summary: "I reached the operator step limit and paused to stay safe.",
+      summary: 'I reached the operator step limit and paused to stay safe.',
       lastRequest: activeRequest,
       nextSuggestedAction: 'Confirm continuation or provide a narrower instruction.',
       reason: 'loop_guard_max_steps',
+      recoveryKind: 'resume_active_run',
+      recoveryActions: recoveryActionsFor('resume_active_run'),
       results,
     };
     emit({
@@ -1448,22 +911,15 @@ export class ConversationalOrchestrator {
       message: paused.summary,
       request: activeRequest,
       ...(paused.reason ? { reason: paused.reason } : {}),
+      ...(paused.recoveryActions ? { recoveryActions: paused.recoveryActions } : {}),
     });
-    activeRunState = {
-      ...activeRunState,
-      request: activeRequest,
-      updatedAt: new Date().toISOString(),
-      lastPauseReason: paused.summary,
-      pauseState: {
-        kind: 'guard',
-        reason: paused.summary,
-        ...(paused.nextSuggestedAction ? { nextSuggestedAction: paused.nextSuggestedAction } : {}),
-      },
-      ...(historyForRequest.length > 0 ? { resumableContext: { history: [...historyForRequest] } } : {}),
-    };
-    await this.recordActiveRun(activeRunState);
-    await this.recordRunOutcome(paused);
-    await this.flushSessionState();
+    await mutateLedger(this.cwd, (document) => {
+      writeBoundaryState(document, {
+        request: activeRequest,
+        pauseReason: paused.summary,
+      });
+      writeRunOutcome(document, paused);
+    });
     return paused;
   }
 }

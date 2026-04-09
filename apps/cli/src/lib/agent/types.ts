@@ -1,4 +1,10 @@
-import type { AIProvider, InteractionMode, WorkerKind } from '@scrimble/shared';
+import type {
+  AIModelStrategy,
+  AIProfileAuthStrategy,
+  AIProvider,
+  InteractionMode,
+  WorkerKind,
+} from '@scrimble/shared';
 
 export type AgentToolAction =
   | 'inspect_repo'
@@ -7,6 +13,8 @@ export type AgentToolAction =
   | 'generate_or_update_tasks'
   | 'show_plan'
   | 'execute_tasks'
+  | 'repair_state'
+  | 'recover_failed_tasks'
   | 'check_status'
   | 'show_logs'
   | 'doctor';
@@ -36,9 +44,15 @@ export interface AgentPlan {
 }
 
 export interface AgentSetupInput {
+  profileId?: string;
+  profileName?: string;
   provider?: AIProvider;
+  modelStrategy?: AIModelStrategy;
   model?: string;
+  authStrategy?: AIProfileAuthStrategy;
   apiKey?: string;
+  token?: string;
+  baseUrl?: string;
   interactionMode?: InteractionMode;
 }
 
@@ -73,12 +87,42 @@ export interface OperatorBoundary {
   action: AgentToolAction;
   actionSummary: string;
   reason: string;
+  category?: 'setup' | 'planning' | 'execution' | 'inspection';
+  riskLevel?: 'low' | 'medium' | 'high';
+  nextStepHint?: string;
   scope: {
     parallel: number;
     maxTasks: number;
     args: Record<string, unknown>;
   };
   choices: Array<'proceed' | 'pause' | 'redirect'>;
+}
+
+export type OperatorRecoveryKind =
+  | 'resume_active_run'
+  | 'pending_approval'
+  | 'retry_task'
+  | 'replan'
+  | 'revise_foundation'
+  | 'inspect_logs'
+  | 'show_plan'
+  | 'clear_stale_execution'
+  | 'mark_failed_and_continue'
+  | 'dismiss_completed'
+  | 'state_inconsistent';
+
+export interface OperatorRecoveryAction {
+  kind: OperatorRecoveryKind;
+  label: string;
+  description: string;
+}
+
+export interface OperatorFailureContext {
+  source: 'execution' | 'ownership' | 'verification' | 'planning' | 'runtime' | 'consistency';
+  taskId?: string;
+  files?: string[];
+  commands?: string[];
+  detail?: string;
 }
 
 export type OperatorBoundaryResolution =
@@ -137,6 +181,8 @@ export interface OperatorEvent {
   boundary?: OperatorBoundary;
   summary?: string;
   reason?: string;
+  recoveryActions?: OperatorRecoveryAction[];
+  lastFailure?: OperatorFailureContext;
 }
 
 export interface OperatorRunResult {
@@ -146,5 +192,8 @@ export interface OperatorRunResult {
   nextSuggestedAction?: string;
   boundary?: OperatorBoundary;
   reason?: string;
+  recoveryKind?: OperatorRecoveryKind;
+  recoveryActions?: OperatorRecoveryAction[];
+  lastFailure?: OperatorFailureContext;
   results: AgentToolResult[];
 }

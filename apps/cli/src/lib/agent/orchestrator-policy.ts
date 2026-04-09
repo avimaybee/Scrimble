@@ -7,6 +7,8 @@ const MUTATING_ACTIONS = new Set<AgentToolAction>([
   'configure_ai',
   'generate_or_update_tasks',
   'execute_tasks',
+  'repair_state',
+  'recover_failed_tasks',
 ]);
 
 export interface PermissionPolicyDecision {
@@ -37,6 +39,10 @@ export function actionSummary(action: AgentToolAction): string {
       return 'Outline the next steps.';
     case 'execute_tasks':
       return 'Start the next task.';
+    case 'repair_state':
+      return 'Repair inconsistent runtime/operator state.';
+    case 'recover_failed_tasks':
+      return 'Recover failed/blocked tasks for retry.';
     case 'check_status':
       return 'Summarize current progress.';
     case 'show_logs':
@@ -117,6 +123,28 @@ export function permissionPolicyForCall(
     };
   }
 
+  if (call.action === 'repair_state') {
+    return {
+      requiresConfirmation: interactionMode !== 'operator',
+      reason:
+        interactionMode === 'operator'
+          ? 'Operator mode can apply deterministic state repair automatically.'
+          : 'I need your approval to repair runtime/orchestration state.',
+      scope: { parallel: 1, maxTasks: 1, args: toToolArgs(call.args) },
+    };
+  }
+
+  if (call.action === 'recover_failed_tasks') {
+    return {
+      requiresConfirmation: interactionMode === 'guide',
+      reason:
+        interactionMode === 'guide'
+          ? 'I need your approval to recover failed/blocked tasks for retry.'
+          : 'Recovery can move failed/blocked tasks back into an executable state in this mode.',
+      scope: { parallel: 1, maxTasks: 1, args: toToolArgs(call.args) },
+    };
+  }
+
   return {
     requiresConfirmation: interactionMode === 'guide',
     reason:
@@ -128,11 +156,28 @@ export function permissionPolicyForCall(
 }
 
 export function toBoundary(call: AgentToolCall, decision: PermissionPolicyDecision): OperatorBoundary {
+  const category: OperatorBoundary['category'] =
+    call.action === 'configure_ai'
+      ? 'setup'
+      : call.action === 'generate_or_update_tasks'
+        ? 'planning'
+        : call.action === 'execute_tasks' || call.action === 'repair_state' || call.action === 'recover_failed_tasks'
+          ? 'execution'
+          : 'inspection';
+  const riskLevel: OperatorBoundary['riskLevel'] =
+    call.action === 'execute_tasks' || call.action === 'repair_state' || call.action === 'recover_failed_tasks'
+      ? 'high'
+      : call.action === 'generate_or_update_tasks' || call.action === 'configure_ai'
+        ? 'medium'
+        : 'low';
   return {
     id: randomUUID(),
     action: call.action,
     actionSummary: actionSummary(call.action),
     reason: decision.reason,
+    category,
+    riskLevel,
+    nextStepHint: expectedOutcomeForAction(call.action),
     scope: {
       parallel: decision.scope.parallel,
       maxTasks: decision.scope.maxTasks,
@@ -150,6 +195,10 @@ export function expectedOutcomeForAction(action: AgentToolAction): string {
       return 'Task graph is refreshed to reflect the current goal.';
     case 'execute_tasks':
       return 'The next bounded task step is executed and progress advances.';
+    case 'repair_state':
+      return 'Runtime/orchestration state is repaired and resume can continue safely.';
+    case 'recover_failed_tasks':
+      return 'Failed/blocked tasks are recovered into an executable state for the next bounded step.';
     case 'check_status':
       return 'Latest progress and blockers are summarized.';
     case 'show_logs':
@@ -167,6 +216,10 @@ export function pauseConditionForAction(action: AgentToolAction): string {
       return 'pause if no safe next task can be derived';
     case 'execute_tasks':
       return 'pause if execution fails, conflicts, or needs approval';
+    case 'repair_state':
+      return 'pause if deterministic repair cannot be applied safely';
+    case 'recover_failed_tasks':
+      return 'pause if failed/blocked tasks cannot be recovered safely';
     default:
       return 'pause if no safe next action is available';
   }

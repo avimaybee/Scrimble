@@ -1,7 +1,7 @@
 /**
  * Scrimble Native Ledger Types
  *
- * The ledger is the canonical source of truth for task state, assignments,
+ * The ledger is the canonical source of truth for task state, runtime execution,
  * and ownership scope. Provider artifacts (GEMINI.md, AGENTS.md, conductor/)
  * are supplemental context only.
  */
@@ -19,27 +19,17 @@ export type WorkerKind = 'gemini' | 'copilot';
  * Task lifecycle status.
  *
  * State machine:
- *   pending → leased → running → verify_pending → completed
- *                             ↘ blocked / failed
- *                             ↘ needs_retry → running
+ *   pending → ready → in_progress → completed
+ *                           ↘ blocked / failed
+ *                           ↘ ready (retry)
  */
 export type TaskStatus =
-  | 'pending' // Ready to be assigned
-  | 'leased' // Assigned to a worker, not yet started
-  | 'running' // Worker is actively executing
-  | 'verify_pending' // Execution complete, awaiting verification
+  | 'pending' // Waiting on dependencies
+  | 'ready' // Ready to execute
+  | 'in_progress' // Worker is actively executing this task
   | 'blocked' // Blocked by dependency or conflict
   | 'failed' // Terminal failure, requires intervention
   | 'completed'; // Successfully completed and verified
-
-/** Assignment status for worker-task binding. */
-export type AssignmentStatus =
-  | 'unassigned' // No worker assigned
-  | 'assigned' // Worker assigned, waiting to start
-  | 'in_progress' // Worker actively executing
-  | 'needs_retry' // Failed but retryable
-  | 'conflicted' // File conflict detected
-  | 'done'; // Assignment completed
 
 // --- Core Ledger Entities ---
 
@@ -51,12 +41,18 @@ export interface LedgerTask {
   title: string;
   /** What the task should accomplish. */
   objective: string;
+  /** Why this task exists in the generated plan. */
+  rationale?: string;
   /** Criteria for determining task completion. */
   doneCriteria: string;
   /** Files/globs this task is allowed to create or modify. */
   ownedFiles: string[];
   /** Additional files the task may read but not modify. */
   allowedFiles: string[];
+  /** Ownership confidence from planner inference. */
+  ownershipConfidence?: 'high' | 'medium' | 'low';
+  /** Planning warnings attached to this task. */
+  planningWarnings?: string[];
   /** Commands to verify task completion. */
   verificationCommands: string[];
   /** Task IDs that must complete before this task. */
@@ -81,24 +77,23 @@ export interface LedgerTask {
   maxRetries: number;
 }
 
-/** Assignment binding a task to a worker. */
-export interface Assignment {
-  /** Task being assigned. */
+/** Execution phase of the currently active task attempt. */
+export type ActiveExecutionPhase = 'dispatching' | 'executing' | 'verifying';
+
+/** Single in-flight task execution state for the runtime. */
+export interface ActiveExecutionState {
+  /** Task currently being executed. */
   taskId: string;
-  /** Worker assigned to the task. */
-  worker: WorkerKind;
-  /** Assignment status. */
-  status: AssignmentStatus;
-  /** When the assignment was created. */
-  leasedAt: string;
-  /** When execution started (null if not yet started). */
-  startedAt?: string;
-  /** When execution completed (null if not yet complete). */
-  completedAt?: string;
-  /** Last heartbeat from the worker. */
-  lastHeartbeat?: string;
-  /** Session ID for the worker process. */
-  sessionId?: string;
+  /** Worker currently executing the task. */
+  workerId: WorkerKind;
+  /** Execution start timestamp. */
+  startedAt: string;
+  /** Attempt number of the task execution. */
+  attempt: number;
+  /** Optional phase for status/reporting UI. */
+  phase?: ActiveExecutionPhase;
+  /** Optional status line for status/reporting UI. */
+  statusMessage?: string;
 }
 
 /** Record of a single execution attempt. */
@@ -145,8 +140,6 @@ export interface WorkerHealth {
   sessionId?: string;
   /** Last heartbeat timestamp. */
   lastHeartbeat?: string;
-  /** Task currently being executed. */
-  currentTaskId?: string;
   /** Number of tasks completed this session. */
   tasksCompleted: number;
   /** Number of tasks failed this session. */
@@ -167,12 +160,12 @@ export interface TasksState {
   updatedAt: string;
 }
 
-/** Root container for assignments in the ledger document. */
-export interface AssignmentsState {
+/** Root runtime state for the ledger document. */
+export interface RuntimeState {
   /** Schema version for migrations. */
   version: number;
-  /** All active assignments. */
-  assignments: Assignment[];
+  /** Optional currently active execution. */
+  activeExecution?: ActiveExecutionState;
   /** Timestamp of last modification. */
   updatedAt: string;
 }
@@ -201,38 +194,15 @@ export interface LedgerApprovalState {
   updatedAt: string;
 }
 
-/** Snapshot of a conversational plan for interruption-safe resume. */
-export interface OrchestrationPlanState {
-  id: string;
-  request: string;
-  goal: string;
-  requiresConfirmation: boolean;
-  createdAt: string;
-  steps: Array<{
-    action: string;
-    summary: string;
-    mutating: boolean;
-  }>;
-}
-
-/** Snapshot of the latest conversational execution result. */
-export interface OrchestrationExecutionSummaryState {
-  planId: string;
-  request: string;
-  summary: string;
-  completedAt: string;
-  results: Array<{
-    action: string;
-    summary: string;
-  }>;
-}
-
 /** Pending approval boundary for the operator loop. */
 export interface OrchestrationBoundaryState {
   id: string;
   action: string;
   actionSummary: string;
   reason: string;
+  category?: 'setup' | 'planning' | 'execution' | 'inspection';
+  riskLevel?: 'low' | 'medium' | 'high';
+  nextStepHint?: string;
   scope: {
     parallel: number;
     maxTasks: number;
@@ -254,8 +224,8 @@ export interface OrchestrationActiveRunState {
   request: string;
   startedAt: string;
   updatedAt: string;
-  stepCount: number;
-  completedSteps: OrchestrationStepState[];
+  completedSteps?: OrchestrationStepState[];
+  lastCompletedStep?: OrchestrationStepState;
   currentStep?: {
     action: string;
     actionSummary: string;
@@ -265,17 +235,8 @@ export interface OrchestrationActiveRunState {
     pauseCondition: string;
     plannedAt: string;
   };
-  resumableContext?: {
-    history: string[];
-  };
-  pauseState?: {
-    kind: 'boundary' | 'guard' | 'blocked' | 'manual';
-    reason: string;
-    nextSuggestedAction?: string;
-  };
   pendingBoundary?: OrchestrationBoundaryState;
   lastPauseReason?: string;
-  lastRedirect?: string;
 }
 
 /** Snapshot of the latest operator-loop outcome. */
@@ -285,6 +246,19 @@ export interface OrchestrationRunOutcomeState {
   summary: string;
   reason?: string;
   nextSuggestedAction?: string;
+  recoveryKind?: string;
+  recoveryActions?: Array<{
+    kind: string;
+    label: string;
+    description: string;
+  }>;
+  lastFailure?: {
+    source: string;
+    taskId?: string;
+    files?: string[];
+    commands?: string[];
+    detail?: string;
+  };
   completedAt: string;
 }
 
@@ -292,11 +266,9 @@ export interface OrchestrationRunOutcomeState {
 export interface OrchestrationState {
   version: number;
   sessionId: string;
-  lastProposedPlan?: OrchestrationPlanState;
-  lastConfirmedPlan?: OrchestrationPlanState;
-  lastExecutionSummary?: OrchestrationExecutionSummaryState;
   activeRun?: OrchestrationActiveRunState;
   lastRunOutcome?: OrchestrationRunOutcomeState;
+  recentOutcomes?: OrchestrationRunOutcomeState[];
   updatedAt: string;
 }
 
@@ -305,7 +277,7 @@ export interface LedgerDocument {
   version: number;
   updatedAt: string;
   tasks: TasksState;
-  assignments: AssignmentsState;
+  runtime: RuntimeState;
   workers: WorkersState;
   intent: IntentState;
   approval: LedgerApprovalState;
@@ -318,17 +290,11 @@ export interface LedgerDocument {
 export type LedgerEventType =
   // Task lifecycle
   | 'task_created'
-  | 'task_leased'
   | 'task_started'
   | 'task_completed'
   | 'task_failed'
   | 'task_blocked'
   | 'task_retried'
-  // Assignment lifecycle
-  | 'assignment_created'
-  | 'assignment_started'
-  | 'assignment_completed'
-  | 'assignment_conflicted'
   // Verification
   | 'verification_started'
   | 'verification_passed'
@@ -365,8 +331,8 @@ export interface LedgerSummary {
   totalTasks: number;
   /** Tasks by status. */
   tasksByStatus: Record<TaskStatus, number>;
-  /** Active assignments. */
-  activeAssignments: number;
+  /** Current active execution task, if any. */
+  activeExecutionTaskId?: string;
   /** Available workers. */
   availableWorkers: WorkerKind[];
   /** Blocked tasks. */
@@ -381,7 +347,7 @@ export interface LedgerSummary {
 export interface TaskQuery {
   /** Filter by status. */
   status?: TaskStatus | TaskStatus[];
-  /** Filter by worker assignment. */
+  /** Filter by preferred worker. */
   worker?: WorkerKind;
   /** Only tasks with no unmet dependencies. */
   ready?: boolean;

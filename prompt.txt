@@ -1,0 +1,55 @@
+# Coherent Product Surface And Entrypoint Cleanup
+
+## Summary
+
+This pass should do one thing only: make Scrimble’s CLI surface clean, coherent, and warning-free.
+
+The core problem is stale Oclif command discovery from compiled output, not the current source command folder. The pass should clean the actual discovery path, tighten build behavior so deleted commands cannot survive in `dist`, and leave the CLI presenting only the approved conversational surface.
+
+## Key Changes
+
+### 1. Audit the real command discovery path
+- Audit `apps/cli/package.json` Oclif configuration and confirm the effective command source is `./dist/commands`.
+- Compare `apps/cli/src/commands` against `apps/cli/dist/commands` and identify stale compiled command artifacts.
+- Run `--help` on the main entrypoints and capture every warning emitted during command discovery.
+- Confirm whether test artifacts under `dist/commands` are also being scanned and contributing noise.
+
+### 2. Fix build and discovery so stale commands disappear
+- Clean the compiled command output before rebuild so removed commands do not persist in `apps/cli/dist/commands`.
+- Ensure the CLI build process cannot leave deleted command modules behind after refactors.
+- Verify Oclif only discovers the approved commands:
+  - `root`
+  - `init`
+  - `doctor`
+  - `logs`
+  - `config`
+- Remove or isolate any compiled artifacts that should never participate in command discovery, including deleted commands and test command outputs if applicable.
+
+### 3. Tighten entrypoint behavior and exposed surface
+- Keep deprecated-command interception in `bin/run.js`, but make sure it no longer depends on Oclif discovering stale legacy command modules.
+- Align help text and visible command descriptions with the current conversational operator product.
+- Ensure the bare `scrimble` path, `scrimble root`, and support commands all present one coherent product surface.
+
+### 4. Validate the cleaned CLI surface
+- Verify these are warning-free:
+  - `node apps/cli/bin/run.js --help`
+  - `node apps/cli/bin/run.js root --help`
+  - `scrimble`
+  - `scrimble init`
+  - `scrimble doctor`
+  - `scrimble logs`
+- Confirm the output is informative and only references supported commands and flows.
+- Leave startup-summary UX changes for the next pass; do not fold them into this cleanup pass.
+
+## Test Plan
+
+- Rebuild from a clean state and confirm stale deleted commands do not reappear in `dist`.
+- Verify help output for approved commands is warning-free.
+- Verify deprecated command names are intercepted by `bin/run.js` without Oclif import noise.
+- Confirm no deleted command module is reachable through command discovery after the pass.
+
+## Assumptions
+
+- The approved command surface for this pass is `root`, `init`, `doctor`, `logs`, and `config`.
+- `oclif.manifest.json` is not the active root cause unless later audit proves otherwise.
+- Startup-summary and conversational onboarding refinements belong to the next UX pass, not this cleanup pass.
