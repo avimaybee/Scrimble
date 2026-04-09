@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { migrateLegacyLedgerIfPresent } from '../ledger/legacy-migration.js';
 import type { ValidationFixtureName, ValidationScenarioDefinition } from './types.js';
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -286,5 +287,6 @@ export async function materializeScenarioFixture(name: ValidationFixtureName): P
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), `scrimble-validation-${name}-`));
   await fs.cp(source, workspace, { recursive: true, force: true });
   await fs.mkdir(path.join(workspace, '.git'), { recursive: true });
+  await migrateLegacyLedgerIfPresent(workspace);
   return workspace;
 }

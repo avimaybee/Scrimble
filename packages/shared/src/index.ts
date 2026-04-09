@@ -14,25 +14,9 @@ export {
   interactionModeSchema,
   legacyScrimbleConfigSchema,
   scrimbleConfigSchema,
-  projectStatusSchema,
-  createProjectSchema,
-  chunkStatusSchema,
-  chunkDefinitionSchema,
-  planDataSchema,
   verificationStatusSchema,
   verificationCheckSchema,
   verificationResultSchema,
-  generationRunTypeSchema,
-  generationRunStatusSchema,
-  stackInfoSchema,
-  directoryNodeSchema,
-  repoContextSchema,
-  generationInputSchema,
-  initProjectRequestSchema,
-  completeChunkRequestSchema,
-  skipChunkRequestSchema,
-  updatePlanRequestSchema,
-  firebaseApproveRequestSchema,
 } from './schemas/index.js';
 
 // Constants
@@ -50,7 +34,7 @@ export const VERIFICATION_DIR = 'verification';
 export const PROMPTS_DIR = 'prompts';
 export const RULES_DIR = 'rules';
 
-// Conductor artifact paths (planning truth)
+// Conductor artifact paths (supplemental planning context only)
 export const CONDUCTOR_DIR = 'conductor';
 export const CONDUCTOR_PRODUCT_FILE = 'product.md';
 export const CONDUCTOR_GUIDELINES_FILE = 'product-guidelines.md';
@@ -59,7 +43,7 @@ export const CONDUCTOR_WORKFLOW_FILE = 'workflow.md';
 export const CONDUCTOR_TRACKS_FILE = 'tracks.md';
 export const CONDUCTOR_TRACKS_DIR = 'tracks';
 
-// Scrimble runtime paths (runtime truth)
+// Runtime artifact paths
 export const RUNTIME_DIR = 'runtime';
 export const RUNTIME_STATE_FILE = 'run-state.json';
 export const RUNTIME_APPROVALS_FILE = 'approvals.json';
@@ -67,10 +51,8 @@ export const RUNTIME_EVENTS_FILE = 'events.ndjson';
 export const RUNTIME_ATTEMPTS_DIR = 'attempts';
 export const RUNTIME_WORKERS_FILE = 'workers.json';
 
-// Scrimble ledger paths (task/runtime truth)
+// Canonical ledger/document paths
 export const LEDGER_DIR = 'ledger';
 export const LEDGER_TASKS_FILE = 'tasks.json';
-export const LEDGER_ASSIGNMENTS_FILE = 'assignments.json';
-export const LEDGER_FILE_LEASES_FILE = 'file-leases.json';
 export const INTENT_FILE = 'intent.json';
 export const LEDGER_FILE = 'ledger.json';

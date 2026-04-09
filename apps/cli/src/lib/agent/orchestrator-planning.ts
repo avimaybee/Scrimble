@@ -22,6 +22,7 @@ import {
   toOperatorStep,
   withBoundedExecuteDefaults,
 } from './orchestrator-policy.js';
+import { detectConsistencyIssue, isRepairStateRequest } from './orchestrator-consistency.js';
 import type {
   AgentExecutionResult,
   AgentPlan,
@@ -494,57 +495,64 @@ function recoverableTaskCount(ledger: LedgerDocument): number {
   return ledger.tasks.tasks.filter((task) => task.status === 'failed' || task.status === 'blocked').length;
 }
 
-function detectStateInconsistency(ledger: LedgerDocument): string | undefined {
-  const activeExecution = ledger.runtime.activeExecution;
-  const activeRun = ledger.orchestration.activeRun;
-  const tasks = ledger.tasks.tasks;
-  const inProgressTasks = tasks.filter((task) => task.status === 'in_progress');
-  if (activeExecution) {
-    const task = tasks.find((entry) => entry.id === activeExecution.taskId);
-    if (!task) {
-      return `Active execution references missing task "${activeExecution.taskId}".`;
-    }
-    if (task.status !== 'in_progress') {
-      return `Active execution task "${task.id}" is ${task.status} instead of in_progress.`;
-    }
-    if (!activeRun) {
-      return 'Runtime has an active execution but no active orchestration run.';
-    }
-    if (activeRun.pendingBoundary) {
-      return 'Runtime is executing while orchestration is paused on an approval boundary.';
-    }
+const EXPLICIT_INSPECTION_REQUESTS: Readonly<Record<string, AgentToolAction>> = {
+  doctor: 'doctor',
+  'run doctor': 'doctor',
+  'show logs': 'show_logs',
+  logs: 'show_logs',
+  'show recent runtime logs and summarize blockers': 'show_logs',
+  'show the latest failure details including files, commands, and recommended recovery actions': 'show_logs',
+  status: 'check_status',
+  'check status': 'check_status',
+  'show status': 'check_status',
+  'inspect repo': 'inspect_repo',
+  'inspect repository': 'inspect_repo',
+  'show plan': 'show_plan',
+  'show current plan': 'show_plan',
+  'show current plan with rationale, scope, dependencies, verification, and warnings': 'show_plan',
+};
+
+function normalizeRequestValue(request: string): string {
+  return request.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isExplicitReplanRequest(request: string): boolean {
+  const normalized = normalizeRequestValue(request);
+  return normalized === 'replan' ||
+    normalized === 'refresh plan' ||
+    normalized === 'replan from current state' ||
+    normalized === 'replan from current state and regenerate the task graph' ||
+    normalized === 'regenerate the task graph' ||
+    normalized === 'revise foundation';
+}
+
+export function explicitInspectionActionForRequest(request: string): AgentToolAction | undefined {
+  const normalized = normalizeRequestValue(request);
+  const exact = EXPLICIT_INSPECTION_REQUESTS[normalized];
+  if (exact) {
+    return exact;
   }
-  if (!activeExecution && inProgressTasks.length > 0) {
-    return `Found ${inProgressTasks.length} in_progress task(s) with no runtime active execution.`;
+  if (normalized.startsWith('doctor')) {
+    return 'doctor';
+  }
+  if (normalized.startsWith('show logs') || normalized.startsWith('show log')) {
+    return 'show_logs';
+  }
+  if (normalized.startsWith('show plan')) {
+    return 'show_plan';
+  }
+  if (normalized.startsWith('inspect repo') || normalized.startsWith('inspect repository')) {
+    return 'inspect_repo';
+  }
+  if (
+    normalized === 'status' ||
+    normalized.startsWith('show status') ||
+    normalized.startsWith('check status') ||
+    normalized.includes('setup status')
+  ) {
+    return 'check_status';
   }
   return undefined;
-}
-
-function isRepairRequest(request: string): boolean {
-  return /\b(repair state|repair|fix state|clear stale|consistency)\b/.test(request.toLowerCase());
-}
-
-function tokenizeForOverlap(value: string): Set<string> {
-  return new Set(
-    value
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .map((token) => token.trim())
-      .filter((token) => token.length >= 3),
-  );
-}
-
-function overlapScore(left: Set<string>, right: Set<string>): number {
-  if (left.size === 0 || right.size === 0) {
-    return 0;
-  }
-  let overlap = 0;
-  for (const token of left) {
-    if (right.has(token)) {
-      overlap += 1;
-    }
-  }
-  return overlap / Math.max(left.size, right.size);
 }
 
 function planHasCriticalQualityGaps(ledger: LedgerDocument): boolean {
@@ -554,73 +562,47 @@ function planHasCriticalQualityGaps(ledger: LedgerDocument): boolean {
     task.objective === 'Run verification commands and resolve failing checks');
 }
 
-function shouldReplanForRequest(request: string, ledger: LedgerDocument): { replan: boolean; reason?: string } {
-  const normalized = request.trim().toLowerCase();
-  if (!normalized) {
-    return { replan: false };
-  }
-
-  if (/\b(replan|refresh plan|new goal|change direction|pivot|different approach)\b/.test(normalized)) {
-    return { replan: true, reason: 'The request explicitly asks for a fresh plan.' };
-  }
-
-  if (planHasCriticalQualityGaps(ledger)) {
-    return { replan: true, reason: 'Current task graph quality is outdated and should be replanned before execution.' };
-  }
-
+function planningBasisMismatchReason(ledger: LedgerDocument): string | undefined {
   const intent = ledger.intent.intent;
   if (!intent) {
-    return { replan: false };
+    return undefined;
+  }
+  const basis = ledger.tasks.planningBasis;
+  if (!basis || !basis.intentId || !basis.intentUpdatedAt) {
+    return 'Task graph is missing planning basis metadata and should be regenerated.';
+  }
+  if (basis.intentId !== intent.id) {
+    return `Task graph intent basis (${basis.intentId}) does not match approved intent (${intent.id}).`;
+  }
+  if (basis.intentUpdatedAt !== intent.updatedAt) {
+    return 'Approved intent changed after task graph generation.';
+  }
+  const approvedDiscoveryMode = ledger.intent.discovery.mode ?? intent.discoveryMode;
+  if (basis.discoveryMode && approvedDiscoveryMode && basis.discoveryMode !== approvedDiscoveryMode) {
+    return `Task graph discovery basis (${basis.discoveryMode}) differs from current discovery mode (${approvedDiscoveryMode}).`;
+  }
+  return undefined;
+}
+
+function shouldReplanForRequest(request: string, ledger: LedgerDocument): { replan: boolean; reason?: string } {
+  if (isExplicitReplanRequest(request)) {
+    return { replan: true, reason: 'The request explicitly asks for a fresh plan.' };
   }
 
   if (ledger.intent.updatedAt > ledger.tasks.updatedAt) {
     return { replan: true, reason: 'Intent was updated after the task graph and requires replanning.' };
   }
 
-  const requestTokens = tokenizeForOverlap(normalized);
-  const goalTokens = tokenizeForOverlap(intent.goal);
-  const similarity = overlapScore(requestTokens, goalTokens);
-  const shiftSignal = /\b(instead|switch|change|new|different|replace|drop)\b/.test(normalized);
-  if (shiftSignal && similarity < 0.25) {
-    return { replan: true, reason: 'Request conflicts with the current goal and should replan before execution.' };
+  if (planHasCriticalQualityGaps(ledger)) {
+    return { replan: true, reason: 'Current task graph quality is outdated and should be replanned before execution.' };
+  }
+
+  const basisMismatch = planningBasisMismatchReason(ledger);
+  if (basisMismatch) {
+    return { replan: true, reason: basisMismatch };
   }
 
   return { replan: false };
-}
-
-export function isReadOnlyRequest(request: string): boolean {
-  const normalized = request.trim().toLowerCase();
-  if (!normalized) {
-    return true;
-  }
-
-  const mutatingSignals =
-    /\b(implement|fix|build|create|add|update|change|refactor|ship|execute|run|complete|write|modify|start)\b/;
-  const readOnlySignals =
-    /\b(status|progress|log|logs|show|list|inspect|review|summarize|what|why|diagnose|doctor|health)\b/;
-
-  if (mutatingSignals.test(normalized)) {
-    return false;
-  }
-
-  return readOnlySignals.test(normalized);
-}
-
-function readOnlyActionForRequest(request: string): AgentToolAction {
-  const normalized = request.toLowerCase();
-  if (/\b(log|logs|history)\b/.test(normalized)) {
-    return 'show_logs';
-  }
-  if (/\b(doctor|diagnose|health)\b/.test(normalized)) {
-    return 'doctor';
-  }
-  if (/\b(plan|next|todo|tasks?)\b/.test(normalized)) {
-    return 'show_plan';
-  }
-  if (/\b(inspect|explore|repo|repository|files?|structure)\b/.test(normalized)) {
-    return 'inspect_repo';
-  }
-  return 'check_status';
 }
 
 export function selectDeterministicStep(input: {
@@ -639,7 +621,7 @@ export function selectDeterministicStep(input: {
     );
   }
 
-  const consistencyIssue = detectStateInconsistency(input.ledger);
+  const consistencyIssue = detectConsistencyIssue(input.ledger);
   if (consistencyIssue) {
     return toOperatorStep(
       {
@@ -653,7 +635,7 @@ export function selectDeterministicStep(input: {
     );
   }
 
-  if (isRepairRequest(input.request) && lastCompletedAction !== 'repair_state') {
+  if (isRepairStateRequest(input.request) && lastCompletedAction !== 'repair_state') {
     return toOperatorStep(
       {
         id: randomUUID(),
@@ -666,12 +648,12 @@ export function selectDeterministicStep(input: {
     );
   }
 
-  if (isReadOnlyRequest(input.request)) {
-    const action = readOnlyActionForRequest(input.request);
+  const explicitInspectionAction = explicitInspectionActionForRequest(input.request);
+  if (explicitInspectionAction) {
     return toOperatorStep(
-      { id: randomUUID(), action, args: {}, mutating: false },
+      { id: randomUUID(), action: explicitInspectionAction, args: {}, mutating: false },
       input.interactionMode,
-      'This request is read-only, so the next step is a non-mutating status/inspection action.',
+      'This request maps to an explicit non-mutating steering action.',
     );
   }
 

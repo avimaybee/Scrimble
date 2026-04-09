@@ -9,13 +9,14 @@ import {
   buildProgressPrompt,
   buildSingleCallPlan,
   executePlan as executePlannedCalls,
-  isReadOnlyRequest,
+  explicitInspectionActionForRequest,
   nextStepFromPlan,
   normalizeGoal,
   proposePlan as proposePlanForRequest,
   selectDeterministicStep,
   type ProposePlanOptions,
 } from './orchestrator-planning.js';
+import { detectConsistencyIssue, isRepairStateRequest } from './orchestrator-consistency.js';
 import {
   isMutatingAction,
   permissionPolicyForCall,
@@ -167,35 +168,6 @@ function parseFailureContextFromResult(result: AgentToolResult): OperatorFailure
   };
 }
 
-function detectConsistencyIssue(ledger: Awaited<ReturnType<typeof readLedger>>): string | undefined {
-  const activeExecution = ledger.runtime.activeExecution;
-  const activeRun = ledger.orchestration.activeRun;
-  const inProgressTasks = ledger.tasks.tasks.filter((task) => task.status === 'in_progress');
-  if (activeExecution) {
-    const activeTask = ledger.tasks.tasks.find((task) => task.id === activeExecution.taskId);
-    if (!activeTask) {
-      return `Runtime active execution references missing task "${activeExecution.taskId}".`;
-    }
-    if (activeTask.status !== 'in_progress') {
-      return `Runtime active execution task "${activeTask.id}" is ${activeTask.status}.`;
-    }
-    if (!activeRun) {
-      return 'Runtime active execution exists with no active orchestration run.';
-    }
-    if (activeRun.pendingBoundary) {
-      return 'Active execution is running while orchestration is paused for approval.';
-    }
-  }
-  if (!activeExecution && inProgressTasks.length > 0) {
-    return `Found ${inProgressTasks.length} in_progress task(s) with no active runtime execution.`;
-  }
-  return undefined;
-}
-
-function wantsRepairRequest(request: string): boolean {
-  return /\b(repair state|repair|fix state|clear stale|consistency)\b/.test(request.toLowerCase());
-}
-
 function hasNoRemainingWork(tasks: ReadonlyArray<{ status: string }>): boolean {
   if (tasks.length === 0) {
     return false;
@@ -318,7 +290,7 @@ export class ConversationalOrchestrator {
 
     const resumeLedger = await readLedger(this.cwd);
     const resumeIssue = detectConsistencyIssue(resumeLedger);
-    if (resumeIssue && !wantsRepairRequest(resumedRequest)) {
+    if (resumeIssue && !isRepairStateRequest(resumedRequest)) {
       const paused: OperatorRunResult = {
         status: 'paused',
         summary: 'Resume paused due to runtime/orchestration consistency mismatch.',
@@ -455,7 +427,7 @@ export class ConversationalOrchestrator {
 
     const initialLedger = await readLedger(this.cwd);
     const stateIssue = detectConsistencyIssue(initialLedger);
-    if (stateIssue && !wantsRepairRequest(activeRequest)) {
+    if (stateIssue && !isRepairStateRequest(activeRequest)) {
       const paused: OperatorRunResult = {
         status: 'paused',
         summary: 'State mismatch detected between runtime/orchestration/task graph.',
@@ -831,8 +803,14 @@ export class ConversationalOrchestrator {
           }
         }
 
-        const readOnlyTurn = isReadOnlyRequest(activeRequest) && !call.mutating;
-        if (readOnlyTurn) {
+        const explicitInspectionAction = explicitInspectionActionForRequest(activeRequest);
+        const shouldCompleteAfterInspection =
+          !call.mutating &&
+          (
+            (call.action === 'show_plan' && explicitInspectionAction === 'show_plan') ||
+            (call.action !== 'show_plan' && call.action !== 'check_setup')
+          );
+        if (shouldCompleteAfterInspection) {
           const completed: OperatorRunResult = {
             status: 'completed',
             summary: latestResult.summary,

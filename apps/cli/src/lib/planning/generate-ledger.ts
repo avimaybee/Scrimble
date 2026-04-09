@@ -265,15 +265,20 @@ export async function generateLedgerTasks(input: GenerateLedgerTasksInput): Prom
     repoContext,
     ...(intentState.intent ? { previousIntent: intentState.intent } : {}),
   });
-  if (!intentState.intent || intentState.intent.goal !== planningIntent.goal) {
+  const shouldPersistPlanningIntent = !intentState.intent || intentState.intent.goal !== planningIntent.goal;
+  if (shouldPersistPlanningIntent) {
     await saveCurrentIntent(planningIntent, {
       cwd,
       reason: intentState.intent ? 'intent_refined' : 'intent_created',
     });
   }
+  const intentForPlanning = shouldPersistPlanningIntent ? planningIntent : intentState.intent;
+  if (!intentForPlanning) {
+    throw new Error('Project intent is missing after foundation approval.');
+  }
 
   const generated = generateTaskGraph({
-    intent: planningIntent,
+    intent: intentForPlanning,
     repoContext,
     repoScan: scan,
     existingFiles,
@@ -306,6 +311,15 @@ export async function generateLedgerTasks(input: GenerateLedgerTasksInput): Prom
         ...currentLedger.tasks,
         version: currentTasks.version,
         tasks: nextTasks,
+        planningBasis: {
+          intentId: intentForPlanning.id,
+          intentUpdatedAt: intentForPlanning.updatedAt,
+          ...(intentState.discovery.mode
+            ? { discoveryMode: intentState.discovery.mode }
+            : intentForPlanning.discoveryMode
+              ? { discoveryMode: intentForPlanning.discoveryMode }
+              : {}),
+        },
         updatedAt: new Date().toISOString(),
       },
       runtime: {

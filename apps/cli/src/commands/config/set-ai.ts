@@ -18,6 +18,7 @@ import {
 import { describeProfileModel } from '../../lib/ai/provider.js';
 import { getDefaultAuthStrategy, providerSupportsAutoModel } from '../../lib/ai/provider-catalog.js';
 import { runProviderSetupStudio } from '../../lib/ai/setup-studio.js';
+import { migrateLegacyLedgerIfPresent } from '../../lib/ledger/legacy-migration.js';
 import { writeSecureJson } from '../../lib/security.js';
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -95,6 +96,7 @@ export default class ConfigSetAi extends Command {
     }
 
     const cwd = process.cwd();
+    await migrateLegacyLedgerIfPresent(cwd);
     const configPath = path.join(cwd, SCRIMBLE_DIR, CONFIG_FILE);
 
     let existingConfig: Awaited<ReturnType<typeof loadScrimbleConfig>>;

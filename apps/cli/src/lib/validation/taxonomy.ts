@@ -8,6 +8,7 @@ import type {
   ValidationFoundationSummary,
   ValidationLedgerSnapshot,
 } from './types.js';
+import { detectConsistencyIssue } from '../agent/orchestrator-consistency.js';
 
 const TASK_STATUSES: TaskStatus[] = ['pending', 'ready', 'in_progress', 'completed', 'blocked', 'failed'];
 
@@ -26,31 +27,6 @@ function higherSeverity(
   right: 'low' | 'medium' | 'high',
 ): 'low' | 'medium' | 'high' {
   return severityRank(left) >= severityRank(right) ? left : right;
-}
-
-function detectConsistencyIssue(ledger: LedgerDocument): string | undefined {
-  const activeExecution = ledger.runtime.activeExecution;
-  const activeRun = ledger.orchestration.activeRun;
-  const inProgressTasks = ledger.tasks.tasks.filter((task) => task.status === 'in_progress');
-  if (activeExecution) {
-    const activeTask = ledger.tasks.tasks.find((task) => task.id === activeExecution.taskId);
-    if (!activeTask) {
-      return `Runtime active execution references missing task "${activeExecution.taskId}".`;
-    }
-    if (activeTask.status !== 'in_progress') {
-      return `Runtime active execution task "${activeTask.id}" is ${activeTask.status}.`;
-    }
-    if (!activeRun) {
-      return 'Runtime active execution exists with no active orchestration run.';
-    }
-    if (activeRun.pendingBoundary) {
-      return 'Active execution exists while orchestration is paused for approval.';
-    }
-  }
-  if (!activeExecution && inProgressTasks.length > 0) {
-    return `Found ${inProgressTasks.length} in_progress task(s) with no active runtime execution.`;
-  }
-  return undefined;
 }
 
 export function summarizeFoundation(ledger: LedgerDocument): ValidationFoundationSummary {

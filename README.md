@@ -68,7 +68,7 @@ Permission checks are policy-based at action boundaries:
 - task-graph updates follow your interaction mode
 - conversational execution is always one bounded active task step (`parallel=1`, `maxTasks=1`)
 
-## Visible Commands (Phase 1)
+## Visible Commands
 
 | Command | Description |
 |---------|-------------|
@@ -96,6 +96,11 @@ Scrimble stores canonical orchestration state in `.scrimble/`:
 
 Provider artifacts (`GEMINI.md`, `AGENTS.md`, `.github/copilot/settings.json`, `conductor/`) are treated as supplemental context, not scheduler truth.
 
+Stable product model:
+- Provider profiles (`activeProfileId` + `profiles[]`) drive model/auth setup.
+- Foundation discovery gates planning/execution until approved or intentionally skipped.
+- Runtime execution is bounded to one active task attempt (`runtime.activeExecution`) while conversation continuity remains in `orchestration.activeRun`.
+
 ## Default Conversational Output
 
 By default, Scrimble reports in a human workflow shape:
@@ -111,6 +116,14 @@ At confirmation boundaries in interactive mode, you can also type a new directio
 ## Execution Safety Model
 
 Scrimble runs one active executable task step at a time in the default operator path. Safety is enforced by task ownership scope: each task declares `ownedFiles`, and out-of-scope edits are treated as conflicts that block completion.
+
+## Validation Harness
+
+Scenario validation is the behavioral release signal for operator quality. The canonical harness runs shell-adjacent and one-shot flows, produces ranked failure categories, and is expected to remain clean for target remediation categories.
+
+```bash
+pnpm --filter scrimble run validate:scenarios
+```
 
 ## Development
 

@@ -24,6 +24,7 @@ import type {
 } from '../lib/agent/types.js';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { ensureDiscoveryFoundation } from '../lib/discovery/plaintext.js';
+import { migrateLegacyLedgerIfPresent } from '../lib/ledger/legacy-migration.js';
 import { runOperatorShell } from '../lib/shell/run-operator-shell.js';
 import { writeSecureJson } from '../lib/security.js';
 
@@ -225,6 +226,7 @@ export default class Root extends Command {
   async run(): Promise<void> {
     const { flags, argv } = await this.parse(Root);
     const cwd = process.cwd();
+    await migrateLegacyLedgerIfPresent(cwd);
     const orchestrator = new ConversationalOrchestrator(cwd);
     const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
     const prompt = trimOrUndefined(flags.prompt) ?? trimOrUndefined(argv.join(' '));

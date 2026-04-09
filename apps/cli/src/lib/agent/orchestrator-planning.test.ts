@@ -38,6 +38,11 @@ function makeLedger(overrides: Partial<LedgerDocument> = {}): LedgerDocument {
     tasks: {
       version: 1,
       tasks: [],
+      planningBasis: {
+        intentId: 'intent-1',
+        intentUpdatedAt: '2026-01-01T00:00:00.000Z',
+        discoveryMode: 'interactive',
+      },
       updatedAt: '2026-01-01T00:00:00.000Z',
       ...(overrides.tasks ?? {}),
     },
@@ -174,7 +179,7 @@ describe('selectDeterministicStep', () => {
     expect(step?.args['maxTasks']).toBe(1);
   });
 
-  it('triggers deterministic replanning for explicit direction shifts', () => {
+  it('triggers deterministic replanning for explicit steering requests', () => {
     const ledger = makeLedger({
       tasks: {
         version: 1,
@@ -205,7 +210,30 @@ describe('selectDeterministicStep', () => {
       },
     });
     const step = selectDeterministicStep({
-      request: 'pivot to a different mobile app approach',
+      request: 'replan from current state and regenerate the task graph',
+      interactionMode: 'operator',
+      ledger,
+      setupResult: setupReadyResult(),
+    });
+    expect(step?.action).toBe('generate_or_update_tasks');
+    expect(step?.args['replan']).toBe(true);
+  });
+
+  it('triggers replanning when planning basis no longer matches approved intent', () => {
+    const ledger = makeLedger({
+      tasks: {
+        version: 1,
+        tasks: [makeTask()],
+        planningBasis: {
+          intentId: 'intent-stale',
+          intentUpdatedAt: '2026-01-01T00:00:00.000Z',
+          discoveryMode: 'interactive',
+        },
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    const step = selectDeterministicStep({
+      request: 'continue implementation',
       interactionMode: 'operator',
       ledger,
       setupResult: setupReadyResult(),
@@ -258,6 +286,20 @@ describe('selectDeterministicStep', () => {
         version: 1,
         sessionId: 'session-1',
         updatedAt: '2026-01-01T00:00:00.000Z',
+        activeRun: {
+          request: 'continue',
+          startedAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+          pendingBoundary: {
+            id: 'boundary-1',
+            action: 'execute_tasks',
+            actionSummary: 'Execute next bounded task',
+            reason: 'Requires approval',
+            scope: { parallel: 1, maxTasks: 1, args: {} },
+            choices: ['proceed', 'pause', 'redirect'],
+            requestedAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
       },
     });
     const step = selectDeterministicStep({

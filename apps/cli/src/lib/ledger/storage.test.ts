@@ -9,6 +9,7 @@ import {
   readLedger,
   writeLedger,
 } from './storage.js';
+import { migrateLegacyLedgerIfPresent } from './legacy-migration.js';
 
 describe('ledger storage', () => {
   let testDir: string;
@@ -87,12 +88,13 @@ describe('ledger storage', () => {
     expect(loaded.approval.approved).toBe(true);
   });
 
-  it('migrates legacy split files into ledger.json on read', async () => {
+  async function seedLegacyTaskFile(): Promise<ReturnType<typeof getLedgerPaths>> {
     const paths = getLedgerPaths(testDir);
-    await fs.mkdir(paths.legacyLedgerDir, { recursive: true });
+    const legacyLedgerDir = path.join(testDir, '.scrimble', 'ledger');
+    await fs.mkdir(legacyLedgerDir, { recursive: true });
     await fs.mkdir(paths.runtime, { recursive: true });
     await fs.writeFile(
-      paths.legacyTasks,
+      path.join(legacyLedgerDir, 'tasks.json'),
       JSON.stringify({
         version: 1,
         tasks: [
@@ -117,6 +119,23 @@ describe('ledger storage', () => {
       }),
       'utf8',
     );
+    return paths;
+  }
+
+  it('does not migrate legacy split files in readLedger hot path', async () => {
+    const paths = await seedLegacyTaskFile();
+    const loaded = await readLedger(testDir);
+    expect(loaded.tasks.tasks).toHaveLength(0);
+
+    const ledgerExists = await fs.access(paths.ledgerFile).then(() => true).catch(() => false);
+    expect(ledgerExists).toBe(false);
+  });
+
+  it('migrates legacy split files into ledger.json via bootstrap migration utility', async () => {
+    const paths = await seedLegacyTaskFile();
+
+    const status = await migrateLegacyLedgerIfPresent(testDir);
+    expect(status).toBe('migrated');
 
     const loaded = await readLedger(testDir);
     expect(loaded.tasks.tasks[0]?.id).toBe('legacy-task');

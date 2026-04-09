@@ -7,7 +7,12 @@ const telemetryMocks = vi.hoisted(() => ({
   recordTelemetry: vi.fn(),
 }));
 
+const migrationMocks = vi.hoisted(() => ({
+  migrateLegacyLedgerIfPresent: vi.fn(),
+}));
+
 vi.mock('../lib/telemetry.js', () => telemetryMocks);
+vi.mock('../lib/ledger/legacy-migration.js', () => migrationMocks);
 
 import Init from './init.js';
 
@@ -36,6 +41,7 @@ describe('init command local-first setup', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'scrimble-init-test-'));
     process.chdir(tempDir);
     telemetryMocks.recordTelemetry.mockResolvedValue(undefined);
+    migrationMocks.migrateLegacyLedgerIfPresent.mockResolvedValue('not_needed');
   });
 
   afterEach(async () => {

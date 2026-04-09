@@ -4,7 +4,12 @@ const ledgerRecordMocks = vi.hoisted(() => ({
   readLedgerEvents: vi.fn(),
 }));
 
+const migrationMocks = vi.hoisted(() => ({
+  migrateLegacyLedgerIfPresent: vi.fn(),
+}));
+
 vi.mock('../lib/ledger/records.js', () => ledgerRecordMocks);
+vi.mock('../lib/ledger/legacy-migration.js', () => migrationMocks);
 
 import Logs from './logs.js';
 
@@ -37,6 +42,8 @@ function makeCommand(flags: {
 
 describe('logs command', () => {
   beforeEach(() => {
+    migrationMocks.migrateLegacyLedgerIfPresent.mockReset();
+    migrationMocks.migrateLegacyLedgerIfPresent.mockResolvedValue('not_needed');
     ledgerRecordMocks.readLedgerEvents.mockResolvedValue([
       {
         id: 'evt-2',

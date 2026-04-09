@@ -1,4 +1,4 @@
-import type { RepoContext } from '@scrimble/shared';
+import type { RepoContext } from '@scrimble/shared/types/legacy';
 
 export interface ChunkPlanningPromptInput {
   projectGoal: string;

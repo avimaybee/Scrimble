@@ -1,6 +1,7 @@
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import type { LedgerEvent, LedgerEventType } from '@scrimble/shared';
+import { migrateLegacyLedgerIfPresent } from '../lib/ledger/legacy-migration.js';
 import { readLedgerEvents } from '../lib/ledger/records.js';
 
 function summarizeData(data: unknown): string {
@@ -75,6 +76,7 @@ export default class Logs extends Command {
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Logs);
+    await migrateLegacyLedgerIfPresent(process.cwd());
     const types = parseTypeFilter(flags.type);
     const seenIds = new Set<string>();
     let since = flags.since;

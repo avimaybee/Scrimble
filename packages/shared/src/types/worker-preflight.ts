@@ -1,4 +1,4 @@
-// Gemini CLI preflight model used by local setup checks.
+// Gemini worker preflight types used by local readiness checks.
 
 /** Status of Gemini CLI detection. */
 export interface GeminiStatus {

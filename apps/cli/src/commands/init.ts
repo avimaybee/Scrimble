@@ -24,6 +24,7 @@ import { recordTelemetry } from '../lib/telemetry.js';
 import { pathExists } from '../lib/fs/index.js';
 import { detectStack } from '../lib/init/stack-detection.js';
 import { setupLocalScaffold } from '../lib/init/local-scaffold.js';
+import { migrateLegacyLedgerIfPresent } from '../lib/ledger/legacy-migration.js';
 
 interface ExistingStateAssessment {
   hasExistingDir: boolean;
@@ -139,6 +140,7 @@ export default class Init extends Command {
     this.log(chalk.bold('\n🚀 Initializing Scrimble\n'));
 
     const cwd = process.cwd();
+    await migrateLegacyLedgerIfPresent(cwd);
     const scrimbleDir = path.join(cwd, SCRIMBLE_DIR);
     const existingState = await assessExistingScrimbleState(cwd);
 

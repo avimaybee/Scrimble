@@ -6,7 +6,6 @@ import React from 'react';
 import {
   CONFIG_FILE,
   SCRIMBLE_DIR,
-  type LedgerDocument,
   type OrchestrationBoundaryState,
   type OrchestrationState,
   type ScrimbleConfig,
@@ -15,6 +14,7 @@ import {
 import { render } from 'ink';
 import { OperatorShell } from '../../components/shell/OperatorShell.js';
 import type { StartupContext } from '../../components/shell/types.js';
+import { detectConsistencyIssue } from '../agent/orchestrator-consistency.js';
 import type { ConversationalOrchestrator } from '../agent/orchestrator.js';
 import type { AgentSetupInput, AgentToolAction, OperatorBoundary } from '../agent/types.js';
 import { evaluateProfileHealth, hasValidActiveProfile } from '../ai/provider.js';
@@ -62,32 +62,6 @@ function toOperatorBoundary(boundary: OrchestrationBoundaryState | undefined): O
     scope: boundary.scope,
     choices: boundary.choices,
   };
-}
-
-function consistencyIssue(ledger: LedgerDocument): string | undefined {
-  const activeExecution = ledger.runtime.activeExecution;
-  const activeRun = ledger.orchestration.activeRun;
-  const tasks = ledger.tasks.tasks;
-  const inProgress = tasks.filter((task) => task.status === 'in_progress');
-  if (activeExecution) {
-    const activeTask = tasks.find((task) => task.id === activeExecution.taskId);
-    if (!activeTask) {
-      return `Runtime active execution references missing task "${activeExecution.taskId}".`;
-    }
-    if (activeTask.status !== 'in_progress') {
-      return `Runtime active execution task "${activeTask.id}" is ${activeTask.status}, expected in_progress.`;
-    }
-    if (!activeRun) {
-      return 'Runtime execution exists but orchestration has no active run.';
-    }
-    if (activeRun.pendingBoundary) {
-      return 'Orchestration is waiting for approval while runtime execution is active.';
-    }
-  }
-  if (!activeExecution && inProgress.length > 0) {
-    return `Found ${inProgress.length} in_progress task(s) with no runtime active execution.`;
-  }
-  return undefined;
 }
 
 async function detectBranch(cwd: string): Promise<string | undefined> {
@@ -164,7 +138,7 @@ export async function buildStartupContext(options: StartupContextOptions): Promi
   const ledger = await readLedger(options.cwd);
   const session = options.session ?? ledger.orchestration;
   const discovery = await loadDiscoveryBootstrap(options.cwd);
-  const issue = consistencyIssue(ledger);
+  const issue = detectConsistencyIssue(ledger);
   const activeExecution = ledger.runtime.activeExecution;
   const blockedTask = ledger.tasks.tasks.find((task) => task.status === 'blocked');
   const failedTask = ledger.tasks.tasks.find((task) => task.status === 'failed');

@@ -18,6 +18,10 @@ const discoveryMocks = vi.hoisted(() => ({
   ensureDiscoveryFoundation: vi.fn(),
 }));
 
+const migrationMocks = vi.hoisted(() => ({
+  migrateLegacyLedgerIfPresent: vi.fn(),
+}));
+
 vi.mock('../lib/agent/orchestrator.js', () => ({
   ConversationalOrchestrator: class {
     runRequest = orchestratorMocks.runRequest;
@@ -28,6 +32,7 @@ vi.mock('../lib/agent/orchestrator.js', () => ({
 vi.mock('../lib/shell/run-operator-shell.js', () => shellMocks);
 vi.mock('../lib/config/load-config.js', () => configMocks);
 vi.mock('../lib/discovery/plaintext.js', () => discoveryMocks);
+vi.mock('../lib/ledger/legacy-migration.js', () => migrationMocks);
 
 import Root from './root.js';
 
@@ -95,10 +100,12 @@ describe('root conversational command', () => {
     shellMocks.runOperatorShell.mockReset();
     configMocks.loadScrimbleConfig.mockReset();
     discoveryMocks.ensureDiscoveryFoundation.mockReset();
+    migrationMocks.migrateLegacyLedgerIfPresent.mockReset();
     orchestratorMocks.loadSessionState.mockResolvedValue(null);
     orchestratorMocks.resumeActiveRun.mockResolvedValue(completedResult('resumed'));
     configMocks.loadScrimbleConfig.mockResolvedValue(validConfig());
     discoveryMocks.ensureDiscoveryFoundation.mockResolvedValue(true);
+    migrationMocks.migrateLegacyLedgerIfPresent.mockResolvedValue('not_needed');
     Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
     Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
   });

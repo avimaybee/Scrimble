@@ -6,7 +6,7 @@
  * are supplemental context only.
  */
 
-import type { IntentState } from './intent.js';
+import type { DiscoveryMode, IntentState } from './intent.js';
 
 // --- Worker Identity ---
 
@@ -151,11 +151,23 @@ export interface WorkerHealth {
 // --- Ledger State Containers ---
 
 /** Root container for the task graph in the ledger document. */
+export interface TaskPlanningBasis {
+  /** Intent ID used when task graph was generated. */
+  intentId: string;
+  /** Intent updatedAt used as planning input. */
+  intentUpdatedAt: string;
+  /** Discovery mode used for planning when available. */
+  discoveryMode?: DiscoveryMode;
+}
+
+/** Root container for the task graph in the ledger document. */
 export interface TasksState {
   /** Schema version for migrations. */
   version: number;
   /** All tasks in the ledger. */
   tasks: LedgerTask[];
+  /** Planning provenance used for deterministic replan checks. */
+  planningBasis?: TaskPlanningBasis;
   /** Timestamp of last modification. */
   updatedAt: string;
 }

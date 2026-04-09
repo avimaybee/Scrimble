@@ -14,9 +14,17 @@
       "types": "./dist/types/index.d.ts",
       "import": "./dist/types/index.js"
     },
+    "./types/legacy": {
+      "types": "./dist/types/legacy.d.ts",
+      "import": "./dist/types/legacy.js"
+    },
     "./schemas": {
       "types": "./dist/schemas/index.d.ts",
       "import": "./dist/schemas/index.js"
+    },
+    "./schemas/legacy": {
+      "types": "./dist/schemas/legacy.d.ts",
+      "import": "./dist/schemas/legacy.js"
     }
   },
   "scripts": {

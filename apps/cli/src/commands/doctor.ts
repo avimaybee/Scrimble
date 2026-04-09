@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import { loadScrimbleConfig } from '../lib/config/load-config.js';
 import { refreshProfileHealth } from '../lib/ai/provider.js';
 import { describeProfileModel, getActiveProfile } from '../lib/ai/profiles.js';
+import { migrateLegacyLedgerIfPresent } from '../lib/ledger/legacy-migration.js';
 import { getWorkerDriver } from '../lib/workers/factory.js';
 
 export default class Doctor extends Command {
@@ -23,6 +24,7 @@ export default class Doctor extends Command {
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Doctor);
+    await migrateLegacyLedgerIfPresent(process.cwd());
     const checks: Array<{ name: string; status: 'pass' | 'warn' | 'fail'; message: string }> = [];
 
     const nodeVersion = process.version;
