@@ -306,6 +306,8 @@ export class RetryableGenerationPipelineError extends GenerationPipelineError {
   }
 }
 
+export interface OrchestratorStepConfig { retries?: { limit: number; delay: string; backoff: 'exponential' | 'linear' }; timeout?: string; }
+export interface StepOrchestrator { runStep<T>(name: string, config: OrchestratorStepConfig, fn: () => Promise<T>): Promise<T>; }
 type BatchExecutionResult = 'complete' | 'checkpointed';
 
 type Batch2CheckpointData = {
@@ -4310,7 +4312,7 @@ export async function executeBatch2(
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
-  checkpointItemInterval = GENERATION_CHECKPOINT_ITEM_INTERVAL,
+  orchestrator: StepOrchestrator = { runStep: async (n, c, f) => f() },
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const projectId = project.id;
@@ -4325,61 +4327,22 @@ export async function executeBatch2(
     projectBrief,
     sourceTargetCount,
   );
-  const checkpoint = await loadGenerationCheckpoint<Batch2CheckpointData>(
-    env,
-    projectId,
-    runId,
-    'batch_2_fetch_and_read',
-  );
-  const researchTargets =
-    checkpoint?.data.researchTargets || targetSelection.targets;
-  const totalCandidateTargets = checkpoint?.data.totalCandidateTargets ?? targetSelection.totalCandidates;
-  const fetchedSources: FetchedTechnologyResearch[] = checkpoint?.data.fetchedSources
-    ? [...checkpoint.data.fetchedSources]
-    : [];
-  const collectedSources: CollectedResearchSource[] = checkpoint?.data.collectedSources
-    ? [...checkpoint.data.collectedSources]
-    : [];
-  const sourceCandidates: SourceCandidate[] = checkpoint?.data.sourceCandidates
-    ? [...checkpoint.data.sourceCandidates]
-    : [];
-  const rankedSources: RankedSource[] = checkpoint?.data.rankedSources
-    ? [...checkpoint.data.rankedSources]
-    : [];
-  const sourceNotes: SourceNote[] = checkpoint?.data.sourceNotes
-    ? [...checkpoint.data.sourceNotes]
-    : [];
-  const evidencePacks: EvidencePack[] = checkpoint?.data.evidencePacks
-    ? [...checkpoint.data.evidencePacks]
-    : [];
+    const researchTargets = targetSelection.targets;
+  const totalCandidateTargets = targetSelection.totalCandidates;
+  const fetchedSources: FetchedTechnologyResearch[] = [];
+  const collectedSources: CollectedResearchSource[] = [];
+  const sourceCandidates: SourceCandidate[] = [];
+  const rankedSources: RankedSource[] = [];
+  const sourceNotes: SourceNote[] = [];
+  const evidencePacks: EvidencePack[] = [];
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   const briefResearchCount = researchTargets.filter((target) => target.source === 'brief').length;
   const profileResearchCount = researchTargets.filter((target) => target.source === 'profile').length;
-  let issuesFound = checkpoint?.data.issuesFound ?? 0;
-  const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
-  const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
-  // IMPORTANT: Checkpoints store durable logical progress (index + fetched data), not transient
-  // per-invocation counters. A resumed workflow step starts with a fresh subrequest budget.
-  let subrequestCounter = 0;
-  const startIndex = checkpoint?.currentIndex ?? 0;
-  let processedThisInvocation = 0;
-  const subrequestTracker = createResearchSubrequestTracker({
-    initialCount: 0,
-    limit: maxSubrequestBudget,
-    isLocal,
-  });
-
-  const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
-    pushPartialFailure(partialFailures, tool, technologyName, message);
-    degradedTools.add(tool);
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      runId,
-      kind: 'warning',
-      message,
-    });
-  };
+  let issuesFound = 0;
+  const partialFailures: Array<{ tool: string, technology: string, message: string }> = [];
+  const degradedTools = new Set<string>();
+  const startIndex = 0;
+  
 
   await emitBatchStart(env, projectId, runId, 'batch_2_fetch_and_read');
   await logActivity(env, {
@@ -4402,75 +4365,59 @@ export async function executeBatch2(
     message: `RAG retrieval mode enabled with ${deepProvider.model}: researching up to ${sourceTargetCount} technologies, using strict sequential fetches and one targeted search query per tool, and assembling prompts from retrieved chunks only.`,
   });
 
-  if (checkpoint) {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      runId,
-      kind: 'system',
-      message: `Resuming fetched-doc research at technology ${startIndex + 1} of ${researchTargets.length}.`,
-    });
-  }
-
+  
   for (let index = startIndex; index < researchTargets.length; index += 1) {
     const technology = researchTargets[index];
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      runId,
-      kind: 'fetch',
-      message:
-        technology.source === 'brief'
-          ? `Researching your confirmed stack tool ${technology.name} before anything else...`
-          : technology.source === 'profile'
-          ? `Researching your saved tool ${technology.name} before anything else...`
-          : `Researching ${technology.name} with every source you've connected...`,
-    });
+    const stepResult = await orchestrator.runStep(`batch2-target-${index}`, {
+      retries: { limit: 2, delay: '10 seconds', backoff: 'exponential' },
+      timeout: '15 minutes'
+    }, async () => {
+      let stepIssuesFound = 0;
+      const stepPartialFailures: Array<any> = [];
+      const stepCollectedSources: Array<any> = [];
 
-    // Check budget before starting research for this technology.
-    // This guard prevents runaway fetching if something goes wrong with tracking.
-    // With proper counter reset on resume, this should rarely trigger.
-    if (processedThisInvocation > 0 && subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index, {
-        researchTargets,
-        fetchedSources,
-        sourceCandidates,
-        rankedSources,
-        sourceNotes,
-        evidencePacks,
-        researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
-        issuesFound,
-        partialFailures,
-        totalCandidateTargets,
-        collectedSources,
-      });
+      const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
+        stepPartialFailures.push({ tool, technology: technologyName, message });
+        await logActivity(env, {
+          projectId,
+          batchName: 'batch_2_fetch_and_read',
+          runId,
+          kind: 'warning',
+          message,
+        });
+      };
+
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
         runId,
-        kind: 'system',
-        message: `Approaching subrequest budget limit — saved checkpoint at technology ${index + 1} of ${researchTargets.length}. Resuming from the next workflow step...`,
+        kind: 'fetch',
+        message:
+          technology.source === 'brief'
+            ? `Researching your confirmed stack tool ${technology.name} before anything else...`
+            : technology.source === 'profile'
+            ? `Researching your saved tool ${technology.name} before anything else...`
+            : `Researching ${technology.name} with every source you've connected...`,
       });
-      return 'checkpointed';
-    }
 
-    const mappedDocs = resolveToolDocsEntry(technology.name);
-    const docsUrl = (technology.docs_url || '').trim() || mappedDocs?.docs || '';
-    const githubRepository = resolveResearchRepository(technology.github_url || '', mappedDocs?.github);
-      const githubUrl = githubRepository
-      ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
-      : (technology.github_url || '').trim();
-      const changelogUrl = (technology.changelog_url || '').trim();
+      const mappedDocs = resolveToolDocsEntry(technology.name);
+      const docsUrl = (technology.docs_url || '').trim() || mappedDocs?.docs || '';
+      const githubRepository = resolveResearchRepository(technology.github_url || '', mappedDocs?.github);
+        const githubUrl = githubRepository
+        ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
+        : (technology.github_url || '').trim();
+        const changelogUrl = (technology.changelog_url || '').trim();
 
-    const researchContext: Parameters<typeof facadeFetchDocs>[0] = {
-      env,
-      userId: project.user_id,
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      subrequestTracker,
-    };
+      const subrequestTracker = createResearchSubrequestTracker({ initialCount: 0, limit: maxSubrequestBudget, isLocal });
+      const researchContext: Parameters<typeof facadeFetchDocs>[0] = {
+        env,
+        userId: project.user_id,
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        subrequestTracker,
+      };
 
-    const fanOutQueries = buildBatch2FanOutQueries(technology.name);
+      const fanOutQueries = buildBatch2FanOutQueries(technology.name);
     
     // docsResult
     let docsResult: ResearchResult;
@@ -4531,8 +4478,7 @@ export async function executeBatch2(
 
     const flattenedWebResearchResults: ResearchResult[] = fanOutSearchResults.flat();
 
-    subrequestCounter = subrequestTracker.count;
-
+    
     if (docsUrl && docsResult.tool === 'failed') {
       await recordPartialFailure(
         'Jina Reader',
@@ -4658,7 +4604,7 @@ export async function executeBatch2(
     const latestVersion = parseLatestVersionFromText(githubResult.content, releaseSignal);
     const lastCommitDate = parseLastCommitDateFromText(githubResult.content);
     const openIssuesCount = parseOpenIssuesCount(githubResult.content);
-    issuesFound += openIssuesCount;
+    stepIssuesFound += openIssuesCount;
 
     const technologySources = dedupeResearchSources([
       ...(docsResult.content
@@ -4704,7 +4650,7 @@ export async function executeBatch2(
     if (docsResult.content) {
       const sourceId = `source_${normalizeBuilderProfileName(`${technology.name}-${docsUrl || docsResult.source}-docs`)}`;
       const sourceType = inferSourceTypeFromToolLabel(toolLabelFromDocTool(docsResult.tool));
-      collectedSources.push({
+      stepCollectedSources.push({
         id: sourceId,
         source_type: sourceType,
         title: `${technology.name} docs`,
@@ -4718,7 +4664,7 @@ export async function executeBatch2(
     if (githubResult.content) {
       const sourceId = `source_${normalizeBuilderProfileName(`${technology.name}-${githubResult.source || githubUrl}-github`)}`;
       const sourceType = inferSourceTypeFromToolLabel(toolLabelFromGithubTool(githubResult.tool));
-      collectedSources.push({
+      stepCollectedSources.push({
         id: sourceId,
         source_type: sourceType,
         title: githubRepository
@@ -4737,7 +4683,7 @@ export async function executeBatch2(
         continue;
       }
 
-      collectedSources.push({
+      stepCollectedSources.push({
         id: `source_${normalizeBuilderProfileName(`${technology.name}-${page.url}-community`)}`,
         source_type: 'community_page',
         title: page.title || `${technology.name} community`,
@@ -4749,57 +4695,40 @@ export async function executeBatch2(
       });
     }
 
-    fetchedSources.push({
-      technology: technology.name,
-      docs_url: docsUrl,
-      github_url: githubUrl,
-      changelog_url: changelogUrl,
-      docs_content: docsResult.content || 'Documentation source unavailable.',
-      github_readme: githubResult.content || 'GitHub repository data unavailable.',
-      latest_version: latestVersion,
-      last_commit_date: lastCommitDate,
-      open_issues_count: openIssuesCount,
-      recent_breaking_changes: recentBreakingChangesRaw,
-      repo_health_summary: repoHealthSummary,
-      community_sentiment:
-        (communitySentiment || formatSearchResults(searchResults)).trim() || 'Community sentiment unavailable.',
-      bug_report_digest: (bugSignal || 'No recent bug reports found.').trim(),
-      source_ledger: technologySources,
-      community_pages: communityPages,
+      const fetchedSource = {
+        technology: technology.name,
+        docs_url: docsUrl,
+        github_url: githubUrl,
+        changelog_url: changelogUrl,
+        docs_content: docsResult.content || 'Documentation source unavailable.',
+        github_readme: githubResult.content || 'GitHub repository data unavailable.',
+        latest_version: latestVersion,
+        last_commit_date: lastCommitDate,
+        open_issues_count: openIssuesCount,
+        recent_breaking_changes: recentBreakingChangesRaw,
+        repo_health_summary: repoHealthSummary,
+        community_sentiment:
+          (communitySentiment || formatSearchResults(searchResults)).trim() || 'Community sentiment unavailable.',
+        bug_report_digest: (bugSignal || 'No recent bug reports found.').trim(),
+        source_ledger: technologySources,
+        community_pages: communityPages,
+      };
+
+      return {
+        fetchedSource,
+        stepCollectedSources,
+        stepPartialFailures,
+        stepIssuesFound,
+      };
     });
 
-    processedThisInvocation += 1;
-
-    const hasMoreWork = index + 1 < researchTargets.length;
-    const processedCount = index + 1;
-    const shouldCheckpoint = checkpointItemInterval > 0 && processedCount % checkpointItemInterval === 0;
-    if (
-      hasMoreWork &&
-      (shouldCheckpoint
-        || (checkpointItemInterval > 0 && subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE))
-    ) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
-        researchTargets,
-        fetchedSources,
-        sourceCandidates,
-        rankedSources,
-        sourceNotes,
-        evidencePacks,
-        researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
-        issuesFound,
-        partialFailures,
-        totalCandidateTargets,
-        collectedSources,
-      });
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_2_fetch_and_read',
-        runId,
-        kind: 'system',
-        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
-      });
-      return 'checkpointed';
+    fetchedSources.push(stepResult.fetchedSource);
+    collectedSources.push(...stepResult.stepCollectedSources);
+    for (const f of stepResult.stepPartialFailures) {
+      pushPartialFailure(partialFailures, f.tool, f.technology, f.message);
+      degradedTools.add(f.tool);
     }
+    issuesFound += stepResult.stepIssuesFound;
   }
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
@@ -5414,7 +5343,7 @@ export async function executeBatch5(
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
-  checkpointStepInterval = 3,
+  orchestrator: StepOrchestrator = { runStep: async (n, c, f) => f() },
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const project = await getProjectById(env, projectId);
@@ -5432,32 +5361,13 @@ export async function executeBatch5(
     .replace(/\s+/g, ' ')
     .trim()
     || 'web app';
-  const checkpoint = await loadGenerationCheckpoint<Batch5CheckpointData>(
-    env,
-    projectId,
-    runId,
-    'batch_5_enrich_steps',
-  );
-  const connectedTools = await getConnectedResearchTools(env, project.user_id);
-  const researchManifest = buildResearchManifest(
-    builderProfile,
-    projectBrief.summary || project.description || '',
-    {
-      confirmedStackTools: projectBrief.confirmedStackTools,
-      inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean),
-    },
-  );
-  const planSteps = checkpoint?.data.steps || flattenPlanSteps(plan);
-  const stepResearchContexts: StepResearchContext[] = checkpoint?.data.stepResearchContexts
-    ? [...checkpoint.data.stepResearchContexts]
-    : [];
-  const startIndex = checkpoint?.currentIndex ?? 0;
+    const planSteps = flattenPlanSteps(plan);
+  const stepResearchContexts: StepResearchContext[] = [];
+  const startIndex = 0;
   const isLocal = env.ENVIRONMENT === 'local';
-  const subrequestTracker = createResearchSubrequestTracker({
-    initialCount: 0,
-    limit: 40, // Cloudflare standard limit is 50
-    isLocal,
-  });
+  const connectedTools = await getConnectedResearchTools(env, project.user_id);
+  const researchManifest = buildResearchManifest(builderProfile, projectBrief.summary || project.description || '', { confirmedStackTools: projectBrief.confirmedStackTools, inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean) });
+
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
   await logActivity(env, {
@@ -5468,81 +5378,62 @@ export async function executeBatch5(
     message: 'Refreshing every step with live docs, issues, and current implementation notes...',
   });
 
-  if (checkpoint) {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'system',
-      message: `Resuming step research at step ${Math.min(startIndex + 1, planSteps.length)} of ${planSteps.length}.`,
-    });
-  }
-
+  
   for (let index = startIndex; index < planSteps.length; index += 1) {
     const step = planSteps[index];
 
-    await maybeTouchGenerationHeartbeat(env, projectId, runId);
+    const stepResult = await orchestrator.runStep(`batch5-step-${index}`, {
+      retries: { limit: 2, delay: '20 seconds', backoff: 'exponential' },
+      timeout: '20 minutes'
+    }, async () => {
+      await maybeTouchGenerationHeartbeat(env, projectId, runId);
 
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'fetch',
-      message: `Refreshing ${step.title} with live docs and current implementation notes...`,
-    });
-
-    const stepResearch = await collectStepResearchContext({
-      env,
-      userId: project.user_id,
-      stepId: step.id,
-      stepTitle: step.title,
-      stepObjective: step.objective,
-      stepWhyItMatters: step.why_it_matters,
-      stepCategory: step.category,
-      stepDoneWhen: step.done_when,
-      stepIsGate: step.is_gate,
-      adr,
-      research,
-      batchName: 'batch_5_enrich_steps',
-      projectId,
-      connectedTools,
-      researchManifest,
-      runId,
-      subrequestTracker,
-    });
-
-    stepResearchContexts.push(stepResearch);
-
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'fetch',
-      message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
-    });
-
-    // Standard overhead for current step (heartbeat, logs)
-    subrequestTracker.count += 3;
-
-    const shouldCheckpoint = checkpointStepInterval > 0 && (index + 1 < planSteps.length) && (
-      (index + 1 - startIndex) >= checkpointStepInterval || 
-      subrequestTracker.count >= 32 
-    );
-
-    if (shouldCheckpoint) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
-        steps: planSteps,
-        stepResearchContexts,
-      });
       await logActivity(env, {
         projectId,
         batchName: 'batch_5_enrich_steps',
         runId,
-        kind: 'system',
-        message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing from the latest checkpoint...`,
+        kind: 'fetch',
+        message: `Refreshing ${step.title} with live docs and current implementation notes...`,
       });
-      return 'checkpointed';
-    }
+
+      const subrequestTracker = createResearchSubrequestTracker({
+        initialCount: 0,
+        limit: 40,
+        isLocal,
+      });
+
+      const stepResearch = await collectStepResearchContext({
+        env,
+        userId: project.user_id,
+        stepId: step.id,
+        stepTitle: step.title,
+        stepObjective: step.objective,
+        stepWhyItMatters: step.why_it_matters,
+        stepCategory: step.category,
+        stepDoneWhen: step.done_when,
+        stepIsGate: step.is_gate,
+        adr,
+        research,
+        batchName: 'batch_5_enrich_steps',
+        projectId,
+        connectedTools,
+        researchManifest,
+        runId,
+        subrequestTracker,
+      });
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_5_enrich_steps',
+        runId,
+        kind: 'fetch',
+        message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
+      });
+
+      return stepResearch;
+    });
+
+    stepResearchContexts.push(stepResult);
   }
   const stepResearchSlice = retrieveStepResearchSlice(
     planSteps,
