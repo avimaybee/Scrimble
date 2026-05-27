@@ -5,9 +5,9 @@ import { fileURLToPath } from 'node:url';
 import {
   buildCanonicalRetrievalInput,
   buildResearchQuery,
-} from '../functions/server/research-query-policy.ts';
-import { buildResearchManifest } from '../functions/server/research-manifest.ts';
-import { buildGenerationEventEnvelope } from '../functions/server/generation-events.ts';
+} from '@scrimble/core';
+import { buildResearchManifest } from '@scrimble/core';
+import { buildGenerationEventEnvelope } from '@scrimble/core';
 import { buildGenerationSessionViewModel } from '../src/lib/generation-session.ts';
 import type {
   GenerationRuntime,

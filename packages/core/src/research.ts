@@ -1,4 +1,4 @@
-import { fetchAndParse, type GitHubResearchResult, type SubrequestTracker } from '../utils/fetch-url';
+import { fetchAndParse, type GitHubResearchResult, type SubrequestTracker } from './utils/fetch-url';
 import { persistGenerationStreamEvent } from './generation-events';
 import { getActiveMCPServer } from './mcp-servers';
 import type { Bindings, GenerationBatchName } from './types';
@@ -88,11 +88,11 @@ type ResearchService = {
 };
 
 export function createResearchSubrequestTracker(
-  options: { initialCount?: number; limit?: number } = {},
+  options: { initialCount?: number; limit?: number; isLocal?: boolean } = {},
 ): ResearchSubrequestTracker {
   return {
     count: Math.max(0, Math.floor(options.initialCount || 0)),
-    limit: Math.max(1, Math.floor(options.limit || RESEARCH_SUBREQUEST_LIMIT)),
+    limit: options.isLocal ? Infinity : Math.max(1, Math.floor(options.limit || RESEARCH_SUBREQUEST_LIMIT)),
   };
 }
 
@@ -191,7 +191,8 @@ async function fetchText(
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<{ ok: boolean; status: number; text: string; error?: string }> {
   const tracker = context.subrequestTracker;
-  if (tracker) {
+  const isLocal = context.env.ENVIRONMENT === 'local';
+  if (!isLocal && tracker) {
     if (tracker.count >= tracker.limit) {
       return {
         ok: false,

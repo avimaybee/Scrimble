@@ -21,7 +21,7 @@ import {
   type Batch6GenerateFiles,
   type SkillFileName,
   schemaDescriptions,
-} from './generation-schemas';
+} from './schemas';
 import {
   GENERATION_BATCHES,
   type Bindings,
@@ -54,7 +54,7 @@ import {
 } from './checkpoint-storage';
 
 
-import { extractGitHubRepository } from '../utils/fetch-url';
+import { extractGitHubRepository } from './utils/fetch-url';
 import { buildResearchManifest } from './research-manifest';
 import { buildResearchQuery } from './research-query-policy';
 import {
@@ -63,7 +63,7 @@ import {
   resolveToolDocsEntry,
   type ResearchResult,
 } from './research';
-import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
+import { normalizeBuilderProfileName } from './builder-profile';
 import { getConnectedResearchTools } from './mcp-servers';
 import { appendProjectBriefSystemPrompt, loadProjectBriefContext } from './project-briefs';
 import {
@@ -351,8 +351,8 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
 ]);
 const ACTIVE_GENERATION_HEARTBEAT_STATUSES = Array.from(ACTIVE_GENERATION_STATUSES);
 
-export const GENERATION_STALE_MS = 15 * 60 * 1000;
-export const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
+const GENERATION_STALE_MS = 15 * 60 * 1000;
+const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
@@ -3420,7 +3420,7 @@ export async function loadBatchOutput<T>(
   projectId: string,
   runType: GenerationBatchName,
   schema: ZodType<T>,
-) {
+): Promise<T> {
   const typedRecord = await loadBatchRunRecord(env, projectId, runType);
 
   if (!typedRecord) {
@@ -3486,7 +3486,7 @@ async function loadArchitectureReviewContext(env: Bindings, projectId: string): 
 
 export async function getArchitectureReviewPayload(env: Bindings, projectId: string) {
   const context = await loadArchitectureReviewContext(env, projectId);
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2);
 }
 
@@ -3686,7 +3686,7 @@ async function callValidatedBatch<T>(
     schema: ZodType<T>;
     schemaDescription: string;
   },
-) {
+): Promise<{ data: T; rawResponse: string; attemptCount: number }> {
   let prompt = options.prompt;
   let lastError = 'The AI response was empty.';
   const emitter = createThrottledThinkingEmitter(
@@ -4232,7 +4232,7 @@ Identify the stack implied by the idea. For each technology, provide:
   Only include technologies that matter to implementation.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId: project.id,
       runId,
@@ -4243,9 +4243,9 @@ Identify the stack implied by the idea. For each technology, provide:
       schema: Batch1ResearchStackSchema,
       schemaDescription: schemaDescriptions.batch_1_research_stack,
     });
-    const technologies = limitBatch1Technologies(result.data.technologies);
+    const technologies = limitBatch1Technologies((result.data as any).technologies);
 
-    if (technologies.length < result.data.technologies.length) {
+    if (technologies.length < (result.data as any).technologies.length) {
       await logActivity(env, {
         projectId: project.id,
         batchName: 'batch_1_research_stack',
@@ -4314,8 +4314,9 @@ export async function executeBatch2(
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const projectId = project.id;
-  const maxSubrequestBudget = RESEARCH_SUBREQUEST_LIMIT;
-  const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
+  const isLocal = env.ENVIRONMENT === 'local';
+  const maxSubrequestBudget = isLocal ? Infinity : RESEARCH_SUBREQUEST_LIMIT;
+  const batch1 = await loadBatchOutput<Batch1ResearchStack>(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
   const sourceTargetCount = resolveBatch2SourceTargetCount();
   const searchResultLimit = resolveBatch2SearchResultLimit();
   const targetSelection = buildResearchTargets(
@@ -4365,6 +4366,7 @@ export async function executeBatch2(
   const subrequestTracker = createResearchSubrequestTracker({
     initialCount: 0,
     limit: maxSubrequestBudget,
+    isLocal,
   });
 
   const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
@@ -4770,11 +4772,11 @@ export async function executeBatch2(
 
     const hasMoreWork = index + 1 < researchTargets.length;
     const processedCount = index + 1;
-    const normalizedCheckpointItemInterval = Math.max(1, checkpointItemInterval);
+    const shouldCheckpoint = checkpointItemInterval > 0 && processedCount % checkpointItemInterval === 0;
     if (
       hasMoreWork &&
-      (processedCount % normalizedCheckpointItemInterval === 0
-        || subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE)
+      (shouldCheckpoint
+        || (checkpointItemInterval > 0 && subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE))
     ) {
       await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
         researchTargets,
@@ -4918,7 +4920,7 @@ For each technology, return:
 Preserve specific version and compatibility details.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -4930,11 +4932,11 @@ Preserve specific version and compatibility details.`;
       schemaDescription: schemaDescriptions.batch_2_fetch_and_read,
     });
 
-    const researchByTechnology = new Map(
-      result.data.research.map((entry) => [entry.technology.toLowerCase(), entry] as const),
+    const researchByTechnology = new Map<string, any>(
+      (result.data as any).research.map((entry) => [entry.technology.toLowerCase(), entry] as const),
     );
     const technologyInsightByName = new Map(
-      result.data.research.map((entry) => {
+      (result.data as any).research.map((entry) => {
         const combinedInsight = summarizeSnippet(
           [
             entry.repo_health_summary,
@@ -4956,7 +4958,7 @@ Preserve specific version and compatibility details.`;
         ...entry,
         chars_read: entry.chars_read || entry.summary.length,
         relevance: entry.relevance || 'medium',
-        insight: summarizeSnippet(entry.insight || technologyInsight || entry.summary, 220),
+        insight: summarizeSnippet((entry.insight || technologyInsight || entry.summary) as string, 220),
       }));
 
       return {
@@ -5044,7 +5046,7 @@ export async function executeBatch3(
   projectBrief: LoadedProjectBriefContext,
 ) {
   const startedAt = Date.now();
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const projectDescription = projectBrief.summary || project.description || '';
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
   const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
@@ -5135,7 +5137,7 @@ Produce a structured Architecture Decision Record (ADR):
 Base every single recommendation on the provided research corpus. If a technology was not researched in Batch 2, do not recommend it unless it is a standard browser feature.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -5160,7 +5162,7 @@ Base every single recommendation on the provided research corpus. If a technolog
       Date.now() - startedAt,
     );
     await updateProjectMetadataFromAdr(env, projectId, result.data);
-    for (const gotcha of result.data.gotchas.slice(0, 3)) {
+    for (const gotcha of (result.data as any).gotchas.slice(0, 3)) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_3_architect',
@@ -5174,7 +5176,7 @@ Base every single recommendation on the provided research corpus. If a technolog
       batchName: 'batch_3_architect',
       runId,
       kind: 'complete',
-      message: `Architecture locked in — ${result.data.data_model.length} tables, ${result.data.integrations.length} integrations.`,
+      message: `Architecture locked in — ${(result.data as any).data_model.length} tables, ${(result.data as any).integrations.length} integrations.`,
     });
   } catch (error) {
     const errorClass = classifyAIError(error);
@@ -5254,7 +5256,7 @@ export async function executeBatch4(
 ) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
   const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const projectDescription = projectBrief.summary || '';
@@ -5346,7 +5348,7 @@ Rules:
 - content must be dense and senior-developer quality.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -5420,9 +5422,9 @@ export async function executeBatch5(
     throw new Error('Project not found.');
   }
 
-  const adr = await loadBatchOutput(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
-  const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
-  const research = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const adr = await loadBatchOutput<Batch3Architect>(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
+  const plan = await loadBatchOutput<PlanAuthoringRecord>(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
+  const research = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const chunkStore = resolveChunkStoreFromBatch2(research);
   const evidencePacks = resolveEvidencePacksFromBatch2(research);
   const projectStack = [project.stack || '', projectBrief.summary || project.description || '']
@@ -5450,9 +5452,11 @@ export async function executeBatch5(
     ? [...checkpoint.data.stepResearchContexts]
     : [];
   const startIndex = checkpoint?.currentIndex ?? 0;
+  const isLocal = env.ENVIRONMENT === 'local';
   const subrequestTracker = createResearchSubrequestTracker({
     initialCount: 0,
     limit: 40, // Cloudflare standard limit is 50
+    isLocal,
   });
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
@@ -5520,10 +5524,9 @@ export async function executeBatch5(
     // Standard overhead for current step (heartbeat, logs)
     subrequestTracker.count += 3;
 
-    const normalizedCheckpointStepInterval = Math.max(1, checkpointStepInterval);
-    const shouldCheckpoint = (index + 1 < planSteps.length) && (
-      (index + 1 - startIndex) >= normalizedCheckpointStepInterval || // Process groups safely within one turn
-      subrequestTracker.count >= 32 // Or when near subrequest limit (40 - 8 reserve)
+    const shouldCheckpoint = checkpointStepInterval > 0 && (index + 1 < planSteps.length) && (
+      (index + 1 - startIndex) >= checkpointStepInterval || 
+      subrequestTracker.count >= 32 
     );
 
     if (shouldCheckpoint) {
@@ -5633,7 +5636,7 @@ For each step, obey any requirements array included in the live step research co
 Populate navigation_links from the researched docs URLs so the user can click directly into setup pages.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -5648,7 +5651,7 @@ Populate navigation_links from the researched docs URLs so the user can click di
     const finalEnrichments = ensureCompleteStepEnrichments(
       planSteps,
       stepResearchById,
-      result.data.enrichments,
+      (result.data as any).enrichments,
     );
     const finalResult: Batch5EnrichSteps = {
       enrichments: finalEnrichments,
@@ -5706,9 +5709,9 @@ export async function executeBatch6(
 ) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
-  const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
-  const enrichments = await loadBatchOutput(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const plan = await loadBatchOutput<PlanAuthoringRecord>(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
+  const enrichments = await loadBatchOutput<Batch5EnrichSteps>(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
   const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const fileResearchSlice = retrieveResearchSlice(

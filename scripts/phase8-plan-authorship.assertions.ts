@@ -4,13 +4,13 @@ import {
   computePlanAuthoringHash,
   mergePlanWithEnrichments,
   normalizePlanStructure,
-} from '../functions/server/generation-pipeline.ts';
+} from '@scrimble/core';
 import {
   Batch5EnrichStepsSchema,
   PlanAuthoringRecordSchema,
   type Batch5EnrichSteps,
   type PlanAuthoringRecord,
-} from '../functions/server/generation-schemas.ts';
+} from '@scrimble/core';
 
 async function runTest(name: string, test: () => void | Promise<void>) {
   try {

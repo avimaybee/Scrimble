@@ -40,7 +40,7 @@ export interface GenerationRuntimeState {
 
 export type GenerationLifecycleStatus = 'intake' | GenerationRunStatus;
 
-export type GenerationFailureClass = 'run_failed' | 'stalled' | 'cancelled' | null;
+export type RuntimeFailureClass = 'run_failed' | 'stalled' | 'cancelled' | null;
 
 export interface GenerationRuntimeContract {
   runId: string | null;
@@ -52,7 +52,7 @@ export interface GenerationRuntimeContract {
   providerId: string | null;
   heartbeatAt: string | null;
   completedBatches: GenerationBatchName[];
-  failureClass: GenerationFailureClass;
+  failureClass: RuntimeFailureClass;
 }
 
 const TERMINAL_LIFECYCLE_STATUSES = new Set<GenerationLifecycleStatus>(['complete', 'failed', 'cancelled']);
@@ -75,7 +75,7 @@ export function buildGenerationRuntimeContract(
   const lifecycleStatus: GenerationLifecycleStatus = runtime.run?.status ?? 'intake';
   const isTerminal = isTerminalLifecycleStatus(lifecycleStatus);
 
-  let failureClass: GenerationFailureClass = null;
+  let failureClass: RuntimeFailureClass = null;
   if (lifecycleStatus === 'failed') {
     failureClass = 'run_failed';
   } else if (lifecycleStatus === 'cancelled') {

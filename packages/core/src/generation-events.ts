@@ -1,4 +1,4 @@
-import type { Batch3Architect } from './generation-schemas';
+import type { Batch3Architect } from './schemas';
 import type { Bindings, GenerationBatchName } from './types';
 
 export type GenerationStreamEvent =

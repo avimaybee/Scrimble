@@ -1,0 +1,12 @@
+{
+  "name": "@scrimble/cli",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "scrimble": "src/index.ts"
+  },
+  "dependencies": {
+    "@scrimble/core": "*",
+    "commander": "^12.0.0"
+  }
+}

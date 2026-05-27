@@ -1,4 +1,4 @@
-import type { Bindings } from './types';
+import type { Bindings } from '@scrimble/core';
 
 export async function saveToR2(
   env: Pick<Bindings, 'SCRIMBLE_BUCKET' | 'CHECKPOINT_BUCKET'>,

@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mapProjectRowToResponse } from '../functions/server/generation-runtime.ts';
+import { mapProjectRowToResponse } from '@scrimble/core';
 import {
   appendGenerationThinkingDelta,
   buildGenerationEventEnvelope,
   listPersistedGenerationEventsSince,
-} from '../functions/server/generation-events.ts';
+} from '@scrimble/core';
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const currentDir = dirname(currentFilePath);

@@ -22,7 +22,7 @@
 import type { Bindings, GenerationBatchName } from './types';
 import { getActiveMCPServer } from './mcp-servers';
 import { persistGenerationStreamEvent } from './generation-events';
-import { fetchAndParse, type GitHubResearchResult } from '../utils/fetch-url';
+import { fetchAndParse, type GitHubResearchResult } from './utils/fetch-url';
 
 // ─────────────────────────────────────────────────────────────────
 // Types
@@ -155,7 +155,7 @@ export interface ResearchContext {
 // Constants
 // ─────────────────────────────────────────────────────────────────
 
-export const RESEARCH_SUBREQUEST_LIMIT = 35;
+const RESEARCH_SUBREQUEST_LIMIT = 35;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const SEARCH_RESULT_LIMIT = 5;
 
