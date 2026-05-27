@@ -60,7 +60,6 @@ import {
   getBatchCompletionMessage,
   hasApprovedArchitectureReview,
   loadBatchOutput,
-  resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
 } from './generation-pipeline';
 import {
@@ -477,19 +476,6 @@ async function getOwnedProjectWithRuntime(c: AppContext, projectId: string) {
     generationRuntime,
     lifecycleStatus: generationRuntime.lifecycleStatus,
   };
-}
-
-async function getCompletedGenerationBatches(c: AppContext, projectId: string) {
-  const rows = await c.env.DB.prepare(`
-    SELECT run_type, completed_at
-    FROM agent_runs
-    WHERE project_id = ? AND status = 'complete' AND run_type IN (${GENERATION_BATCHES.map(() => '?').join(', ')})
-    ORDER BY sequence_index ASC, completed_at ASC
-  `)
-    .bind(projectId, ...GENERATION_BATCHES)
-    .all();
-
-  return rows.results as Array<{ run_type: string; completed_at: string | null }>;
 }
 
 async function buildIntakeResponse(c: AppContext, projectId: string) {
@@ -1616,10 +1602,6 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'Cannot resume a project that is already complete.' }, 409);
   }
 
-  const completedBatchRows = await getCompletedGenerationBatches(c, projectId);
-  const completedBatchNames = completedBatchRows.map((row) => row.run_type);
-  const resumeStatus = await resolvePipelineStatusToRun(c.env, projectId, 'queued', completedBatchNames);
-
   const runtimeState = await getGenerationRuntimeState(c.env, projectId);
   const canResume = runtimeState.canResume;
 
@@ -1627,7 +1609,7 @@ app.post('/projects/:id/resume', async (c) => {
     return c.json({ error: 'This generation run is still active. Wait for it to finish or stall before resuming.' }, 409);
   }
 
-  if (resumeStatus === 'awaiting_review') {
+  if (lifecycleStatus === 'awaiting_review') {
     return c.json({ error: 'Architecture review is waiting for approval, so there is nothing to resume yet.' }, 409);
   }
 
@@ -1658,7 +1640,7 @@ app.post('/projects/:id/resume', async (c) => {
       runId,
       kind: 'resume',
       previousStatus: lifecycleStatus as ProjectGenerationStatus,
-      targetStatus: resumeStatus,
+      targetStatus: 'queued',
     });
 
     await clearGenerationCheckpoints(c.env, projectId, runId);
