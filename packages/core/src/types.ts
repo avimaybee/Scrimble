@@ -178,6 +178,11 @@ export type Bindings = {
     put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
     get(key: string): Promise<R2Object | null>;
     delete(key: string): Promise<void>;
+    list(options?: { prefix?: string; cursor?: string }): Promise<{
+      objects: Array<{ key: string }>;
+      truncated: boolean;
+      cursor?: string;
+    }>;
   };
   SCRIMBLE_BUCKET?: {
     put(key: string, body: string | ArrayBuffer | Uint8Array): Promise<R2Object>;
