@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { decrypt, encrypt } from '../utils/crypto';
+import { decrypt, encrypt } from './utils/crypto';
 import type { Bindings } from './types';
 
 export const MCP_SERVER_TYPES = ['brave-search', 'github', 'context7', 'custom'] as const;

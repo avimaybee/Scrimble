@@ -6,7 +6,7 @@ import type {
   Bindings,
   GenerationWorkflowPayload,
   WorkflowApprovalPayload,
-} from './functions/server/types';
+} from '@scrimble/core';
 
 export { GenerationWorkflow };
 

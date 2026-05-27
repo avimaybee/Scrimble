@@ -10,13 +10,13 @@ import {
   Batch3ArchitectSchema,
   Batch6GenerateFilesSchema,
   getSkillFileSortIndex,
-} from './generation-schemas';
-import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
+} from '@scrimble/core';
+import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from '@scrimble/core';
 import {
   createGenerationSseStream,
   persistGenerationStreamEvent,
   resetGenerationThinkingState,
-} from './generation-events';
+} from '@scrimble/core';
 import {
   cancelWorkflowGeneration,
   sendWorkflowDispatchEvent,
@@ -32,7 +32,7 @@ import {
   updateGenerationRunStatus,
   mapProjectRowToResponse,
   buildGenerationRuntimeContract,
-} from './generation-runtime';
+} from '@scrimble/core';
 import {
   callAIWithRetry,
 
@@ -40,7 +40,7 @@ import {
   extractJSON,
   getProvider,
   streamProviderText,
-} from './ai';
+} from '@scrimble/core';
 import {
   BUILDER_PROFILE_CATEGORY_KEYS,
   TOOL_PROFICIENCIES,
@@ -53,7 +53,7 @@ import {
   listProjectIntakeMessages,
   loadProjectBriefContext,
   upsertProjectBrief,
-} from './project-briefs';
+} from '@scrimble/core';
 import {
   clearGenerationCheckpoints,
   getArchitectureReviewPayload,
@@ -62,13 +62,13 @@ import {
   loadBatchOutput,
   resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
-} from './generation-pipeline';
+} from '@scrimble/core';
 import {
   runProjectIntakeTurn,
 } from './project-intake';
 import { applyPlanDiffToProject } from './plan-diff';
-import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
-import { buildResearchManifest } from './research-manifest';
+import { collectStepResearchContext, formatStepResearchPrompt } from '@scrimble/core';
+import { buildResearchManifest } from '@scrimble/core';
 import {
   buildToolsContext,
   deleteUserTool,
@@ -76,7 +76,7 @@ import {
   loadBuilderProfileContext,
   updateUserTool,
   upsertUserTool,
-} from './user-tools';
+} from '@scrimble/core';
 import { WorkflowBriefDriftError, processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
 import {
   GENERATION_BATCHES,
@@ -85,7 +85,7 @@ import {
   type Bindings,
   type GenerationBatchName,
   type ProjectGenerationStatus,
-} from './types';
+} from '@scrimble/core';
 
 export const app = new Hono<AppEnv>().basePath('/api');
 

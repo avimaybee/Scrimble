@@ -1,13 +1,13 @@
 import { z } from 'zod';
-import { callAIText, extractJSON } from './ai';
+import { callAIText, extractJSON } from '@scrimble/core';
 import {
   buildProjectBriefSummary,
   projectBriefStructuredSchema,
   type ProjectBriefStructured,
   type ProjectIntakeMessage,
-} from './project-briefs';
-import { loadBuilderProfileContext } from './user-tools';
-import type { Bindings, ProviderType } from './types';
+} from '@scrimble/core';
+import { loadBuilderProfileContext } from '@scrimble/core';
+import type { Bindings, ProviderType } from '@scrimble/core';
 
 function normalizeIntakeStringList(value: unknown) {
   if (!Array.isArray(value)) {

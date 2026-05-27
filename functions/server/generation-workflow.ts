@@ -5,8 +5,8 @@ import {
   Batch3ArchitectSchema,
   PlanAuthoringRecordSchema,
   Batch5EnrichStepsSchema,
-} from './generation-schemas';
-import { persistGenerationStreamEvent, resetGenerationThinkingState } from './generation-events';
+} from '@scrimble/core';
+import { persistGenerationStreamEvent, resetGenerationThinkingState } from '@scrimble/core';
 import {
   executeBatch1,
   executeBatch2,
@@ -21,10 +21,10 @@ import {
   resolvePipelineStatusToRun,
   saveArchitectureReviewApproval,
   type ProviderConfig,
-} from './generation-pipeline';
-import { getGenerationRuntimeState, updateGenerationRunStatus } from './generation-runtime';
-import { loadProjectBriefContext } from './project-briefs';
-import { loadBuilderProfileContext } from './user-tools';
+} from '@scrimble/core';
+import { getGenerationRuntimeState, updateGenerationRunStatus } from '@scrimble/core';
+import { loadProjectBriefContext } from '@scrimble/core';
+import { loadBuilderProfileContext } from '@scrimble/core';
 import { saveToR2, loadFromR2 } from './workflow-storage';
 import { WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED } from './generation-dispatch';
 import type {
@@ -33,7 +33,7 @@ import type {
   GenerationRunStatus,
   ProjectGenerationStatus,
   ResolvedGenerationProviderConfig,
-} from './types';
+} from '@scrimble/core';
 
 const DEVELOPER_TOOLS = new Set([
   'vs code',
@@ -270,7 +270,7 @@ async function resolveTechsToResearch(
   env: Bindings,
   projectId: string,
 ): Promise<Array<{ name: string; docsUrl?: string; githubRepo?: string }>> {
-  const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
+  const batch1 = await loadBatchOutput<any>(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
   return batch1.technologies
     .map((technology) => ({
       name: technology.name,

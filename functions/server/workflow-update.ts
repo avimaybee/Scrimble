@@ -1,35 +1,35 @@
 import { z } from 'zod';
-import { callAIText, extractJSON } from './ai';
+import { callAIText, extractJSON } from '@scrimble/core';
 import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
 import {
   Batch2FetchAndReadSchema,
   Batch3ArchitectSchema,
   type Batch2FetchAndRead,
   type Batch3Architect,
-} from './generation-schemas';
-import { loadBatchOutput } from './generation-pipeline';
+} from '@scrimble/core';
+import { loadBatchOutput } from '@scrimble/core';
 import { applyPlanDiffToProject } from './plan-diff';
 import {
   appendProjectBriefSystemPrompt,
   loadProjectBriefContext,
   upsertProjectBrief,
   type StoredProjectBrief,
-} from './project-briefs';
-import { buildResearchManifest, type ResearchManifest } from './research-manifest';
-import { buildResearchQuery, type ResearchQueryFamily } from './research-query-policy';
-import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
-import { loadBuilderProfileContext } from './user-tools';
-import { getConnectedResearchTools } from './mcp-servers';
+} from '@scrimble/core';
+import { buildResearchManifest, type ResearchManifest } from '@scrimble/core';
+import { buildResearchQuery, type ResearchQueryFamily } from '@scrimble/core';
+import { collectStepResearchContext, formatStepResearchPrompt } from '@scrimble/core';
+import { loadBuilderProfileContext } from '@scrimble/core';
+import { getConnectedResearchTools } from '@scrimble/core';
 import { 
   fetchLibraryDocs, 
   analyzeGitHubRepo as facadeAnalyzeGitHubRepo, 
   searchWeb as facadeSearchWeb,
   type GitHubAnalysisResponse,
   type WebSearchResult,
-} from './research-facade';
+} from '@scrimble/core';
 import type { PlanDiff } from '../types/diff';
 import { diffSchema } from '../types/diff';
-import type { Bindings, ProviderType } from './types';
+import type { Bindings, ProviderType } from '@scrimble/core';
 
 type WorkflowUpdateProviderContext = {
   providerType: ProviderType;
@@ -405,7 +405,7 @@ function resolveResearchHints(
 ) {
   const normalizedKey = normalizeTechKey(change.technology);
   const researchMatch =
-    research.research.find((item) => normalizeTechKey(item.technology) === normalizedKey) || null;
+    (research as any).research.find((item) => normalizeTechKey(item.technology) === normalizedKey) || null;
   const githubSource =
     researchMatch?.sources
       .map((source) => parseGitHubRepoUrl(source.url))
@@ -902,7 +902,7 @@ export async function processWorkflowUpdate(options: {
     projectBriefContext.summary || options.project.description || '',
     {
       confirmedStackTools: projectBriefContext.confirmedStackTools,
-      inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean),
+      inferredTechnologies: (research as any).research.map((entry) => entry.technology).filter(Boolean),
     },
   );
 
