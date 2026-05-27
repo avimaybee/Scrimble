@@ -47,7 +47,6 @@ import {
   type GenerationFailureClass,
 } from './ai';
 import {
-  deleteJsonPayload,
   loadJsonPayload,
   loadJsonPayloadText,
   storeJsonPayload,
@@ -3155,7 +3154,6 @@ async function clearGenerationCheckpoint(
     return;
   }
 
-  await deleteJsonPayload(env, typedExisting.payload_r2_key);
   await env.DB.prepare('DELETE FROM generation_checkpoints WHERE id = ?')
     .bind(typedExisting.id)
     .run();
@@ -3166,19 +3164,6 @@ export async function clearGenerationCheckpoints(
   projectId: string,
   runId?: string,
 ) {
-  const rows = await env.DB.prepare(`
-    SELECT id, payload_r2_key
-    FROM generation_checkpoints
-    WHERE project_id = ?
-      ${runId ? 'AND run_id = ?' : ''}
-  `)
-    .bind(...(runId ? [projectId, runId] : [projectId]))
-    .all();
-
-  for (const row of rows.results as Array<{ id: string; payload_r2_key: string | null }>) {
-    await deleteJsonPayload(env, row.payload_r2_key);
-  }
-
   await env.DB.prepare(`
     DELETE FROM generation_checkpoints
     WHERE project_id = ?

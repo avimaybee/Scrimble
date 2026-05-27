@@ -19,6 +19,9 @@ bucket_name = "scrimble"
 ENVIRONMENT = "production"
 FIREBASE_PROJECT_ID = "scrimble-auth"
 
+[triggers]
+crons = ["0 * * * *"]
+
 [[workflows]]
 name = "scrimble-generation"
 binding = "GENERATION_WORKFLOW"

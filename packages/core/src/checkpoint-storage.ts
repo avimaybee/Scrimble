@@ -25,10 +25,6 @@ export async function storeJsonPayload(
   const serialized = typeof value === 'string' ? value : JSON.stringify(value);
 
   if (serialized.length <= MAX_INLINE_JSON_BYTES || !env.CHECKPOINT_BUCKET) {
-    if (existingR2Key && env.CHECKPOINT_BUCKET) {
-      await deleteR2Object(env, existingR2Key);
-    }
-
     return {
       inlineText: serialized,
       r2Key: null,
@@ -36,12 +32,17 @@ export async function storeJsonPayload(
     };
   }
 
-  const r2Key = `${namespace}/${crypto.randomUUID()}.json`;
-  await env.CHECKPOINT_BUCKET.put(r2Key, serialized);
+  // Generate SHA-256 hash of the content
+  const hashBuffer = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(serialized)
+  );
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-  if (existingR2Key && existingR2Key !== r2Key) {
-    await deleteR2Object(env, existingR2Key);
-  }
+  // Use a global namespace to enable cross-user deduplication
+  const r2Key = `objects/${hashHex}.json`;
+  await env.CHECKPOINT_BUCKET.put(r2Key, serialized);
 
   return {
     inlineText: null,
@@ -100,5 +101,56 @@ export async function deleteJsonPayload(
   env: Bindings,
   r2Key: string | null | undefined,
 ) {
-  await deleteR2Object(env, r2Key);
+  // Now handles deletion asynchronously via deferred cleanup, no-op here if called.
+}
+
+export async function cleanupOrphanedStorage(env: Bindings): Promise<{ deletedCount: number, errors: number }> {
+  if (!env.CHECKPOINT_BUCKET) {
+    return { deletedCount: 0, errors: 0 };
+  }
+
+  const prefixes = ['agent-runs/', 'generation-checkpoints/', 'objects/'];
+  let deletedCount = 0;
+  let errors = 0;
+
+  try {
+    for (const prefix of prefixes) {
+      let cursor: string | undefined = undefined;
+
+      do {
+        const listed = await env.CHECKPOINT_BUCKET.list({ prefix, cursor });
+        
+        for (const object of listed.objects) {
+          const r2Key = object.key;
+          let isReferenced = false;
+
+          // Check both tables since any prefix can now theoretically be in either
+          const agentRunRecord = await env.DB.prepare(
+            'SELECT 1 FROM agent_runs WHERE output_r2_key = ? LIMIT 1'
+          ).bind(r2Key).first();
+          
+          if (agentRunRecord) {
+            isReferenced = true;
+          } else {
+            const checkpointRecord = await env.DB.prepare(
+              'SELECT 1 FROM generation_checkpoints WHERE payload_r2_key = ? LIMIT 1'
+            ).bind(r2Key).first();
+            isReferenced = !!checkpointRecord;
+          }
+
+          if (!isReferenced) {
+            await env.CHECKPOINT_BUCKET.delete(r2Key);
+            deletedCount++;
+          }
+        }
+
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+    }
+  } catch (error) {
+    console.error('[cleanup-orphaned-storage-error]', error);
+    errors++;
+  }
+
+  return { deletedCount, errors };
 }
