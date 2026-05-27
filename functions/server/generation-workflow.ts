@@ -91,14 +91,6 @@ type ProjectGenerationRow = {
   current_generation_run_id: string | null;
 };
 
-type Batch2LoopOutcome =
-  | { done: true; batch2Key: string }
-  | { done: false };
-
-type Batch5LoopOutcome =
-  | { done: true; enrichmentsKey: string }
-  | { done: false };
-
 class WorkflowRunStoppedError extends Error {
   constructor(message: string) {
     super(message);
@@ -357,64 +349,37 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
       state = await resolveCurrentStatusToRun(this.env, projectId);
 
       if (state.statusToRun === 'batch_1_research_stack') {
-        let iteration = 0;
-        let done = false;
-        while (!done) {
-          if (iteration >= MAX_BATCH2_WORKFLOW_STEPS) {
-            throw new Error('Batch 2 exceeded the maximum workflow step iterations.');
-          }
+        const project = await step.do('assert-project', async () => {
+          await assertActiveRun(this.env, projectId, runId);
+          const p = await getProjectRow(this.env, projectId);
+          if (!p) throw new Error('Project not found.');
+          return p;
+        });
 
-          const outcome = await step.do<Batch2LoopOutcome>(
-            `batch2-research-${String(iteration + 1).padStart(3, '0')}`,
-            {
-              retries: { limit: 2, delay: '10 seconds', backoff: 'exponential' },
-              timeout: '15 minutes',
-            },
-            async () => {
-              await assertActiveRun(this.env, projectId, runId);
-              const project = await getProjectRow(this.env, projectId);
-              if (!project) {
-                throw new Error('Project not found.');
-              }
+        await executeBatch2(
+          this.env,
+          project,
+          fastProvider,
+          deepProvider,
+          runId,
+          builderProfile,
+          projectBrief,
+          {
+            runStep: (name, config, fn) => step.do(name, config, fn),
+          },
+        );
 
-              const result = await executeBatch2(
-                this.env,
-                project,
-                fastProvider,
-                deepProvider,
-                runId,
-                builderProfile,
-                projectBrief,
-                WORKFLOW_BATCH2_CHECKPOINT_INTERVAL,
-              );
-
-              if (result === 'checkpointed') {
-                return { done: false };
-              }
-
-              const batch2 = await saveBatchOutputSnapshot(
-                this.env,
-                projectId,
-                runId,
-                'batch-2-research',
-                'batch_2_fetch_and_read',
-                Batch2FetchAndReadSchema,
-              );
-
-              return {
-                done: true,
-                batch2Key: batch2.r2Key,
-              };
-            },
+        batch2Key = await step.do('save-batch2-output', async () => {
+          const batch2 = await saveBatchOutputSnapshot(
+            this.env,
+            projectId,
+            runId,
+            'batch-2-research',
+            'batch_2_fetch_and_read',
+            Batch2FetchAndReadSchema,
           );
-
-          if (outcome.done) {
-            batch2Key = outcome.batch2Key;
-            done = true;
-          } else {
-            iteration += 1;
-          }
-        }
+          return batch2.r2Key;
+        });
       } else {
         batch2Key = await step.do('load-batch2-output', async () => {
           const batch2 = await saveBatchOutputSnapshot(
@@ -594,57 +559,34 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
       state = await resolveCurrentStatusToRun(this.env, projectId);
 
       if (state.statusToRun === 'batch_4_plan_build') {
-        let iteration = 0;
-        let done = false;
-        while (!done) {
-          if (iteration >= MAX_BATCH5_WORKFLOW_STEPS) {
-            throw new Error('Batch 5 exceeded the maximum workflow step iterations.');
-          }
+        await step.do('assert-project-batch-5', async () => {
+          await assertActiveRun(this.env, projectId, runId);
+          return null;
+        });
 
-          const outcome = await step.do<Batch5LoopOutcome>(
-            `batch5-enrich-${String(iteration + 1).padStart(3, '0')}`,
-            {
-              retries: { limit: 2, delay: '20 seconds', backoff: 'exponential' },
-              timeout: '20 minutes',
-            },
-            async () => {
-              await assertActiveRun(this.env, projectId, runId);
-              const result = await executeBatch5(
-                this.env,
-                projectId,
-                deepProvider,
-                runId,
-                builderProfile,
-                projectBrief,
-                WORKFLOW_BATCH5_CHECKPOINT_INTERVAL,
-              );
+        await executeBatch5(
+          this.env,
+          projectId,
+          deepProvider,
+          runId,
+          builderProfile,
+          projectBrief,
+          {
+            runStep: (name, config, fn) => step.do(name, config, fn),
+          },
+        );
 
-              if (result === 'checkpointed') {
-                return { done: false };
-              }
-
-              const enrichments = await saveBatchOutputSnapshot(
-                this.env,
-                projectId,
-                runId,
-                'step-enrichments',
-                'batch_5_enrich_steps',
-                Batch5EnrichStepsSchema,
-              );
-              return {
-                done: true,
-                enrichmentsKey: enrichments.r2Key,
-              };
-            },
+        enrichmentsKey = await step.do('save-enrichments-output', async () => {
+          const enrichments = await saveBatchOutputSnapshot(
+            this.env,
+            projectId,
+            runId,
+            'step-enrichments',
+            'batch_5_enrich_steps',
+            Batch5EnrichStepsSchema,
           );
-
-          if (outcome.done) {
-            enrichmentsKey = outcome.enrichmentsKey;
-            done = true;
-          } else {
-            iteration += 1;
-          }
-        }
+          return enrichments.r2Key;
+        });
       } else {
         enrichmentsKey = await step.do('load-enrichments-output', async () => {
           const enrichments = await saveBatchOutputSnapshot(
