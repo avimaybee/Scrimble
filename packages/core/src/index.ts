@@ -14,3 +14,4 @@ export * from './generation-runtime.js';
 export * from './checkpoint-storage.js';
 export * from './research-facade.js';
 
+export { resolvePipelineStatusToRun } from './engine.js';

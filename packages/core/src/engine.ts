@@ -307,6 +307,41 @@ export class RetryableGenerationPipelineError extends GenerationPipelineError {
 
 export interface OrchestratorStepConfig { retries?: { limit: number; delay: string; backoff: 'exponential' | 'linear' }; timeout?: string; }
 export interface StepOrchestrator { runStep<T>(name: string, config: OrchestratorStepConfig, fn: () => Promise<T>): Promise<T>; }
+
+export async function runStatefulAccumulatorLoop<TItem, TState>(
+  env: Bindings,
+  projectId: string,
+  runId: string,
+  batchName: GenerationBatchName,
+  loopName: string,
+  items: TItem[],
+  initialState: TState,
+  orchestrator: StepOrchestrator,
+  checkpointInterval: number,
+  stepFn: (item: TItem, index: number, state: TState, loopOrchestrator: StepOrchestrator) => Promise<TState>
+): Promise<TState> {
+  const checkpoint = await loadGenerationCheckpoint<TState>(env, projectId, runId, batchName);
+  const startIndex = checkpoint ? checkpoint.currentIndex : 0;
+  let state = checkpoint ? checkpoint.data : initialState;
+
+  for (let index = startIndex; index < items.length; index += 1) {
+    const item = items[index];
+    const loopOrchestrator: StepOrchestrator = {
+      runStep: async (name, config, fn) => {
+        return orchestrator.runStep(`${loopName}-${index}-${name}`, config, fn);
+      }
+    };
+
+    state = await stepFn(item, index, state, loopOrchestrator);
+
+    if ((index + 1) % checkpointInterval === 0 || index === items.length - 1) {
+      await saveGenerationCheckpoint<TState>(env, projectId, runId, batchName, index + 1, state);
+    }
+  }
+
+  return state;
+}
+
 type BatchExecutionResult = 'complete' | 'checkpointed';
 
 type Batch2CheckpointData = {
@@ -4326,9 +4361,6 @@ export async function executeBatch2(
   let issuesFound = 0;
   const partialFailures: Array<{ tool: string, technology: string, message: string }> = [];
   const degradedTools = new Set<string>();
-  const startIndex = 0;
-  
-
   await emitBatchStart(env, projectId, runId, 'batch_2_fetch_and_read');
   await logActivity(env, {
     projectId,
@@ -4351,9 +4383,18 @@ export async function executeBatch2(
   });
 
   
-  for (let index = startIndex; index < researchTargets.length; index += 1) {
-    const technology = researchTargets[index];
-    const stepResult = await orchestrator.runStep(`batch2-target-${index}`, {
+  const accumulatorState = await runStatefulAccumulatorLoop(
+    env,
+    projectId,
+    runId,
+    'batch_2_fetch_and_read',
+    'batch2-target',
+    researchTargets,
+    { fetchedSources: [], collectedSources: [], partialFailures: [], issuesFound: 0 } as Batch2CheckpointData,
+    orchestrator,
+    1, // WORKFLOW_BATCH2_CHECKPOINT_INTERVAL
+    async (technology, index, state, loopOrchestrator) => {
+      const stepResult = await loopOrchestrator.runStep('process', {
       retries: { limit: 2, delay: '10 seconds', backoff: 'exponential' },
       timeout: '15 minutes'
     }, async () => {
@@ -4700,21 +4741,30 @@ export async function executeBatch2(
       };
 
       return {
-        fetchedSource,
-        stepCollectedSources,
-        stepPartialFailures,
-        stepIssuesFound,
-      };
-    });
+          fetchedSource,
+          stepCollectedSources,
+          stepPartialFailures,
+          stepIssuesFound,
+        };
+      });
 
-    fetchedSources.push(stepResult.fetchedSource);
-    collectedSources.push(...stepResult.stepCollectedSources);
-    for (const f of stepResult.stepPartialFailures) {
-      pushPartialFailure(partialFailures, f.tool, f.technology, f.message);
-      degradedTools.add(f.tool);
+      return {
+        ...state,
+        fetchedSources: [...state.fetchedSources, stepResult.fetchedSource],
+        collectedSources: [...state.collectedSources, ...stepResult.stepCollectedSources],
+        partialFailures: [...state.partialFailures, ...stepResult.stepPartialFailures],
+        issuesFound: state.issuesFound + stepResult.stepIssuesFound,
+      };
     }
-    issuesFound += stepResult.stepIssuesFound;
+  );
+
+  fetchedSources.push(...accumulatorState.fetchedSources);
+  collectedSources.push(...accumulatorState.collectedSources);
+  for (const f of accumulatorState.partialFailures) {
+    pushPartialFailure(partialFailures, f.tool, f.technology, f.message);
+    degradedTools.add(f.tool);
   }
+  issuesFound += accumulatorState.issuesFound;
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
   const rankedArtifacts = buildRankedResearchSources(fetchedSources, projectBrief);
@@ -5348,7 +5398,6 @@ export async function executeBatch5(
     || 'web app';
     const planSteps = flattenPlanSteps(plan);
   const stepResearchContexts: StepResearchContext[] = [];
-  const startIndex = 0;
   const isLocal = env.ENVIRONMENT === 'local';
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   const researchManifest = buildResearchManifest(builderProfile, projectBrief.summary || project.description || '', { confirmedStackTools: projectBrief.confirmedStackTools, inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean) });
@@ -5364,10 +5413,18 @@ export async function executeBatch5(
   });
 
   
-  for (let index = startIndex; index < planSteps.length; index += 1) {
-    const step = planSteps[index];
-
-    const stepResult = await orchestrator.runStep(`batch5-step-${index}`, {
+  const accumulatorState = await runStatefulAccumulatorLoop(
+    env,
+    projectId,
+    runId,
+    'batch_5_enrich_steps',
+    'batch5-step',
+    planSteps,
+    [] as StepResearchContext[],
+    orchestrator,
+    5, // WORKFLOW_BATCH5_CHECKPOINT_INTERVAL
+    async (step, index, state, loopOrchestrator) => {
+      const stepResult = await loopOrchestrator.runStep('process', {
       retries: { limit: 2, delay: '20 seconds', backoff: 'exponential' },
       timeout: '20 minutes'
     }, async () => {
@@ -5416,10 +5473,13 @@ export async function executeBatch5(
       });
 
       return stepResearch;
-    });
+      });
 
-    stepResearchContexts.push(stepResult);
-  }
+      return [...state, stepResult];
+    }
+  );
+
+  stepResearchContexts.push(...accumulatorState);
   const stepResearchSlice = retrieveStepResearchSlice(
     planSteps,
     projectStack,
