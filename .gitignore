@@ -42,3 +42,4 @@ wrangler.toml.bak
 debug
 # Scratch
 prompt.txt
+.scrimble/

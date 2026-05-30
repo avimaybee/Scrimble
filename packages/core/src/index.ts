@@ -13,3 +13,4 @@ export * from './generation-events.js';
 export * from './generation-runtime.js';
 export * from './checkpoint-storage.js';
 export * from './research-facade.js';
+export * from './generation-workflow-logic.js';
