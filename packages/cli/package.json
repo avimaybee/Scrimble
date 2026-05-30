@@ -1,12 +1,27 @@
 {
   "name": "@scrimble/cli",
   "version": "1.0.0",
+  "description": "The Scrimble Core Engine CLI",
+  "license": "MIT",
   "type": "module",
   "bin": {
-    "scrimble": "src/index.ts"
+    "scrimble": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
+    "release:patch": "npm version patch && npm publish --access public",
+    "release:minor": "npm version minor && npm publish --access public",
+    "release:major": "npm version major && npm publish --access public"
   },
   "dependencies": {
-    "@scrimble/core": "*",
     "commander": "^12.0.0"
+  },
+  "devDependencies": {
+    "@scrimble/core": "*",
+    "tsup": "^8.5.1"
   }
 }
