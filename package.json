@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "deploy": "vite build && wrangler pages deploy dist",
     "deploy:consumer": "wrangler deploy --config wrangler.consumer.toml",

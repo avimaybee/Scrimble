@@ -7,7 +7,7 @@ import {
   type BuilderProfileCategory,
   type BuilderProfileTool,
   type ToolProficiency,
-} from '../../src/lib/builder-profile';
+} from './builder-profile';
 import type { Bindings } from './types';
 
 export type DeclaredResearchTool = BuilderProfileTool & {

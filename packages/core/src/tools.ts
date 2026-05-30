@@ -1,7 +1,7 @@
-import { fetchAndParse, type GitHubResearchResult } from '../../functions/utils/fetch-url';
-import { persistGenerationStreamEvent } from '@scrimble/core';
-import { decrypt } from '../../functions/utils/crypto';
-import type { Bindings, GenerationBatchName } from '@scrimble/core';
+import { fetchAndParse, type GitHubResearchResult } from './utils/fetch-url.js';
+import { persistGenerationStreamEvent } from './index.js';
+import { decrypt } from './utils/crypto.js';
+import type { Bindings, GenerationBatchName } from './index.js';
 
 const TOOL_TIMEOUT_MS = 10_000;
 const BRAVE_RESULT_LIMIT = 5;
@@ -165,6 +165,7 @@ async function getUserMCPConfig(
   serverType: 'brave-search' | 'github' | 'context7',
   env: Bindings,
 ): Promise<string | null> {
+  if (env.ENVIRONMENT === 'local') return null;
   const row = await env.DB.prepare(
     `SELECT config_enc FROM mcp_servers
      WHERE user_id = ? AND server_type = ? AND is_active = 1

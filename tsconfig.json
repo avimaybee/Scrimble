@@ -18,6 +18,9 @@
     "paths": {
       "@/*": [
         "./src/*"
+      ],
+      "@scrimble/core": [
+        "./packages/core/src/index.ts"
       ]
     },
     "allowImportingTsExtensions": true,

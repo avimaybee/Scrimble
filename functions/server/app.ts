@@ -10,13 +10,13 @@ import {
   Batch3ArchitectSchema,
   Batch6GenerateFilesSchema,
   getSkillFileSortIndex,
-} from './generation-schemas';
-import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from './mcp-servers';
+} from '@scrimble/core';
+import { listUserMCPServers, mcpServerPayloadSchema, upsertUserMCPServer } from '@scrimble/core';
 import {
   createGenerationSseStream,
   persistGenerationStreamEvent,
   resetGenerationThinkingState,
-} from './generation-events';
+} from '@scrimble/core';
 import {
   cancelWorkflowGeneration,
   sendWorkflowDispatchEvent,
@@ -32,7 +32,7 @@ import {
   updateGenerationRunStatus,
   mapProjectRowToResponse,
   buildGenerationRuntimeContract,
-} from './generation-runtime';
+} from '@scrimble/core';
 import {
   callAIWithRetry,
 
@@ -40,7 +40,7 @@ import {
   extractJSON,
   getProvider,
   streamProviderText,
-} from './ai';
+} from '@scrimble/core';
 import {
   BUILDER_PROFILE_CATEGORY_KEYS,
   TOOL_PROFICIENCIES,
@@ -53,7 +53,7 @@ import {
   listProjectIntakeMessages,
   loadProjectBriefContext,
   upsertProjectBrief,
-} from './project-briefs';
+} from '@scrimble/core';
 import {
   clearGenerationCheckpoints,
   getArchitectureReviewPayload,
@@ -61,13 +61,14 @@ import {
   hasApprovedArchitectureReview,
   loadBatchOutput,
   saveArchitectureReviewApproval,
-} from './generation-pipeline';
+  saveArchitectureReviewDraft,
+} from '@scrimble/core';
 import {
   runProjectIntakeTurn,
 } from './project-intake';
 import { applyPlanDiffToProject } from './plan-diff';
-import { collectStepResearchContext, formatStepResearchPrompt } from './step-research';
-import { buildResearchManifest } from './research-manifest';
+import { collectStepResearchContext, formatStepResearchPrompt } from '@scrimble/core';
+import { buildResearchManifest } from '@scrimble/core';
 import {
   buildToolsContext,
   deleteUserTool,
@@ -75,7 +76,7 @@ import {
   loadBuilderProfileContext,
   updateUserTool,
   upsertUserTool,
-} from './user-tools';
+} from '@scrimble/core';
 import { WorkflowBriefDriftError, processWorkflowUpdate, workflowUpdateRequestSchema } from './workflow-update';
 import {
   GENERATION_BATCHES,
@@ -84,7 +85,7 @@ import {
   type Bindings,
   type GenerationBatchName,
   type ProjectGenerationStatus,
-} from './types';
+} from '@scrimble/core';
 
 export const app = new Hono<AppEnv>().basePath('/api');
 
@@ -1584,6 +1585,30 @@ const handleProjectArchitectureApproval = async (c: AppContext) => {
 
 app.post('/projects/:id/approve', handleProjectArchitectureApproval);
 app.post('/projects/:id/architecture-review', handleProjectArchitectureApproval);
+
+const architectureReviewDraftSchema = z.object({
+  feedback: z.string().max(20000),
+});
+
+app.post('/projects/:id/architecture-review/draft', async (c) => {
+  const projectId = c.req.param('id');
+  const projectRuntime = await getOwnedProjectWithRuntime(c, projectId);
+  if (!projectRuntime) {
+    return c.json({ error: 'Project not found' }, 404);
+  }
+
+  if (projectRuntime.lifecycleStatus !== 'awaiting_review') {
+    return c.json({ error: 'Drafts can only be saved while awaiting architecture review.' }, 409);
+  }
+
+  const parsed = architectureReviewDraftSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    return c.json({ error: 'Draft payload is invalid.', details: parsed.error.format() }, 400);
+  }
+
+  await saveArchitectureReviewDraft(c.env, projectId, parsed.data.feedback);
+  return c.json({ success: true, savedAt: new Date().toISOString() });
+});
 
 app.post('/projects/:id/resume', async (c) => {
   const projectId = c.req.param('id');

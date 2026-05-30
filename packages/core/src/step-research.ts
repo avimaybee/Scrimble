@@ -6,8 +6,8 @@ import {
   type Env as ToolEnv,
   type GithubIssue,
   type SearchResult,
-} from '../../workers/tools';
-import type { Batch2FetchAndRead, Batch3Architect } from './generation-schemas';
+} from './tools.js';
+import type { Batch2FetchAndRead, Batch3Architect } from './schemas';
 import { getConnectedResearchTools } from './mcp-servers';
 import { selectManifestToolsForStep, type ResearchManifest } from './research-manifest';
 import type { Bindings, GenerationBatchName } from './types';

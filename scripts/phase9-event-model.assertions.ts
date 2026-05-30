@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {
   buildGenerationEventEnvelope,
   type GenerationStreamEvent,
-} from '../functions/server/generation-events.ts';
+} from '@scrimble/core';
 
 function runTest(name: string, test: () => void) {
   try {

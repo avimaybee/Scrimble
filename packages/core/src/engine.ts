@@ -21,7 +21,7 @@ import {
   type Batch6GenerateFiles,
   type SkillFileName,
   schemaDescriptions,
-} from './generation-schemas';
+} from './schemas';
 import {
   GENERATION_BATCHES,
   type Bindings,
@@ -47,14 +47,13 @@ import {
   type GenerationFailureClass,
 } from './ai';
 import {
-  deleteJsonPayload,
   loadJsonPayload,
   loadJsonPayloadText,
   storeJsonPayload,
 } from './checkpoint-storage';
 
 
-import { extractGitHubRepository } from '../utils/fetch-url';
+import { extractGitHubRepository } from './utils/fetch-url';
 import { buildResearchManifest } from './research-manifest';
 import { buildResearchQuery } from './research-query-policy';
 import {
@@ -63,7 +62,7 @@ import {
   resolveToolDocsEntry,
   type ResearchResult,
 } from './research';
-import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
+import { normalizeBuilderProfileName } from './builder-profile';
 import { getConnectedResearchTools } from './mcp-servers';
 import { appendProjectBriefSystemPrompt, loadProjectBriefContext } from './project-briefs';
 import {
@@ -165,6 +164,7 @@ export type ArchitectureReviewPayload = {
   data_quality: ArchitectureReviewDataQuality;
   review_feedback: string;
   review_feedback_provided: boolean;
+  review_draft: { feedback: string; lastSavedAt: string } | null;
 };
 
 type ArchitectureReviewContext = {
@@ -306,6 +306,43 @@ export class RetryableGenerationPipelineError extends GenerationPipelineError {
   }
 }
 
+export interface OrchestratorStepConfig { retries?: { limit: number; delay: string; backoff: 'exponential' | 'linear' }; timeout?: string; }
+export interface StepOrchestrator { runStep<T>(name: string, config: OrchestratorStepConfig, fn: () => Promise<T>): Promise<T>; }
+
+export async function runStatefulAccumulatorLoop<TItem, TState>(
+  env: Bindings,
+  projectId: string,
+  runId: string,
+  batchName: GenerationBatchName,
+  loopName: string,
+  items: TItem[],
+  initialState: TState,
+  orchestrator: StepOrchestrator,
+  checkpointInterval: number,
+  stepFn: (item: TItem, index: number, state: TState, loopOrchestrator: StepOrchestrator) => Promise<TState>
+): Promise<TState> {
+  const checkpoint = await loadGenerationCheckpoint<TState>(env, projectId, runId, batchName);
+  const startIndex = checkpoint ? checkpoint.currentIndex : 0;
+  let state = checkpoint ? checkpoint.data : initialState;
+
+  for (let index = startIndex; index < items.length; index += 1) {
+    const item = items[index];
+    const loopOrchestrator: StepOrchestrator = {
+      runStep: async (name, config, fn) => {
+        return orchestrator.runStep(`${loopName}-${index}-${name}`, config, fn);
+      }
+    };
+
+    state = await stepFn(item, index, state, loopOrchestrator);
+
+    if ((index + 1) % checkpointInterval === 0 || index === items.length - 1) {
+      await saveGenerationCheckpoint<TState>(env, projectId, runId, batchName, index + 1, state);
+    }
+  }
+
+  return state;
+}
+
 type BatchExecutionResult = 'complete' | 'checkpointed';
 
 type Batch2CheckpointData = {
@@ -351,8 +388,8 @@ const ACTIVE_GENERATION_STATUSES = new Set<ProjectGenerationStatus | 'approved'>
 ]);
 const ACTIVE_GENERATION_HEARTBEAT_STATUSES = Array.from(ACTIVE_GENERATION_STATUSES);
 
-export const GENERATION_STALE_MS = 15 * 60 * 1000;
-export const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
+const GENERATION_STALE_MS = 15 * 60 * 1000;
+const QUEUED_GENERATION_RESUME_MS = 2 * 60 * 1000;
 const HEARTBEAT_TOUCH_INTERVAL_MS = 30 * 1000;
 const GENERATION_CHECKPOINT_ITEM_INTERVAL = 20;
 const MAX_BATCH1_TECHNOLOGIES = 8;
@@ -2415,6 +2452,7 @@ function buildArchitectureReviewPayload(
   adr: Batch3Architect,
   input: Record<string, unknown>,
   research: Batch2FetchAndRead,
+  reviewDraft?: { feedback: string; lastSavedAt: string } | null,
 ): ArchitectureReviewPayload {
   const seen = new Set<string>();
   const stackCards = adr.integrations.reduce<ArchitectureReviewStackCard[]>((cards, integration) => {
@@ -2463,6 +2501,7 @@ function buildArchitectureReviewPayload(
     data_quality: research.data_quality,
     review_feedback: reviewFeedback,
     review_feedback_provided: reviewFeedbackProvided,
+    review_draft: reviewDraft || null,
   };
 }
 
@@ -3153,7 +3192,6 @@ async function clearGenerationCheckpoint(
     return;
   }
 
-  await deleteJsonPayload(env, typedExisting.payload_r2_key);
   await env.DB.prepare('DELETE FROM generation_checkpoints WHERE id = ?')
     .bind(typedExisting.id)
     .run();
@@ -3164,19 +3202,6 @@ export async function clearGenerationCheckpoints(
   projectId: string,
   runId?: string,
 ) {
-  const rows = await env.DB.prepare(`
-    SELECT id, payload_r2_key
-    FROM generation_checkpoints
-    WHERE project_id = ?
-      ${runId ? 'AND run_id = ?' : ''}
-  `)
-    .bind(...(runId ? [projectId, runId] : [projectId]))
-    .all();
-
-  for (const row of rows.results as Array<{ id: string; payload_r2_key: string | null }>) {
-    await deleteJsonPayload(env, row.payload_r2_key);
-  }
-
   await env.DB.prepare(`
     DELETE FROM generation_checkpoints
     WHERE project_id = ?
@@ -3420,7 +3445,7 @@ export async function loadBatchOutput<T>(
   projectId: string,
   runType: GenerationBatchName,
   schema: ZodType<T>,
-) {
+): Promise<T> {
   const typedRecord = await loadBatchRunRecord(env, projectId, runType);
 
   if (!typedRecord) {
@@ -3486,8 +3511,39 @@ async function loadArchitectureReviewContext(env: Bindings, projectId: string): 
 
 export async function getArchitectureReviewPayload(env: Bindings, projectId: string) {
   const context = await loadArchitectureReviewContext(env, projectId);
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
-  return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  
+  const runRow = (await env.DB.prepare('SELECT review_draft FROM generation_runs WHERE id = ?')
+    .bind(context.runId)
+    .first()) as { review_draft: string | null } | null;
+  
+  const draftStr = runRow?.review_draft;
+  let reviewDraft = null;
+  if (draftStr) {
+    try {
+      reviewDraft = JSON.parse(draftStr);
+    } catch (e) {
+      // ignore parse error
+    }
+  }
+
+  return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2, reviewDraft);
+}
+
+export async function saveArchitectureReviewDraft(
+  env: Bindings,
+  projectId: string,
+  feedback: string,
+) {
+  const context = await loadArchitectureReviewContext(env, projectId);
+  const draft = JSON.stringify({
+    feedback,
+    lastSavedAt: new Date().toISOString(),
+  });
+
+  await env.DB.prepare('UPDATE generation_runs SET review_draft = ? WHERE id = ?')
+    .bind(draft, context.runId)
+    .run();
 }
 
 export async function saveArchitectureReviewApproval(
@@ -3507,6 +3563,10 @@ export async function saveArchitectureReviewApproval(
 
   await env.DB.prepare('UPDATE agent_runs SET input = ? WHERE id = ?')
     .bind(JSON.stringify(nextInput), context.runId)
+    .run();
+
+  await env.DB.prepare('UPDATE generation_runs SET review_draft = NULL WHERE id = ?')
+    .bind(context.runId)
     .run();
 
   return {
@@ -3686,7 +3746,7 @@ async function callValidatedBatch<T>(
     schema: ZodType<T>;
     schemaDescription: string;
   },
-) {
+): Promise<{ data: T; rawResponse: string; attemptCount: number }> {
   let prompt = options.prompt;
   let lastError = 'The AI response was empty.';
   const emitter = createThrottledThinkingEmitter(
@@ -4232,7 +4292,7 @@ Identify the stack implied by the idea. For each technology, provide:
   Only include technologies that matter to implementation.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId: project.id,
       runId,
@@ -4243,9 +4303,9 @@ Identify the stack implied by the idea. For each technology, provide:
       schema: Batch1ResearchStackSchema,
       schemaDescription: schemaDescriptions.batch_1_research_stack,
     });
-    const technologies = limitBatch1Technologies(result.data.technologies);
+    const technologies = limitBatch1Technologies((result.data as any).technologies);
 
-    if (technologies.length < result.data.technologies.length) {
+    if (technologies.length < (result.data as any).technologies.length) {
       await logActivity(env, {
         projectId: project.id,
         batchName: 'batch_1_research_stack',
@@ -4310,12 +4370,13 @@ export async function executeBatch2(
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
-  checkpointItemInterval = GENERATION_CHECKPOINT_ITEM_INTERVAL,
+  orchestrator: StepOrchestrator = { runStep: async (n, c, f) => f() },
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const projectId = project.id;
-  const maxSubrequestBudget = RESEARCH_SUBREQUEST_LIMIT;
-  const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
+  const isLocal = env.ENVIRONMENT === 'local';
+  const maxSubrequestBudget = isLocal ? Infinity : RESEARCH_SUBREQUEST_LIMIT;
+  const batch1 = await loadBatchOutput<Batch1ResearchStack>(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
   const sourceTargetCount = resolveBatch2SourceTargetCount();
   const searchResultLimit = resolveBatch2SearchResultLimit();
   const targetSelection = buildResearchTargets(
@@ -4324,61 +4385,20 @@ export async function executeBatch2(
     projectBrief,
     sourceTargetCount,
   );
-  const checkpoint = await loadGenerationCheckpoint<Batch2CheckpointData>(
-    env,
-    projectId,
-    runId,
-    'batch_2_fetch_and_read',
-  );
-  const researchTargets =
-    checkpoint?.data.researchTargets || targetSelection.targets;
-  const totalCandidateTargets = checkpoint?.data.totalCandidateTargets ?? targetSelection.totalCandidates;
-  const fetchedSources: FetchedTechnologyResearch[] = checkpoint?.data.fetchedSources
-    ? [...checkpoint.data.fetchedSources]
-    : [];
-  const collectedSources: CollectedResearchSource[] = checkpoint?.data.collectedSources
-    ? [...checkpoint.data.collectedSources]
-    : [];
-  const sourceCandidates: SourceCandidate[] = checkpoint?.data.sourceCandidates
-    ? [...checkpoint.data.sourceCandidates]
-    : [];
-  const rankedSources: RankedSource[] = checkpoint?.data.rankedSources
-    ? [...checkpoint.data.rankedSources]
-    : [];
-  const sourceNotes: SourceNote[] = checkpoint?.data.sourceNotes
-    ? [...checkpoint.data.sourceNotes]
-    : [];
-  const evidencePacks: EvidencePack[] = checkpoint?.data.evidencePacks
-    ? [...checkpoint.data.evidencePacks]
-    : [];
+    const researchTargets = targetSelection.targets;
+  const totalCandidateTargets = targetSelection.totalCandidates;
+  const fetchedSources: FetchedTechnologyResearch[] = [];
+  const collectedSources: CollectedResearchSource[] = [];
+  const sourceCandidates: SourceCandidate[] = [];
+  const rankedSources: RankedSource[] = [];
+  const sourceNotes: SourceNote[] = [];
+  const evidencePacks: EvidencePack[] = [];
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
   const briefResearchCount = researchTargets.filter((target) => target.source === 'brief').length;
   const profileResearchCount = researchTargets.filter((target) => target.source === 'profile').length;
-  let issuesFound = checkpoint?.data.issuesFound ?? 0;
-  const partialFailures = checkpoint?.data.partialFailures ? [...checkpoint.data.partialFailures] : [];
-  const degradedTools = new Set(partialFailures.map((failure) => failure.tool));
-  // IMPORTANT: Checkpoints store durable logical progress (index + fetched data), not transient
-  // per-invocation counters. A resumed workflow step starts with a fresh subrequest budget.
-  let subrequestCounter = 0;
-  const startIndex = checkpoint?.currentIndex ?? 0;
-  let processedThisInvocation = 0;
-  const subrequestTracker = createResearchSubrequestTracker({
-    initialCount: 0,
-    limit: maxSubrequestBudget,
-  });
-
-  const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
-    pushPartialFailure(partialFailures, tool, technologyName, message);
-    degradedTools.add(tool);
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      runId,
-      kind: 'warning',
-      message,
-    });
-  };
-
+  let issuesFound = 0;
+  const partialFailures: Array<{ tool: string, technology: string, message: string }> = [];
+  const degradedTools = new Set<string>();
   await emitBatchStart(env, projectId, runId, 'batch_2_fetch_and_read');
   await logActivity(env, {
     projectId,
@@ -4400,75 +4420,68 @@ export async function executeBatch2(
     message: `RAG retrieval mode enabled with ${deepProvider.model}: researching up to ${sourceTargetCount} technologies, using strict sequential fetches and one targeted search query per tool, and assembling prompts from retrieved chunks only.`,
   });
 
-  if (checkpoint) {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      runId,
-      kind: 'system',
-      message: `Resuming fetched-doc research at technology ${startIndex + 1} of ${researchTargets.length}.`,
-    });
-  }
+  
+  const accumulatorState = await runStatefulAccumulatorLoop(
+    env,
+    projectId,
+    runId,
+    'batch_2_fetch_and_read',
+    'batch2-target',
+    researchTargets,
+    { fetchedSources: [], collectedSources: [], partialFailures: [], issuesFound: 0 } as Batch2CheckpointData,
+    orchestrator,
+    1, // WORKFLOW_BATCH2_CHECKPOINT_INTERVAL
+    async (technology, index, state, loopOrchestrator) => {
+      const stepResult = await loopOrchestrator.runStep('process', {
+      retries: { limit: 2, delay: '10 seconds', backoff: 'exponential' },
+      timeout: '15 minutes'
+    }, async () => {
+      let stepIssuesFound = 0;
+      const stepPartialFailures: Array<any> = [];
+      const stepCollectedSources: Array<any> = [];
 
-  for (let index = startIndex; index < researchTargets.length; index += 1) {
-    const technology = researchTargets[index];
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      runId,
-      kind: 'fetch',
-      message:
-        technology.source === 'brief'
-          ? `Researching your confirmed stack tool ${technology.name} before anything else...`
-          : technology.source === 'profile'
-          ? `Researching your saved tool ${technology.name} before anything else...`
-          : `Researching ${technology.name} with every source you've connected...`,
-    });
+      const recordPartialFailure = async (tool: string, technologyName: string, message: string) => {
+        stepPartialFailures.push({ tool, technology: technologyName, message });
+        await logActivity(env, {
+          projectId,
+          batchName: 'batch_2_fetch_and_read',
+          runId,
+          kind: 'warning',
+          message,
+        });
+      };
 
-    // Check budget before starting research for this technology.
-    // This guard prevents runaway fetching if something goes wrong with tracking.
-    // With proper counter reset on resume, this should rarely trigger.
-    if (processedThisInvocation > 0 && subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index, {
-        researchTargets,
-        fetchedSources,
-        sourceCandidates,
-        rankedSources,
-        sourceNotes,
-        evidencePacks,
-        researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
-        issuesFound,
-        partialFailures,
-        totalCandidateTargets,
-        collectedSources,
-      });
       await logActivity(env, {
         projectId,
         batchName: 'batch_2_fetch_and_read',
         runId,
-        kind: 'system',
-        message: `Approaching subrequest budget limit — saved checkpoint at technology ${index + 1} of ${researchTargets.length}. Resuming from the next workflow step...`,
+        kind: 'fetch',
+        message:
+          technology.source === 'brief'
+            ? `Researching your confirmed stack tool ${technology.name} before anything else...`
+            : technology.source === 'profile'
+            ? `Researching your saved tool ${technology.name} before anything else...`
+            : `Researching ${technology.name} with every source you've connected...`,
       });
-      return 'checkpointed';
-    }
 
-    const mappedDocs = resolveToolDocsEntry(technology.name);
-    const docsUrl = (technology.docs_url || '').trim() || mappedDocs?.docs || '';
-    const githubRepository = resolveResearchRepository(technology.github_url || '', mappedDocs?.github);
-      const githubUrl = githubRepository
-      ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
-      : (technology.github_url || '').trim();
-      const changelogUrl = (technology.changelog_url || '').trim();
+      const mappedDocs = resolveToolDocsEntry(technology.name);
+      const docsUrl = (technology.docs_url || '').trim() || mappedDocs?.docs || '';
+      const githubRepository = resolveResearchRepository(technology.github_url || '', mappedDocs?.github);
+        const githubUrl = githubRepository
+        ? `https://github.com/${githubRepository.owner}/${githubRepository.repo}`
+        : (technology.github_url || '').trim();
+        const changelogUrl = (technology.changelog_url || '').trim();
 
-    const researchContext: Parameters<typeof facadeFetchDocs>[0] = {
-      env,
-      userId: project.user_id,
-      projectId,
-      batchName: 'batch_2_fetch_and_read',
-      subrequestTracker,
-    };
+      const subrequestTracker = createResearchSubrequestTracker({ initialCount: 0, limit: maxSubrequestBudget, isLocal });
+      const researchContext: Parameters<typeof facadeFetchDocs>[0] = {
+        env,
+        userId: project.user_id,
+        projectId,
+        batchName: 'batch_2_fetch_and_read',
+        subrequestTracker,
+      };
 
-    const fanOutQueries = buildBatch2FanOutQueries(technology.name);
+      const fanOutQueries = buildBatch2FanOutQueries(technology.name);
     
     // docsResult
     let docsResult: ResearchResult;
@@ -4529,8 +4542,7 @@ export async function executeBatch2(
 
     const flattenedWebResearchResults: ResearchResult[] = fanOutSearchResults.flat();
 
-    subrequestCounter = subrequestTracker.count;
-
+    
     if (docsUrl && docsResult.tool === 'failed') {
       await recordPartialFailure(
         'Jina Reader',
@@ -4656,7 +4668,7 @@ export async function executeBatch2(
     const latestVersion = parseLatestVersionFromText(githubResult.content, releaseSignal);
     const lastCommitDate = parseLastCommitDateFromText(githubResult.content);
     const openIssuesCount = parseOpenIssuesCount(githubResult.content);
-    issuesFound += openIssuesCount;
+    stepIssuesFound += openIssuesCount;
 
     const technologySources = dedupeResearchSources([
       ...(docsResult.content
@@ -4702,7 +4714,7 @@ export async function executeBatch2(
     if (docsResult.content) {
       const sourceId = `source_${normalizeBuilderProfileName(`${technology.name}-${docsUrl || docsResult.source}-docs`)}`;
       const sourceType = inferSourceTypeFromToolLabel(toolLabelFromDocTool(docsResult.tool));
-      collectedSources.push({
+      stepCollectedSources.push({
         id: sourceId,
         source_type: sourceType,
         title: `${technology.name} docs`,
@@ -4716,7 +4728,7 @@ export async function executeBatch2(
     if (githubResult.content) {
       const sourceId = `source_${normalizeBuilderProfileName(`${technology.name}-${githubResult.source || githubUrl}-github`)}`;
       const sourceType = inferSourceTypeFromToolLabel(toolLabelFromGithubTool(githubResult.tool));
-      collectedSources.push({
+      stepCollectedSources.push({
         id: sourceId,
         source_type: sourceType,
         title: githubRepository
@@ -4735,7 +4747,7 @@ export async function executeBatch2(
         continue;
       }
 
-      collectedSources.push({
+      stepCollectedSources.push({
         id: `source_${normalizeBuilderProfileName(`${technology.name}-${page.url}-community`)}`,
         source_type: 'community_page',
         title: page.title || `${technology.name} community`,
@@ -4747,58 +4759,50 @@ export async function executeBatch2(
       });
     }
 
-    fetchedSources.push({
-      technology: technology.name,
-      docs_url: docsUrl,
-      github_url: githubUrl,
-      changelog_url: changelogUrl,
-      docs_content: docsResult.content || 'Documentation source unavailable.',
-      github_readme: githubResult.content || 'GitHub repository data unavailable.',
-      latest_version: latestVersion,
-      last_commit_date: lastCommitDate,
-      open_issues_count: openIssuesCount,
-      recent_breaking_changes: recentBreakingChangesRaw,
-      repo_health_summary: repoHealthSummary,
-      community_sentiment:
-        (communitySentiment || formatSearchResults(searchResults)).trim() || 'Community sentiment unavailable.',
-      bug_report_digest: (bugSignal || 'No recent bug reports found.').trim(),
-      source_ledger: technologySources,
-      community_pages: communityPages,
-    });
+      const fetchedSource = {
+        technology: technology.name,
+        docs_url: docsUrl,
+        github_url: githubUrl,
+        changelog_url: changelogUrl,
+        docs_content: docsResult.content || 'Documentation source unavailable.',
+        github_readme: githubResult.content || 'GitHub repository data unavailable.',
+        latest_version: latestVersion,
+        last_commit_date: lastCommitDate,
+        open_issues_count: openIssuesCount,
+        recent_breaking_changes: recentBreakingChangesRaw,
+        repo_health_summary: repoHealthSummary,
+        community_sentiment:
+          (communitySentiment || formatSearchResults(searchResults)).trim() || 'Community sentiment unavailable.',
+        bug_report_digest: (bugSignal || 'No recent bug reports found.').trim(),
+        source_ledger: technologySources,
+        community_pages: communityPages,
+      };
 
-    processedThisInvocation += 1;
+      return {
+          fetchedSource,
+          stepCollectedSources,
+          stepPartialFailures,
+          stepIssuesFound,
+        };
+      });
 
-    const hasMoreWork = index + 1 < researchTargets.length;
-    const processedCount = index + 1;
-    const normalizedCheckpointItemInterval = Math.max(1, checkpointItemInterval);
-    if (
-      hasMoreWork &&
-      (processedCount % normalizedCheckpointItemInterval === 0
-        || subrequestCounter >= maxSubrequestBudget - SUBREQUEST_RESERVE)
-    ) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_2_fetch_and_read', index + 1, {
-        researchTargets,
-        fetchedSources,
-        sourceCandidates,
-        rankedSources,
-        sourceNotes,
-        evidencePacks,
-        researchSourceLedger: dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger)),
-        issuesFound,
-        partialFailures,
-        totalCandidateTargets,
-        collectedSources,
-      });
-      await logActivity(env, {
-        projectId,
-        batchName: 'batch_2_fetch_and_read',
-        runId,
-        kind: 'system',
-        message: `Saved a fetch checkpoint after ${fetchedSources.length} technologies. Continuing from the latest checkpoint...`,
-      });
-      return 'checkpointed';
+      return {
+        ...state,
+        fetchedSources: [...state.fetchedSources, stepResult.fetchedSource],
+        collectedSources: [...state.collectedSources, ...stepResult.stepCollectedSources],
+        partialFailures: [...state.partialFailures, ...stepResult.stepPartialFailures],
+        issuesFound: state.issuesFound + stepResult.stepIssuesFound,
+      };
     }
+  );
+
+  fetchedSources.push(...accumulatorState.fetchedSources);
+  collectedSources.push(...accumulatorState.collectedSources);
+  for (const f of accumulatorState.partialFailures) {
+    pushPartialFailure(partialFailures, f.tool, f.technology, f.message);
+    degradedTools.add(f.tool);
   }
+  issuesFound += accumulatorState.issuesFound;
 
   const sourceLedger = dedupeResearchSources(fetchedSources.flatMap((source) => source.source_ledger));
   const rankedArtifacts = buildRankedResearchSources(fetchedSources, projectBrief);
@@ -4918,7 +4922,7 @@ For each technology, return:
 Preserve specific version and compatibility details.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -4930,11 +4934,11 @@ Preserve specific version and compatibility details.`;
       schemaDescription: schemaDescriptions.batch_2_fetch_and_read,
     });
 
-    const researchByTechnology = new Map(
-      result.data.research.map((entry) => [entry.technology.toLowerCase(), entry] as const),
+    const researchByTechnology = new Map<string, any>(
+      (result.data as any).research.map((entry) => [entry.technology.toLowerCase(), entry] as const),
     );
     const technologyInsightByName = new Map(
-      result.data.research.map((entry) => {
+      (result.data as any).research.map((entry) => {
         const combinedInsight = summarizeSnippet(
           [
             entry.repo_health_summary,
@@ -4956,7 +4960,7 @@ Preserve specific version and compatibility details.`;
         ...entry,
         chars_read: entry.chars_read || entry.summary.length,
         relevance: entry.relevance || 'medium',
-        insight: summarizeSnippet(entry.insight || technologyInsight || entry.summary, 220),
+        insight: summarizeSnippet((entry.insight || technologyInsight || entry.summary) as string, 220),
       }));
 
       return {
@@ -5044,7 +5048,7 @@ export async function executeBatch3(
   projectBrief: LoadedProjectBriefContext,
 ) {
   const startedAt = Date.now();
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const projectDescription = projectBrief.summary || project.description || '';
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
   const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
@@ -5135,7 +5139,7 @@ Produce a structured Architecture Decision Record (ADR):
 Base every single recommendation on the provided research corpus. If a technology was not researched in Batch 2, do not recommend it unless it is a standard browser feature.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -5160,7 +5164,7 @@ Base every single recommendation on the provided research corpus. If a technolog
       Date.now() - startedAt,
     );
     await updateProjectMetadataFromAdr(env, projectId, result.data);
-    for (const gotcha of result.data.gotchas.slice(0, 3)) {
+    for (const gotcha of (result.data as any).gotchas.slice(0, 3)) {
       await logActivity(env, {
         projectId,
         batchName: 'batch_3_architect',
@@ -5174,7 +5178,7 @@ Base every single recommendation on the provided research corpus. If a technolog
       batchName: 'batch_3_architect',
       runId,
       kind: 'complete',
-      message: `Architecture locked in — ${result.data.data_model.length} tables, ${result.data.integrations.length} integrations.`,
+      message: `Architecture locked in — ${(result.data as any).data_model.length} tables, ${(result.data as any).integrations.length} integrations.`,
     });
   } catch (error) {
     const errorClass = classifyAIError(error);
@@ -5254,7 +5258,7 @@ export async function executeBatch4(
 ) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
   const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const projectDescription = projectBrief.summary || '';
@@ -5346,7 +5350,7 @@ Rules:
 - content must be dense and senior-developer quality.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -5412,7 +5416,7 @@ export async function executeBatch5(
   runId: string,
   builderProfile: LoadedBuilderProfileContext,
   projectBrief: LoadedProjectBriefContext,
-  checkpointStepInterval = 3,
+  orchestrator: StepOrchestrator = { runStep: async (n, c, f) => f() },
 ): Promise<BatchExecutionResult> {
   const startedAt = Date.now();
   const project = await getProjectById(env, projectId);
@@ -5420,9 +5424,9 @@ export async function executeBatch5(
     throw new Error('Project not found.');
   }
 
-  const adr = await loadBatchOutput(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
-  const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
-  const research = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const adr = await loadBatchOutput<Batch3Architect>(env, projectId, 'batch_3_architect', Batch3ArchitectSchema);
+  const plan = await loadBatchOutput<PlanAuthoringRecord>(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
+  const research = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
   const chunkStore = resolveChunkStoreFromBatch2(research);
   const evidencePacks = resolveEvidencePacksFromBatch2(research);
   const projectStack = [project.stack || '', projectBrief.summary || project.description || '']
@@ -5430,30 +5434,12 @@ export async function executeBatch5(
     .replace(/\s+/g, ' ')
     .trim()
     || 'web app';
-  const checkpoint = await loadGenerationCheckpoint<Batch5CheckpointData>(
-    env,
-    projectId,
-    runId,
-    'batch_5_enrich_steps',
-  );
+    const planSteps = flattenPlanSteps(plan);
+  const stepResearchContexts: StepResearchContext[] = [];
+  const isLocal = env.ENVIRONMENT === 'local';
   const connectedTools = await getConnectedResearchTools(env, project.user_id);
-  const researchManifest = buildResearchManifest(
-    builderProfile,
-    projectBrief.summary || project.description || '',
-    {
-      confirmedStackTools: projectBrief.confirmedStackTools,
-      inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean),
-    },
-  );
-  const planSteps = checkpoint?.data.steps || flattenPlanSteps(plan);
-  const stepResearchContexts: StepResearchContext[] = checkpoint?.data.stepResearchContexts
-    ? [...checkpoint.data.stepResearchContexts]
-    : [];
-  const startIndex = checkpoint?.currentIndex ?? 0;
-  const subrequestTracker = createResearchSubrequestTracker({
-    initialCount: 0,
-    limit: 40, // Cloudflare standard limit is 50
-  });
+  const researchManifest = buildResearchManifest(builderProfile, projectBrief.summary || project.description || '', { confirmedStackTools: projectBrief.confirmedStackTools, inferredTechnologies: research.research.map((entry) => entry.technology).filter(Boolean) });
+
 
   await emitBatchStart(env, projectId, runId, 'batch_5_enrich_steps');
   await logActivity(env, {
@@ -5464,83 +5450,74 @@ export async function executeBatch5(
     message: 'Refreshing every step with live docs, issues, and current implementation notes...',
   });
 
-  if (checkpoint) {
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'system',
-      message: `Resuming step research at step ${Math.min(startIndex + 1, planSteps.length)} of ${planSteps.length}.`,
-    });
-  }
+  
+  const accumulatorState = await runStatefulAccumulatorLoop(
+    env,
+    projectId,
+    runId,
+    'batch_5_enrich_steps',
+    'batch5-step',
+    planSteps,
+    [] as StepResearchContext[],
+    orchestrator,
+    5, // WORKFLOW_BATCH5_CHECKPOINT_INTERVAL
+    async (step, index, state, loopOrchestrator) => {
+      const stepResult = await loopOrchestrator.runStep('process', {
+      retries: { limit: 2, delay: '20 seconds', backoff: 'exponential' },
+      timeout: '20 minutes'
+    }, async () => {
+      await maybeTouchGenerationHeartbeat(env, projectId, runId);
 
-  for (let index = startIndex; index < planSteps.length; index += 1) {
-    const step = planSteps[index];
-
-    await maybeTouchGenerationHeartbeat(env, projectId, runId);
-
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'fetch',
-      message: `Refreshing ${step.title} with live docs and current implementation notes...`,
-    });
-
-    const stepResearch = await collectStepResearchContext({
-      env,
-      userId: project.user_id,
-      stepId: step.id,
-      stepTitle: step.title,
-      stepObjective: step.objective,
-      stepWhyItMatters: step.why_it_matters,
-      stepCategory: step.category,
-      stepDoneWhen: step.done_when,
-      stepIsGate: step.is_gate,
-      adr,
-      research,
-      batchName: 'batch_5_enrich_steps',
-      projectId,
-      connectedTools,
-      researchManifest,
-      runId,
-      subrequestTracker,
-    });
-
-    stepResearchContexts.push(stepResearch);
-
-    await logActivity(env, {
-      projectId,
-      batchName: 'batch_5_enrich_steps',
-      runId,
-      kind: 'fetch',
-      message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
-    });
-
-    // Standard overhead for current step (heartbeat, logs)
-    subrequestTracker.count += 3;
-
-    const normalizedCheckpointStepInterval = Math.max(1, checkpointStepInterval);
-    const shouldCheckpoint = (index + 1 < planSteps.length) && (
-      (index + 1 - startIndex) >= normalizedCheckpointStepInterval || // Process groups safely within one turn
-      subrequestTracker.count >= 32 // Or when near subrequest limit (40 - 8 reserve)
-    );
-
-    if (shouldCheckpoint) {
-      await saveGenerationCheckpoint(env, projectId, runId, 'batch_5_enrich_steps', index + 1, {
-        steps: planSteps,
-        stepResearchContexts,
-      });
       await logActivity(env, {
         projectId,
         batchName: 'batch_5_enrich_steps',
         runId,
-        kind: 'system',
-        message: `Saved a step-research checkpoint after ${stepResearchContexts.length} step${stepResearchContexts.length === 1 ? '' : 's'}. Continuing from the latest checkpoint...`,
+        kind: 'fetch',
+        message: `Refreshing ${step.title} with live docs and current implementation notes...`,
       });
-      return 'checkpointed';
+
+      const subrequestTracker = createResearchSubrequestTracker({
+        initialCount: 0,
+        limit: 40,
+        isLocal,
+      });
+
+      const stepResearch = await collectStepResearchContext({
+        env,
+        userId: project.user_id,
+        stepId: step.id,
+        stepTitle: step.title,
+        stepObjective: step.objective,
+        stepWhyItMatters: step.why_it_matters,
+        stepCategory: step.category,
+        stepDoneWhen: step.done_when,
+        stepIsGate: step.is_gate,
+        adr,
+        research,
+        batchName: 'batch_5_enrich_steps',
+        projectId,
+        connectedTools,
+        researchManifest,
+        runId,
+        subrequestTracker,
+      });
+
+      await logActivity(env, {
+        projectId,
+        batchName: 'batch_5_enrich_steps',
+        runId,
+        kind: 'fetch',
+        message: `${step.title} research refreshed — ${stepResearch.docs.length} doc source${stepResearch.docs.length === 1 ? '' : 's'}, ${stepResearch.issues.length} issue${stepResearch.issues.length === 1 ? '' : 's'}, ${stepResearch.community.length} community source${stepResearch.community.length === 1 ? '' : 's'}.`,
+      });
+
+      return stepResearch;
+      });
+
+      return [...state, stepResult];
     }
-  }
+  );
+
+  stepResearchContexts.push(...accumulatorState);
   const stepResearchSlice = retrieveStepResearchSlice(
     planSteps,
     projectStack,
@@ -5633,7 +5610,7 @@ For each step, obey any requirements array included in the live step research co
 Populate navigation_links from the researched docs URLs so the user can click directly into setup pages.`;
 
   try {
-    const result = await callValidatedBatch(provider, {
+    const result = await callValidatedBatch<any>(provider, {
       env,
       projectId,
       runId,
@@ -5648,7 +5625,7 @@ Populate navigation_links from the researched docs URLs so the user can click di
     const finalEnrichments = ensureCompleteStepEnrichments(
       planSteps,
       stepResearchById,
-      result.data.enrichments,
+      (result.data as any).enrichments,
     );
     const finalResult: Batch5EnrichSteps = {
       enrichments: finalEnrichments,
@@ -5706,9 +5683,9 @@ export async function executeBatch6(
 ) {
   const startedAt = Date.now();
   const reviewContext = await loadArchitectureReviewContext(env, projectId);
-  const batch2 = await loadBatchOutput(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
-  const plan = await loadBatchOutput(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
-  const enrichments = await loadBatchOutput(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
+  const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
+  const plan = await loadBatchOutput<PlanAuthoringRecord>(env, projectId, 'batch_4_plan_build', Batch4PlanBuildSchema);
+  const enrichments = await loadBatchOutput<Batch5EnrichSteps>(env, projectId, 'batch_5_enrich_steps', Batch5EnrichStepsSchema);
   const chunkStore = resolveChunkStoreFromBatch2(batch2);
   const evidencePacks = resolveEvidencePacksFromBatch2(batch2);
   const fileResearchSlice = retrieveResearchSlice(

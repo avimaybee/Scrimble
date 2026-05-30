@@ -1,5 +1,5 @@
 import type { PlanDiff } from '../types/diff';
-import type { Bindings } from './types';
+import type { Bindings } from '@scrimble/core';
 
 type ApplyPlanDiffResult = {
   updatedStepIds: string[];

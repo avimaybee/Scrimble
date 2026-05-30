@@ -1,4 +1,4 @@
-import { normalizeBuilderProfileName, type BuilderProfileCategory } from '../../src/lib/builder-profile';
+import { normalizeBuilderProfileName, type BuilderProfileCategory } from './builder-profile';
 import { resolveToolDocsEntry } from './research';
 import type { DeclaredResearchTool } from './user-tools';
 import {

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
+import { normalizeBuilderProfileName } from './builder-profile';
 import { buildToolsContext } from './user-tools';
 import type { Bindings } from './types';
 

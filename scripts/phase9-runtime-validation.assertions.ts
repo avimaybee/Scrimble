@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {
   buildGenerationRuntimeContract,
   type GenerationRuntimeState,
-} from '../functions/server/generation-runtime.ts';
+} from '@scrimble/core';
 
 function runTest(name: string, test: () => void) {
   try {

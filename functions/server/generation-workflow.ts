@@ -5,8 +5,8 @@ import {
   Batch3ArchitectSchema,
   PlanAuthoringRecordSchema,
   Batch5EnrichStepsSchema,
-} from './generation-schemas';
-import { persistGenerationStreamEvent, resetGenerationThinkingState } from './generation-events';
+} from '@scrimble/core';
+import { persistGenerationStreamEvent, resetGenerationThinkingState } from '@scrimble/core';
 import {
   executeBatch1,
   executeBatch2,
@@ -19,10 +19,10 @@ import {
   pauseForArchitectureReview,
   saveArchitectureReviewApproval,
   type ProviderConfig,
-} from './generation-pipeline';
-import { getGenerationRuntimeState, updateGenerationRunStatus } from './generation-runtime';
-import { loadProjectBriefContext } from './project-briefs';
-import { loadBuilderProfileContext } from './user-tools';
+} from '@scrimble/core';
+import { getGenerationRuntimeState, updateGenerationRunStatus } from '@scrimble/core';
+import { loadProjectBriefContext } from '@scrimble/core';
+import { loadBuilderProfileContext } from '@scrimble/core';
 import { saveToR2, loadFromR2 } from './workflow-storage';
 import { WORKFLOW_EVENT_TYPE_ARCHITECTURE_APPROVED } from './generation-dispatch';
 import type {
@@ -31,7 +31,7 @@ import type {
   GenerationRunStatus,
   ProjectGenerationStatus,
   ResolvedGenerationProviderConfig,
-} from './types';
+} from '@scrimble/core';
 
 const DEVELOPER_TOOLS = new Set([
   'vs code',
@@ -72,6 +72,9 @@ type GenerationPayload = {
   stackTechnologies: Array<{ name: string; docsUrl?: string; githubRepo?: string }>;
 };
 
+type Batch2LoopOutcome = { done: false } | { done: true; batch2Key: string };
+type Batch5LoopOutcome = { done: false } | { done: true; enrichmentsKey: string };
+
 type ReviewApprovalEventPayload = {
   feedback: string;
   preferredIde: string;
@@ -88,14 +91,6 @@ type ProjectGenerationRow = {
   stack: string | null;
   current_generation_run_id: string | null;
 };
-
-type Batch2LoopOutcome =
-  | { done: true; batch2Key: string }
-  | { done: false };
-
-type Batch5LoopOutcome =
-  | { done: true; enrichmentsKey: string }
-  | { done: false };
 
 class WorkflowRunStoppedError extends Error {
   constructor(message: string) {
@@ -238,7 +233,7 @@ async function resolveTechsToResearch(
   env: Bindings,
   projectId: string,
 ): Promise<Array<{ name: string; docsUrl?: string; githubRepo?: string }>> {
-  const batch1 = await loadBatchOutput(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
+  const batch1 = await loadBatchOutput<any>(env, projectId, 'batch_1_research_stack', Batch1ResearchStackSchema);
   return batch1.technologies
     .map((technology) => ({
       name: technology.name,
@@ -334,7 +329,6 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
               runId,
               builderProfile,
               projectBrief,
-              WORKFLOW_BATCH2_CHECKPOINT_INTERVAL,
             );
 
             if (result === 'checkpointed') {
@@ -515,7 +509,6 @@ export class GenerationWorkflow extends WorkflowEntrypoint<Bindings, GenerationP
               runId,
               builderProfile,
               projectBrief,
-              WORKFLOW_BATCH5_CHECKPOINT_INTERVAL,
             );
 
             if (result === 'checkpointed') {

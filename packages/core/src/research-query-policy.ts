@@ -1,4 +1,4 @@
-import { normalizeBuilderProfileName } from '../../src/lib/builder-profile';
+import { normalizeBuilderProfileName } from './builder-profile';
 
 export type ResearchQueryFamily = 'setup' | 'errors' | 'release_notes' | 'deployment';
 

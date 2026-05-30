@@ -3,7 +3,7 @@ import {
   buildGenerationRuntimeContract,
   mapProjectRowToResponse,
   type GenerationRuntimeState,
-} from '../functions/server/generation-runtime.ts';
+} from '@scrimble/core';
 import { normalizeGenerationRuntime } from '../src/lib/generation-runtime.ts';
 
 function runTest(name: string, test: () => void) {

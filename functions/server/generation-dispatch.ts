@@ -1,11 +1,11 @@
-import { getProvider } from './ai';
+import { getProvider } from '@scrimble/core';
 import type {
   Bindings,
   GenerationWorkflowPayload,
   ProjectGenerationStatus,
   ResolvedGenerationProviderConfig,
   WorkflowApprovalPayload,
-} from './types';
+} from '@scrimble/core';
 import { GENERATION_WORKFLOW_PROTOCOL_VERSION } from './workflow-protocol';
 
 export type GenerationDispatchKind =

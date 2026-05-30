@@ -1,4 +1,4 @@
-import { decrypt } from '../utils/crypto';
+import { decrypt } from './utils/crypto';
 import type { Bindings, ProviderType } from './types';
 
 type StreamCallbacks = {
