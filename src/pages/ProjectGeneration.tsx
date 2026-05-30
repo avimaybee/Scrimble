@@ -322,6 +322,7 @@ export default function ProjectGeneration() {
   const [currentActivity, setCurrentActivity] = useState<ActivityFeedItem | null>(null);
   const [reviewData, setReviewData] = useState<ArchitectureReviewResponse | null>(null);
   const [reviewFeedback, setReviewFeedback] = useState('');
+  const [reviewDraftLastSavedAt, setReviewDraftLastSavedAt] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [isResuming, setIsResuming] = useState(false);
   const [showResumeBadge, setShowResumeBadge] = useState(false);
@@ -468,7 +469,14 @@ export default function ProjectGeneration() {
       setError('');
       setReviewData(review);
       reviewDataRef.current = review;
-      setReviewFeedback((previous) => (hasEditedReview ? previous : review.review_feedback));
+      setReviewFeedback((previous) => {
+        if (hasEditedReview) return previous;
+        if (review.review_draft) return review.review_draft.feedback;
+        return review.review_feedback;
+      });
+      if (review.review_draft) {
+        setReviewDraftLastSavedAt(review.review_draft.lastSavedAt);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : UI_COPY.generation.reviewLoadFailed);
     } finally {
@@ -1278,6 +1286,24 @@ export default function ProjectGeneration() {
     void requestResume('automatic');
   }, [autoRecoveryFailed, autoRecoveryKey, isAutoRecovering, isResuming, requestResume, showResumeBadge]);
 
+  useEffect(() => {
+    if (!hasEditedReview || !id || status?.generation_runtime?.lifecycleStatus !== 'awaiting_review') {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      dbService.saveArchitectureReviewDraft(id, reviewFeedback).then((res) => {
+        if (res.success) {
+          setReviewDraftLastSavedAt(res.savedAt);
+        }
+      }).catch((err) => {
+        console.error('Failed to save draft:', err);
+      });
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [hasEditedReview, id, reviewFeedback, status?.generation_runtime?.lifecycleStatus]);
+
   if (isLoading && !status) {
     return (
       <FullscreenStatus
@@ -1654,7 +1680,14 @@ export default function ProjectGeneration() {
                           <div className="border-t border-border-subtle" />
 
                           <section className="py-7">
-                            <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Anything to change?</div>
+                            <div className="flex items-center justify-between">
+                              <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-muted">Anything to change?</div>
+                              {reviewDraftLastSavedAt && (
+                                <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-text-tertiary">
+                                  Draft saved {new Date(reviewDraftLastSavedAt).toLocaleTimeString()}
+                                </div>
+                              )}
+                            </div>
                             <textarea
                               ref={feedbackRef}
                               value={reviewFeedback}

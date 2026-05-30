@@ -551,6 +551,13 @@ export const dbService = {
     return fetchAPI<ArchitectureReviewResponse>(`/projects/${projectId}/architecture-review`);
   },
 
+  async saveArchitectureReviewDraft(projectId: string, feedback: string): Promise<{ success: boolean; savedAt: string }> {
+    return fetchAPI<{ success: boolean; savedAt: string }>(`/projects/${projectId}/architecture-review/draft`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    });
+  },
+
   async approveArchitectureReview(projectId: string, feedback: string, preferredIde = ''): Promise<{
     success: boolean;
     generation_runtime: GenerationRuntime;

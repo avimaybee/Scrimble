@@ -164,6 +164,7 @@ export type ArchitectureReviewPayload = {
   data_quality: ArchitectureReviewDataQuality;
   review_feedback: string;
   review_feedback_provided: boolean;
+  review_draft: { feedback: string; lastSavedAt: string } | null;
 };
 
 type ArchitectureReviewContext = {
@@ -2451,6 +2452,7 @@ function buildArchitectureReviewPayload(
   adr: Batch3Architect,
   input: Record<string, unknown>,
   research: Batch2FetchAndRead,
+  reviewDraft?: { feedback: string; lastSavedAt: string } | null,
 ): ArchitectureReviewPayload {
   const seen = new Set<string>();
   const stackCards = adr.integrations.reduce<ArchitectureReviewStackCard[]>((cards, integration) => {
@@ -2499,6 +2501,7 @@ function buildArchitectureReviewPayload(
     data_quality: research.data_quality,
     review_feedback: reviewFeedback,
     review_feedback_provided: reviewFeedbackProvided,
+    review_draft: reviewDraft || null,
   };
 }
 
@@ -3509,7 +3512,38 @@ async function loadArchitectureReviewContext(env: Bindings, projectId: string): 
 export async function getArchitectureReviewPayload(env: Bindings, projectId: string) {
   const context = await loadArchitectureReviewContext(env, projectId);
   const batch2 = await loadBatchOutput<Batch2FetchAndRead>(env, projectId, 'batch_2_fetch_and_read', Batch2FetchAndReadSchema);
-  return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2);
+  
+  const runRow = (await env.DB.prepare('SELECT review_draft FROM generation_runs WHERE id = ?')
+    .bind(context.runId)
+    .first()) as { review_draft: string | null } | null;
+  
+  const draftStr = runRow?.review_draft;
+  let reviewDraft = null;
+  if (draftStr) {
+    try {
+      reviewDraft = JSON.parse(draftStr);
+    } catch (e) {
+      // ignore parse error
+    }
+  }
+
+  return buildArchitectureReviewPayload(projectId, context.adr, context.input, batch2, reviewDraft);
+}
+
+export async function saveArchitectureReviewDraft(
+  env: Bindings,
+  projectId: string,
+  feedback: string,
+) {
+  const context = await loadArchitectureReviewContext(env, projectId);
+  const draft = JSON.stringify({
+    feedback,
+    lastSavedAt: new Date().toISOString(),
+  });
+
+  await env.DB.prepare('UPDATE generation_runs SET review_draft = ? WHERE id = ?')
+    .bind(draft, context.runId)
+    .run();
 }
 
 export async function saveArchitectureReviewApproval(
@@ -3529,6 +3563,10 @@ export async function saveArchitectureReviewApproval(
 
   await env.DB.prepare('UPDATE agent_runs SET input = ? WHERE id = ?')
     .bind(JSON.stringify(nextInput), context.runId)
+    .run();
+
+  await env.DB.prepare('UPDATE generation_runs SET review_draft = NULL WHERE id = ?')
+    .bind(context.runId)
     .run();
 
   return {

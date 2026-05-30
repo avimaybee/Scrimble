@@ -634,4 +634,8 @@ export interface ArchitectureReviewResponse {
   data_quality: ArchitectureReviewDataQuality;
   review_feedback: string;
   review_feedback_provided: boolean;
+  review_draft?: {
+    feedback: string;
+    lastSavedAt: string;
+  } | null;
 }
