@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "updatedAt": "2026-04-09T18:50:20.975Z",
+  "profiles": {
+    "profile-openai": {
+      "profileId": "profile-openai",
+      "provider": "openai",
+      "authStrategy": "api_key",
+      "authStatus": "ready",
+      "authSource": "profile",
+      "modelStrategy": "explicit",
+      "model": "gpt-4o",
+      "modelAvailability": "available",
+      "capability": {
+        "source": "cached",
+        "availableModels": [
+          "gpt-4o",
+          "gpt-4.1"
+        ],
+        "validatedAt": "2026-04-09T16:56:14.500Z",
+        "stale": true
+      },
+      "issues": [],
+      "usabilityIssues": [],
+      "validatedAt": "2026-04-09T16:56:14.500Z"
+    },
+    "openai-ee7585c3": {
+      "profileId": "openai-ee7585c3",
+      "provider": "openai",
+      "authStrategy": "api_key",
+      "authStatus": "ready",
+      "authSource": "env:OPENAI_API_KEY",
+      "modelStrategy": "explicit",
+      "model": "gpt-4o",
+      "modelAvailability": "available",
+      "capability": {
+        "source": "cached",
+        "availableModels": [
+          "gpt-4o",
+          "gpt-4.1"
+        ],
+        "validatedAt": "2026-04-09T18:37:20.596Z"
+      },
+      "issues": [],
+      "usabilityIssues": [],
+      "validatedAt": "2026-04-09T18:37:20.596Z"
+    },
+    "openai-cdb97180": {
+      "profileId": "openai-cdb97180",
+      "provider": "openai",
+      "authStrategy": "api_key",
+      "authStatus": "ready",
+      "authSource": "env:OPENAI_API_KEY",
+      "modelStrategy": "explicit",
+      "model": "gpt-4o",
+      "modelAvailability": "available",
+      "capability": {
+        "source": "cached",
+        "availableModels": [
+          "gpt-4o",
+          "gpt-4.1"
+        ],
+        "validatedAt": "2026-04-09T18:38:05.119Z"
+      },
+      "issues": [],
+      "usabilityIssues": [],
+      "validatedAt": "2026-04-09T18:38:05.119Z"
+    },
+    "openai-7c25e61b": {
+      "profileId": "openai-7c25e61b",
+      "provider": "openai",
+      "authStrategy": "api_key",
+      "authStatus": "ready",
+      "authSource": "env:OPENAI_API_KEY",
+      "modelStrategy": "explicit",
+      "model": "gpt-4o",
+      "modelAvailability": "available",
+      "capability": {
+        "source": "cached",
+        "availableModels": [
+          "gpt-4o",
+          "gpt-4.1"
+        ],
+        "validatedAt": "2026-04-09T18:38:46.759Z"
+      },
+      "issues": [],
+      "usabilityIssues": [],
+      "validatedAt": "2026-04-09T18:38:46.759Z"
+    }
+  }
+}

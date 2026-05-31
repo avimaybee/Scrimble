@@ -21,7 +21,7 @@
     "commander": "^12.0.0"
   },
   "devDependencies": {
-    "@scrimble/core": "*",
+    "@scrimble/core": "workspace:*",
     "tsup": "^8.5.1"
   }
 }

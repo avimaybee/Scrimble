@@ -1,56 +1,33 @@
 {
-  "name": "react-example",
+  "name": "scrimble",
+  "version": "0.1.0",
   "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "workspaces": [
-    "packages/*"
-  ],
-  "scripts": {
-    "deploy": "vite build && wrangler pages deploy dist",
-    "deploy:consumer": "wrangler deploy --config wrangler.consumer.toml",
-    "deploy:all": "npm run deploy && npm run deploy:consumer",
-    "dev": "vite --port=3000 --host=0.0.0.0",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+  "description": "CLI-resident execution companion for solo AI-native builders",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avimaybee/Scrimble.git"
   },
-  "dependencies": {
-    "@google/genai": "^1.29.0",
-    "@tailwindcss/vite": "^4.1.14",
-    "@vitejs/plugin-react": "^5.0.4",
-    "@xyflow/react": "^12.10.1",
-    "canvas-confetti": "^1.9.4",
-    "class-variance-authority": "^0.7.1",
-    "clsx": "^2.1.1",
-    "date-fns": "^4.1.0",
-    "firebase": "^12.10.0",
-    "framer-motion": "^12.35.1",
-    "hono": "^4.12.5",
-    "jszip": "^3.10.1",
-    "lucide-react": "^0.546.0",
-    "motion": "^12.23.24",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "react-markdown": "^10.1.0",
-    "react-router-dom": "^7.13.1",
-    "shadcn": "^4.0.1",
-    "sonner": "^2.0.7",
-    "tailwind-merge": "^3.5.0",
-    "tw-animate-css": "^1.4.0",
-    "vite": "^6.2.0",
-    "zod": "^4.3.6",
-    "zustand": "^5.0.11"
+  "keywords": ["cli", "ai", "productivity", "execution", "planning"],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/avimaybee/Scrimble/issues"
+  },
+  "homepage": "https://github.com/avimaybee/Scrimble#readme",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "test": "turbo test",
+    "clean": "turbo clean && rimraf node_modules"
   },
   "devDependencies": {
-    "@types/canvas-confetti": "^1.9.0",
-    "@types/node": "^22.14.0",
-    "autoprefixer": "^10.4.21",
-    "tailwindcss": "^4.1.14",
-    "tsx": "^4.21.0",
-    "typescript": "~5.8.2",
-    "vite": "^6.2.0",
-    "wrangler": "^4.76.0"
+    "turbo": "^2.4.0",
+    "rimraf": "^6.0.0",
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

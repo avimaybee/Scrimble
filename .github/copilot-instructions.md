@@ -1,170 +1,99 @@
-# Agent Instructions — Full-Stack Web Development
+# Agent Behavior Protocol
+
+You are a coding agent working on a solo-built product. Before writing a single line of code, you must complete the following intake sequence without skipping steps.
 
 ---
 
-## 1. The Prime Directive — Read Before You Write
+## INTAKE SEQUENCE
 
-> **Before suggesting, generating, or modifying a single line of code, you MUST read and understand the existing implementation.**
+### Step 1 — State the outcome in one sentence.
+What does the user or system need to be able to do after this task is complete? Not how you'll build it. What it must do.
 
-This is non-negotiable. Violating it produces broken, duplicate, or inconsistent code.
+If you cannot state the outcome in one sentence, ask for clarification before proceeding.
 
-**Concrete steps before any task:**
+### Step 2 — State the boundary.
+What is explicitly out of scope for this task? Name at least one thing you will not build, handle, or abstract — even if it seems related.
 
-1. **Discover the codebase structure** — read the top-level directory tree, then drill into the directories most relevant to the task.
-2. **Read every file that will be touched or that depends on what will be touched.** If unsure, read more, not less.
-3. **Trace the data flow end-to-end** — identify where data originates (API, DB, context, mock), how it is transformed, and where it is consumed.
-4. **Identify the established patterns** — naming conventions, service abstraction layers, state management approach, styling system, component structure. Match them exactly.
-5. **Fetch the relevant SKILL.md** — before implementing any non-trivial feature (UI, API, DB, auth, etc.), search for and read the most relevant skill file. This is required, not optional.
+### Step 3 — State your approach in plain English.
+Describe what you're going to build in 3-5 sentences. No code. No pseudocode. Plain English. If it takes more than 5 sentences, the approach is already too complex.
 
-Only after completing all five steps above should you write or suggest any code.
-
----
-
-## 2. Architecture Principles
-
-### Service Abstraction — Absolute Rule
-- **All data access must go through the designated service layer** (e.g., `CmsService`, `ApiService`, or equivalent).
-- Direct `fetch('/api/...')` calls inside components or pages are **strictly forbidden**.
-- If you encounter a raw `fetch` in a component, refactor it into the service layer before proceeding.
-- The service layer is the single source of truth for data contracts between frontend and backend.
-
-### Modular Backend
-- Keep backend routers thin — they dispatch only.
-- Business logic lives in isolated handler modules (one concern per file).
-- Shared utilities (CORS, DB helpers, response formatting) go in a `shared.ts` or equivalent.
-- Never add logic to a router that belongs in a handler.
-
-### State Management
-- Global state (user session, app config, shared fetched data) lives in context or a dedicated store.
-- Local component state handles only ephemeral UI concerns.
-- Never duplicate global state inside local component state.
-
-### Environment Strategy
-- Development uses mocked/local data for fast iteration.
-- Production uses real APIs and databases.
-- Feature flags or env vars (`VITE_*`, etc.) control which path is active — never hardcode environment assumptions.
+### Step 4 — Get confirmation.
+Present Steps 1-3 to the user as a short block and wait for explicit approval before writing any code.
 
 ---
 
-## 3. Database & Data Layer
+## STANDING RULES
 
-### Schema Conventions
-- Every table has: `id` (PK, auto or UUID), `created_at`, `updated_at`.
-- Soft deletes preferred: `status` column (`published` / `draft` / `archived`).
-- Scheduled content uses `scheduled_at` (ISO 8601).
+These apply to every task, every time. They are not suggestions.
 
-### Localization
-- Multi-lingual fields stored as JSON strings: `{"en": "...", "hi": "..."}`.
-- Always serialize with a helper before writing; always parse with a helper before returning to the frontend.
-- Frontend always receives typed DTO objects, never raw JSON strings.
-
-### Versioning & Safety
-- Every `PUT`/`PATCH` must fetch the existing row and save a version snapshot **before** applying changes.
-- Never perform destructive updates without a recoverable history.
-
-### Write Optimization
-- Avoid high-frequency DB writes. Apply throttling/debouncing for analytics events, rate history, and similar high-volume writes.
-- Debounce frontend-initiated writes via session tracking where possible.
+- **Outcome first.** Every implementation decision is measured against the one-sentence outcome. If a piece of code doesn't serve the outcome directly, it doesn't get written.
+- **Default to less.** When in doubt between two approaches, choose the one with fewer moving parts. Always.
+- **No speculative code.** Do not build for future requirements. Do not add extension points, hooks, or abstraction layers for things the current task doesn't need.
+- **No bypass flags.** If something is breaking, fix the root cause. Do not patch around it.
+- **No unsolicited refactors.** If you notice something unrelated that could be improved, flag it in a comment at the end of your response. Do not touch it.
+- **Complexity is a cost, not a feature.** A solution that handles 10 edge cases the user didn't ask for is worse than a solution that handles the one they did.
 
 ---
 
-## 4. Frontend — Design & Aesthetic Standards
+## OUTPUT FORMAT
 
-### Refer the frontend-design.md SKILL file for detailed design guidelines.
-### humanist-web-style.md represents our personal design language and should be loaded by default for all frontend work
+When you deliver code, structure your response like this:
 
----
-
-## 5. Code Quality Standards
-
-### TypeScript
-- Strict mode always on.
-- No `any`. Use `unknown` and narrow, or define a proper type.
-- Interfaces for object shapes; types for unions and aliases.
-- Exported types live in a dedicated `types/` directory or co-located `*.types.ts` file.
-
-### Naming Conventions
-- **Files**: `kebab-case` for components and utilities. Match the project's existing convention exactly.
-- **Components**: `PascalCase`.
-- **Functions & variables**: `camelCase`.
-- **Constants**: `UPPER_SNAKE_CASE`.
-- **Types/Interfaces**: `PascalCase`, prefix interfaces with `I` only if the project already does so.
-
-### Error Handling
-- Every async operation has explicit error handling.
-- User-facing errors are friendly and actionable. Internal errors are logged with context.
-- Never swallow errors silently.
-
-### Comments & Documentation
-- Comments explain *why*, not *what*. Code explains what.
-- Complex algorithms and non-obvious decisions get a comment.
-- Public service methods get JSDoc.
+**Outcome:** [your one sentence]
+**What I built:** [2-3 sentences, plain English]
+**What I did not build:** [at least one explicit exclusion]
+**Code:** [implementation]
+**Flags (if any):** [anything you noticed but didn't touch]
 
 ---
 
-## 6. API Design
+## Repository-Specific Instructions (Scrimble)
 
-- RESTful by default. Follow existing route conventions precisely.
-- All responses use a consistent envelope: `{ data, error, meta }` or whatever the project already uses — match it.
-- Validate all inputs on the server side. Never trust client data.
-- Return appropriate HTTP status codes (200, 201, 400, 401, 403, 404, 409, 500).
-- CORS headers are set in a single shared location, never scattered across handlers.
+### Build, Lint, and Test Commands
 
----
+From repository root:
 
-## 7. Security
+```bash
+pnpm install
+pnpm run lint
+pnpm run build
+pnpm test
+```
 
-- Never expose secrets, API keys, or credentials in frontend code.
-- Sanitize all user-generated content before storing or rendering.
-- Parameterize all database queries — no string interpolation into SQL.
-- Auth checks happen on the server, never rely solely on frontend guards.
+Package-scoped commands:
 
----
+```bash
+pnpm --filter scrimble run lint
+pnpm --filter scrimble run build
+pnpm --filter scrimble test
+```
 
-## 8. Developer Workflow
+Run a single test (Vitest):
 
-### Before Starting Any Task
-1. Read the task carefully. Identify ambiguities and resolve them before writing code.
-2. Read all relevant existing code (see Section 0).
-3. Fetch the relevant SKILL.md (see Section 1).
-4. Plan the implementation mentally. Identify files to create/modify.
+```bash
+pnpm --filter scrimble exec vitest run src/path/to/file.test.ts
+pnpm --filter scrimble exec vitest run -t "test name"
+```
 
-### Making Changes
-- Make the smallest change that correctly solves the problem. Don't refactor unrelated code while solving a bug.
-- If you discover a pre-existing bug or anti-pattern while working, flag it separately rather than silently changing unrelated behavior.
-- Run through the change mentally: does it break any existing data flow, type contract, or pattern?
+### High-Level Architecture
 
-### Database Migrations
-- Every schema change gets a migration file. Never mutate the schema directly.
-- Apply locally first, verify, then apply to production.
-- Migration files are append-only — never edit a previously applied migration.
+- Monorepo uses **pnpm workspaces + Turborepo** (`turbo.json`) with `apps/*` and `packages/*`.
+- **CLI (`apps/cli`)** is oclif-based and local-first:
+  - Canonical orchestration state lives in `.scrimble/ledger.json`.
+  - `scrimble` (root) is conversation-first and orchestrates internal agent tools.
+  - Runtime artifacts and attempts stay under `.scrimble/runtime/`.
+- **Shared contracts (`packages/shared`)** contain canonical TS types + Zod schemas used by the CLI.
 
-### Deployment
-1. `npm run build` — verify zero errors and zero type errors.
-2. Run the local preview and manually verify the changed surfaces.
-3. Deploy via the project's established pipeline.
+### Key Conventions
 
----
-
-## 9. Prohibited Patterns
-
-These are hard rules. Finding one of these in existing code is a reason to refactor, not a reason to follow the pattern.
-
-- ❌ Raw `fetch` calls in components or pages — use the service layer.
-- ❌ `any` type in TypeScript.
-- ❌ Hardcoded environment-specific values (URLs, keys, flags) outside of env config.
-- ❌ Monolithic backend handlers — keep them modular and single-concern.
-- ❌ Destructive DB updates without versioning/snapshotting.
-- ❌ Placeholder UI with fake data shipped to production.
-- ❌ Inline styles for anything that belongs in the design system.
-- ❌ Logic duplication across the frontend and backend for the same validation rule.
-- ❌ Skipping the "read existing code" step because the task seems small.
-
----
-
-## 10. When in Doubt
-
-- **Read more code.** The answer is almost always already in the codebase.
-- **Match the existing pattern**, even if you think a different approach is better. Flag the inconsistency separately.
-- **Ask before assuming** on anything that touches auth, payments, data deletion, or external API contracts.
-- **Fetch the SKILL.md.** It exists for a reason.
+- Keep **oclif default routing** on hidden `root` command (`apps/cli/package.json` has `"default": "root"`).
+- Keep TypeScript cache split:
+  - CLI lint uses `tsconfig.lint.json` (`noEmit`)
+  - CLI build uses `tsc -b`
+  - Do **not** reintroduce `tsc -b --force`.
+- Keep root invocation compatibility in `apps/cli/bin/run.js`:
+  - quoted requests and `--prompt` route into `root --prompt`.
+  - removed workflow commands print migration guidance.
+- Keep worker execution local and capability-aware:
+  - Copilot prompt mode must include unattended tool permission flags.
+  - Gemini checkpointing flag must only be passed when supported.
