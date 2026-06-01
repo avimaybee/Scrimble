@@ -55,13 +55,106 @@ program
     
     applyMigrations(dbWrapper.getDb(), srcMigrations);
     
+    const storageDir = path.resolve(projectDir, '.scrimble', 'storage');
+    if (!fs.existsSync(storageDir)) {
+      fs.mkdirSync(storageDir, { recursive: true });
+    }
+
     const env = {
       ENVIRONMENT: 'local',
       DB: dbWrapper,
       CHECKPOINT_BUCKET: {
-        get: async () => null,
-        put: async () => {},
-        delete: async () => {},
+        get: async (key: string) => {
+          const filePath = path.join(storageDir, key);
+          try {
+            const data = await fs.promises.readFile(filePath, 'utf8');
+            return {
+              key,
+              size: Buffer.byteLength(data, 'utf8'),
+              httpEtag: 'W/\"local\"',
+              body: new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode(data));
+                  controller.close();
+                }
+              }),
+              text: async () => data,
+              json: async () => JSON.parse(data),
+            };
+          } catch (e: any) {
+            if (e.code === 'ENOENT') {
+              throw new Error(`Local storage file is missing for key: ${key}. Expected at ${filePath}`);
+            }
+            throw e;
+          }
+        },
+        put: async (key: string, data: any) => {
+          const filePath = path.join(storageDir, key);
+          const dir = path.dirname(filePath);
+          await fs.promises.mkdir(dir, { recursive: true });
+          
+          let stringData = '';
+          if (typeof data === 'string') {
+            stringData = data;
+          } else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+            stringData = new TextDecoder().decode(data);
+          } else {
+            stringData = String(data);
+          }
+          
+          await fs.promises.writeFile(filePath, stringData, 'utf8');
+          
+          return {
+            key,
+            size: Buffer.byteLength(stringData, 'utf8'),
+            httpEtag: 'W/\"local\"',
+            body: new ReadableStream(),
+            text: async () => stringData,
+            json: async () => JSON.parse(stringData)
+          };
+        },
+        delete: async (key: string) => {
+          const filePath = path.join(storageDir, key);
+          try {
+            await fs.promises.unlink(filePath);
+          } catch (e: any) {
+            if (e.code !== 'ENOENT') throw e;
+          }
+        },
+        list: async (options?: { prefix?: string; cursor?: string }) => {
+          let allFiles: string[] = [];
+          
+          const getFiles = async (dir: string, currentPrefix: string) => {
+            let entries;
+            try {
+              entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            } catch (e: any) {
+              if (e.code === 'ENOENT') return;
+              throw e;
+            }
+            
+            for (const entry of entries) {
+              const res = path.resolve(dir, entry.name);
+              const relativeKey = currentPrefix + entry.name;
+              if (entry.isDirectory()) {
+                await getFiles(res, relativeKey + '/');
+              } else {
+                allFiles.push(relativeKey);
+              }
+            }
+          };
+          
+          await getFiles(storageDir, '');
+          
+          if (options?.prefix) {
+            allFiles = allFiles.filter(f => f.startsWith(options.prefix as string));
+          }
+          
+          return {
+            objects: allFiles.map(key => ({ key })),
+            truncated: false
+          };
+        }
       }
     } as unknown as Bindings;
     
