@@ -4,6 +4,11 @@ import { executeBatch1, executeBatch2, executeBatch3, executeBatch4, executeBatc
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import { config } from 'dotenv';
+
+// Load environment variables from local .env file, without overriding existing system env vars
+config({ path: path.resolve(process.cwd(), '.env') });
+
 import { LocalD1Database, applyMigrations } from './db.js';
 import { authenticateUser, getStoredToken } from './auth.js';
 import { syncLocalToCloud } from './sync.js';
@@ -62,6 +67,16 @@ program
         get: async () => null,
         put: async () => {},
         delete: async () => {},
+      },
+      get ENCRYPTION_KEY() {
+        const key = process.env.ENCRYPTION_KEY;
+        if (!key) {
+          throw new Error('ENCRYPTION_KEY is required for this operation. Please provide it by creating a .env file in the current directory or by exporting it in your shell. Example: export ENCRYPTION_KEY="your-64-char-hex-key"');
+        }
+        if (!/^[a-fA-F0-9]{64}$/.test(key)) {
+          throw new Error('ENCRYPTION_KEY must be a valid 64-character hexadecimal string.');
+        }
+        return key;
       }
     } as unknown as Bindings;
     

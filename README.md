@@ -57,6 +57,21 @@ Scrimble is an AI-powered project orchestration platform that helps you plan, tr
    ```
    Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
 
+### Local CLI Usage
+
+The Scrimble CLI can be used to run operations completely offline or to sync local changes with the cloud. Some offline operations (like accessing locally stored AI provider keys) require the same `ENCRYPTION_KEY` used by your Cloudflare Workers environment.
+
+You can provide this key to the CLI in two ways:
+1. **Using a `.env` file**: Create a `.env` file in the directory where you run the CLI commands, and add the key:
+   ```env
+   ENCRYPTION_KEY=your_64_character_hex_key_here
+   ```
+2. **Exporting as a system environment variable**: Explicitly set the variable in your shell (this will override any value in your `.env` file):
+   ```bash
+   export ENCRYPTION_KEY="your_64_character_hex_key_here"
+   scrimble plan .
+   ```
+
 ## Deployment
 
 This app is designed to be deployed on **Cloudflare Pages**.
